@@ -104,16 +104,14 @@
     "startup_mail",
     "official_messages",
     "cookie_store",
+    "password_vault",
+    "password_vault_ui",
     "identity_store",
-    "canvas",
-    "canvas_edit",
-    "canvas_view",
     "context_router",
     "agent_contract",
     "branch",
     "file_pager",
     "context_snapshot",
-    "infinite_canvas",
     "prop_ui",
     "vision",
     "retask",
@@ -161,6 +159,7 @@
       "aiortc",
       "av",
       "cffi",
+      "cryptography",
       "pyte"
     ]
   },
@@ -194,6 +193,7 @@
     "rich>=13.0.0",
     "prompt_toolkit>=3.0.0",
     "pyte>=0.8.2,<0.9",
-    "pysocks>=1.7"
+    "pysocks>=1.7",
+    "cryptography>=41.0"
   ]
 }

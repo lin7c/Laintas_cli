@@ -1,5 +1,5 @@
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Canonical context-compaction policy shared across agent products (laintas_cli, Helpwo). Single source of truth for the KNOBS that drive compaction; each product implements the mechanism against its own message/history structure. Derived from opencode's strategy (packages/opencode/src/session/{compaction,overflow}.ts + packages/core/src/session/compaction.ts). Vendored into each product like tools/catalog.json. DO NOT edit the vendored copies — edit here and re-sync.",
   "auto": true,
   "buffer_tokens": 20000,
@@ -71,7 +71,8 @@
     "usable_tokens": "window - max(max_output, buffer_tokens) — the budget the assembled prompt must fit under (opencode overflow.ts: usable()).",
     "keep_recent_tokens": "token budget of the most-recent turns kept verbatim as the tail; clamp(usable*keep_recent_ratio, keep_recent_min, keep_recent_max) when not pinned (opencode preserveRecentBudget()).",
     "tail_turns": "max recent user-turns considered for the tail; older turns become the head to summarize.",
-    "prune": "Opencode intent (prune()): walk tool outputs backwards; protect the most-recent prune_protect_tokens and prune_protected_tools; truncate older completed tool outputs to tool_output_max_chars; only act when reclaimable > prune_minimum_tokens. IMPLEMENTATION STATUS: prune_minimum_tokens and prune_protect_tokens are RESERVED / not-yet-wired — no current consumer (laintas_cli, gateway, Helpwo) reads either knob, so changing their values has no effect. Consumers today protect the recent tail via keep_recent_tokens + prune_protected_tools and prune tool outputs once the thread exceeds usable_tokens; the separate prune_protect_tokens boundary and the prune_minimum_tokens reclaimable-gate are not implemented."
+    "prune": "Opencode intent (prune()): walk tool outputs backwards; protect the most-recent prune_protect_tokens and prune_protected_tools; truncate older completed tool outputs to tool_output_max_chars; only act when reclaimable > prune_minimum_tokens. IMPLEMENTATION STATUS: prune_minimum_tokens and prune_protect_tokens are RESERVED / not-yet-wired — no current consumer (laintas_cli, gateway, Helpwo) reads either knob, so changing their values has no effect. Consumers today protect the recent tail via keep_recent_tokens + prune_protected_tools and prune tool outputs once the thread exceeds usable_tokens; the separate prune_protect_tokens boundary and the prune_minimum_tokens reclaimable-gate are not implemented.",
+    "tool_output_tail_ratio": "Share of tool_output_max_chars kept from the END of a truncated tool output. A long result's most valuable lines are often the last ones — a traceback, a failing assertion, a summary printed last — and head-only truncation cut exactly those. Added in 0.2.0; it had been edited into laintas_cli's vendored copy only, which is what the DO-NOT-EDIT note above exists to prevent. Bump `version` on every change so a stale copy is visible."
   },
   "tool_output_tail_ratio": 0.35
 }

@@ -511,6 +511,12 @@ def activate_patch(patch_id: str) -> tuple[bool, str]:
             compile_patch(patch)
         except ValueError as exc:
             return False, f"Patch validation failed: {exc}"
+        runs = patch.get("test_runs") or []
+        if not runs or not runs[-1].get("passed"):
+            return False, (
+                f"Patch {patch_id} does not have a passing latest test; "
+                "run /prompt test before activating."
+            )
         profile = get_active_profile()
         before = list(profile.get("patches") or [])
         if patch_id in before:

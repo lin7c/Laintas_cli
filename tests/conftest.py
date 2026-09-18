@@ -49,3 +49,20 @@ def _isolated_preference_store():
         finally:
             terminal_preferences.preference_path = real
             terminal_preferences.reset_cache()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_compaction_folds():
+    """Keep one test's completed chunk folds out of the next one's bill.
+
+    ``background_compaction`` caches finished folds process-wide and keyed by
+    content, so that an attempt cancelled half way through a head resumes
+    instead of re-summarizing from the first chunk. Tests that reuse the same
+    synthetic chunk text would otherwise inherit each other's folds and see the
+    summarizer never called.
+    """
+    import background_compaction
+
+    background_compaction.forget_folds()
+    yield
+    background_compaction.forget_folds()

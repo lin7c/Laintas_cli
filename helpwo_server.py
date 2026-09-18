@@ -419,7 +419,13 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
             return True
         self._json(403, {
             "error": "authentication required",
-            "detail": "open the URL printed by /helpwo, which carries ?token=",
+            "detail": (
+                "open the Bridge login URL printed by /app start, which carries ?token=; "
+                "API clients must send Authorization: token <LAINTAS_APP_TOKEN>"
+                if _app_profile is not None else
+                "open the URL printed by /helpwo, which carries ?token=; "
+                "API clients may send Authorization: token <token>"
+            ),
         })
         return False
 
@@ -1934,18 +1940,22 @@ def idle_seconds() -> float:
     return max(0.0, time.monotonic() - _last_request_at)
 
 
-def get_url(with_token: bool = False) -> str:
+def get_url(with_token: bool = False, *, path: str = "") -> str:
     """Base URL of the running server (or empty string).
 
     with_token appends the one the browser needs on its first visit; after
-    that the cookie carries it.
+    that the cookie carries it. Apps use /api/local-runtime as their login
+    destination because they do not serve the static Helpwo page at /.
     """
     if not is_running():
         return ""
     host = _bind_host if _bind_host not in ("0.0.0.0", "::") else "127.0.0.1"
     url = f"http://{host}:{_server_port_val}"
+    if path:
+        url += "/" + path.lstrip("/")
     if with_token and _auth_token():
-        url += f"/?token={_auth_token()}"
+        from urllib.parse import quote
+        url += ("" if path else "/") + f"?token={quote(_auth_token(), safe='')}"
     return url
 
 

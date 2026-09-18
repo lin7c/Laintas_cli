@@ -203,10 +203,28 @@ class ExtensionContext:
 
     def register_command(self, name: str, handler: Callable, *,
                          description: str = "",
-                         subcommands: Optional[list[tuple[str, str]]] = None) -> None:
+                         subcommands: Optional[list[tuple[str, str]]] = None,
+                         arg_rules: Optional[list] = None,
+                         file_arguments: Optional[list] = None) -> None:
+        """Register a slash command.
+
+        ``arg_rules`` is an optional list of ``(subcommand, max_args, usage)``
+        — ``""`` for the bare command — and buys the same argument checking a
+        built-in gets: a typo in a trailing word is reported as a usage error
+        instead of being silently ignored. Without it the command still works;
+        its arguments are simply never validated, which is what every
+        extension command had before.
+
+        ``file_arguments`` is an optional list of ``(subcommand, suffixes)``
+        — again ``""`` for the bare command — and turns on the CLI's own path
+        completion at those positions. Suffixes only: the extension declares
+        WHAT it takes, and the CLI keeps owning how paths are found and cached.
+        """
         self._runtime.register_command(self.name, name, handler,
                                        description=description,
-                                       subcommands=subcommands)
+                                       subcommands=subcommands,
+                                       arg_rules=arg_rules,
+                                       file_arguments=file_arguments)
 
     def register_tool(self, tool, handler: Optional[Callable] = None,
                       spec: Optional[dict] = None) -> None:
@@ -312,6 +330,12 @@ class ExtensionRuntime:
         self._loaded: dict[str, LoadedExtension] = {}
         self._commands: dict[str, tuple[str, Callable]] = {}
         self._command_meta: dict[str, dict] = {}  # {"/org": {"description": str, "subcommands": [(name, desc), ...]}}
+        # {"/canvas": {"": (1, usage), "new": (2, usage)}} — the argument
+        # contract an extension declares for its own command.
+        self._command_rules: dict[str, dict[str, tuple[int, str]]] = {}
+        # {"/canvas": {"": (".excalidraw",)}} — the file types a command's
+        # arguments name, for path completion.
+        self._command_files: dict[str, dict[str, tuple[str, ...]]] = {}
         self._loops: dict[str, list[Callable]] = {}
         self._tool_prefixes: dict[str, str] = {}
         self._console: Any = None
@@ -332,7 +356,9 @@ class ExtensionRuntime:
 
     def register_command(self, owner: str, name: str, handler: Callable,
                          *, description: str = "",
-                         subcommands: Optional[list[tuple[str, str]]] = None) -> None:
+                         subcommands: Optional[list[tuple[str, str]]] = None,
+                         arg_rules: Optional[list] = None,
+                         file_arguments: Optional[list] = None) -> None:
         normalized = name if str(name).startswith("/") else f"/{name}"
         if not re.fullmatch(r"/[A-Za-z0-9][A-Za-z0-9_-]{0,63}", normalized):
             raise ValueError(f"invalid extension command: {name}")
@@ -348,6 +374,31 @@ class ExtensionRuntime:
             "description": description,
             "subcommands": list(subcommands) if subcommands else [],
         }
+        rules = {}
+        for rule in (arg_rules or []):
+            try:
+                sub, max_args, usage = rule
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "arg_rules entries are (subcommand, max_args, usage)") from exc
+            rules[str(sub or "").lower()] = (int(max_args), str(usage))
+        if rules:
+            self._command_rules[normalized.lower()] = rules
+        else:
+            self._command_rules.pop(normalized.lower(), None)
+        files = {}
+        for entry in (file_arguments or []):
+            try:
+                sub_name, suffixes = entry
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "file_arguments entries are (subcommand, suffixes)") from exc
+            files[str(sub_name or "").lower()] = tuple(
+                str(item) for item in suffixes if str(item).strip())
+        if files:
+            self._command_files[normalized.lower()] = files
+        else:
+            self._command_files.pop(normalized.lower(), None)
 
     def register_tool(self, owner: str, tool: Tool) -> None:
         if not isinstance(tool, Tool):
@@ -459,6 +510,16 @@ class ExtensionRuntime:
             command: meta for command, meta in self._command_meta.items()
             if self._commands.get(command)  # keep only still-registered
         }
+        # Argument contracts follow the command that declared them; keyed by
+        # command, so they are dropped by what is left rather than by owner.
+        self._command_rules = {
+            command: rules for command, rules in self._command_rules.items()
+            if self._commands.get(command)
+        }
+        self._command_files = {
+            command: files for command, files in self._command_files.items()
+            if self._commands.get(command)
+        }
         self._loops.pop(name, None)
         self._tool_prefixes.pop(name, None)
         get_registry().unregister_source(f"extension:{name}")
@@ -527,6 +588,24 @@ class ExtensionRuntime:
             if arity is None:
                 return True, handler(parts)
             raise
+
+    def command_arg_rule(self, command: str, subcommand: str = "") -> Optional[tuple]:
+        """(max_args, usage) an extension declared for this command, or None.
+
+        Checked most specific first, exactly like the built-in table: a rule
+        for the subcommand wins over the rule for the bare command.
+        """
+        rules = self._command_rules.get(str(command or "").lower())
+        if not rules:
+            return None
+        return rules.get(str(subcommand or "").lower()) or rules.get("")
+
+    def command_file_suffixes(self, command: str, subcommand: str = "") -> tuple:
+        """File suffixes an extension's command takes at this position."""
+        files = self._command_files.get(str(command or "").lower())
+        if not files:
+            return ()
+        return files.get(str(subcommand or "").lower()) or files.get("") or ()
 
     def intercept_loop(self, command: str, ctx: dict) -> Optional[str]:
         for owner in list(self._loaded):

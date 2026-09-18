@@ -18,6 +18,8 @@ SUMMARY = "## Goal\nFix service\n## Progress\nTests failed\n## Next Steps\nRepai
 @pytest.fixture
 def env(monkeypatch):
     loop.reset_runtime_config()
+    bg.forget_folds()
+    bg._parked.clear()
     coordinator = bg.Coordinator()
     token = bg.current.set(coordinator)
     messages = [{"role": "user", "content": "a" * 6000},
@@ -54,12 +56,17 @@ def env(monkeypatch):
     release.set()
     job = coordinator.job
     coordinator.close()
+    for parked in list(bg._parked.values()):
+        parked.close()
+    bg._parked.clear()
     if job is not None:
         job.thread.join(2)
         assert not job.thread.is_alive()
     bg.current.reset(token)
     loop.reset_runtime_config()
     assert bg.status(loop._compaction_owner(state)) == "idle"
+    bg.forget_folds()
+    bg._parked.clear()
 
 
 def start(e):
@@ -95,7 +102,7 @@ def test_background_does_not_block_or_mutate_and_commits_appended_messages(env):
     assert not job.thread.is_alive()
 
 
-@pytest.mark.parametrize("mutation", ["prefix", "summary", "run", "session", "config"])
+@pytest.mark.parametrize("mutation", ["prefix", "summary", "session", "config"])
 def test_stale_result_never_overwrites_live_history(env, mutation):
     e = env
     start(e)
@@ -104,8 +111,6 @@ def test_stale_result_never_overwrites_live_history(env, mutation):
         e.messages[0]["content"] += "changed"
     elif mutation == "summary":
         e.state["_thread_summary"] = "newer summary"
-    elif mutation == "run":
-        e.state["_run_id"] = "new run"
     elif mutation == "session":
         e.state["_session_id"] = "another session"
     else:
@@ -327,7 +332,7 @@ def test_invalid_thresholds_are_rejected(env, key, value):
         loop.set_runtime_config(key, value)
 
 
-def test_scope_cancels_on_exception(env):
+def test_scope_parks_work_even_when_the_run_raises(env):
     jobs = []
 
     @bg.scoped
@@ -339,8 +344,10 @@ def test_scope_cancels_on_exception(env):
 
     with pytest.raises(RuntimeError, match="loop failed"):
         run()
-    assert jobs[0].cancel.requested()
-    assert not jobs[0].thread.is_alive()
+    # A crashed run does not invalidate a summary of the thread's head, and the
+    # scope must still be restored.
+    assert not jobs[0].cancel.requested()
+    assert bg._parked
     assert bg.current.get() is env.coordinator
 
 
@@ -364,3 +371,124 @@ def test_process_and_session_limits_prevent_duplicate_workers():
             coordinator.close()
             if coordinator.job:
                 assert not coordinator.job.thread.is_alive()
+
+
+def test_summary_started_in_one_run_is_committed_by_the_next(env):
+    """A turn boundary is not a reason to throw away a paid-for summary.
+
+    Cancelling the job at run exit (and keying it by `_run_id`) meant every
+    speculative summary that outlived its turn was discarded, so on short turns
+    the background path could never commit anything at all.
+    """
+    e = env
+    original = copy.deepcopy(e.messages)
+    started = []
+
+    @bg.scoped
+    def first_turn():
+        assert not e.check()
+        assert e.entered.wait(2)
+        started.append(bg.current.get().job)
+
+    first_turn()
+    job = started[0]
+    assert not job.cancel.requested()        # parked, not killed
+    assert bg._parked
+    e.release.set()
+    assert job.done.wait(2)
+
+    @bg.scoped
+    def second_turn():
+        return e.check()
+
+    assert second_turn()                     # adopted and committed
+    assert e.state["_thread_summary"] == SUMMARY
+    assert e.messages[1:] == original[2:]
+    assert e.summarizer.call_count == 1
+    assert not bg._parked
+
+
+def test_run_exit_still_cancels_an_interrupted_job(env):
+    e = env
+    interrupt = threading.Event()
+
+    @bg.scoped
+    def run():
+        assert not e.check(interrupt_event=interrupt)
+        assert e.entered.wait(2)
+        job = bg.current.get().job
+        interrupt.set()
+        return job
+
+    job = run()
+    assert job.done.wait(2)
+    assert job.cancelled
+    assert not bg._parked
+
+
+@pytest.fixture
+def folding(monkeypatch):
+    """Drive `_summarize_head_in_chunks` directly over two known chunks."""
+    bg.forget_folds()
+    folded = []
+    stop = threading.Event()
+
+    def summarize(deps, session, cwd, text, summary, lang, trajectory, cancel):
+        folded.append(text)
+        return "merged:" + text
+
+    monkeypatch.setattr(loop, "_llm_summarize", summarize)
+    monkeypatch.setattr(loop, "_llm_review_summary",
+                        lambda d, s, c, text, merged, prev, lang, t, cancel: SUMMARY + merged)
+    monkeypatch.setattr(loop, "_valid_structured_summary", lambda summary, lang: bool(summary))
+    monkeypatch.setattr(loop, "_summary_source_chunks", lambda head, budget: ["one", "two"])
+    monkeypatch.setattr(loop, "_summary_window", lambda model: 100000)
+
+    def fold(interrupt=None):
+        return loop._summarize_head_in_chunks(
+            mock.Mock(), {}, [{"role": "user", "content": "evidence"}],
+            None, "EN", "traj", interrupt)
+
+    yield SimpleNamespace(folded=folded, stop=stop, fold=fold)
+    bg.forget_folds()
+
+
+def test_completed_folds_survive_an_abandoned_attempt(folding):
+    """The cache is what lets a head bigger than one attempt ever compact."""
+    give_up = threading.Event()
+    original = loop._llm_review_summary
+
+    def review(*args):
+        result = original(*args)
+        give_up.set()                        # stall once the first fold is in
+        return result
+
+    loop._llm_review_summary = review
+    try:
+        assert folding.fold(give_up) is None
+    finally:
+        loop._llm_review_summary = original
+    assert folding.folded == ["one"]
+
+    folding.folded.clear()
+    assert folding.fold(threading.Event()).endswith("merged:two")
+    assert folding.folded == ["two"]         # chunk 1 reused, not re-billed
+
+
+def test_stall_deadline_restarts_on_every_completed_fold(folding):
+    """A four-chunk head must not die because the JOB took longer than one."""
+    cancel = bg.Cancellation(None, 1)
+    cancel.timeout = 0.3
+    cancel.deadline = time.monotonic() + 0.3
+    original = loop._llm_summarize
+
+    def summarize(*args):
+        time.sleep(0.2)                      # each fold outlives a total budget
+        return original(*args)
+
+    loop._llm_summarize = summarize
+    try:
+        assert folding.fold(cancel) is not None
+    finally:
+        loop._llm_summarize = original
+    assert folding.folded == ["one", "two"]

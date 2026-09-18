@@ -171,15 +171,56 @@ def recall(query: str, *, mem_type: str = None, k: int = 5,
     return result
 
 
+#: Ceiling on how many entries a budgeted block may consider. A budget with no
+#: ceiling would rank the whole store on every prompt rebuild for lines that
+#: will not fit anyway.
+_BUDGET_MAX_HITS = 24
+
+# Names already counted as used, as (query, name). The prompt is rebuilt every
+# loop from the same cached ranking, so without this one recall would count the
+# same entry dozens of times in a single run and "how often has this been
+# useful" would measure loop iterations instead.
+_USE_RECORDED: set = set()
+_USE_RECORDED_MAX = 4096
+
+
+def _record_use(query: str, names) -> None:
+    fresh = []
+    for name in names:
+        key = (str(query)[:120], str(name))
+        if key in _USE_RECORDED:
+            continue
+        if len(_USE_RECORDED) >= _USE_RECORDED_MAX:
+            _USE_RECORDED.clear()
+        _USE_RECORDED.add(key)
+        fresh.append(name)
+    if not fresh:
+        return
+    try:
+        memory_system.touch(fresh, kind="recall")
+    except Exception:
+        pass
+
+
 def relevant_block(query: str, *, k: int = 5, session: Optional[dict] = None,
-                   local_only: bool = False) -> str:
+                   local_only: bool = False, budget_chars: int = 0) -> str:
     """Formatted task-relevant summary section for the prompt, or ``""``.
+
+    With ``budget_chars``, ``k`` becomes a FLOOR and the block fills to the
+    character budget instead. A fixed count per prompt was the reason a store
+    of 150 entries showed the same handful forever: the window never widened,
+    so anything ranked sixth was unreachable no matter how relevant it was —
+    while a one-line summary costs about as much as one line of anything else
+    already in the prompt.
 
     Full entries remain available through ``mem.list``/``mem.read``; callers do
     not need to bulk-inject the store.
     """
+    want = max(1, int(k or 1))
+    if budget_chars and budget_chars > 0:
+        want = max(want, _BUDGET_MAX_HITS)
     try:
-        hits = recall(query, k=k, session=session, local_only=local_only)
+        hits = recall(query, k=want, session=session, local_only=local_only)
     except Exception:
         return ""
     if not hits:
@@ -187,7 +228,9 @@ def relevant_block(query: str, *, k: int = 5, session: Optional[dict] = None,
     # Summary-only, like the bulk context: name + category + one-line summary, no
     # body. The agent expands a specific entry via mem.read when it needs detail.
     lines = ["★ Most relevant memories for the current task (summaries; use mem.read for full text):"]
-    for h in hits:
+    used = len(lines[0])
+    shown: list = []
+    for index, h in enumerate(hits):
         name = h.get("name", "")
         typ = h.get("type", "")
         desc = (h.get("description", "") or "").strip()
@@ -197,15 +240,41 @@ def relevant_block(query: str, *, k: int = 5, session: Optional[dict] = None,
         # that stops the model from checking it. Carry the flag through.
         flag = (" [STALE — cited source changed; verify before relying on it]"
                 if h.get("status") == memory_system.STATUS_STALE else "")
-        lines.append(f"{head} {desc}{flag}".rstrip())
+        line = f"{head} {desc}{flag}".rstrip()
+        # The floor is honoured before the budget: a prompt that shows nothing
+        # because the first summary was long is worse than one line over.
+        if (budget_chars and index >= max(1, int(k or 1))
+                and used + len(line) + 1 > budget_chars):
+            break
+        used += len(line) + 1
+        lines.append(line)
+        shown.append(name)
+    # Counted here, not in recall(): an entry that was ranked and then cut by
+    # the budget was never put in front of the model, and counting it would
+    # make "used" mean "considered".
+    _record_use(query, shown)
     return "\n".join(lines)
 
 
 def _lexical_fallback(query: str, mem_type: str, k: int) -> list:
+    """Local ranking: lexical overlap first, then what has earned its keep.
+
+    ``search_memories`` scores ``hits * 10 + importance``, so whole-point gaps
+    mean "matched one more term". The usage prior is deliberately smaller than
+    that: it breaks ties between entries the query touches equally, and never
+    outvotes an actual term match.
+    """
     try:
-        results = memory_system.search_memories(query, mem_type=mem_type, limit=k)
+        results = memory_system.search_memories(
+            query, mem_type=mem_type, limit=max(k, _BUDGET_MAX_HITS))
     except Exception:
         return []
     for r in results:
         r["method"] = "lexical"
-    return results
+        try:
+            r["score"] = round(float(r.get("score", 0.0))
+                               + 2.0 * memory_system.eviction_score(r), 3)
+        except Exception:
+            pass
+    results.sort(key=lambda r: float(r.get("score", 0.0)), reverse=True)
+    return results[:max(1, int(k or 1))]

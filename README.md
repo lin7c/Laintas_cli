@@ -4,6 +4,10 @@
 
 [Download](https://cli.laintas.com) · [Documentation](https://laintas.com/docs) · [Releases](https://github.com/lin7c/Laintas_cli/releases) · [Laintas](https://laintas.com)
 
+[![A recorded laintas-cli session: it runs the test suite, finds why one test fails, shows the patch, waits for approval, applies it, and re-runs the suite green](docs/assets/terminal-session.svg)](https://cli.laintas.com)
+
+<sub>A real v1.29.4 session recorded off a terminal and replayed frame for frame — 2× speed, long model pauses cut, nothing on screen rewritten.</sub>
+
 Laintas CLI combines a normal interactive shell with an agent runtime. Shell commands still run directly in a real PTY; natural-language tasks enter an iterative agent loop that can inspect the workspace, call tools, delegate work, and continue from the results.
 
 It is designed for developers, server operators, and remote workspaces that want an AI agent close to the filesystem and terminal—not isolated in a separate chat window.
@@ -426,6 +430,7 @@ sub-terminal, `/helpwo` serves in place as before.
 
 ```json
 {"name": "notes", "description": "…", "command": "node server.js",
+ "app_url": "http://127.0.0.1:3000",
  "prompt": "What this app's agent is for.", "persistence": "none", "port": 8123,
  "session_tools": ["shell.exec"], "auto_approve": false,
  "max_sessions": 10, "session_idle_minutes": 30}
@@ -435,6 +440,11 @@ A manifest must be trusted (`/app trust <name>`) before it starts, and again
 after it changes. The `command` runs with `LAINTAS_APP_BRIDGE_URL`,
 `LAINTAS_APP_TOKEN`, `LAINTAS_APP_AGENT_ID` and `LAINTAS_APP_NAME` in its
 environment, logs to the app's state folder, and stops with the sub-terminal.
+
+Set `app_url` to the project's actual HTTP(S) address. Startup prints this as
+**Project URL**, separately from **Bridge API** and **Bridge login**. The `port`
+field configures the bridge; `app_url` only advertises the project address and
+does not change its listener or check readiness.
 
 Agents manage the full lifecycle with `app.manifest.put`, `app.list`,
 `app.manifest.get`, `app.start`, `app.stop`, `app.trust.request` and

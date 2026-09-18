@@ -44,8 +44,6 @@ _GROUPS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
      ("web.",)),
     (("browser", "website", "page", "dom", "playwright", "screenshot", "ui test"),
      ("browser.",)),
-    (("canvas", "diagram", "whiteboard", "mind map"),
-     ("canvas.",)),
     (("image", "photo", "picture", "ocr", "vision"),
      ("image.",)),
     (("generate image", "generate video", "video", "media"),
@@ -146,6 +144,31 @@ _INPUT_ALIASES = {
 }
 
 
+
+#: Keyword groups contributed at runtime, by extensions that own a tool family.
+#: The router already matches an extension's tools by name and description, but
+#: the words a person actually uses are often in neither: "whiteboard" appears
+#: nowhere in `canvas.draw`. An extension that moved out of the core (canvas
+#: did) would otherwise lose the synonyms the built-in table gave it.
+_registered_groups: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+
+
+def register_group(triggers, selectors) -> None:
+    """Route `selectors` (tool-name prefixes) whenever a `trigger` appears."""
+    entry = (tuple(str(t).casefold() for t in triggers if str(t).strip()),
+             tuple(str(s) for s in selectors if str(s).strip()))
+    if not entry[0] or not entry[1]:
+        raise ValueError("register_group needs triggers and selectors")
+    unregister_group(entry[1])
+    _registered_groups.append(entry)
+
+
+def unregister_group(selectors) -> None:
+    """Drop the group that owns these selectors, when its extension unloads."""
+    wanted = tuple(str(s) for s in selectors)
+    _registered_groups[:] = [g for g in _registered_groups if g[1] != wanted]
+
+
 def _normalize_query(text: str) -> str:
     value = str(text or "").casefold()
     concepts = [english for phrase, english in _INPUT_ALIASES.items() if phrase in value]
@@ -185,7 +208,7 @@ def select_tool_names(query: str, tools: Iterable[object]) -> set[str]:
     selected = set(CORE_TOOLS) & available
     lowered = _normalize_query(query)
 
-    for triggers, selectors in _GROUPS:
+    for triggers, selectors in (*_GROUPS, *_registered_groups):
         if any(_contains(lowered, trigger) for trigger in triggers):
             selected.update(name for name in available if _matches_name(name, selectors))
 

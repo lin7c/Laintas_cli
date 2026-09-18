@@ -373,29 +373,36 @@ html { scroll-behavior: smooth; }
 .proof-label { position: absolute; z-index: 2; top: -34px; right: 2px; display: flex; align-items: center; gap: 8px; color: var(--ops-muted); font: 600 10px/1 var(--font-mono); letter-spacing: .12em; }
 .live-dot { width: 7px; height: 7px; border-radius: 50%; background: #18a266; box-shadow: 0 0 0 5px rgba(24,162,102,.11); }
 
-/* Live terminal demo — rendered in HTML/CSS, replaces raster screenshots */
-.termdemo { overflow: hidden; border: 1px solid var(--ops-line-strong); border-radius: 13px; background: #0a0f0b; box-shadow: 0 40px 110px var(--ops-shadow); }
-.termdemo-bar { display: flex; align-items: center; gap: 12px; height: 40px; padding: 0 16px; border-bottom: 1px solid var(--ops-line); background: rgba(255,255,255,.02); }
-.termdemo-dots { display: flex; gap: 7px; }.termdemo-dots i { width: 11px; height: 11px; border-radius: 50%; background: #d83b32; }.termdemo-dots i:nth-child(2) { background: #d8a53a; }.termdemo-dots i:nth-child(3) { background: #3aa76a; }
-.termdemo-title { color: var(--ops-muted); font: 500 11px/1 var(--font-mono); letter-spacing: .02em; }
-.termdemo-rec { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; color: #62c58f; font: 600 9px/1 var(--font-mono); letter-spacing: .14em; }.termdemo-rec b { width: 7px; height: 7px; border-radius: 50%; background: #18a266; box-shadow: 0 0 0 4px rgba(24,162,102,.15); animation: blink 1.6s ease-in-out infinite; }
-@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
-.termdemo-body { min-height: 320px; padding: 20px 20px 24px; font-family: var(--font-mono); font-size: 13px; line-height: 1.75; }
-.td-line { white-space: pre-wrap; word-break: break-word; }
-.td-cmd { color: #d3d9d2; }
-.td-input { color: #7fd8ad; }
-.td-step { color: #c9a35e; }
-.td-ok { color: #62c58f; }
-.td-tool { color: #8fc7ee; }
-.td-done { color: #62c58f; font-weight: 600; }
-.td-accent { color: #6ad29c; }
-.td-prompt { color: #d3d9d2; }
-.td-muted, .td-plain { color: #8b938b; }
-.td-blank { color: transparent; }
-.td-spin { color: #7fd8ad; font-weight: 600; }
-.td-spin .td-clock { color: #8b949e; font-weight: 400; }
-.td-status { padding: 2px 0; color: var(--ops-muted); font-size: 11px; letter-spacing: .01em; }
-.td-caret { display: inline-block; width: 8px; height: 15px; margin-left: 2px; vertical-align: text-bottom; background: #7fd8ad; animation: blink .8s step-end infinite; }
+/* Terminal replay — a recorded laintas-cli session played back frame by frame.
+   The body is a fixed grid of terminal cells: every run is pinned to its own
+   column width in TerminalReplay.jsx, so the recording is never re-wrapped. */
+.termreplay { min-width: 0; overflow: hidden; border: 1px solid var(--ops-line-strong); border-radius: 13px; background: #0b0f0c; box-shadow: 0 40px 110px var(--ops-shadow); }
+.termreplay-bar { display: flex; align-items: center; gap: 12px; height: 38px; padding: 0 16px; border-bottom: 1px solid var(--ops-line); background: rgba(255,255,255,.02); }
+.termreplay-dots { display: flex; gap: 7px; }
+.termreplay-dots i { width: 11px; height: 11px; border-radius: 50%; background: #d83b32; }
+.termreplay-dots i:nth-child(2) { background: #d8a53a; }
+.termreplay-dots i:nth-child(3) { background: #3aa76a; }
+.termreplay-title { color: var(--ops-muted); font: 500 11px/1 var(--font-mono); letter-spacing: .02em; }
+.termreplay-rec { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; color: #d98b84; font: 600 9px/1 var(--font-mono); letter-spacing: .14em; }
+.termreplay-rec b { width: 7px; height: 7px; border-radius: 50%; background: #d83b32; box-shadow: 0 0 0 4px rgba(216,59,50,.14); animation: blink 1.9s ease-in-out infinite; }
+@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: .28; } }
+/* JetBrains Mono ships from Google Fonts without box drawing or the ● status
+   glyph, so the recording's banner and tool rows need a mono fallback that has
+   them: Menlo (macOS), Consolas/Cascadia (Windows), DejaVu/Noto Mono (Linux). */
+.termreplay-viewport { position: relative; overflow: hidden; font-family: 'JetBrains Mono', Menlo, Consolas, 'Cascadia Mono', 'DejaVu Sans Mono', 'Noto Sans Mono', 'Noto Sans SC', monospace; font-variant-ligatures: none; color: #c9d1d9; }
+/* The stage keeps the recording's own pixel width and is scaled into the
+   card, so it must not size the card: out of flow, or the fixed width would
+   push the page wider than the screen on a phone. */
+.termreplay-stage { position: absolute; top: 0; left: 18px; transform-origin: 0 0; }
+.tr-row { white-space: pre; }
+/* A blank screen row still occupies its line: the strut gives the empty div a
+   line box, so a row the session left empty keeps the grid from collapsing. */
+.tr-row::after { content: ''; display: inline-block; width: 0; }
+/* Each run is pinned to its own columns and may overflow them: a terminal
+   lets a too-wide glyph spill into the next cell as well, and clipping it
+   would cut the ● tool dots in half. */
+.tr-row span { display: inline-block; vertical-align: top; }
+
 .hero-terminal figcaption { display: flex; align-items: flex-start; gap: 28px; padding: 20px 4px 0; }.hero-terminal figcaption > div { display: flex; flex-direction: column; gap: 6px; }.hero-terminal figcaption strong { font-size: 13px; }.hero-terminal figcaption span { color: var(--ops-muted); font-size: 12px; line-height: 1.6; }
 
 .section-intro { scroll-margin-top: 95px; display: grid; grid-template-columns: 1fr 3fr; gap: 40px; padding-top: 138px; }

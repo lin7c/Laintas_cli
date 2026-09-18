@@ -20,8 +20,10 @@ Everything is best-effort: a failure writes nothing and never disturbs the loop.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from pathlib import Path
 from typing import Callable, Optional
 
 import memory_system
@@ -60,7 +62,11 @@ SYSTEM_PROMPT = (
     "If nothing durable is worth remembering, return an empty array.\n\n"
     "Output ONLY a JSON array, no prose. Each item: "
     '{"type": "user|feedback|project|structure|reference", "name": "short-kebab-slug", '
-    '"description": "one line", "body": "the fact", "importance": 0.0-1.0}.'
+    '"description": "one line", "body": "the fact", "importance": 0.0-1.0, '
+    '"evidence": ["relative/path/of/a/file/the/claim/came/from"]}. '
+    "Evidence paths must be repo files that actually appeared in the "
+    "conversation (at most 3). They let the store flag the claim stale when "
+    "that source later changes; omit the key for facts with no file source."
 )
 
 
@@ -93,6 +99,63 @@ def build_messages(conversation_text: str) -> list:
 def _slugify(name: str) -> str:
     s = _NAME_RE.sub("-", str(name or "").strip().lower()).strip("-")
     return s[:80]
+
+
+def _normalize_slug(name: str) -> str:
+    """Hyphen/underscore-insensitive form of a slug for name-based dedup.
+
+    The exact-slug gate was the hole the near-duplicates fell through: the
+    same topic named "ai-pow-ocr" in one session and "aipow-ocr" in the next
+    produced two entries, because "ai-pow-ocr" != "aipow-ocr" byte for byte.
+    Comparing with all separators collapsed closes it without fuzzy matching.
+    """
+    return re.sub(r"[^a-z0-9]+", "", str(name or "").lower())
+
+
+#: A proposal may cite at most this many source files; each is hashed now so
+#: the stale check (mem_review) can detect later changes to the source.
+_EVIDENCE_MAX_PATHS = 3
+_EVIDENCE_MAX_BYTES = 4_000_000
+
+
+def _proposal_evidence(item: dict) -> list:
+    """Resolve a proposal's cited source paths into evidence dicts.
+
+    Delegates the fingerprint to ``mem_evidence.evidence_for`` — the drift
+    check compares stored ``sha`` against ``mem_evidence.content_hash``, so a
+    hand-rolled hash of a different length would flag every cited file as
+    changed on the first re-check. Only files that exist right now are
+    attested: evidence without a readable source is meaningless.
+    """
+    raw = item.get("evidence")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    try:
+        import mem_evidence
+    except Exception:
+        return []
+    out = []
+    for chunk in raw[:_EVIDENCE_MAX_PATHS]:
+        text = str(chunk or "").strip().strip("`\"'")
+        if not text or len(text) > 400:
+            continue
+        try:
+            path = Path(text)
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            resolved = path.resolve()
+            if not resolved.is_file():
+                continue
+            if resolved.stat().st_size > _EVIDENCE_MAX_BYTES:
+                continue
+            entry = mem_evidence.evidence_for(str(resolved))
+            if entry and entry.get("sha"):
+                out.append(entry)
+        except OSError:
+            continue
+    return out
 
 
 def parse_proposals(reply: str) -> list:
@@ -140,8 +203,67 @@ def parse_proposals(reply: str) -> list:
             "type": mtype, "name": name,
             "description": desc or body[:60], "body": body,
             "importance": importance,
+            "evidence": _proposal_evidence(item),
         })
     return out
+
+
+#: How many entries one automatic budget pass may archive. Small on purpose —
+#: see enforce_budget's docstring.
+_BUDGET_PASS_MAX = 10
+
+_merge_warning_sent = False
+
+
+def _warn_if_merge_unavailable(session=None) -> None:
+    """Post one session notice when semantic dedup cannot run."""
+    global _merge_warning_sent
+    if _merge_warning_sent or embeddings is None:
+        return
+    try:
+        down, reason, _left = embeddings.degraded()
+        if not down and embeddings.available():
+            return
+    except Exception:
+        return
+    _merge_warning_sent = True
+    try:
+        import startup_mail
+        startup_mail.post(
+            "memory-dedup",
+            "Memory de-duplication is degraded",
+            "The embedding endpoint is unreachable, so new memories can only "
+            "be matched against existing ones by exact name. Near-duplicates "
+            "will accumulate until it is back."
+            + (f" Last error: {reason}" if reason else ""),
+            action="/memory to review, or check the embedding provider")
+    except Exception:
+        pass
+
+
+def _enforce_budget_quietly() -> None:
+    """Keep the live store inside its budget after a write burst."""
+    try:
+        archived = memory_system.enforce_budget(max_archived=_BUDGET_PASS_MAX)
+        room = max(0, _BUDGET_PASS_MAX - len(archived))
+        if room:
+            archived += memory_system.enforce_global_budget(max_archived=room)
+    except Exception:
+        return
+    if not archived:
+        return
+    try:
+        import startup_mail
+        names = ", ".join(e.get("name", "") for e in archived[:5])
+        startup_mail.post(
+            "memory-budget",
+            f"Archived {len(archived)} memories over the store budget",
+            "The weakest entries by importance, last use and use count were "
+            f"moved to memory/archive/ (kept, not deleted): {names}"
+            + (" …" if len(archived) > 5 else ""),
+            action="/memory to review; LAINTAS_MEMORY_BUDGET raises the limit")
+    except Exception:
+        pass
 
 
 def _existing_names() -> set:
@@ -149,6 +271,23 @@ def _existing_names() -> set:
         return {e.get("name", "") for e in memory_system.list_memories()}
     except Exception:
         return set()
+
+
+def _existing_by_normalized() -> dict:
+    """normalized slug → canonical (on-disk) name, for the separator-blind
+    name-dedup gate. First entry wins on collision; the archive/live split is
+    irrelevant here because both halves of a duplicate pair degrade recall
+    equally."""
+    try:
+        names = [e.get("name", "") for e in memory_system.list_memories()]
+    except Exception:
+        return {}
+    out = {}
+    for n in names:
+        key = _normalize_slug(n)
+        if key and key not in out:
+            out[key] = n
+    return out
 
 
 def _call_llm(llm_fn: Callable, messages: list, system_prompt: str) -> str:
@@ -281,7 +420,13 @@ def extract_and_store(conversation_text: str,
     proposals = proposals[:_MAX_WRITE]
 
     taken = _existing_names()          # slugs already on disk (any scope-visible)
+    taken_norm = _existing_by_normalized()
     written = []
+    # Say it once when the merge path is unavailable. Without embeddings this
+    # function can only dedup by exact slug, so a fact the model names slightly
+    # differently becomes a second entry — which is how a store grows to
+    # hundreds of near-duplicates while looking like it is working.
+    _warn_if_merge_unavailable(session)
     for p in proposals:
         try:
             match = _nearest_existing(p, session)
@@ -296,7 +441,11 @@ def extract_and_store(conversation_text: str,
                     overwrite=True,
                     scope=match["meta"].get("scope"),
                     scope_id=match["meta"].get("scope_id"),
-                    importance=max(old_imp, p["importance"]))
+                    importance=max(old_imp, p["importance"]),
+                    # A fresh proposal citing files re-attests the merged claim;
+                    # write_memory preserves prior evidence when None is passed,
+                    # so the old attestation survives a merge without new paths.
+                    evidence=(p.get("evidence") or None))
                 if ok:
                     written.append(match["name"])
                 continue
@@ -305,14 +454,21 @@ def extract_and_store(conversation_text: str,
             # entry, but fall back to name-based dedup: skip if the slug already
             # exists on disk or was just written in this batch. This preserves the
             # original conservative behaviour and keeps the offline path safe.
+            # The gate is separator-blind (ai-pow-x == aipow_x): the same topic
+            # named with different hyphenation used to slip through as a second
+            # entry, which is one way the store filled with near-duplicates.
             name = p["name"]
-            if name in taken:
+            norm = _normalize_slug(name)
+            if name in taken or (norm and norm in taken_norm):
                 continue
             ok, _ = memory_system.write_memory(
                 name, p["type"], p["description"], p["body"],
-                overwrite=False, importance=p["importance"])
+                overwrite=False, importance=p["importance"],
+                evidence=p.get("evidence") or None)
             if ok:
                 taken.add(name)
+                if norm:
+                    taken_norm[norm] = name
                 written.append(name)
         except Exception:
             continue

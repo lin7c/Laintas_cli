@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import re
 import json
+import math
 import time
 import hashlib
 import uuid
@@ -34,6 +35,140 @@ except Exception:
 MEMORY_DIR = paths.MEMORY_DIR
 MEMORY_INDEX = paths.MEMORY_INDEX
 LOCAL_USER_SCOPE = "local-user"
+
+#: Entries that were written but never used again are the ones worth dropping
+#: first, and nothing recorded whether an entry had ever been used. Usage lives
+#: in a sidecar rather than in each memory's frontmatter for two reasons: a
+#: counter bump must not rewrite a user-visible file, and it must not touch its
+#: mtime — recall and the prompt both order by mtime, so writing "I read this"
+#: into the file would make every read look like a fresh edit.
+#: Resolved through a function, never bound at import: MEMORY_DIR is
+#: redirected (tests, alternate stores), and a constant captured at import
+#: time would keep pointing at the real store after the redirect.
+USAGE_FILENAME = ".usage.json"
+
+
+def usage_file() -> Path:
+    return MEMORY_DIR / USAGE_FILENAME
+
+#: Above this many live entries in one scope, the weakest are archived (moved
+#: to ``memory/archive/``, dropped from the index, never deleted). The store
+#: used to grow without any bound at all while the prompt window stayed the
+#: same size, so everything past the window was cost without benefit.
+MEMORY_BUDGET = int(os.environ.get("LAINTAS_MEMORY_BUDGET", "150"))
+
+#: The same idea one level up. Entries are scoped to the project they were
+#: learned in, so every scope can sit inside its own budget while the directory
+#: as a whole keeps growing with one more project's worth of facts forever —
+#: and every scan pays for all of them, whatever scope they belong to.
+MEMORY_GLOBAL_BUDGET = int(os.environ.get("LAINTAS_MEMORY_GLOBAL_BUDGET", "400"))
+
+#: Types that are never auto-archived. These are the user's own words about
+#: themselves and about how they want work done: few, small, and the most
+#: expensive thing in the store to lose.
+PROTECTED_TYPES = ("user", "feedback")
+
+#: Usage half-life for the eviction score, in days.
+_USAGE_HALFLIFE_DAYS = 60.0
+
+
+def _load_usage() -> dict:
+    try:
+        with open(usage_file(), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_usage(data: dict) -> None:
+    try:
+        _atomic_write_text(usage_file(), json.dumps(data, ensure_ascii=False))
+    except OSError:
+        pass
+
+
+class _UsageLock:
+    """Cross-thread and cross-process lock around the usage sidecar.
+
+    ``touch`` is read-modify-write on one shared file, and this CLI runs
+    several agents at once, each rebuilding its own prompt. Measured without
+    this: four concurrent writers recording 50 uses each landed 55 of 200 on
+    disk — three quarters of the signal the eviction score depends on, lost to
+    interleaving. A flock is held for microseconds and costs nothing next to
+    being wrong.
+    """
+
+    def __init__(self):
+        self._fh = None
+
+    def __enter__(self):
+        try:
+            import fcntl
+            MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+            self._fh = open(usage_file().with_suffix(".lock"), "a+")
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            # No fcntl (or no directory): proceed unlocked rather than lose the
+            # write entirely. Usage is a heuristic, not an accounting ledger.
+            self._close()
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            if self._fh is not None:
+                import fcntl
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        self._close()
+        return False
+
+    def _close(self):
+        try:
+            if self._fh is not None:
+                self._fh.close()
+        except Exception:
+            pass
+        self._fh = None
+
+
+#: Serialises same-process writers too: two threads holding two separate flocks
+#: on the same file DO contend, but taking this first keeps the critical
+#: section short and the lock file opened once per writer rather than per race.
+_usage_thread_lock = __import__("threading").Lock()
+
+
+def touch(names, *, kind: str = "read") -> None:
+    """Record that these memories were actually USED.
+
+    Called when an entry is read through the ``mem.read`` tool or shown in the
+    prompt by recall — not when a listing walks past it. A memory that is
+    merely on disk and a memory the agent keeps coming back to should not look
+    the same to whatever decides what to drop.
+    """
+    if isinstance(names, str):
+        names = [names]
+    names = [str(n) for n in (names or []) if str(n or "").strip()]
+    if not names:
+        return
+    now = time.time()
+    with _usage_thread_lock, _UsageLock():
+        data = _load_usage()
+        for name in names:
+            row = data.get(name)
+            if not isinstance(row, dict):
+                row = {"uses": 0, "last_used": 0.0}
+            row["uses"] = int(row.get("uses", 0) or 0) + 1
+            row["last_used"] = now
+            row["kind"] = kind
+            data[name] = row
+        _save_usage(data)
+
+
+def usage_of(name: str) -> dict:
+    row = _load_usage().get(str(name))
+    return row if isinstance(row, dict) else {"uses": 0, "last_used": 0.0}
 
 # Valid memory types and their descriptions
 MEMORY_TYPES = {
@@ -172,7 +307,45 @@ def ensure_memory_dir() -> Path:
             "# Format: - [Title](file.md) — one-line description\n\n",
             encoding="utf-8",
         )
+    migrate_legacy_scopes()
     return MEMORY_DIR
+
+
+_legacy_migrated_dirs: set = set()
+
+
+def migrate_legacy_scopes() -> int:
+    """Persist scope/scope_id for entries written before scoping existed.
+
+    Runs at most once per process. This is the write half of the compatibility
+    shim in ``list_memories``, kept out of the read path so that listing the
+    store can never modify it.
+    """
+    key = str(MEMORY_DIR)
+    if key in _legacy_migrated_dirs:
+        return 0
+    _legacy_migrated_dirs.add(key)
+    fixed = 0
+    for f in MEMORY_DIR.glob("*.md"):
+        if f.name == "MEMORY.md":
+            continue
+        try:
+            meta, body = _parse_frontmatter(f.read_text(encoding="utf-8"))
+            if meta.get("scope") and meta.get("scope_id"):
+                continue
+            entry_type = meta.get("type") or meta.get("metadata", {}).get("type", "unknown")
+            scope, scope_id = _resolve_scope(entry_type)
+            meta.update({
+                "product": "laintas_cli",
+                "scope": scope,
+                "scope_id": scope_id,
+                "importance": meta.get("importance", "0.5"),
+            })
+            _atomic_write_text(f, _format_frontmatter(meta, body))
+            fixed += 1
+        except (OSError, ValueError):
+            continue
+    return fixed
 
 
 def _parse_frontmatter(content: str) -> tuple[dict, str]:
@@ -253,6 +426,14 @@ def _format_frontmatter(meta: dict, body: str) -> str:
         lines.append(f"scope_id: {meta['scope_id']}")
     if meta.get('importance') is not None:
         lines.append(f"importance: {meta['importance']}")
+    # When the entry was first written. Not the same question as the file's
+    # mtime, which answers "when was it last touched" and gets reset by merges.
+    if meta.get('created_at'):
+        lines.append(f"created_at: {meta['created_at']}")
+    if meta.get('archived_at'):
+        lines.append(f"archived_at: {meta['archived_at']}")
+    if meta.get('archived_reason'):
+        lines.append(f"archived_reason: {str(meta['archived_reason'])[:200]}")
     # Assertion lifecycle. Written only when non-default so untouched memories
     # keep the exact bytes they had before this existed.
     if meta.get('evidence'):
@@ -302,7 +483,8 @@ def _visible_in_current_scope(meta: dict) -> bool:
 
 
 def list_memories(mem_type: str = None, *,
-                  include_superseded: bool = False) -> list[dict]:
+                  include_superseded: bool = False,
+                  all_scopes: bool = False) -> list[dict]:
     """List all memory entries, optionally filtered by type.
 
     Returns list of {name, description, type, path, mtime, status, evidence}.
@@ -310,6 +492,7 @@ def list_memories(mem_type: str = None, *,
     supersession chain can be walked, but they are not current knowledge.
     """
     ensure_memory_dir()
+    usage = _load_usage()
     results = []
     for f in sorted(MEMORY_DIR.glob("*.md")):
         if f.name == "MEMORY.md":
@@ -319,8 +502,12 @@ def list_memories(mem_type: str = None, *,
             meta, body = _parse_frontmatter(content)
             entry_type = meta.get("type") or meta.get("metadata", {}).get("type", "unknown")
             if not meta.get("scope") or not meta.get("scope_id"):
-                # Compatibility migration: bind legacy project/reference facts
-                # to the current project on first use; user/feedback stays global.
+                # Compatibility: bind legacy project/reference facts to the
+                # current project; user/feedback stays global. Resolved in
+                # memory only. Listing used to PERSIST this, which made a read
+                # a write: every scan could rewrite files, bumping the mtime
+                # that recall and the prompt order by. migrate_legacy_scopes()
+                # does the writing, once, off this path.
                 scope, scope_id = _resolve_scope(entry_type)
                 meta.update({
                     "product": "laintas_cli",
@@ -328,16 +515,16 @@ def list_memories(mem_type: str = None, *,
                     "scope_id": scope_id,
                     "importance": meta.get("importance", "0.5"),
                 })
-                f.write_text(_format_frontmatter(meta, body), encoding="utf-8")
             if mem_type and entry_type != mem_type:
                 continue
-            if not _visible_in_current_scope(meta):
+            if not all_scopes and not _visible_in_current_scope(meta):
                 continue
             status = str(meta.get("status") or STATUS_ACTIVE)
             if status not in VALID_STATUSES:
                 status = STATUS_ACTIVE
             if status == STATUS_SUPERSEDED and not include_superseded:
                 continue
+            _usage = usage.get(meta.get("name", f.stem)) or {}
             results.append({
                 "name": meta.get("name", f.stem),
                 "description": meta.get("description", ""),
@@ -351,6 +538,9 @@ def list_memories(mem_type: str = None, *,
                 "superseded_by": str(meta.get("superseded_by") or ""),
                 "path": str(f),
                 "mtime": f.stat().st_mtime,
+                "created_at": float(meta.get("created_at") or 0.0) or None,
+                "uses": int(_usage.get("uses", 0) or 0),
+                "last_used": float(_usage.get("last_used", 0.0) or 0.0),
             })
         except (OSError, ValueError):
             pass
@@ -365,12 +555,19 @@ def read_memory(name: str) -> Optional[dict]:
     except ValueError:
         return None
     if not f.exists():
-        return None
+        # An archived entry is still readable by name. Archiving bounds what is
+        # live, not what is knowable — a pointer from some other memory must
+        # not dead-end because the target fell out of the budget.
+        archived = archive_dir() / f.name
+        if not archived.exists():
+            return None
+        f = archived
     try:
         content = f.read_text(encoding="utf-8")
         meta, body = _parse_frontmatter(content)
         entry_type = meta.get("type") or meta.get("metadata", {}).get("type", "unknown")
         if not meta.get("scope") or not meta.get("scope_id"):
+            # Resolved for this read only; migrate_legacy_scopes() persists it.
             scope, scope_id = _resolve_scope(entry_type)
             meta.update({
                 "product": "laintas_cli",
@@ -378,7 +575,6 @@ def read_memory(name: str) -> Optional[dict]:
                 "scope_id": scope_id,
                 "importance": meta.get("importance", "0.5"),
             })
-            _atomic_write_text(f, _format_frontmatter(meta, body))
         if not _visible_in_current_scope(meta):
             return None
         return {"meta": meta, "body": body, "path": str(f)}
@@ -473,11 +669,23 @@ def write_memory(name: str, mem_type: str, description: str,
             status = STATUS_ACTIVE
         stale_reason = str(prior_meta.get("stale_reason") or "")
 
+    # First write wins: created_at is the entry's birthday, not its last edit,
+    # and a merge that folds a new fact into an old entry must not make the old
+    # entry look new. Without it nothing could tell a memory written today from
+    # one written in July — file mtime answers a different question.
+    try:
+        created_at = float(prior_meta.get("created_at") or 0.0)
+    except (TypeError, ValueError):
+        created_at = 0.0
+    if created_at <= 0:
+        created_at = time.time()
+
     meta = {
         "name": name,
         "description": description,
         "type": mem_type,
         "product": "laintas_cli",
+        "created_at": round(created_at, 3),
         "scope": resolved_scope,
         "scope_id": resolved_scope_id,
         "importance": resolved_importance,
@@ -666,6 +874,151 @@ def list_stale(mem_type: str = None) -> list[dict]:
     """Every visible memory whose cited source has moved under it."""
     return [entry for entry in list_memories(mem_type)
             if entry.get("status") == STATUS_STALE]
+
+
+# ── Budget ────────────────────────────────────────────────────────────────
+# Writing was unbounded and reading was not: the store grew every turn while
+# the prompt kept showing the same handful of entries, so past a point new
+# memories cost tokens and disk and bought nothing. A scope now has a budget;
+# past it, the weakest entries are ARCHIVED — moved aside and dropped from the
+# index, never deleted, because "nothing here destroys a memory" is the rule
+# the rest of this module is built on.
+
+ARCHIVE_DIRNAME = "archive"
+
+
+def archive_dir() -> Path:
+    """Where archived entries live. Resolved per call, like ``usage_file``."""
+    return MEMORY_DIR / ARCHIVE_DIRNAME
+
+
+def eviction_score(entry: dict, now: float = None) -> float:
+    """How much an entry has earned its place. Lower is weaker.
+
+    Three things matter and they are all on the entry: how important it was
+    thought to be when written, how long since it was last USED (not written —
+    a file nobody has read in two months is the candidate, however recently
+    some merge rewrote it), and how often it has been used at all.
+    """
+    now = time.time() if now is None else now
+    importance = float(entry.get("importance", 0.5) or 0.5)
+    uses = int(entry.get("uses", 0) or 0)
+    last = float(entry.get("last_used") or 0.0)
+    if last <= 0:
+        last = float(entry.get("created_at") or entry.get("mtime") or now)
+    age_days = max(0.0, (now - last) / 86400.0)
+    recency = 0.5 ** (age_days / _USAGE_HALFLIFE_DAYS)
+    return importance * recency * (1.0 + math.log1p(uses))
+
+
+def archive_memory(name: str, reason: str = "") -> tuple[bool, str]:
+    """Move one memory out of the live set. The file survives under archive/."""
+    try:
+        f = _memory_path(name)
+    except ValueError as exc:
+        return False, str(exc)
+    if not f.exists():
+        return False, f"Memory '{name}' not found"
+    try:
+        target_dir = archive_dir()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        meta, body = _parse_frontmatter(f.read_text(encoding="utf-8"))
+        meta["archived_at"] = round(time.time(), 3)
+        meta["archived_reason"] = str(reason or "")[:200]
+        _atomic_write_text(target_dir / f.name, _format_frontmatter(meta, body))
+        f.unlink()
+    except OSError as exc:
+        return False, str(exc)
+    _remove_from_index(name)
+    return True, str(target_dir / f.name)
+
+
+def enforce_budget(limit: int = None, *, dry_run: bool = False,
+                   max_archived: int = 0) -> list[dict]:
+    """Archive the weakest entries until the visible scope fits its budget.
+
+    Returns the entries archived (or, with ``dry_run``, the ones that would
+    be). ``user`` and ``feedback`` entries are never chosen: they are what the
+    person told us about themselves and about how to work, they are few, and
+    re-learning them costs far more than the space they take.
+
+    ``max_archived`` caps one pass. The automatic caller sets it: a store that
+    has been growing for months is suddenly hundreds over budget the first time
+    this runs, and moving hundreds of the user's memories aside inside one turn
+    is not a housekeeping step, it is an event. Converging a few per pass keeps
+    it visible and reversible; ``/memory`` can run an uncapped pass on request.
+    """
+    limit = int(MEMORY_BUDGET if limit is None else limit)
+    if limit <= 0:
+        return []
+    entries = list_memories()
+    if len(entries) <= limit:
+        return []
+    now = time.time()
+    candidates = [e for e in entries if e.get("type") not in PROTECTED_TYPES]
+    protected = len(entries) - len(candidates)
+    # An unmeetable budget must not be met by emptying everything else. With
+    # more protected entries than the whole limit, archiving every project fact
+    # in the store still would not reach it — so the store would be stripped of
+    # what it knows about the work and the budget would be missed anyway.
+    # Measured, before this check: budget 3 against 6 protected entries
+    # archived all 4 project entries and still reported 6 live.
+    if protected >= limit:
+        return []
+    excess = len(entries) - limit
+    if excess <= 0 or not candidates:
+        return []
+    candidates.sort(key=lambda e: eviction_score(e, now))
+    take = min(excess, len(candidates))
+    if max_archived and max_archived > 0:
+        take = min(take, int(max_archived))
+    chosen = candidates[:take]
+    if dry_run:
+        return chosen
+    archived = []
+    for entry in chosen:
+        ok, _ = archive_memory(
+            entry["name"],
+            f"over budget ({len(entries)} > {limit}; {protected} protected)")
+        if ok:
+            archived.append(entry)
+    return archived
+
+
+def enforce_global_budget(limit: int = None, *, dry_run: bool = False,
+                          max_archived: int = 0) -> list[dict]:
+    """The budget across every scope on disk, not just the visible one.
+
+    Same score, same protections, same archive. Entries belonging to other
+    projects are judged only on what is true of them regardless of where you
+    are standing: how important they were thought to be, when they were last
+    used, and how often.
+    """
+    limit = int(MEMORY_GLOBAL_BUDGET if limit is None else limit)
+    if limit <= 0:
+        return []
+    entries = list_memories(all_scopes=True)
+    excess = len(entries) - limit
+    if excess <= 0:
+        return []
+    now = time.time()
+    candidates = [e for e in entries if e.get("type") not in PROTECTED_TYPES]
+    if not candidates:
+        return []
+    candidates.sort(key=lambda e: eviction_score(e, now))
+    take = min(excess, len(candidates))
+    if max_archived and max_archived > 0:
+        take = min(take, int(max_archived))
+    chosen = candidates[:take]
+    if dry_run:
+        return chosen
+    archived = []
+    for entry in chosen:
+        ok, _ = archive_memory(
+            entry["name"], f"over global budget ({len(entries)} > {limit})")
+        if ok:
+            archived.append(entry)
+    return archived
 
 
 def load_all_for_prompt(max_per_type: int = 8) -> str:

@@ -40,6 +40,7 @@ in a nested CLI with its own primary agent. Helpwo uses `/helpwo`, not a manifes
   "name": "notes",
   "description": "Notes application",
   "command": "node server.js",
+  "app_url": "http://127.0.0.1:3000",
   "prompt": "Maintain and operate the notes application; verify completed work.",
   "persistence": "workspace",
   "auto_approve": true,
@@ -60,7 +61,13 @@ in a nested CLI with its own primary agent. Helpwo uses `/helpwo`, not a manifes
 - `name`: lowercase letters, digits, `.`, `_`, `-`, up to 32 characters;
   `helpwo` and `term0` are reserved.
 - `description`, `command`, `prompt`: strings; command and prompt are optional.
-- `persistence`: `none` (default) or `workspace`; optional `port`: 1–65535.
+- `persistence`: `none` (default) or `workspace`; optional `port`: the bridge
+  port (1–65535), not the project's web server port.
+- `app_url`: the project's absolute HTTP(S) address, including its actual port
+  and optional base path. Read the server configuration/startup log and set it
+  for web apps, then verify it responds. This field displays the address; it
+  does not configure the server's listener or prove readiness. Startup prints
+  Project URL separately from Bridge API and Bridge login. Omit for non-web apps.
 - `agent`: primary agent configuration. `agents`: named children, with optional
   `parent` (primary or an earlier entry) and `terminal` (a declared terminal).
   Both accept `prompt`, `profile` (an existing employee role), `title`,
@@ -90,6 +97,14 @@ The app command receives `LAINTAS_APP_BRIDGE_URL`, `LAINTAS_APP_TOKEN`,
 `Authorization: token <token>`; never expose the operator token to untrusted
 end users. The bridge has the normal authenticated file, shell, terminal,
 proxy and agent APIs. Tool visibility is not an OS sandbox.
+
+`app.start` returns `runtime.url` (the API base), `runtime.token`, and
+`runtime.open_url` (a browser login link). The configured project URL is
+`runtime.app_url`. The command environment includes
+`LAINTAS_APP_BRIDGE_OPEN_URL`. Open that link to establish the browser cookie;
+it displays bridge runtime information, not the project's frontend. API clients
+must send the token header on every request. Do not use the bare bridge URL as
+a login link or append API paths to the login URL containing `?token=`.
 
 POST `/api/agents/<id>/send` with `{kind, reqId, payload}`; poll
 GET `/api/agents/<id>/updates`. Supported kinds include `chat`, `abort`,

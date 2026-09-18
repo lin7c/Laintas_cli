@@ -747,6 +747,12 @@ def _bi_mem_read(params: dict, ctx: ToolCtx) -> dict:
     data = _mem_sys.read_memory(name)
     if data is None:
         return {"ok": False, "error": f"memory '{name}' not found in the current scope"}
+    # An explicit read is the clearest "this entry was worth keeping" signal
+    # the store gets, and it is what the budget's eviction score leans on.
+    try:
+        _mem_sys.touch(name, kind="read")
+    except Exception:
+        pass
     return {"ok": True, "result": {"name": name, **data}}
 
 
@@ -6003,6 +6009,7 @@ def _bi_app_list(params: dict, ctx: ToolCtx) -> dict:
         "description": m.description,
         "persistence": m.persistence,
         "port": m.port,
+        "app_url": m.app_url,
         "trusted": app_host.is_trusted(m),
         "running": _app_running(ctx, m.name),
     } for m in sorted(manifests.values(), key=lambda m: m.name)]
@@ -8094,7 +8101,7 @@ def gateway_post_json(session=None, get_profile=None):
 
 
 def _image_tool_path(params: dict, ctx: ToolCtx) -> str:
-    """Resolve `path` against the agent's directory, as fs.* and canvas.* do.
+    """Resolve `path` against the agent's directory, as the fs.* tools do.
 
     Left relative, it was opened against the process directory, so an agent
     working elsewhere read nothing — or a same-named image from another tree.
@@ -8153,33 +8160,6 @@ def _bi_image_to_text(params: dict, ctx: ToolCtx) -> dict:
 # created here is stamped `author="ai"` with the run as its turn, which is
 # what Helpwo's editor groups its Show / Keep / Undo banner by — work the
 # model did stays reviewable instead of just appearing on somebody's board.
-
-
-def _canvas_board(params: dict, ctx: ToolCtx, create: bool = False):
-    """Resolve a board path against the working directory. (editor, error)."""
-    import os
-    import canvas as canvas_mod
-    import canvas_edit
-
-    raw = str(params.get("path") or "").strip()
-    if not raw:
-        return (None, "canvas: a board path is required")
-    path = raw if os.path.isabs(raw) else os.path.join(ctx.cwd or os.getcwd(), raw)
-    if not canvas_mod.is_canvas_path(path):
-        path += canvas_mod.CANVAS_EXTENSION
-    if create and not os.path.exists(path):
-        try:
-            canvas_mod.write_scene(path, canvas_mod.empty_scene())
-        except (canvas_mod.CanvasError, OSError) as e:
-            return (None, f"canvas: {e}")
-    try:
-        editor = canvas_edit.BoardEditor(
-            path, canvas_mod, author="ai", turn=ctx.run_id or "cli-run")
-    except canvas_mod.CanvasError as e:
-        return (None, f"canvas: {e}")
-    except OSError as e:
-        return (None, f"canvas: {e}")
-    return (editor, "")
 
 
 def _retask_root(ctx: ToolCtx) -> str:
@@ -8337,111 +8317,6 @@ def _bi_retask_read(params: dict, ctx: ToolCtx) -> dict:
         text += "\n(other lists: " + ", ".join(
             os.path.relpath(p, _retask_root(ctx)) for p in others[:10]) + ")"
     return {"ok": True, "result": text, "retask": summary}
-
-
-def _bi_canvas_list(params: dict, ctx: ToolCtx) -> dict:
-    """Boards under the working directory, newest first."""
-    import os
-    import canvas as canvas_mod
-    boards = canvas_mod.find_boards(ctx.cwd or os.getcwd())
-    if not boards:
-        return {"ok": True, "result": "no .excalidraw boards here"}
-    lines = []
-    for path in boards:
-        try:
-            live = canvas_mod.live_elements(canvas_mod.read_scene(path))
-            lines.append(f"{os.path.relpath(path, ctx.cwd or os.getcwd())}  "
-                         f"{len(live)} element(s)")
-        except canvas_mod.CanvasError as e:
-            lines.append(f"{os.path.relpath(path)}  [{e}]")
-    return {"ok": True, "result": "\n".join(lines)}
-
-
-def _bi_canvas_read(params: dict, ctx: ToolCtx) -> dict:
-    """What is on a board: ids, labels, and what each arrow connects."""
-    import canvas as canvas_mod
-    editor, error = _canvas_board(params, ctx)
-    if error:
-        return {"ok": False, "error": error}
-    return {"ok": True,
-            "result": canvas_mod.describe_scene(editor.scene),
-            "path": editor.path}
-
-
-def _bi_canvas_draw(params: dict, ctx: ToolCtx) -> dict:
-    """Add shapes (and the arrows between them) to a board in one write."""
-    shapes = params.get("shapes")
-    if not isinstance(shapes, list) or not shapes:
-        return {"ok": False, "error": "canvas.draw: shapes must be a non-empty list"}
-    connect = params.get("connect")
-    connect = connect if isinstance(connect, list) else []
-    editor, error = _canvas_board(params, ctx, create=True)
-    if error:
-        return {"ok": False, "error": error}
-    try:
-        ok, message, names = editor.draw_batch(shapes, connect)
-    except (ValueError, KeyError, TypeError) as e:
-        return {"ok": False, "error": f"canvas.draw: {type(e).__name__}: {e}"}
-    if not ok:
-        return {"ok": False, "error": f"canvas.draw: {message}"}
-    drawn = f"{len(shapes)} shape(s)"
-    if connect:
-        drawn += f", {len(connect)} arrow(s)"
-    return {"ok": True,
-            "result": f"drew {drawn} on {editor.path}\n"
-                      f"ids: {names}" if names else f"drew {drawn} on {editor.path}",
-            "ids": names}
-
-
-def _bi_canvas_update(params: dict, ctx: ToolCtx) -> dict:
-    """Relabel, move or erase elements that are already on a board."""
-    editor, error = _canvas_board(params, ctx)
-    if error:
-        return {"ok": False, "error": error}
-
-    import canvas_edit
-    elements = list(editor.elements)
-    done: list[str] = []
-    missing: list[str] = []
-
-    for entry in (params.get("label") or []):
-        element_id = str(entry.get("id") or "")
-        if editor._in(elements, element_id) is None:
-            missing.append(element_id)
-            continue
-        elements = canvas_edit.label(elements, element_id,
-                                    str(entry.get("text") or ""),
-                                    author=editor.author)
-        done.append(f"labelled {element_id}")
-    for entry in (params.get("move") or []):
-        element_id = str(entry.get("id") or "")
-        if editor._in(elements, element_id) is None:
-            missing.append(element_id)
-            continue
-        elements = canvas_edit.move(elements, element_id,
-                                    float(entry.get("dx") or 0),
-                                    float(entry.get("dy") or 0))
-        done.append(f"moved {element_id}")
-    for element_id in (params.get("erase") or []):
-        element_id = str(element_id)
-        if editor._in(elements, element_id) is None:
-            missing.append(element_id)
-            continue
-        elements = canvas_edit.delete(elements, element_id)
-        done.append(f"erased {element_id}")
-
-    if not done:
-        return {"ok": False,
-                "error": ("canvas.update: nothing to do"
-                          + (f"; no such element: {', '.join(missing)}"
-                             if missing else ""))}
-    ok, message = editor.apply(elements)
-    if not ok:
-        return {"ok": False, "error": f"canvas.update: {message}"}
-    result = "; ".join(done)
-    if missing:
-        result += f" (not found: {', '.join(missing)})"
-    return {"ok": True, "result": result}
 
 
 def _bi_browser_open(params: dict, ctx: ToolCtx) -> dict:
@@ -9294,6 +9169,44 @@ def _contract_notify(ctx, result: dict, what: str) -> None:
         pass
 
 
+def _bi_password_list(params: dict, ctx) -> dict:
+    """Public vault metadata only — never secrets.
+
+    Returns opaque ids, user-written descriptions, and approved HTTPS
+    origins. Usernames, passwords, and notes stay inside the encrypted
+    blob; there is no code path from this tool to them.
+    """
+    import password_vault as pv
+    try:
+        entries = pv.PasswordVault().list_entries()
+    except pv.VaultNotInitialized:
+        return {"ok": False, "status": "no_vault",
+                "error": "no password vault exists yet — create one with /password"}
+    except (pv.VaultError, OSError):
+        return {"ok": False, "status": "unavailable",
+                "error": "vault metadata unavailable; repair or unlock locally"}
+    return {"ok": True, "entries": entries,
+            "note": "descriptions and origins are the model-visible surface; "
+                    "credentials are encrypted and not returned"}
+
+
+def _bi_password_fill(params: dict, ctx) -> dict:
+    """Fail closed: no trusted credential broker is deployed.
+
+    docs/password-vault-design.md requires the broker to own both the vault
+    key material and a protected browser session with OS-enforced
+    separation from model-controlled execution. This deployment has no
+    such boundary, so fill refuses rather than degrade to the ordinary
+    (model-scriptable) browser session. Never accepts scripts, arbitrary
+    destinations, or secret values.
+    """
+    return {"ok": False, "status": "broker_unavailable",
+            "error": ("protected autofill requires a trusted credential broker; "
+                      "none is deployed in this session. The vault stays "
+                      "manageable locally via /password, but credentials are "
+                      "never handed to model-controlled browser tools.")}
+
+
 def register_builtin_tools() -> None:
     """Idempotent — safe to call multiple times."""
     builtins = [
@@ -9407,7 +9320,7 @@ def register_builtin_tools() -> None:
             name="app.manifest.get",
             description=(
                 "Read one hosted application's manifest (name, command, prompt, "
-                "persistence, port, session tools) with its trust and running "
+                "persistence, bridge port, app_url, session tools) with its trust and running "
                 "state. Use it to review a manifest before requesting trust. "
                 "Read-only."),
             schema={"type": "object", "properties": {
@@ -9419,7 +9332,8 @@ def register_builtin_tools() -> None:
             name="app.manifest.put",
             description=("Create or update a hosted app manifest. Validates and atomically writes "
                          "to project (default) or user scope. Supports agent, agents, terminals, "
-                         "session_tools and auto_approve. Call app.start to trust and launch; "
+                         "session_tools, auto_approve and app_url (project HTTP(S) address). "
+                         "Call app.start to trust and launch; "
                          "restart a running app to apply changes."),
             schema={"type": "object", "properties": {
                 "manifest": {"type": "object"},
@@ -11557,127 +11471,6 @@ def register_builtin_tools() -> None:
             invoke=_bi_retask_read,
         ),
         Tool(
-            name="canvas.list",
-            description=(
-                "List the whiteboards (.excalidraw files) under the working "
-                "directory. A board is where a diagram lives that a person "
-                "will look at and edit — use it for architecture sketches, "
-                "flows and layouts, not for anything you would rather write "
-                "as text."),
-            schema={"type": "object", "properties": {}},
-            capabilities=frozenset({"fs.read"}),
-            invoke=_bi_canvas_list,
-        ),
-        Tool(
-            name="canvas.read",
-            description=(
-                "Read what is on a board: every element's id, its label, and "
-                "what each arrow connects. Read before you update — the ids "
-                "in this listing are the ones canvas.update needs."),
-            schema={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "board path, e.g. flow.excalidraw"},
-                },
-                "required": ["path"],
-            },
-            capabilities=frozenset({"fs.read"}),
-            invoke=_bi_canvas_read,
-        ),
-        Tool(
-            name="canvas.draw",
-            description=(
-                "Draw on a board (created if it does not exist), in one "
-                "write. Not only box-and-arrow diagrams: `line` and "
-                "`freedraw` take a list of points, so you can draw a curve, "
-                "an axis, a sketch, a route — anything a path describes — and "
-                "every element takes colour, fill and stroke width. For "
-                "diagrams: give each shape a short `id` of your own and use "
-                "those ids in `connect`, without reading the file back first; "
-                "shapes with no coordinates are laid out in rows below "
-                "whatever is already on the board. What you draw is marked as "
-                "yours, so the person can review or undo it in the editor."),
-            schema={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "board path, e.g. flow.excalidraw"},
-                    "shapes": {
-                        "type": "array",
-                        "description": "shapes to add, in reading order",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {"type": "string", "description": "your name for it, used in connect"},
-                                "kind": {"type": "string", "enum": ["rectangle", "ellipse", "diamond", "text", "line", "freedraw"]},
-                                "label": {"type": "string", "description": "text on the shape (or the text itself for kind=text)"},
-                                "x": {"type": "number"}, "y": {"type": "number"},
-                                "width": {"type": "number"}, "height": {"type": "number"},
-                                "points": {"type": "array",
-                                           "description": "for line/freedraw: [[x,y], …] in board coordinates, at least two",
-                                           "items": {"type": "array", "items": {"type": "number"}}},
-                                "color": {"type": "string", "description": "stroke colour, e.g. #1971c2"},
-                                "background": {"type": "string", "description": "fill colour, e.g. #a5d8ff"},
-                                "fill": {"type": "string", "enum": ["solid", "hachure", "cross-hatch"]},
-                                "strokeWidth": {"type": "number", "description": "1 thin, 2 medium, 4 thick"},
-                                "strokeStyle": {"type": "string", "enum": ["solid", "dashed", "dotted"]},
-                                "opacity": {"type": "number", "description": "0-100"},
-                                "sloppy": {"type": "boolean", "description": "true = hand-drawn look, false = clean lines"},
-                            },
-                            "required": ["kind"],
-                        },
-                    },
-                    "connect": {
-                        "type": "array",
-                        "description": "arrows: from/to are shape ids from this call or from canvas.read",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "from": {"type": "string"}, "to": {"type": "string"},
-                                "label": {"type": "string"},
-                            },
-                            "required": ["from", "to"],
-                        },
-                    },
-                },
-                "required": ["path", "shapes"],
-            },
-            capabilities=frozenset({"fs.read", "fs.write"}),
-            invoke=_bi_canvas_draw,
-        ),
-        Tool(
-            name="canvas.update",
-            description=(
-                "Change elements already on a board: relabel, move by an "
-                "offset, or erase. Ids come from canvas.read. Erasing leaves "
-                "the element recoverable in the editor rather than shredding "
-                "it."),
-            schema={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "label": {
-                        "type": "array",
-                        "items": {"type": "object",
-                                  "properties": {"id": {"type": "string"},
-                                                 "text": {"type": "string"}},
-                                  "required": ["id", "text"]},
-                    },
-                    "move": {
-                        "type": "array",
-                        "items": {"type": "object",
-                                  "properties": {"id": {"type": "string"},
-                                                 "dx": {"type": "number"},
-                                                 "dy": {"type": "number"}},
-                                  "required": ["id"]},
-                    },
-                    "erase": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["path"],
-            },
-            capabilities=frozenset({"fs.read", "fs.write"}),
-            invoke=_bi_canvas_update,
-        ),
-        Tool(
             name="image.describe",
             description=(
                 "Look at an image file and answer a question about it. Use for "
@@ -12064,6 +11857,36 @@ def register_builtin_tools() -> None:
                                    "description": "clear captured console/errors before running (default true)"},
             }, "required": ["steps"]},
             invoke=_bi_browser_test_flow,
+        ),
+        Tool(
+            name="password.list",
+            description="List password-vault entries: opaque id, kind (login or "
+                        "secret — secret entries are a single key/token in any "
+                        "format), user-written description, and approved HTTPS "
+                        "origins only. Usernames, passwords, secret values, and "
+                        "notes are encrypted and never returned. Works while the "
+                        "vault is locked.",
+            schema={"type": "object", "properties": {},
+                    "additionalProperties": False},
+            invoke=_bi_password_list,
+        ),
+        Tool(
+            name="password.fill",
+            description="Fill a vault credential into a protected browser login "
+                        "form. Requires a broker-issued protected tab handle and "
+                        "never accepts scripts, arbitrary destinations, or secret "
+                        "values. Returns a fixed status: filled, locked, "
+                        "origin_mismatch, unsupported_form, or broker_unavailable "
+                        "(no trusted broker deployed — fail closed, no fallback "
+                        "to the ordinary browser).",
+            schema={"type": "object", "properties": {
+                "entry_id": {"type": "string",
+                             "description": "opaque vault entry id from password.list"},
+                "tab": {"type": "string",
+                        "description": "broker-issued protected tab handle"},
+            }, "required": ["entry_id", "tab"],
+            "additionalProperties": False},
+            invoke=_bi_password_fill,
         ),
     ]
     for t in builtins:

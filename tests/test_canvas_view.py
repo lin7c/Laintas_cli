@@ -14,8 +14,10 @@ from prompt_toolkit.mouse_events import (
     MouseButton, MouseEvent, MouseEventType, MouseModifier)
 from prompt_toolkit.data_structures import Point
 
-import canvas_view
-import infinite_canvas as ic
+from tests.extension_packages import extension_module
+
+canvas_view = extension_module("canvas", "canvas_view")
+ic = extension_module("canvas", "infinite_canvas")
 
 
 def _scene():
@@ -195,7 +197,9 @@ class DrawingTests(unittest.TestCase):
     """The viewer half of drawing: gestures in, board operations out."""
 
     def setUp(self):
-        import tempfile, canvas, canvas_edit
+        import tempfile
+        canvas = extension_module("canvas", "canvas")
+        canvas_edit = extension_module("canvas", "canvas_edit")
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = os.path.join(self.tmp.name, "b.excalidraw")
@@ -205,7 +209,7 @@ class DrawingTests(unittest.TestCase):
         self.viewer = self._viewer()
 
     def _scene_now(self):
-        import infinite_canvas
+        infinite_canvas = extension_module("canvas", "infinite_canvas")
         return infinite_canvas.scene_from_json(
             self.canvas.to_canvas_scene(self.editor.scene, title="b"))
 
@@ -340,7 +344,7 @@ class DrawingTests(unittest.TestCase):
 
     def test_an_edit_refused_by_a_concurrent_write_is_reported(self):
         """Helpwo saved the board while it was open here."""
-        import canvas_edit
+        canvas_edit = extension_module("canvas", "canvas_edit")
         theirs = self.canvas.empty_scene()
         theirs["elements"] = [canvas_edit.shape("ellipse", 0, 0, 20, 20)]
         os.utime(self.path, (0, 0))
@@ -399,7 +403,7 @@ class DrawingTests(unittest.TestCase):
         self.assertIn("too short", self.viewer.status_note)
 
     def test_the_pen_style_reaches_the_element(self):
-        import canvas_edit
+        canvas_edit = extension_module("canvas", "canvas_edit")
         self.viewer.set_tool("rectangle")
         self.viewer.cycle_style("color")       # off the default black
         self.viewer.cycle_style("fill")        # on

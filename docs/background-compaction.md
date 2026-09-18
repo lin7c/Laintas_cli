@@ -8,6 +8,26 @@ foreground pruning and compaction.
 Manual `/compact`, `/compact --force`, context-overflow recovery, and
 consecutive output-truncation recovery are all preserved.
 
+## The window the percentages are taken from
+
+The budget is not the model's nominal window. `context_trigger_share` (default
+`0.60`) states the share of the model's REAL window we intend to be holding
+when compaction fires, and the window to budget against is solved backwards
+from it through the output reserve, the measured per-request overhead and
+`compact_auto_ratio`. Both model-specific inputs come from the gateway, which
+maintains them per model and reports them on every response in `_budget`
+(`contextWindow`, `providerMax`); they are remembered per model in
+`~/.laintas/model_windows.json` and also picked up from `/api/models`
+(`modelCapabilities`) so a model that has not been called yet is not budgeted
+blind. `/max` raises the share to the whole window — only the model's own
+output ceiling is still held back. `/compact status` prints the share actually
+reached.
+
+A window too small to give anything back (60% of it would not cover the output
+reserve) is used whole instead of scaled. An explicit `model_context_window`
+still wins over all of this, and `context_window_adopt_cap` remains available
+as an optional absolute ceiling (`0` = none).
+
 ## Budget and configuration
 
 These percentages use the usable message budget from `compaction_budget()` as
@@ -25,7 +45,7 @@ size, and the current background task state.
 | `compact_target_ratio` | `0.50` | Target occupancy after pruning; leaves room for next-turn growth |
 | `compact_background_cooldown` | `60` | Cooldown seconds between background attempts, kept across user turns |
 | `compact_background_min_tokens` | `2000` | Minimum estimated tokens a background summary must reclaim to be committed |
-| `compact_background_timeout` | `180` | Total time budget (seconds) for background generation and review |
+| `compact_background_timeout` | `180` | Seconds a background summary may go without finishing a chunk before it is abandoned (a stall budget per chunk, not a total for the job) |
 
 The thresholds must satisfy `target < background < auto <= 1`; invalid
 combinations are rejected.
@@ -56,8 +76,11 @@ unaffected.
 2. The background task reads only a deep copy of the prefix and the old
    summary, and runs the same chunking, summarization, and evidence review; it
    never mutates in-flight messages or task state.
-3. Before committing, it re-checks the session, agent, working directory, run
-   number, summary config/policy, old summary, and prefix content.
+3. Before committing, it re-checks the session, agent, working directory,
+   summary config/policy, old summary, and prefix content. The run number is
+   deliberately not part of that check: the candidate describes a prefix of the
+   thread, and the prefix itself is re-verified message by message, so a
+   summary started in one turn is still valid in the next.
 4. The main loop only replaces the matching prefix with the summary; the
    suffix and any messages added while the background task ran are kept intact.
 5. A reviewed result is committed before the next request; if the result
@@ -67,13 +90,22 @@ unaffected.
    summary that is still running.
 6. At most one background task per owner; at most two speculative tasks in the
    whole process, so multiple agents cannot monopolize model concurrency.
-7. Ctrl+C, run end, or abnormal exit cancels unfinished tasks; manual
-   compaction first cancels the existing background candidate.
+7. Ctrl+C and manual compaction cancel unfinished tasks. Run end does not:
+   an unfinished task is parked under its owner and the agent's next run adopts
+   it, because a summary is owned by the agent, not by one run of its loop.
    Config, session, or prefix changes invalidate a result; merely appending new
    messages does not.
+8. Every completed chunk fold is cached under the chain of all folds before it,
+   so an attempt that is cancelled or stalls part-way keeps the work it
+   finished and the next attempt resumes at the first unfolded chunk. A changed
+   chunk invalidates the rest of the chain on its own.
 
-If the background task times out or fails, the original messages are kept. At
-the foreground threshold a synchronous recovery is attempted.
+If the background task stalls or fails, the original messages are kept and the
+folds it completed stay cached for the next attempt. At the foreground
+threshold a synchronous recovery is attempted, which reuses those same folds.
+The timeout is a stall budget per chunk rather than a total for the job: a head
+that needs four chunks is allowed the time four chunks take, while a wedged
+backend is still cut off.
 If a cancelled model call does not respond to cancellation, the current turn is
 ended after the cleanup grace period, so over-budget requests are not sent and
 summarization is not re-launched repeatedly.

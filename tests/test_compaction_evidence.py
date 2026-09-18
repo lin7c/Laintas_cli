@@ -192,6 +192,7 @@ def test_model_window_switch_and_smaller_real_window(monkeypatch, tmp_path):
         monkeypatch.setattr(loop, '_provider_window_key', lambda: 'large')
         assert loop._effective_context_window() == 64000
         loop._note_provider_context_window(1000000)
+        # 0.70 of the real window, then the optional absolute ceiling.
         assert loop._effective_context_window() == 200000
         monkeypatch.setattr(loop, '_provider_window_key', lambda: 'small')
         assert loop._effective_context_window() == 32768
@@ -233,3 +234,129 @@ def test_observed_auxiliary_window_limits_next_attempt(monkeypatch, tmp_path):
                                'source', None, 'EN') is None
     assert loop._summary_window(model) == 8192
     assert loop._summary_output_limit() == 1024
+
+
+def test_budget_reserves_what_the_turn_really_sends_not_the_whole_registry():
+    """The reserve used to assume every tool and a fixed system-prompt guess.
+
+    On a live session that reserved 28,677 tokens against 10,808 actually sent
+    (29 authorized tools, not 147), which pulled the automatic trigger ~16k
+    tokens down the window and compacted threads that still had room.
+    """
+    import tools as tools_mod
+
+    full, _ = tools_mod.get_registry().to_openai_tools(
+        unified=bool(loop.get_runtime_config("use_unified_catalog")))
+    names = {"fs.read", "shell.exec"}
+    measured = loop.measure_request_overhead("system prompt " * 100, names)
+    assert 0 < measured < loop._per_request_overhead_tokens({})
+    assert len(full) > len(names)
+
+    state = {"_request_overhead_tokens": measured}
+    assert loop._per_request_overhead_tokens(state) == measured
+    assert loop.compaction_budget(state)["usable"] > loop.compaction_budget({})["usable"]
+
+
+def test_unresolvable_tool_names_keep_the_safe_over_estimate():
+    """A name set the registry cannot resolve must never shrink the reserve."""
+    loop._TOOL_SCHEMA_TOKENS.clear()
+    assert loop.measure_request_overhead("prompt", {"fs.read", "no_such_tool"}) == 0
+    assert loop._per_request_overhead_tokens({"_request_overhead_tokens": 0}) > 0
+
+
+@pytest.fixture
+def provider_window(monkeypatch):
+    """Pretend a model reported its real window, as the gateway does."""
+    monkeypatch.setattr(loop, "_load_remembered_provider_window", lambda: None)
+    monkeypatch.setattr(loop, "_model_capabilities_seen", {})
+    monkeypatch.setattr(loop, "_provider_window_key", lambda: "test-model")
+
+    def report(tokens, max_output=0):
+        monkeypatch.setattr(loop, "_provider_context_window", tokens)
+        loop._model_capabilities_seen["test-model"] = {
+            "window": tokens, "maxOutput": max_output}
+    loop.reset_runtime_config()
+    yield report
+    loop.reset_runtime_config()
+
+
+def _trigger_share(state, real_window):
+    """The share of the real window the automatic trigger actually sits at."""
+    budget = loop.compaction_budget(state)
+    auto_at = int(budget["usable"] * loop.get_runtime_config("compact_auto_ratio"))
+    return (auto_at + budget["overhead"]) / real_window
+
+
+def test_the_trigger_lands_on_the_requested_share_of_the_real_window(provider_window):
+    """The flat 200k ceiling made a 1M model compact at ~12% of its window."""
+    provider_window(1_000_000, max_output=128_000)
+    state = {"_request_overhead_tokens": 10_849}
+    assert round(_trigger_share(state, 1_000_000), 2) == 0.60
+
+    loop.set_runtime_config("context_trigger_share", 0.4)
+    assert round(_trigger_share(state, 1_000_000), 2) == 0.40
+
+    loop.reset_runtime_config()
+    loop.apply_max_config()
+    # /max takes the model's whole window; only its own output ceiling is held
+    # back, so the share is what is left after that.
+    assert loop._effective_context_window() == 1_000_000
+    assert _trigger_share(state, 1_000_000) > 0.75
+
+
+def test_the_share_holds_across_models_with_different_parameters(provider_window):
+    state = {"_request_overhead_tokens": 10_849}
+    for window, max_output in ((262_144, 32_768), (131_072, 0), (1_050_000, 128_000)):
+        provider_window(window, max_output=max_output)
+        assert round(_trigger_share(state, window), 2) == 0.60
+
+
+def test_a_window_too_small_to_share_is_used_whole(provider_window):
+    """A 32k model has nothing to give back — take all of it, not 60%."""
+    provider_window(32_000, max_output=8_192)
+    assert loop._effective_context_window() == 32_000
+
+
+def test_explicitly_configured_window_still_wins(provider_window):
+    provider_window(1_000_000, max_output=128_000)
+    loop.set_runtime_config("model_context_window", 120_000)
+    assert loop._effective_context_window() == 120_000
+
+
+def test_the_output_reserve_comes_from_the_models_own_ceiling(provider_window):
+    provider_window(1_000_000, max_output=128_000)
+    assert loop.model_output_reserve() == 128_000
+    loop.set_runtime_config("max_tokens", 32_000)      # what we actually request
+    assert loop.model_output_reserve() == 32_000
+    loop.reset_runtime_config()
+    provider_window(1_000_000, max_output=0)           # never reported
+    assert loop.model_output_reserve() == loop.ctxpol.load()["buffer_tokens"]
+
+
+def test_summarizer_window_is_the_models_own_not_a_32k_ceiling(monkeypatch, tmp_path):
+    monkeypatch.setattr(loop.paths, "LAINTAS_HOME", tmp_path)
+    monkeypatch.setattr(loop, "_summary_observed_windows", {})
+    assert loop._summary_window("unreported-model") == loop._unknown_summary_window()
+    loop._note_summary_window({"_budget": {"contextWindow": 262_144}}, "gemma-test")
+    assert loop._summary_window("gemma-test") == 262_144
+    # …and the next process starts knowing it.
+    monkeypatch.setattr(loop, "_summary_observed_windows", {})
+    assert loop._summary_window("gemma-test") == 262_144
+
+
+def test_a_huge_head_grows_its_slices_instead_of_making_thirty_calls(monkeypatch):
+    """Folds are sequential, so slice count is wall-clock, not just cost."""
+    monkeypatch.setattr(loop, "_summary_window", lambda model: 262_144)
+    monkeypatch.setattr(loop, "_valid_structured_summary", lambda summary, lang: True)
+    monkeypatch.setattr(loop, "_llm_review_summary", lambda *a, **k: SUMMARY)
+    sizes = []
+
+    def summarize(deps, session, cwd, text, summary, lang, trajectory, cancel=None):
+        sizes.append(len(text))
+        return "merged"
+
+    monkeypatch.setattr(loop, "_llm_summarize", summarize)
+    head = [{"role": "user", "content": "evidence " * 4000} for _ in range(40)]
+    assert loop._summarize_head_in_chunks(
+        mock.Mock(), {}, head, None, "EN", "traj") == SUMMARY
+    assert 0 < len(sizes) <= loop._MAX_SUMMARY_FOLDS

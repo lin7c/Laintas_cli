@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 from typing import Optional
 
 import backend_profiles
@@ -36,9 +37,44 @@ _RANK_TIMEOUT = float(os.environ.get("LAINTAS_RANK_TIMEOUT", "8"))
 _MAX_BATCH = 64          # must stay ≤ the gateway's EMBED_MAX_INPUTS
 _MAX_CHARS = 8000        # must stay ≤ the gateway's EMBED_MAX_CHARS
 
-# Process-flag: once the endpoint answers 503/404 we stop hammering it for the
-# rest of the session (it won't sprout a provider mid-run). Reset only on restart.
-_endpoint_disabled = False
+# Back-off after the endpoint answers 404/503. This used to be a permanent
+# process flag on the theory that a gateway "won't sprout a provider mid-run" —
+# but 503 is also what a gateway returns while its own upstream cools down
+# (60s), and what it returns when an operator switches an embedding account
+# back on. A session that hit one of those minutes lost semantic memory dedup
+# and recall ranking for its entire life, silently, and the store filled with
+# near-duplicate entries nobody asked for. Back off, then look again.
+_ENDPOINT_COOLDOWN_S = float(os.environ.get("LAINTAS_EMBED_COOLDOWN", "300"))
+_endpoint_cool_until = 0.0
+_last_endpoint_error = ""
+
+
+def _note_endpoint_down(reason: str) -> None:
+    global _endpoint_cool_until, _last_endpoint_error
+    _endpoint_cool_until = time.time() + _ENDPOINT_COOLDOWN_S
+    _last_endpoint_error = str(reason or "")[:200]
+
+
+def _note_endpoint_up() -> None:
+    global _endpoint_cool_until, _last_endpoint_error
+    _endpoint_cool_until = 0.0
+    _last_endpoint_error = ""
+
+
+def cooling_down() -> bool:
+    """True while the endpoint is being left alone after a refusal."""
+    return time.time() < _endpoint_cool_until
+
+
+def degraded() -> tuple:
+    """``(is_degraded, reason, seconds_left)`` for callers that want to SAY so.
+
+    Everything that depends on embeddings here has a silent fallback, which is
+    the right behaviour and the wrong thing to keep to yourself: memory dedup
+    quietly stops merging and the user only finds out by counting files.
+    """
+    left = max(0.0, _endpoint_cool_until - time.time())
+    return (left > 0, _last_endpoint_error, left)
 
 # Bounded in-process cache: sha1(text) → vector. Collapses the repeated embedding
 # of the constant task query (the prompt is rebuilt every loop) into one network
@@ -85,13 +121,12 @@ def _load_session() -> Optional[dict]:
 def available() -> bool:
     """Cheap check: a session exists and we haven't already seen the endpoint
     refuse. Not a guarantee — the actual call still degrades gracefully."""
-    return not _endpoint_disabled and _load_session() is not None
+    return not cooling_down() and _load_session() is not None
 
 
 def embed(texts, *, session: Optional[dict] = None) -> Optional[list]:
     """Embed a list of strings. Returns a list of vectors (list[float]) aligned
     with ``texts``, or ``None`` on any failure. Empty input → ``[]``."""
-    global _endpoint_disabled
     if isinstance(texts, str):
         texts = [texts]
     if not texts:
@@ -113,7 +148,7 @@ def embed(texts, *, session: Optional[dict] = None) -> Optional[list]:
             result[i] = _embed_cache[h]
     if not missing_idx:
         return result
-    if _endpoint_disabled:
+    if cooling_down():
         return None
 
     try:
@@ -146,10 +181,12 @@ def embed(texts, *, session: Optional[dict] = None) -> Optional[list]:
         except Exception:
             return None
         if resp.status_code in (404, 503):
-            # No embedding provider configured / route absent — stop trying.
-            _endpoint_disabled = True
+            # No provider configured, route absent, or the gateway's own
+            # upstream is cooling. Back off for a while rather than for good.
+            _note_endpoint_down(f"HTTP {resp.status_code}: {resp.text[:120]}")
             return None
         if resp.status_code != 200:
+            _note_endpoint_down(f"HTTP {resp.status_code}: {resp.text[:120]}")
             return None
         try:
             body = resp.json()
@@ -162,6 +199,7 @@ def embed(texts, *, session: Optional[dict] = None) -> Optional[list]:
 
     if len(fetched) != len(missing_idx):
         return None
+    _note_endpoint_up()
     for idx, vec in zip(missing_idx, fetched):
         result[idx] = vec
         _cache_put(keys[idx], vec)

@@ -53,7 +53,7 @@ class ArgumentContractTests(unittest.TestCase):
     def test_extra_words_are_rejected(self):
         for command in (
                 "/prop sys 2 3", "/usage buy calls now", "/img list extra",
-                "/retask help me", "/canvas list here", "/canvas a.excalidraw b",
+                "/retask help me",
                 "/handoff list mine", "/shared ls a b", "/shared delete a b",
                 "/windows stop now", "/windows start write now",
                 "/web status now", "/web test google bing",

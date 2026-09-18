@@ -10,6 +10,14 @@
       "sha256": "4ec2f1e650a46ea8b824fcc98eff4526e08af21357d7adce3463b2cd39179c3d"
     },
     {
+      "id": "laintas/canvas",
+      "name": "canvas",
+      "version": "1.0.0",
+      "description": "Whiteboards in the terminal: view and draw .excalidraw boards, and let the agent draw on them",
+      "url": "https://cli.laintas.com/extensions/official/canvas-1.0.0.lext",
+      "sha256": "7b7287a6ba64c1a5a811c8b64a12710d41b9b264fcbb98efd586a924885b8a5e"
+    },
+    {
       "id": "laintas/swebench",
       "name": "swebench",
       "version": "1.0.0",

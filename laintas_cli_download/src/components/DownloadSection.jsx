@@ -7,9 +7,9 @@ import {
 } from 'lucide-react';
 import { useLanguage } from '@/contexts/LanguageContext';
 import SiteFooter from './SiteFooter';
-import TerminalDemo from './TerminalDemo';
+import TerminalReplay from './TerminalReplay';
 
-const RELEASE_FALLBACK = 'v1.29.4';
+const RELEASE_FALLBACK = 'v1.30.0';
 // Release files are served by GitHub Releases, the one place CI publishes to.
 const RELEASE_BASE = 'https://github.com/lin7c/Laintas_cli/releases/latest/download';
 const RELEASE_API = 'https://api.github.com/repos/lin7c/Laintas_cli/releases/latest';
@@ -41,8 +41,8 @@ const COPY = {
     introHighlight: '不是聊天窗口。是离文件和终端最近的那个 agent。',
     install: '安装 Laintas CLI', seeWorkflow: '查看运行流程',
     proofLine: ['Linux / Windows', 'HWO / HWG 编排', '策略强制'],
-    realEyebrow: 'LIVE SESSION · RENDERED', realTitle: '一段真实的 agent 会话',
-    realNote: '用 HTML/CSS 实时渲染的终端会话：矢量清晰、可缩放，直接呈现 agent 如何读文件、改代码、跑测试并回到提示符。',
+    realEyebrow: 'RECORDED SESSION · v1.29.4', realTitle: '一段真实会话的录像',
+    realNote: '这不是示意图：真实终端里跑的一次 laintas-cli v1.29.4 会话，逐帧录下来原样回放 —— agent 读项目、跑 pytest、定位失败用例的根因，把补丁摆出来等你批准，落盘后再跑一遍测试。等待思考的长段做了跳剪，画面本身一个字没改。',
     flowKicker: '01 / 请求生命周期', flowTitle: '一条输入，八个真实运行阶段。', flowIntro: '这是 README 与运行时代码定义的请求生命周期，不是抽象营销漏斗。每个阶段都映射到本地模块与状态边界。',
     flow: [
       ['分类输入', 'REPL 区分 Slash 指令、PATH 可执行命令与自然语言任务。'],
@@ -76,8 +76,8 @@ const COPY = {
     introHighlight: 'Not a chat window. The agent closest to your files and terminal.',
     install: 'Install Laintas CLI', seeWorkflow: 'See the workflow',
     proofLine: ['Linux / Windows', 'HWO / HWG', 'Policy enforced'],
-    realEyebrow: 'LIVE SESSION · RENDERED', realTitle: 'A real agent session',
-    realNote: 'Rendered live in HTML/CSS — vector-crisp and zoomable. Watch the agent read a file, edit code, run tests, and return to the prompt.',
+    realEyebrow: 'RECORDED SESSION · v1.29.4', realTitle: 'A recording of a real session',
+    realNote: 'Not a mockup: one laintas-cli v1.29.4 session captured off a real terminal and replayed frame for frame — the agent reads the project, runs pytest, tracks the failing case to its root cause, shows you the patch and waits for approval, then re-runs the tests. Long waits are jump-cut; nothing on screen is rewritten.',
     flowKicker: '01 / REQUEST LIFECYCLE', flowTitle: 'One input. Eight real runtime stages.', flowIntro: 'This is the request lifecycle defined by the README and runtime code, not an abstract funnel. Every stage maps to a local module and state boundary.',
     flow: [
       ['Classify input', 'The REPL distinguishes slash commands, PATH executables, and natural-language tasks.'],
@@ -148,7 +148,7 @@ export default function DownloadSection() {
 
           <motion.div className="hero-terminal" initial={{ opacity: 0, scale: 0.98 }} animate={{ opacity: 1, scale: 1 }} transition={{ duration: 0.65, delay: 0.12 }}>
             <div className="proof-label"><span className="live-dot" />{c.realEyebrow}</div>
-            <TerminalDemo />
+            <TerminalReplay />
             <figcaption><div><strong>{c.realTitle}</strong><span>{c.realNote}</span></div></figcaption>
           </motion.div>
         </div>

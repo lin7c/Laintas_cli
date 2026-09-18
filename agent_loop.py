@@ -157,15 +157,21 @@ _DEFAULT_CONFIG = {
     "use_message_thread": True,     # native OpenAI message thread (assistant tool_calls + role:tool results) — reads stay in context like opencode/Helpwo, no re-read amnesia. Compacted by _compact_thread_messages.
     "use_unified_catalog": True,    # emit shared agent_tools canonical tool names (fs.read->read) to the model — unified taxonomy is the default; set False to fall back to legacy dotted names
     "model_context_window": 64000,  # model's context window (tokens) used to budget thread compaction (prune + summarize)
-    # Ceiling on the window compaction budgets against, even when the provider
-    # offers far more. Exposed as a knob rather than hardcoded, but the DEFAULT
-    # stays at the historical 200000: the budget is supposed to track what the
-    # running model can actually hold, and lowering it globally would make a
-    # 1M-window model compact as though it had a quarter of that — paying for
-    # summarisation to solve a problem that model does not have. If compaction
-    # is not firing when you expect it to, that is a fact about the window, not
-    # a reason to shrink the budget.
-    "context_window_adopt_cap": 200000,
+    # Share of the model's REAL context window we intend to be holding when
+    # compaction fires. The flat 200000 ceiling this replaces was written for
+    # 64k-128k models; once the served models reached 1M it became the dominant
+    # term, and measured over 24 live compactions the trigger fired at a median
+    # of 12.0% of the model's actual window (120,408 tokens) — paying for
+    # summarisation to solve a problem that model does not have.
+    #
+    # The window it implies is solved backwards through the output reserve, the
+    # measured per-request overhead and `compact_auto_ratio`, from parameters
+    # the gateway maintains per model, so this number is the one a user can
+    # check: `/compact status` prints the share actually reached. `/max` takes
+    # everything the model has (bounded only by its own output ceiling).
+    "context_trigger_share": 0.60,
+    # Optional absolute ceiling on top of the ratio, in tokens. 0 = none.
+    "context_window_adopt_cap": 0,
     # Largest slice of thread the summarizer is handed in one call. Without a
     # bound the head goes up in a single request — the 312k-token outlier in
     # that same sample was exactly this. Chunking also keeps the job inside a
@@ -178,6 +184,9 @@ _DEFAULT_CONFIG = {
     "compact_target_ratio": 0.50,
     "compact_background_cooldown": 60,
     "compact_background_min_tokens": 2000,
+    # Stall budget, not a total: every completed fold restarts it (see
+    # background_compaction.Cancellation). A four-slice head is allowed to take
+    # as long as it takes, a wedged backend still gets cut off.
     "compact_background_timeout": 180,
     # Model for the auxiliary calls (compaction, critic, memory extraction).
     # Empty = use whatever the terminal has selected, i.e. the main model, which
@@ -211,7 +220,8 @@ _DEFAULT_CONFIG = {
     "rag_capture": False,              # Training-content capture is explicit opt-in; no passive coding-session collection.
     "dynamic_context": True,           # core + task-relevant tool schemas, memory summaries, and skill metadata
     "dynamic_skill_limit": 3,          # relevant skill summaries advertised before explicit skill.list/load
-    "dynamic_memory_limit": 5,         # relevant memory summaries advertised before explicit mem.list/read
+    "dynamic_memory_limit": 5,         # relevant memory summaries advertised before explicit mem.list/read (a FLOOR; mem_prompt_budget_chars is the ceiling)
+    "mem_prompt_budget_chars": 1400,   # characters of task-relevant memory summaries in the prompt; a budget, not a count, so a large store can still surface more than a fixed few
     "mem_recall_highlight": True,      # True = append a "most relevant to this task" section (semantic recall over all persistent memories, lexical fallback) to the injected memory context. Purely additive — never drops memories. See mem_recall.py.
     "skill_route_highlight": True,      # True = prepend a "most relevant skills for this task" line to the skill catalog (semantic ranking, lexical fallback) so the model loads the right skill first. Purely additive — the full catalog is preserved. See skill_router.py.
     "mem_extract_on_complete": False,  # True = ALSO extract durable memories on every successful task completion. Default OFF: consolidation now happens at compaction time only (mem_extract_on_compact) to keep it rare and cheap. See mem_extract.py.
@@ -938,7 +948,8 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "rprompt_slots_detail_on": "Comma-separated right-prompt slots shown with detail on (messages,agent,mode,model,effort,terminal); empty hides the row",
     "rprompt_slots_detail_off": "Comma-separated right-prompt slots shown with detail off (messages,agent,mode,model,effort,terminal); empty hides the row",
     "rprompt_slot_order": "Left-to-right display order of right-prompt slots (agent,mode,model,effort,terminal); the messages mark is always leftmost; omitted slots follow in default order",
-    "context_window_adopt_cap": "Ceiling on the auto-adopted provider window — lower it to compact earlier. Every turn re-sends the thread, so this is a cost knob, not just an overflow guard",
+    "context_trigger_share": "Share of the model's real context window to be holding when compaction fires (default 0.60; /max uses the whole window). Every turn re-sends the thread, so this is a cost knob as well as an overflow guard",
+    "context_window_adopt_cap": "Optional absolute ceiling in tokens on top of context_trigger_share (0 = none)",
     "compact_chunk_tokens": "Largest slice of thread handed to the summarizer in one call",
     "compact_background": "Prepare context summaries silently while the agent continues working",
     "compact_background_ratio": "Fraction of usable message budget that starts background compaction",
@@ -946,7 +957,7 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "compact_target_ratio": "Desired remaining budget fraction after compaction; below background trigger",
     "compact_background_cooldown": "Minimum seconds between speculative compaction attempts",
     "compact_background_min_tokens": "Minimum estimated tokens reclaimed before committing a background summary",
-    "compact_background_timeout": "Maximum seconds allowed for a speculative summary and its review",
+    "compact_background_timeout": "Seconds a speculative summary may go without completing a chunk before it is abandoned (per chunk, not per job)",
     "aux_model": "Model for compaction / critic / memory-extraction (empty = use the main model)",
     "aux_provider": "Provider paired with aux_model",
     "compact_review_effort": "Thinking level for the summary-review step of context compaction (default none = no thinking, fastest compaction; auto/low/medium/high/max re-enable it — costs output tokens)",
@@ -985,7 +996,8 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "rag_capture": "Log local retrieval diagnostics to .laintas/rag_signals.jsonl (never uploaded by laintas_cli)",
     "dynamic_context": "Send only core plus task-relevant tool schemas, relevant memory summaries, and top relevant skill summaries (zero-network prompt routing)",
     "dynamic_skill_limit": "Maximum relevant skills advertised before explicit skill.list/load",
-    "dynamic_memory_limit": "Maximum relevant memory summaries advertised before explicit mem.list/read",
+    "dynamic_memory_limit": "Minimum relevant memory summaries advertised before explicit mem.list/read (the budget decides how many more fit)",
+    "mem_prompt_budget_chars": "Character budget for task-relevant memory summaries in the prompt (0 = fixed count from dynamic_memory_limit)",
     "mem_recall_highlight": "Append a task-relevant memory highlight (semantic recall, lexical fallback) to the injected memory context (additive; never drops memories)",
     "skill_route_highlight": "Prepend a task-relevant 'most relevant skills' line to the skill catalog (semantic ranking, lexical fallback; additive)",
     "mem_extract_on_complete": "ALSO extract durable memories on task completion (default off; consolidation runs at compaction time instead)",
@@ -1045,11 +1057,13 @@ _RUNTIME_POSITIVE = {
     "microcompact_keep", "microcompact_read_budget",
     "history_max_messages", "message_truncate", "short_memory_max_chars",
     "model_context_window", "remote_max_workers", "remote_control_workers",
-    "context_window_adopt_cap", "compact_chunk_tokens",
-    "dynamic_skill_limit", "dynamic_memory_limit",
+    "compact_chunk_tokens",
+    "dynamic_skill_limit", "dynamic_memory_limit", "mem_prompt_budget_chars",
 }
 
 _RUNTIME_LIMITS = {
+    "context_trigger_share": (0.05, 1.0),
+    "context_window_adopt_cap": (0, 10_000_000),
     "compact_background_ratio": (0.05, 0.95),
     "compact_auto_ratio": (0.1, 1.0),
     "compact_target_ratio": (0.01, 0.9),
@@ -1225,6 +1239,8 @@ def reset_runtime_config():
 # auto-exit circuit breaker. Cosmetic/safety toggles (disable_remote_terminal,
 # show_billing, heartbeat_interval) are intentionally left alone.
 _MAX_CONFIG = {
+    "context_trigger_share": 1.0,   # budget against the model's whole window
+    "context_window_adopt_cap": 0,      # and no absolute ceiling on top of it
     "max_loops": 100000,            # effectively unbounded iterations
     "max_tokens": 0,                # unlimited: take the full provider/window budget
     "max_debug_entries": 1000,
@@ -5216,6 +5232,7 @@ def _persistent_memory_parts(query: str, session) -> tuple[str, str]:
                     k=int(get_runtime_config("dynamic_memory_limit") or 5),
                     session=session,
                     local_only=True,
+                    budget_chars=int(get_runtime_config("mem_prompt_budget_chars") or 0),
                 ) or "")
         except Exception:
             pass
@@ -5225,7 +5242,9 @@ def _persistent_memory_parts(query: str, session) -> tuple[str, str]:
     try:
         if get_runtime_config("mem_recall_highlight") and str(query or "").strip():
             return base, (mem_recall.relevant_block(
-                str(query), k=5, session=session) or "")
+                str(query), k=5, session=session,
+                budget_chars=int(get_runtime_config("mem_prompt_budget_chars") or 0),
+            ) or "")
     except Exception:
         pass
     return base, ""
@@ -5720,16 +5739,40 @@ def _summary_token_count(text: str) -> int:
 _summary_observed_windows: dict[str, int] = {}
 
 
+#: Folds beyond this many are worth a bigger slice: they run one after another,
+#: so a head split into thirty of them is thirty round trips of latency.
+_MAX_SUMMARY_FOLDS = 4
+
+
+def _unknown_summary_window() -> int:
+    """What to assume for a summarizer that has not reported its parameters.
+
+    Derived from the policy rather than picked: exactly enough to fold one
+    policy-sized chunk plus its prompt and output. A model we know nothing
+    about gets the smallest window the job is defined for, and the first
+    response it sends replaces the guess with its real one.
+    """
+    policy = ctxpol.load() if ctxpol is not None else {}
+    chunk = int(policy.get("summary_chunk_tokens") or 24000)
+    output = int(policy.get("summary_output_tokens") or 4096)
+    return chunk + 2 * output + 2048
+
+
 def _summary_window(model: str) -> int:
-    """Conservative ceiling until this model has reported its real window."""
+    """The summarizer's real window, or the policy-derived floor until it reports.
+
+    This used to return `min(32000, window)` — a ceiling, not a guess — so a
+    model with a 262,144-token window was chunked as though it had an eighth of
+    that. The head was then split into eight times as many slices, each slice
+    costing a generate + a review call in sequence; that is what turned one
+    compaction into half an hour of aux traffic on a long thread.
+    """
     if not model:
-        return min(32000, _effective_context_window())
-    try:
-        known = json_store.load_json(_provider_window_file(), {}) or {}
-        window = int(_summary_observed_windows.get(model) or known.get(model) or 32000)
-        return min(32000, window) if window > 0 else 32000
-    except Exception:
-        return 32000
+        return min(_unknown_summary_window(), _effective_context_window())
+    window = int(_summary_observed_windows.get(model) or 0)
+    if window <= 0:
+        window = int(model_capability(model).get("window") or 0)
+    return window if window > 0 else _unknown_summary_window()
 
 
 def _summary_output_limit() -> int:
@@ -5745,11 +5788,17 @@ def _summary_request_fits(model: str, prompt: str, message: str) -> bool:
 
 
 def _note_summary_window(response, model: str) -> None:
+    """An auxiliary model reports its parameters the same way the main one does."""
     if isinstance(response, dict):
         try:
-            window = int((response.get("_budget") or {}).get("contextWindow") or 0)
+            budget = response.get("_budget") or {}
+            window = int(budget.get("contextWindow") or 0)
             if window > 0 and model:
                 _summary_observed_windows[model] = window
+            # Into the shared store too, so the next process chunks the first
+            # compaction against the real window instead of the unknown-model
+            # fallback.
+            note_model_capability(model, window, int(budget.get("providerMax") or 0))
         except (TypeError, ValueError):
             pass
 
@@ -5905,21 +5954,71 @@ def _serialize_thread_msg(m: dict) -> str:
     return ""
 
 
+_TOOL_SCHEMA_TOKENS: dict = {}
+
+
+def _count_prompt_tokens(text: str) -> int:
+    if tokenizer is not None:
+        try:
+            return tokenizer.count_tokens(text)
+        except Exception:
+            pass
+    return ctxpol.estimate_tokens(text) if ctxpol is not None else len(text) // 4
+
+
+def measure_request_overhead(system_prompt: str, tool_names) -> int:
+    """Tokens THIS turn's request carries on top of the thread.
+
+    The tool schemas are the expensive half, so they are counted for the tools
+    the turn actually authorizes, memoized per name set.
+    """
+    total = _count_prompt_tokens(system_prompt or "")
+    try:
+        import tools as _tools_mod
+        unified = bool(get_runtime_config("use_unified_catalog"))
+        key = (unified, frozenset(tool_names) if tool_names is not None else None)
+        cached = _TOOL_SCHEMA_TOKENS.get(key)
+        if cached is None:
+            names = set(tool_names) if tool_names is not None else None
+            catalog, _ = _tools_mod.get_registry().to_openai_tools(
+                unified=unified, allowed_names=names)
+            # Names the registry did not resolve would silently shrink the
+            # reserve, and under-reserving costs a failed request. Decline to
+            # measure instead, and let the caller keep its safe over-estimate.
+            cached = (0 if names is not None and len(catalog) < len(names)
+                      else _count_prompt_tokens(json.dumps(catalog, ensure_ascii=False)))
+            if len(_TOOL_SCHEMA_TOKENS) > 64:
+                _TOOL_SCHEMA_TOKENS.clear()
+            _TOOL_SCHEMA_TOKENS[key] = cached
+        if not cached and tool_names:
+            return 0
+        total += cached
+    except Exception:
+        return 0
+    return total
+
+
 def _per_request_overhead_tokens(state: dict) -> int:
     """Tokens every request carries on top of the thread.
 
     Compaction budgets the THREAD, but the assembled request is thread + system
-    prompt + the full tool catalogue, and the last of those is not small: 122
-    tools serialise to ~67KB, about 16.9k tokens, re-sent on every single turn.
-    Ignoring it meant compaction could shrink the thread to exactly the budget
-    and still overflow the window by ~2.1k once the request was assembled —
-    invisible on a 256K model, fatal on one served at 65536, which is how it
-    was found.
+    prompt + tool schemas, and the last of those is not small. Ignoring it meant
+    compaction could shrink the thread to exactly the budget and still overflow
+    the window once the request was assembled — invisible on a 256K model,
+    fatal on one served at 65536, which is how it was found.
 
-    Estimated, not measured, and deliberately so: the real tool set varies with
-    `allowed_tool_names` per turn. Over-reserving costs a slightly earlier
-    compaction; under-reserving costs a failed request.
+    Prefer what the loop MEASURED for the turn it is about to send. This used to
+    be estimated from the whole registry and a fixed guess for the system
+    prompt, on the theory that over-reserving only costs "a slightly earlier
+    compaction". On a live session the gap was 28,677 reserved against 10,808
+    actually sent — 29 authorized tools, not 147 — which moved the automatic
+    trigger 16k tokens down the window and compacted threads that had room
+    left. The registry-wide estimate stays as the floor for the first request
+    of a run, before anything has been measured.
     """
+    measured = int((state or {}).get("_request_overhead_tokens") or 0)
+    if measured > 0:
+        return measured
     total = 0
     try:
         import tools as _tools_mod
@@ -6014,24 +6113,64 @@ def _summarize_head_in_chunks(deps, session, head: list,
     generation_window = _summary_window(aux_model_override()[0])
     review_window = _summary_window(str(ctxpol.load().get("summary_review_model")
                                        or "deepseek-v4-flash"))
-    chunk_budget = min(
-        chunk_budget,
+    allowance = min(
         generation_window - previous - output - 1024
         - _summary_token_count(ctxpol.summary_prompt(lang)),
         review_window - previous - 2 * output - 1024
         - _summary_token_count(ctxpol.review_prompt(lang, previous_summary=prev_summary)))
+    chunk_budget = min(chunk_budget, allowance)
     if chunk_budget <= 0:
         return None
     cwd = current_path or os.getcwd()
 
     slices = _summary_source_chunks(head, chunk_budget)
+    # Folds are SEQUENTIAL — each one waits for the previous summary — so the
+    # slice count is wall-clock, not just cost. `compact_chunk_tokens` is the
+    # comfortable slice size, not a reason to make thirty calls: when a head
+    # needs more folds than this, grow the slice to whatever the summarizer's
+    # window still allows. Below the limit nothing changes.
+    if len(slices) > _MAX_SUMMARY_FOLDS and allowance > chunk_budget:
+        source = sum(_summary_token_count(s) for s in slices)
+        grown = min(allowance, max(chunk_budget, -(-source // _MAX_SUMMARY_FOLDS)))
+        # Packing keeps tool exchanges whole, so an exact division still leaves
+        # a remainder slice. Grow a couple of times rather than guess a margin.
+        for _ in range(3):
+            if grown <= chunk_budget:
+                break
+            chunk_budget = grown
+            slices = _summary_source_chunks(head, chunk_budget)
+            if len(slices) <= _MAX_SUMMARY_FOLDS:
+                break
+            grown = min(allowance, int(chunk_budget * 1.5))
 
     summary = prev_summary
     completed_any = False
+    # Folds are cached by the chain of everything folded so far, so an attempt
+    # that is cancelled or stalls mid-head keeps what it finished and the next
+    # one resumes at the first unfolded slice. Without it a head that needed
+    # more slices than a single attempt could finish was re-summarized from
+    # slice 1 forever and never compacted anything — only the bill moved.
+    chain = background_compaction.fold_fingerprint(
+        "", lang, cwd, chunk_budget, prev_summary or "",
+        # Everything that changes what a fold WOULD say belongs in the seed, or
+        # switching summarizer, reviewer or thinking level would silently serve
+        # folds produced under the old settings.
+        *(get_runtime_config(k) for k in (
+            "aux_model", "aux_provider", "compact_review_effort")),
+        ctxpol.load().get("summary_review_model") or "")
     for index, text in enumerate(slices):
+        chain = background_compaction.fold_fingerprint(chain, text)
+        reused = background_compaction.recall_fold(chain)
+        if reused is not None:
+            summary = reused
+            completed_any = True
+            if progress:
+                progress(f"Chunk {index + 1}/{len(slices)} · reusing completed fold")
+            continue
         if interrupt_event is not None and interrupt_event.is_set():
             # Esc between chunks. Same rule as a failed chunk: a partial fold
-            # never replaces the head, so stopping here loses nothing.
+            # never replaces the head, so stopping here loses nothing — and the
+            # folds already cached are waiting for the next attempt.
             return None
         if progress:
             progress(f"Chunk {index + 1}/{len(slices)} · generating summary")
@@ -6048,13 +6187,21 @@ def _summarize_head_in_chunks(deps, session, head: list,
         summary = _llm_review_summary(
             deps, session, cwd, text, merged, summary, lang, trajectory_id,
             interrupt_event)
-        if interrupt_event is not None and interrupt_event.is_set():
-            return None
         if not _valid_structured_summary(summary, lang):
             return None
+        # Cache before testing for cancellation: this fold is complete and paid
+        # for, and the attempt that resumes after the cancel should not buy it
+        # a second time.
+        background_compaction.remember_fold(chain, summary)
+        # It also proves the worker is alive, so restart the stall clock
+        # instead of letting one budget cover the whole head.
+        if hasattr(interrupt_event, "progress"):
+            interrupt_event.progress()
         completed_any = True
         if progress:
             progress(f"Chunks completed: {index + 1}/{len(slices)}")
+        if interrupt_event is not None and interrupt_event.is_set():
+            return None
     return summary if completed_any else None
 
 
@@ -6173,12 +6320,14 @@ def compaction_status_text(*, auto: bool, usable: int = 0, window: int = 0) -> s
         configured = int(get_runtime_config("model_context_window") or 0)
         knob = ("model_context_window"
                 if configured and configured != _DEFAULT_CONFIG["model_context_window"]
-                else "context_window_adopt_cap")
+                else "context_trigger_share")
+        argument = "<tokens>" if knob == "model_context_window" else "<0-1>"
         lines.append(
             f"Auto-compact: the thread reached its "
             f"{int(usable * get_runtime_config('compact_auto_ratio')):,}-token trigger "
             f"(usable {usable:,}) "
-            f"(window {window:,}). Raise the trigger: /config {knob} <tokens>")
+            f"(window {window:,}). Raise the trigger: /config {knob} {argument}"
+            + (" (or /max for the whole window)" if knob != "model_context_window" else ""))
     effort = str(get_runtime_config("compact_review_effort") or "none").strip().lower()
     if effort != "none":
         lines.append(
@@ -6261,7 +6410,13 @@ def _compaction_owner(state):
 
 
 def _compaction_job_key(state):
-    return (_compaction_owner(state), state.get("_run_id"),
+    # Deliberately NOT keyed by `_run_id`. A speculative summary describes a
+    # prefix of the thread, and `matches()` re-checks that prefix message by
+    # message before anything is committed — so the run that happens to be
+    # executing when it lands is irrelevant. Keying by it meant every summary
+    # that outlived its turn was thrown away, which on short turns was all of
+    # them.
+    return (_compaction_owner(state),
             tuple(get_runtime_config(k) for k in (
                 "aux_model", "aux_provider", "compact_review_effort", "compact_chunk_tokens")),
             _fingerprint_payload(ctxpol.load()))
@@ -6281,6 +6436,10 @@ def _coordinate_compaction(messages, deps, session, lang, state, *,
     auto = ctxpol.load().get("auto", True)
     enabled = auto and bool(get_runtime_config("compact_background"))
     cooldown = int(get_runtime_config("compact_background_cooldown"))
+    # A summary this agent's previous run left running. Adopting it before the
+    # checks below lets it be waited for, committed or invalidated exactly like
+    # one this run started.
+    coordinator.adopt(_compaction_owner(state))
     if interrupt_event is not None and interrupt_event.is_set():
         coordinator.close()
         return False
@@ -6540,6 +6699,8 @@ _provider_window_model = None
 # the in-memory window instead is wrong: that value can already equal `tokens`
 # for reasons that never reached disk, and the write is then skipped forever.
 _provider_window_persisted: dict = {}
+# Live per-model parameters as reported this process: {model: {window, maxOutput}}.
+_model_capabilities_seen: dict = {}
 
 
 def _provider_window_file():
@@ -6556,6 +6717,71 @@ def _provider_window_key() -> str:
         return ""
 
 
+def _capability_entry(raw) -> dict:
+    """One model's remembered parameters, from either file generation.
+
+    The file used to be ``{model: window}``. It now carries the output ceiling
+    too, because every budget number that used to be a constant is derived from
+    these two: the gateway maintains them per model (`models.py`) and reports
+    them on every response in `_budget` (`contextWindow`, `providerMax`).
+    """
+    if isinstance(raw, dict):
+        return {"window": int(raw.get("window") or 0),
+                "maxOutput": int(raw.get("maxOutput") or 0)}
+    try:
+        return {"window": int(raw or 0), "maxOutput": 0}
+    except (TypeError, ValueError):
+        return {"window": 0, "maxOutput": 0}
+
+
+def _remembered_capabilities() -> dict:
+    try:
+        stored = json_store.load_json(_provider_window_file(), {}) or {}
+    except Exception:
+        return {}
+    if not isinstance(stored, dict):
+        return {}
+    return {model: _capability_entry(raw) for model, raw in stored.items()}
+
+
+def model_capability(model: str) -> dict:
+    """{"window", "maxOutput"} for a model, zeros when never reported."""
+    model = str(model or "").strip()
+    if not model:
+        return {"window": 0, "maxOutput": 0}
+    live = _model_capabilities_seen.get(model)
+    if live and live.get("window"):
+        return dict(live)
+    remembered = _remembered_capabilities().get(model)
+    return dict(remembered) if remembered else {"window": 0, "maxOutput": 0}
+
+
+def note_model_capability(model: str, window: int = 0, max_output: int = 0) -> None:
+    """Record what a model reported about itself, in memory and on disk."""
+    model = str(model or "").strip()
+    window, max_output = max(0, int(window or 0)), max(0, int(max_output or 0))
+    if not model or not (window or max_output):
+        return
+    entry = dict(_model_capabilities_seen.get(model) or {"window": 0, "maxOutput": 0})
+    if window:
+        entry["window"] = window
+    if max_output:
+        entry["maxOutput"] = max_output
+    _model_capabilities_seen[model] = entry
+    if _provider_window_persisted.get(model) == entry:
+        return
+    try:
+        stored = json_store.load_json(_provider_window_file(), {}) or {}
+        if not isinstance(stored, dict):
+            stored = {}
+        if _capability_entry(stored.get(model)) != entry:
+            stored[model] = entry
+            json_store.save_json_atomic(_provider_window_file(), stored)
+        _provider_window_persisted[model] = entry
+    except Exception:
+        pass
+
+
 def _load_remembered_provider_window() -> None:
     """Seed _provider_context_window from the last run that saw the real one."""
     global _provider_context_window, _provider_window_cache_loaded, _provider_window_model
@@ -6567,55 +6793,79 @@ def _load_remembered_provider_window() -> None:
     _provider_context_window = 0
     if not key:
         return
-    try:
-        remembered = json_store.load_json(_provider_window_file(), {}) or {}
-        value = int(remembered.get(key) or 0)
-    except Exception:
-        value = 0
-    if value > 0:
-        _provider_context_window = value
+    _provider_context_window = model_capability(key).get("window") or 0
 
 
-def _note_provider_context_window(tokens: int) -> None:
+def _note_provider_context_window(tokens: int, max_output: int = 0) -> None:
     global _provider_context_window, _provider_window_model, _provider_window_cache_loaded
-    if not tokens or tokens <= 0:
-        return
-    tokens = int(tokens)
-    _provider_context_window = tokens
     key = _provider_window_key()
-    _provider_window_model = key
-    _provider_window_cache_loaded = True
-    if not key or _provider_window_persisted.get(key) == tokens:
-        return
-    try:
-        remembered = json_store.load_json(_provider_window_file(), {}) or {}
-        if not isinstance(remembered, dict):
-            remembered = {}
-        if int(remembered.get(key) or 0) != tokens:
-            remembered[key] = tokens
-            json_store.save_json_atomic(_provider_window_file(), remembered)
-        _provider_window_persisted[key] = tokens
-    except Exception:
-        pass
+    if tokens and int(tokens) > 0:
+        _provider_context_window = int(tokens)
+        _provider_window_model = key
+        _provider_window_cache_loaded = True
+    note_model_capability(key, tokens, max_output)
 
 
-# A bigger window is not a licence to fill it. Compaction bounds cost and
-# latency as well as overflow: every uncompacted turn re-sends the whole thread,
-# so budgeting against a 1M window would grow prompts until a single request
-# costs dollars and takes minutes. Take the headroom the real window gives us
-# over the old 64000 default, but stop well short of the model's maximum.
-_CONTEXT_WINDOW_ADOPT_CAP = 200_000
+def model_output_reserve(model: str = "") -> int:
+    """Tokens to hold back for the answer — never a guess when we can help it.
+
+    `max_tokens` is the ceiling WE request, so when it is set it is the reserve.
+    At 0 ("unlimited") the gateway grants up to the model's own output ceiling,
+    so that is what has to stay free. The shared policy's `buffer_tokens` is
+    only the last resort, for a model that has not reported yet.
+    """
+    floor = int((ctxpol.load().get("buffer_tokens") if ctxpol is not None else 0) or 20000)
+    configured = int(get_runtime_config("max_tokens") or 0)
+    if configured > 0:
+        return max(configured, floor)
+    reported = model_capability(model or _provider_window_key()).get("maxOutput") or 0
+    # `usable_tokens` floors the reserve at the policy buffer anyway; matching
+    # it here keeps the window solver and the budget from disagreeing about how
+    # much room the answer needs.
+    return max(int(reported), floor)
 
 
-def _effective_context_window() -> int:
+def _effective_context_window(overhead: int = 0) -> int:
+    """The window compaction budgets against.
+
+    Expressed as the share of the model's REAL window we intend to be holding
+    when compaction fires (`context_trigger_share`), and solved backwards
+    through the subtractions that follow — output reserve, per-request
+    overhead, `compact_auto_ratio` — so the knob means the thing a user can
+    actually check rather than a number three steps removed from it. Every
+    input is either one of those ratios or a parameter the gateway maintains
+    per model and reports in `_budget`; the flat 200000 ceiling this replaces
+    was a constant from the 64k-128k era, and once the served models reached 1M
+    it was the reason every session compacted at ~12% of its window.
+    """
     _load_remembered_provider_window()
-    configured = int(get_runtime_config("model_context_window") or 64000)
-    if (configured == _DEFAULT_CONFIG["model_context_window"]
-            and _provider_context_window > configured):
-        cap = int(get_runtime_config("context_window_adopt_cap")
-                  or _CONTEXT_WINDOW_ADOPT_CAP)
-        return min(_provider_context_window, cap)
-    return min(configured, _provider_context_window) if _provider_context_window > 0 else configured
+    configured = int(get_runtime_config("model_context_window") or 0)
+    provider = _provider_context_window
+    if provider <= 0:
+        return configured or int(_DEFAULT_CONFIG["model_context_window"])
+    if configured and configured != _DEFAULT_CONFIG["model_context_window"]:
+        # An explicitly chosen window is a deliberate instruction; honour it,
+        # bounded by what the provider actually offers.
+        return min(configured, provider)
+    try:
+        share = float(get_runtime_config("context_trigger_share") or 0)
+    except (TypeError, ValueError):
+        share = 0.0
+    share = min(1.0, max(0.05, share or _DEFAULT_CONFIG["context_trigger_share"]))
+    auto = float(get_runtime_config("compact_auto_ratio") or 0.9) or 0.9
+    reserve = model_output_reserve()
+    overhead = max(0, int(overhead or 0))
+    # (window - reserve - overhead) * auto + overhead == provider * share
+    adopted = int((provider * share - overhead) / auto) + reserve + overhead
+    cap = int(get_runtime_config("context_window_adopt_cap") or 0)
+    if cap > 0:
+        adopted = min(adopted, cap)
+    if adopted >= provider or adopted <= reserve + overhead:
+        # Asking for more than the model has, or for so little that nothing is
+        # left to hold a thread: take the whole window and let the ratios below
+        # do the bounding.
+        return provider
+    return adopted
 
 
 def aux_model_override() -> tuple[str, str]:
@@ -6691,11 +6941,11 @@ def compaction_budget(state: Optional[dict] = None) -> dict:
     thousands of tokens) that the trigger subtracts — so status could read far
     below 100% on a thread auto-compaction was already summarising.
     """
-    window = _effective_context_window()
-    max_out = int(get_runtime_config("max_tokens") or 8192)
-    reserved = ctxpol.usable_tokens(window, max_out) if ctxpol is not None else 0
     overhead = (_per_request_overhead_tokens(state or {})
                 + int((state or {}).get("_transient_prompt_tokens") or 0))
+    window = _effective_context_window(overhead)
+    reserved = (ctxpol.usable_tokens(window, model_output_reserve())
+                if ctxpol is not None else 0)
     return {
         "window": window,
         "reserved": reserved,
@@ -6710,11 +6960,19 @@ def session_context_status(state: dict) -> dict:
     if not isinstance(messages, list):
         messages = []
     budget = compaction_budget(state)
+    auto_at = int(budget["usable"] * get_runtime_config("compact_auto_ratio"))
+    real_window = _provider_context_window or budget["window"]
     return {
         "supported": ctxpol is not None,
         "messages": state.get("_context_live_messages", len(messages)),
         "tokens": state.get("_context_live_tokens", _thread_tokens(messages)),
         "window": budget["window"],
+        # What the model really holds, and the share of it the automatic
+        # trigger sits at — the budget is several subtractions away from the
+        # nominal window, and that gap is worth seeing rather than deriving.
+        "provider_window": real_window,
+        "auto_at_share": ((auto_at + budget["overhead"]) / real_window
+                          if real_window else 0.0),
         "usable": budget["usable"],
         "summary": bool((state or {}).get("_thread_summary")),
         "auto_enabled": bool(ctxpol is not None and ctxpol.load().get("auto", True)),
@@ -7331,6 +7589,9 @@ def _history_without_current_turn(chat_history: list, original_input: str) -> li
 #: author still remembers which one it should be.
 STATE_KEYS_CARRIED = frozenset({
     "_compact_background_at",
+    # The measured per-request overhead: carrying it keeps the first checkpoint
+    # of the next run off the registry-wide over-estimate.
+    "_request_overhead_tokens", "_system_prompt_chars",
     "_files_seen", "_pager", "_pager_msgs", "_pager_walk", "_session_id",
     "_task_cwd",
     "_term_scroll", "_step_counter",
@@ -7386,6 +7647,11 @@ def prepare_state_for_repl(state: dict) -> dict:
     return {
         "shortTermMemory": _trim_short_term_memory(state.get("shortTermMemory", "")),
         "_compact_background_at": state.get("_compact_background_at", 0),
+        # The last measured per-request overhead. Carried so `/compact status`,
+        # the pager and the first checkpoint of the next turn budget against
+        # what this agent really sends instead of the registry-wide estimate.
+        "_request_overhead_tokens": int(state.get("_request_overhead_tokens") or 0),
+        "_system_prompt_chars": int(state.get("_system_prompt_chars") or 0),
         "lastReply": "",
         "lastOutput": _trim_text(state.get("lastOutput", ""), output_limit),
         "terminalHistory": _microcompact_history(history, keep_recent=5),
@@ -10793,6 +11059,17 @@ def run_agent_loop(
 
         with prompt_lab.project_scope(state.get("_prompt_lab_root")):
             _prompt_lab_section = prompt_lab.get_prompt_lab_section()
+        # The legacy feedback-driven optimizer (prompt_opt.py) shares the
+        # {{promptOpt}} slot. Its optimizing/drafted/applied notices were
+        # dead code after the Prompt Lab migration wired only the section
+        # above; surface them again so /prompt feedback stays observable.
+        try:
+            import prompt_opt as _prompt_opt_mod
+            _legacy_opt_section = _prompt_opt_mod.get_prompt_opt_section()
+        except Exception:
+            _legacy_opt_section = ""
+        if _legacy_opt_section:
+            _prompt_lab_section = _prompt_lab_section + _legacy_opt_section
         _prompt_lab_has_slot = "{{promptOpt}}" in prompt_template
         _durable_rules_has_slot = "{{durableRules}}" in prompt_template
         _terminal_style_has_block = "<terminal_output_style>" in prompt_template
@@ -11188,6 +11465,11 @@ def run_agent_loop(
             )
             state["_transient_prompt_tokens"] = _thread_tokens(
                 [{"role": "user", "content": _live_state}]) if _live_state.strip() else 0
+            # What this request really costs outside the thread: the finished
+            # system prompt and the schemas of the tools this turn authorizes.
+            state["_system_prompt_chars"] = len(system_prompt or "")
+            state["_request_overhead_tokens"] = measure_request_overhead(
+                system_prompt, _allowed_tool_names)
             if compaction_budget(state)["usable"] <= 0:
                 deps.console.print("[yellow]Context window exhausted by system prompt, tools "
                                    "and output reserve; reduce them or select a larger model.[/yellow]")
@@ -12122,7 +12404,8 @@ def run_agent_loop(
         # response to learn that. The gateway reports the room it computed, so
         # act on it while the current turn still succeeded.
         _budget = response.get("_budget") or {}
-        _note_provider_context_window(int(_budget.get("contextWindow") or 0))
+        _note_provider_context_window(int(_budget.get("contextWindow") or 0),
+                                     int(_budget.get("providerMax") or 0))
         _room_ceiling = int(_budget.get("ceiling") or 0)
         _provider_max = int(_budget.get("providerMax") or 0)
         if (_room_ceiling and _provider_max

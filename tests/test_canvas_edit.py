@@ -15,8 +15,10 @@ import os
 import tempfile
 import unittest
 
-import canvas
-import canvas_edit
+from tests.extension_packages import extension_module
+
+canvas = extension_module("canvas", "canvas")
+canvas_edit = extension_module("canvas", "canvas_edit")
 
 
 # What Excalidraw's own element type requires of every element. A skeleton

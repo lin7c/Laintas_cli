@@ -436,15 +436,14 @@ def spawn_optimizer(feedback_id: str, parent_agent_id: str, deps,
 
     if child_id:
         with _lock:
-            global _current_opt
-            _current_opt = {
+            _optimizations[feedback_id] = {
                 "feedback_id": feedback_id,
                 "candidate_id": None,
                 "status": "optimizing",
                 "child_agent_id": child_id,
                 "started": _now_iso(),
             }
-            _save_state(_current_opt)
+            _maybe_promote_current(_optimizations[feedback_id])
     return child_id
 
 
@@ -512,7 +511,6 @@ def draft_candidate(feedback_id: str, patch: str, rationale: str) -> dict:
     _atomic_write_text(_candidate_path(cid), candidate_raw)
 
     with _lock:
-        global _current_opt
         opt = dict(_optimizations.get(feedback_id, {}))
         opt.update({
             "feedback_id": feedback_id,
@@ -522,8 +520,7 @@ def draft_candidate(feedback_id: str, patch: str, rationale: str) -> dict:
             "started": opt.get("started") or _now_iso(),
             "patch": patch,
         })
-        _current_opt = opt
-        _save_state(_current_opt)
+        _maybe_promote_current(opt)
 
     return {"id": cid, "status": "draft", "type": candidate_type,
             "feedback": feedback_id, "rationale": rationale, "patch": patch}
@@ -573,6 +570,24 @@ def read_candidate(cid: Optional[str] = None) -> Optional[dict]:
     meta = _parse_candidate(raw)
     meta["id"] = cid
     return meta
+
+
+def _maybe_promote_current(opt: dict) -> None:
+    """Update _current_opt for this feedback without clobbering others.
+
+    Concurrent optimizers each own a feedback entry in _optimizations. The
+    pointer _current_opt (used by read_candidate(None), /prompt apply with no
+    id, and get_prompt_opt_section) must not be hijacked by a second
+    optimization while a different one is mid-flight; it only moves when it is
+    free, already points at this feedback, or the previous one finished
+    (applied/discarded).
+    """
+    global _current_opt
+    prev = _current_opt or {}
+    if (prev.get("feedback_id") in (None, opt.get("feedback_id"))
+            or prev.get("status") in ("applied", "discarded")):
+        _current_opt = dict(opt)
+        _save_state(_current_opt)
 
 
 def get_active_candidate_id() -> Optional[str]:
@@ -715,6 +730,19 @@ def discard_candidate(cid: Optional[str] = None) -> tuple[bool, str]:
             except OSError as e:
                 return False, f"Failed to read cli.prop backup: {e}"
         else:
+            # No backup: only proceed when the live file is byte-identical to
+            # what apply wrote; otherwise stripping would silently discard
+            # later manual edits to cli.prop.
+            applied_sha = (candidate or {}).get("applied_sha")
+            if applied_sha:
+                live_sha = hashlib.sha256(live.encode("utf-8")).hexdigest()[:16]
+                if live_sha != applied_sha:
+                    return False, (
+                        "Backup for this candidate is missing and cli.prop has "
+                        f"changed since apply (applied sha {applied_sha} -> "
+                        f"live {live_sha}). Review cli.prop manually before "
+                        "discarding."
+                    )
             cleaned = _strip_existing_patch(live)
         try:
             _atomic_write_text(paths.project_file(paths.CWD_CLI_PROP), cleaned)
@@ -916,8 +944,20 @@ def read_skill_patch(cid: Optional[str] = None) -> Optional[dict]:
             re.escape(SKILL_REPLACE_NEW_OPEN) + r"(.*?)" + re.escape(SKILL_REPLACE_NEW_CLOSE),
             body, re.DOTALL,
         )
-        meta["old_string"] = m_old.group(1).strip() if m_old else ""
-        meta["new_string"] = m_new.group(1).strip() if m_new else ""
+        # Preserve exact bytes: replace-mode apply requires an exact, unique
+        # match in the target file, so stripping whitespace would corrupt
+        # indented code blocks. Only the framing newlines added at draft time
+        # (after the open tag / before the close tag) are removed.
+        def _exact(block: Optional[str]) -> str:
+            if block is None:
+                return ""
+            if block.startswith("\n"):
+                block = block[1:]
+            if block.endswith("\n"):
+                block = block[:-1]
+            return block
+        meta["old_string"] = _exact(m_old.group(1) if m_old else None)
+        meta["new_string"] = _exact(m_new.group(1) if m_new else None)
 
     return meta
 

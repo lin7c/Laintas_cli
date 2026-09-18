@@ -371,6 +371,8 @@ class ProviderWindowMemoryTests(unittest.TestCase):
         paths.LAINTAS_HOME = pathlib.Path(self._tmp.name)
         agent_loop._provider_window_key = lambda: "test-model"
         agent_loop._provider_window_persisted.clear()
+        self._capabilities = dict(agent_loop._model_capabilities_seen)
+        agent_loop._model_capabilities_seen.clear()
 
     def tearDown(self):
         paths.LAINTAS_HOME = self._home
@@ -379,17 +381,23 @@ class ProviderWindowMemoryTests(unittest.TestCase):
         agent_loop._provider_window_persisted.clear()
         agent_loop._provider_window_cache_loaded = self._cache_loaded
         agent_loop._provider_window_model = self._window_model
+        agent_loop._model_capabilities_seen.clear()
+        agent_loop._model_capabilities_seen.update(self._capabilities)
 
     def _cold_start(self):
         agent_loop._provider_context_window = 0
         agent_loop._provider_window_cache_loaded = False
 
     def test_window_is_remembered_and_reloaded(self):
-        agent_loop._note_provider_context_window(1_000_000)
+        agent_loop._note_provider_context_window(1_000_000, 128_000)
         self._cold_start()
-        # Adopted, then bounded by context_window_adopt_cap — not the 64000
-        # default the process would otherwise start from.
-        self.assertEqual(200_000, agent_loop._effective_context_window())
+        agent_loop._model_capabilities_seen.clear()      # only the file remains
+        # Solved from context_trigger_share and the model's own parameters, not
+        # the 64000 default the process would otherwise start from.
+        self.assertEqual(
+            {"window": 1_000_000, "maxOutput": 128_000},
+            agent_loop.model_capability("test-model"))
+        self.assertEqual(794_666, agent_loop._effective_context_window())
 
     def test_nothing_remembered_falls_back_to_the_default(self):
         self._cold_start()

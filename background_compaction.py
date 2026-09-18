@@ -1,18 +1,36 @@
-"""Run-owned, cancellable compaction workers. Only the caller commits results."""
+"""Agent-owned, cancellable compaction workers. Only the caller commits results."""
 from __future__ import annotations
 
 import contextvars
 import functools
+import hashlib
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 
 class Cancellation(threading.Event):
+    """Explicit cancel, plus a STALL deadline that each fold pushes forward.
+
+    The deadline used to be a total budget for the whole job. Summarizing a
+    head takes one generate + one review call per slice, so a thread big enough
+    to need four slices needed more wall clock than the budget allowed and was
+    killed every single time — the compaction that was supposed to shrink it
+    never landed, and the thread only grew, which made the next attempt need
+    even more slices. Timing each fold instead bounds a hung backend (the thing
+    the deadline is actually for) without punishing a job for being long.
+    """
+
     def __init__(self, parent, timeout):
         super().__init__()
         self.parent = parent
-        self.deadline = time.monotonic() + timeout
+        self.timeout = max(1, int(timeout))
+        self.deadline = time.monotonic() + self.timeout
+
+    def progress(self):
+        """A fold completed: the worker is alive, so restart its stall clock."""
+        self.deadline = time.monotonic() + self.timeout
 
     def is_set(self):
         return self.requested() or time.monotonic() >= self.deadline
@@ -48,6 +66,54 @@ _owners: dict[tuple, Job] = {}
 # Bound speculative requests across concurrently running agents as well.
 _MAX_WORKERS = 2
 current = contextvars.ContextVar("background_compaction", default=None)
+
+# Coordinators handed over by a finished run, by owner. A speculative summary
+# outlives the turn that started it: the work is owned by the agent, not by one
+# run of its loop, and killing it at every turn boundary is what made short
+# turns burn a slice and leave nothing behind.
+_MAX_PARKED = 32
+_parked: "OrderedDict[tuple, Coordinator]" = OrderedDict()
+
+# Completed folds, keyed by the rolling fingerprint of everything folded so far
+# (see `fold_fingerprint`). A cancelled or stalled attempt keeps whatever it
+# finished, so the next one resumes at the first unfolded slice instead of
+# paying for slice 1 again. Chaining the fingerprint means a resumed attempt is
+# byte-identical to the one it continues, and a changed slice invalidates every
+# fold after it without any extra bookkeeping.
+_MAX_FOLDS = 64
+_folds: "OrderedDict[str, str]" = OrderedDict()
+
+
+def fold_fingerprint(previous: str, *parts) -> str:
+    """Chain `parts` onto the fingerprint of the folds already applied."""
+    digest = hashlib.sha256(previous.encode("utf-8", "replace"))
+    for part in parts:
+        digest.update(b"\x00")
+        digest.update(str(part).encode("utf-8", "replace"))
+    return digest.hexdigest()
+
+
+def remember_fold(fingerprint: str, summary: str) -> None:
+    if not fingerprint or not summary:
+        return
+    with _lock:
+        _folds[fingerprint] = summary
+        _folds.move_to_end(fingerprint)
+        while len(_folds) > _MAX_FOLDS:
+            _folds.popitem(last=False)
+
+
+def recall_fold(fingerprint: str):
+    with _lock:
+        summary = _folds.get(fingerprint)
+        if summary is not None:
+            _folds.move_to_end(fingerprint)
+    return summary
+
+
+def forget_folds() -> None:
+    with _lock:
+        _folds.clear()
 
 
 def status(owner):
@@ -110,7 +176,10 @@ class Coordinator:
             except Exception:
                 job.summary = None
             finally:
-                job.cancelled = job.cancel.is_set()
+                # A summary that landed as the stall deadline expired is a
+                # finished summary. Reading the deadline here threw such a
+                # result away and made the main loop redo the whole head.
+                job.cancelled = job.cancel.requested() or job.summary is None
                 job.done.set()
                 if job.cancelled:
                     _release(job)
@@ -155,10 +224,53 @@ class Coordinator:
     def close(self):
         if self.job is not None:
             cancel_owner(self.job.owner)
+        self.unpark()
+
+    def unpark(self):
+        with _lock:
+            for owner, parked in list(_parked.items()):
+                if parked is self:
+                    _parked.pop(owner, None)
+
+    def park(self):
+        """Leave unfinished work for the next run instead of killing it."""
+        job = self.job
+        if job is None:
+            return
+        if job.cancel.requested():
+            self.close()
+            return
+        with _lock:
+            previous = _parked.pop(job.owner, None)
+            _parked[job.owner] = self
+            stale = [_parked.popitem(last=False)[1]
+                     for _ in range(max(0, len(_parked) - _MAX_PARKED))]
+        if previous is not None and previous is not self:
+            previous.close()
+        for coordinator in stale:
+            coordinator.close()
+
+    def adopt(self, owner):
+        """Take over the summary a previous run of this agent left behind."""
+        if self.job is not None:
+            return False
+        with _lock:
+            parked = _parked.pop(owner, None)
+        if parked is None or parked is self or parked.job is None:
+            return False
+        job = parked.job
+        parked.job = None
+        if job.cancel.requested() or (job.done.is_set() and job.cancelled):
+            _release(job)
+            return False
+        self.job = job
+        self.retry_at = max(self.retry_at, parked.retry_at)
+        self.last_signature = parked.last_signature
+        return True
 
 
 def scoped(function):
-    """Cancel speculative work on every run exit, including exceptions."""
+    """Hand speculative work to the next run; cancel only what is unusable."""
     @functools.wraps(function)
     def wrapped(*args, **kwargs):
         coordinator = Coordinator()
@@ -166,6 +278,6 @@ def scoped(function):
         try:
             return function(*args, **kwargs)
         finally:
-            coordinator.close()
+            coordinator.park()
             current.reset(token)
     return wrapped

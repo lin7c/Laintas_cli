@@ -947,7 +947,9 @@ class AgentTerminationTests(unittest.TestCase):
     def test_status_trigger_and_headroom_share_one_budget(self):
         agent_loop.set_runtime_config("model_context_window", 200000)
         with mock.patch.object(agent_loop, "_per_request_overhead_tokens",
-                               return_value=50000):
+                               return_value=50000), \
+             mock.patch.object(agent_loop, "model_capability",
+                               return_value={}):  # unreported model: policy buffer is the reserve
             budget = agent_loop.compaction_budget({})
             status = agent_loop.session_context_status({"_thread_messages": []})
             state = {}
@@ -1028,7 +1030,8 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertNotIn("Auto-compact", manual)
         self.assertIn("/config compact_review_effort none", manual)
         auto = agent_loop.compaction_status_text(auto=True, usable=150000, window=200000)
-        self.assertIn("/config context_window_adopt_cap", auto)
+        self.assertIn("/config context_trigger_share", auto)
+        self.assertIn("/max", auto)
         agent_loop.set_runtime_config("compact_review_effort", "none")
         self.assertNotIn("compact_review_effort",
                          agent_loop.compaction_status_text(auto=False))

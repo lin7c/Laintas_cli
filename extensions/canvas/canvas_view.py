@@ -15,7 +15,7 @@ from __future__ import annotations
 import shutil
 from typing import Optional
 
-import infinite_canvas as ic
+from . import infinite_canvas as ic
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.key_binding import KeyBindings
@@ -215,7 +215,7 @@ class CanvasViewer:
 
     def pen(self) -> dict:
         """The colour, fill and weight new elements are drawn with."""
-        import canvas_edit
+        from . import canvas_edit
         return {
             "color": canvas_edit.STROKE_COLORS[
                 self.style_at["color"] % len(canvas_edit.STROKE_COLORS)],
@@ -230,7 +230,7 @@ class CanvasViewer:
         }
 
     def cycle_style(self, what: str, delta: int = 1) -> None:
-        import canvas_edit
+        from . import canvas_edit
         sizes = {"color": len(canvas_edit.STROKE_COLORS),
                  "fill": len(canvas_edit.FILL_STYLES) + 1,   # +1 = no fill
                  "width": len(canvas_edit.STROKE_WIDTHS)}

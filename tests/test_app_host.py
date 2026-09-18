@@ -121,6 +121,11 @@ class ManifestTests(_Home):
             {"name": "Bad Name"},
             {"name": "ok", "persistence": "forever"},
             {"name": "ok", "port": 70000},
+            {"name": "ok", "app_url": 3000},
+            {"name": "ok", "app_url": "javascript:alert(1)"},
+            {"name": "ok", "app_url": "http://localhost:70000"},
+            {"name": "ok", "app_url": "http://user:password@localhost"},
+            {"name": "ok", "app_url": "http://localhost\n"},
             {"name": "ok", "shell": True},
             {"name": "ok", "prompt": 3},
             {"name": "ok", "session_tools": ["unknown.tool"]},
@@ -352,6 +357,55 @@ class AppBridgeTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as refused:
             urlopen(self.base + "/api/agents", timeout=2)
         self.assertEqual(refused.exception.code, 403)
+
+    def test_app_login_url_authenticates_browser_and_subsequent_api_requests(self):
+        from http.cookiejar import CookieJar
+        from urllib.request import build_opener, HTTPCookieProcessor
+        browser = build_opener(HTTPCookieProcessor(CookieJar()))
+        login_url = helpwo_server.get_url(with_token=True, path="/api/local-runtime")
+        with browser.open(login_url, timeout=2) as response:
+            self.assertEqual(json.load(response)["agentId"], "local-notes-abc")
+        with browser.open(self.base + "/api/agents", timeout=2) as response:
+            self.assertEqual(json.load(response)[0]["id"], "local-notes-abc")
+
+    def test_app_auth_error_points_to_app_and_header_credentials(self):
+        with self.assertRaises(HTTPError) as refused:
+            urlopen(self.base + "/api/agents", timeout=2)
+        with refused.exception as response:
+            detail = json.load(response)["detail"]
+        self.assertIn("/app start", detail)
+        self.assertIn("Authorization: token", detail)
+        self.assertNotIn("/helpwo", detail)
+
+    def test_app_start_returns_and_passes_effective_bridge_credentials(self):
+        helpwo_server.stop_server()
+        manifest, error = app_host.parse_manifest({"name": "notes", "command": "app-command",
+            "app_url": "http://127.0.0.1:3000/notes"}, "/notes.json")
+        self.assertEqual(error, "")
+        with mock.patch.object(app_host, "discover_manifests", return_value=({"notes": manifest}, [])), \
+                mock.patch.object(app_host, "is_trusted", return_value=True), \
+                mock.patch.object(app_host, "configure_runtime", return_value=mock.Mock()), \
+                mock.patch.object(app_host, "_active", None), \
+                mock.patch.dict(laintas_cli._HOSTED_APP, {}, clear=True), \
+                mock.patch.object(app_host, "spawn_app_process", return_value=SimpleNamespace(pid=1)) as spawn, \
+                _Capture():
+            result = laintas_cli._app_start_in_process("notes", self.registry, {},
+                {"local_agent_id": "local-notes-abc"}, Path(self._tmp.name) / "state")
+        self.assertEqual(result["status"], "ready")
+        self.assertTrue(result["token"])
+        self.assertEqual(result["token"], helpwo_server.auth_token())
+        self.assertNotIn("?", result["url"])
+        self.assertEqual(result["app_url"], "http://127.0.0.1:3000/notes")
+        with urlopen(result["open_url"], timeout=2) as response:
+            self.assertEqual(response.status, 200)
+        env = spawn.call_args.kwargs["env_extra"]
+        self.assertEqual(env["LAINTAS_APP_TOKEN"], result["token"])
+        self.assertEqual(env["LAINTAS_APP_BRIDGE_OPEN_URL"], result["open_url"])
+        with _Capture() as output:
+            laintas_cli._report_app_runtime("notes", result, open_url=False)
+        self.assertIn("Bridge login:", output.text)
+        self.assertIn("Project URL: http://127.0.0.1:3000/notes", output.text)
+        self.assertIn("Bridge API:", output.text)
 
 
 @unittest.skipUnless(os.name == "posix", "process groups")

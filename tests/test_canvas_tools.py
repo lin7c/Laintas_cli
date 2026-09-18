@@ -12,14 +12,22 @@ import os
 import tempfile
 import unittest
 
-import canvas
 import tools
+
+from tests.extension_packages import extension_module, extension_package
+
+canvas_ext = extension_package("canvas")
+canvas = extension_module("canvas", "canvas")
 
 
 class CanvasToolTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         tools.register_builtin_tools()
+        # The four canvas tools ship with the extension now, so the test
+        # registers exactly what the host would register on load.
+        for tool in canvas_ext._canvas_tools():
+            tools.get_registry().register(tool, overwrite=True)
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -188,7 +196,7 @@ class CanvasToolTests(unittest.TestCase):
 
     def test_a_write_over_somebody_elses_edit_is_refused(self):
         """Between the read and the write, Helpwo saved the board."""
-        import canvas_edit
+        canvas_edit = extension_module("canvas", "canvas_edit")
         self.call("canvas.draw", path="flow.excalidraw",
                   shapes=[{"kind": "rectangle"}])
         path = os.path.join(self.tmp.name, "flow.excalidraw")

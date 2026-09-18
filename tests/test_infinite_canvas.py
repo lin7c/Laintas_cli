@@ -11,7 +11,9 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import infinite_canvas as ic
+from tests.extension_packages import extension_module
+
+ic = extension_module("canvas", "infinite_canvas")
 
 
 def _nested_scene():

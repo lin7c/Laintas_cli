@@ -238,6 +238,7 @@ class AppManifest:
     prompt: str = ""
     persistence: str = PERSISTENCE_NONE
     port: Optional[int] = None
+    app_url: str = ""
     session_tools: list = field(default_factory=lambda: list(SESSION_DEFAULT_TOOLS))
     auto_approve: bool = False
     max_sessions: int = 10
@@ -268,7 +269,7 @@ def parse_manifest(data, source: str, scope: str = "user"
     if not isinstance(data, dict):
         return None, "manifest must be a JSON object"
     unknown = set(data) - {"name", "description", "command", "prompt",
-                           "persistence", "port", "session_tools",
+                           "persistence", "port", "app_url", "session_tools",
                            "auto_approve", "max_sessions",
                            "session_idle_minutes", "agent", "agents", "terminals"}
     if unknown:
@@ -295,6 +296,22 @@ def parse_manifest(data, source: str, scope: str = "user"
     if port is not None and (not isinstance(port, int) or isinstance(port, bool)
                              or not 1 <= port <= 65535):
         return None, "port must be an integer 1-65535"
+    app_url = data.get("app_url", "")
+    if not isinstance(app_url, str):
+        return None, "app_url must be an HTTP(S) URL string"
+    if app_url:
+        from urllib.parse import urlsplit
+        try:
+            parsed_url = urlsplit(app_url)
+            valid_url = (parsed_url.scheme in {"http", "https"} and parsed_url.hostname
+                         and parsed_url.username is None and parsed_url.password is None
+                         and not any(char.isspace() or ord(char) < 32 for char in app_url))
+            if parsed_url.port is not None and parsed_url.port < 1:
+                valid_url = False
+        except ValueError:
+            valid_url = False
+        if not valid_url:
+            return None, "app_url must be an absolute HTTP(S) URL without embedded credentials"
     session_tools = data.get("session_tools", list(SESSION_DEFAULT_TOOLS))
     if (not isinstance(session_tools, list)
             or not all(isinstance(item, str) for item in session_tools)):
@@ -318,7 +335,7 @@ def parse_manifest(data, source: str, scope: str = "user"
         return None, "session_idle_minutes must be an integer 0-10080 (0 = never)"
     return AppManifest(
         name=name, description=description.strip(), command=command.strip(),
-        prompt=prompt.strip(), persistence=persistence, port=port,
+        prompt=prompt.strip(), persistence=persistence, port=port, app_url=app_url,
         session_tools=list(dict.fromkeys(session_tools)),
         auto_approve=auto_approve, max_sessions=max_sessions,
         session_idle_minutes=idle,

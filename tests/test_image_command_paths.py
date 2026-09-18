@@ -1,4 +1,4 @@
-"""/img, /canvas and the image tools: the paths a person or an agent names.
+"""/img and the image tools: the paths a person or an agent names.
 
 Each case is a bug that shipped because the typed path and the agent path
 were two implementations: /img asked the user's text model to look at the
@@ -165,14 +165,6 @@ class ImgCommandTests(unittest.TestCase):
     def test_other_commands_still_reject_unbalanced_quotes(self):
         with self.assertRaises(laintas_cli.SlashCommandUsageError):
             laintas_cli._parse_slash_command("/config theme 'dark")
-
-
-class CanvasCommandTests(unittest.TestCase):
-
-    def test_text_without_a_path_prints_usage(self):
-        with _Quiet() as out:
-            laintas_cli._cmd_canvas("text")
-        self.assertIn("a board path is required", out.text)
 
 
 class ImageToolPathTests(unittest.TestCase):

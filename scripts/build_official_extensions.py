@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT))
 from extension_manager import create_publication_archive, read_manifest  # noqa: E402
 
 
-OFFICIAL_NAMES = ("blindpick", "swebench", "whatsapp")
+OFFICIAL_NAMES = ("blindpick", "canvas", "swebench", "whatsapp")
 
 
 def main() -> None:

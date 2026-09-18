@@ -17,9 +17,15 @@ import tempfile
 import unittest
 from unittest import mock
 
-import canvas
 import laintas_cli
 import vision
+
+from tests.extension_packages import (
+    bind_context, extension_module, extension_package)
+
+canvas_ext = extension_package("canvas")
+canvas = extension_module("canvas", "canvas")
+bind_context(canvas_ext)
 
 
 IS_IMAGE = (lambda tok: os.path.splitext(tok)[1].lower()
@@ -117,29 +123,29 @@ class QuickStart(unittest.TestCase):
         self.assertNotIn("plan", os.path.basename(path))
 
     def test_the_command_creates_and_reports_without_a_terminal(self):
-        with mock.patch.object(laintas_cli, "_canvas_can_view",
+        with mock.patch.object(canvas_ext, "_canvas_can_view",
                                return_value=False):
-            laintas_cli._cmd_canvas("")
+            canvas_ext._cmd_canvas("")
         self.assertEqual(len(self._boards()), 1)
         # and a second run adds nothing
-        with mock.patch.object(laintas_cli, "_canvas_can_view",
+        with mock.patch.object(canvas_ext, "_canvas_can_view",
                                return_value=False):
-            laintas_cli._cmd_canvas("")
+            canvas_ext._cmd_canvas("")
         self.assertEqual(len(self._boards()), 1)
 
     def test_the_command_opens_the_viewer_when_there_is_a_terminal(self):
-        with mock.patch.object(laintas_cli, "_canvas_can_view",
+        with mock.patch.object(canvas_ext, "_canvas_can_view",
                                return_value=True), \
-                mock.patch.object(laintas_cli, "_canvas_view",
+                mock.patch.object(canvas_ext, "_canvas_view",
                                   return_value=True) as view:
-            laintas_cli._cmd_canvas("")
+            canvas_ext._cmd_canvas("")
         view.assert_called_once()
         self.assertTrue(view.call_args[0][0].endswith(".excalidraw"))
 
     def test_list_still_lists(self):
         canvas.write_scene("plan.excalidraw", canvas.empty_scene())
-        with mock.patch.object(laintas_cli.console, "print") as printed:
-            laintas_cli._cmd_canvas("list")
+        with mock.patch.object(canvas_ext._ctx.console, "print") as printed:
+            canvas_ext._cmd_canvas("list")
         text = " ".join(str(c) for c in printed.call_args_list)
         self.assertIn("plan.excalidraw", text)
 

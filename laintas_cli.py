@@ -3241,25 +3241,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         )),
     CommandSpec("/scan", "List user-facing PATH commands", "Basics"),
     CommandSpec(
-        "/canvas", "Whiteboards: open a canvas, draw on it, list boards", "Basics",
-        "/canvas [| <path> | text <path> | new <path> | open [path] | list]",
-        subcommands=("new", "open", "list", "text", "help"),
-        help_text=(
-            "A board is an ordinary .excalidraw file. With no arguments it "
-            "opens a canvas straight away, making a board first if there is "
-            "no empty one to reuse; `b` inside the viewer switches to another "
-            "board. With a path, that board opens on an infinite canvas in "
-            "the terminal: the wheel zooms at the pointer, dragging pans, "
-            "clicking tells you what a shape is, and `w` turns on drawing: "
-            "shapes and arrows, but also straight lines and freehand pencil "
-            "strokes, in six colours with fills and three stroke widths. "
-            "Edits are written straight to the file, and refused rather than "
-            "applied if Helpwo changed the board in the meantime. "
-            "`text` prints the elements instead — ids, labels, and what each "
-            "arrow connects — which is what an edit would name. Drawing "
-            "happens in Helpwo: `open` starts the local gateway, which mounts "
-            "this folder, and hands you the URL.")),
-    CommandSpec(
         "/img", "Read an image: ask about it, or transcribe it", "Basics",
         "/img [<path> [question] | text <path> | list]",
         subcommands=("text", "list", "help"),
@@ -3271,6 +3252,20 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "the working directory and recent browser screenshots. `--text` "
             "is accepted as an alias for the `text` action.")),
     CommandSpec("/login", "Re-authenticate with Laintas", "Account & Session"),
+    CommandSpec(
+        "/password", "Open the local password vault", "Account & Session",
+        "/password",
+        help_text=(
+            "Opens a local interactive vault on this terminal. Entries are "
+            "either logins (username + password for an approved site) or "
+            "secrets (a single key/token in any format, multi-line supported). "
+            "Descriptions and approved origins are visible to the AI "
+            "assistant; usernames, passwords, secret values, and notes stay "
+            "encrypted and never enter the chat. Takes no arguments — secrets "
+            "must never be typed as command text. The AI can list entries "
+            "(password.list) and request a protected fill (password.fill); "
+            "fills require a trusted credential broker and fail closed when "
+            "none is deployed.")),
     CommandSpec(
         "/training", "Manage optional training-data sharing", "Account & Session",
         "/training [status|on|off]",
@@ -3550,7 +3545,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/skill", "Manage skills", "Config & Tools", "/skill [manager|list|trust|revoke|load|unload|reload|new|dir]", subcommands=("manager", "list", "trust", "revoke", "load", "unload", "reload", "new", "dir")),
     CommandSpec("/mcp", "Manage MCP servers", "Config & Tools", "/mcp {list|trust|revoke|connect|disconnect|reload|tools|init|config}", subcommands=("list", "trust", "revoke", "connect", "disconnect", "reload", "tools", "init", "config")),
     CommandSpec("/bash", "Run a command through term0", "Config & Tools", "/bash <command>|list|add <command>|remove <command>", subcommands=("list", "add", "remove")),
-    CommandSpec("/memory", "Manage memory (interactive view/delete); split into global/local", "Config & Tools", "/memory [global|local|persistent|project|show <id|name>]", subcommands=("global", "local", "persistent", "project", "show")),
+    CommandSpec("/memory", "Manage memory (interactive view/delete); split into global/local", "Config & Tools", "/memory [global|local|persistent|project|show <id|name>|status|compact [dry]]", subcommands=("global", "local", "persistent", "project", "show", "status", "compact")),
     CommandSpec(
         "/prop", "Inspect complete model context and system prompts", "Config & Tools",
         "/prop [sys] [N]",
@@ -3861,12 +3856,16 @@ _ARG_COMPLETIONS: dict[str, tuple] = {
     "/usage": ((("buy",), _static_candidates(
         ("calls", "Buy a call pack"), ("storage", "Buy a storage pack"))),),
     "/model": (
+        # Model ids are deliberately NOT completed here: the id list is a
+        # network fetch and is already served by the interactive selector that
+        # bare `/model` opens, so TAB only offers structural targets —
+        # terminals, the `aux` axis and `reset`.
         ((), _terminal_candidates(include_primary=True, stationed_only=True)),
-        ((), _model_candidates),
-        (("aux",), _model_candidates),
+        ((), _static_candidates(("aux", "Pick the compaction/critic/memory model"))),
         (("aux",), _static_candidates(("reset", "Use the terminal's own model again"))),
+        (("aux",), _terminal_candidates(include_primary=True, stationed_only=True)),
         (("*",), lambda fragment, prior: (
-            _model_candidates(fragment, prior) + [("reset", "Clear this terminal's override")]
+            [("reset", "Clear this terminal's override")]
             if get_terminal(prior[0]) is not None else [])),
     ),
     "/term": ((("rename",), _terminal_candidates()),),
@@ -4005,10 +4004,6 @@ _ARG_COMPLETIONS: dict[str, tuple] = {
         ((), _path_candidates(_IMAGE_SUFFIXES)),
         (("text",), _path_candidates((*_IMAGE_SUFFIXES, ".pdf"))),
     ),
-    "/canvas": (
-        ((), _path_candidates((".excalidraw",))),
-        ((("text", "open", "new"),), _path_candidates((".excalidraw",))),
-    ),
     "/undo": (((), _cached_provider("snapshots", _snapshot_loader)),),
     "/shared": (
         (("push",), _path_candidates()),
@@ -4041,6 +4036,17 @@ _ARG_COMPLETIONS["/workflow"] = (
 def _dynamic_arg_candidates(command: str, prior: list[str], fragment: str):
     """Yield (value, description) for the words typed so far after `command`."""
     lowered = [word.casefold() for word in prior]
+    if command not in _ARG_COMPLETIONS:
+        # An extension command may have declared the file types it takes. The
+        # extension names the suffixes; searching and caching stay here.
+        suffixes = extension_runtime.get_runtime().command_file_suffixes(
+            command, lowered[0] if lowered else "")
+        if suffixes and len(lowered) <= 1:
+            try:
+                yield from (_path_candidates(tuple(suffixes))(fragment, prior) or [])
+            except Exception:
+                pass
+        return
     for pattern, provider in _ARG_COMPLETIONS.get(command, ()):
         if provider is None or len(pattern) != len(lowered):
             continue
@@ -6221,6 +6227,28 @@ def _render_bottom_toolbar():
 _prompt_session: Optional[PromptSession] = None
 
 
+def _is_password_command(text: str) -> bool:
+    words = (text or "").split(maxsplit=1)
+    return bool(words) and words[0].lower() == "/password"
+
+
+class _PrivateCommandHistory(FileHistory):
+    """Reject vault command text before prompt_toolkit persists it.
+
+    Slash argument validation runs only after history append, too late to
+    protect a password accidentally supplied as an argument.
+    """
+
+    def append_string(self, string: str) -> None:
+        if not _is_password_command(string):
+            super().append_string(string)
+
+    def load_history_strings(self):
+        for string in super().load_history_strings():
+            if not _is_password_command(string):
+                yield string
+
+
 def _refresh_live_prompt() -> None:
     """Repaint the prompt from another thread, if one is on screen.
 
@@ -6262,7 +6290,7 @@ def get_prompt_session() -> PromptSession:
     if _prompt_session is None:
         hist_file = paths.HISTORY_FILE
         _prompt_session = PromptSession(
-            history=FileHistory(str(hist_file)),
+            history=_PrivateCommandHistory(str(hist_file)),
             completer=MetaCompleter(),
             auto_suggest=AutoSuggestFromHistory(),
             style=_build_prompt_style(),
@@ -6797,6 +6825,35 @@ def _safe_status(message, *, spinner="dots", **_ignored):
         yield lambda text: relay.update(text=Text.from_markup(text))
 
 
+def _remember_model_capabilities(payload) -> None:
+    """Keep the per-model parameters the gateway publishes alongside the list.
+
+    The catalogue already carries each model's real context window and output
+    ceiling (`modelCapabilities`), which is exactly what the compaction budget
+    needs. Without this the CLI only learns a model's parameters by calling it,
+    so the first compaction after switching models budgets blind.
+    """
+    if not isinstance(payload, dict):
+        return
+    import agent_loop as _agent_loop_mod
+
+    capabilities = payload.get("modelCapabilities")
+    windows = payload.get("contextWindows")
+    try:
+        if isinstance(capabilities, dict):
+            for model, spec in capabilities.items():
+                if isinstance(spec, dict):
+                    _agent_loop_mod.note_model_capability(
+                        model, spec.get("contextWindow") or 0,
+                        spec.get("maxOutputTokens") or 0)
+        elif isinstance(windows, dict):
+            for model, window in windows.items():
+                _agent_loop_mod.note_model_capability(model, window or 0)
+    except Exception:
+        # Model parameters are an optimization; never fail the picker over them.
+        pass
+
+
 def fetch_available_models(
     session: dict,
     cancel_event: Optional[threading.Event] = None,
@@ -6857,6 +6914,7 @@ def fetch_available_models(
             last_error = f"Unexpected response shape from {endpoint}"
             continue
         models = [m for m in models if m.get("id")]
+        _remember_model_capabilities(data)
         return models, endpoint
 
     raise RuntimeError(last_error or "No model endpoint responded")
@@ -12798,7 +12856,7 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
         (name,): _arg_rule(0, name)
         for name in (
             "/cwd", "/scan", "/login", "/max",
-            "/tools", "/snapshots", "/continue",
+            "/tools", "/snapshots", "/continue", "/password",
         )
     },
     # /prop takes `sys` and/or a conversation number; prop_ui.parse_target
@@ -12813,12 +12871,6 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/img", "help"): _arg_rule(1, "/img help"),
     ("/retask", "list"): _arg_rule(1, "/retask list"),
     ("/retask", "help"): _arg_rule(1, "/retask help"),
-    ("/canvas",): _arg_rule(1, "/canvas [<path>|text <path>|new <path>|open [path]|list]"),
-    ("/canvas", "list"): _arg_rule(1, "/canvas list"),
-    ("/canvas", "help"): _arg_rule(1, "/canvas help"),
-    ("/canvas", "new"): _arg_rule(2, "/canvas new <path>"),
-    ("/canvas", "open"): _arg_rule(2, "/canvas open [path]"),
-    ("/canvas", "text"): _arg_rule(2, "/canvas text <path>"),
     ("/handoff", "list"): _arg_rule(1, "/handoff list"),
     ("/handoff", "ls"): _arg_rule(1, "/handoff list"),
     ("/handoff", "help"): _arg_rule(1, "/handoff help"),
@@ -12921,6 +12973,8 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/memory", "global"): _arg_rule(1, "/memory global"),
     ("/memory", "local"): _arg_rule(1, "/memory local"),
     ("/memory", "show"): _arg_rule(2, "/memory show <id|name>"),
+    ("/memory", "status"): _arg_rule(1, "/memory status"),
+    ("/memory", "compact"): _arg_rule(2, "/memory compact [dry]"),
     ("/backend", "status"): _arg_rule(1, "/backend status"),
     ("/backend", "list"): _arg_rule(1, "/backend list"),
     ("/backend", "use"): _arg_rule(2, "/backend use <name>"),
@@ -13051,11 +13105,18 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
 def _validate_slash_args(action: str, args: list[str]) -> None:
     """Reject ignored arguments only for explicitly contracted built-ins."""
     spec = _find_command_spec(action)
-    if spec is None:
-        return
-    canonical = spec.name.lower()
     sub = args[0].lower() if args else ""
     normalized_action = action.lower()
+    if spec is None:
+        # Not a built-in. An extension may still have declared the shape of
+        # its own command, and a contract that only covers built-ins would let
+        # `/canvas list here` silently drop the word the user typed.
+        declared = extension_runtime.get_runtime().command_arg_rule(
+            normalized_action, sub)
+        if declared and len(args) > declared[0]:
+            raise SlashCommandUsageError(f"Usage: {declared[1]}")
+        return
+    canonical = spec.name.lower()
     rule = _SLASH_ARG_RULES.get((normalized_action, sub))
     if rule is None:
         rule = _SLASH_ARG_RULES.get((normalized_action,))
@@ -13481,6 +13542,15 @@ def _validate_prop_template(prop: str) -> tuple[list[str], list[str], list[str]]
     return variables, errors, warnings
 
 
+def _legacy_prompt_opt_section() -> str:
+    """Legacy prompt_opt status notices, shared with the {{promptOpt}} slot."""
+    try:
+        import prompt_opt
+        return prompt_opt.get_prompt_opt_section()
+    except Exception:
+        return ""
+
+
 def _render_prop_effective(prop: str, redact: bool = True,
                            prompt_section: Optional[str] = None) -> str:
     import durable_rules
@@ -13510,6 +13580,7 @@ def _render_prop_effective(prop: str, redact: bool = True,
         "persistentMemory": memory_system.get_memory_context(),
         "planMode": plan_mode.get_plan_prompt(),
         "promptOpt": (prompt_lab.get_prompt_lab_section()
+                      + _legacy_prompt_opt_section()
                       if prompt_section is None else prompt_section),
         "agentName": current.name if current else "Laintas CLI",
         "agentId": current.id if current else "unknown",
@@ -14595,7 +14666,7 @@ def _cmd_back(raw_args: str) -> bool:
 def _split_verb(raw_args: str, verbs: tuple, is_path) -> tuple:
     """Split "<verb> <rest>" or "<path> <rest>" without needing a flag.
 
-    The rule both /img and /canvas follow: **the verbs are a small closed set,
+    The rule /img and the canvas extension both follow: **the verbs are a small closed set,
     and anything else is a path.** Not the other way round — deciding by "does
     this look like a file?" turns every mistyped or extension-less path into
     "unknown action", which sends the user to the help text when what they
@@ -14621,8 +14692,8 @@ def _split_verb(raw_args: str, verbs: tuple, is_path) -> tuple:
 def _leading_path_arg(text: str) -> tuple:
     """Split "<path> <rest>" where the path may contain spaces. (path, rest).
 
-    The dispatcher's argv already honours quotes, but /img and /canvas keep a
-    free-text tail and so read the raw string — and splitting that on the
+    The dispatcher's argv already honours quotes, but /img and the canvas
+    extension keep a free-text tail and so read the raw string — and splitting that on the
     first space turned `"my shot.png"` into the path `"my`. Accepted, in
     order: a quoted path, backslash-escaped spaces, and an unquoted name with
     spaces when some prefix of the words names a file that exists (a macOS
@@ -14864,300 +14935,6 @@ def _cmd_retask(raw_args: str) -> None:
                     for t in retask_mod.changed_tasks(before, doc)],
     })
     console.print("[dim]The AI checks it on your next message.[/dim]")
-
-
-def _cmd_canvas(raw_args: str) -> None:
-    """/canvas — whiteboards, from the terminal.
-
-    Bare `/canvas` opens a canvas straight away, making a board to open if
-    there is not already an empty one: typing the command is the whole
-    request, and being asked for a filename first is the thing that made this
-    feel like it needed a file before it would do anything. Existing boards
-    are still one keystroke away — `b` inside the viewer, `/canvas list`
-    outside it.
-
-    Reads and creates; it does not edit. A board Helpwo has open lives in the
-    editor with the file trailing behind it, so a write from here would be
-    overwritten by its next autosave without either side noticing. Editing
-    waits for the two to agree on who holds a board — see canvas.py.
-    """
-    import canvas as canvas_mod
-
-    verb, rest = _split_verb(
-        raw_args, ("new", "list", "open", "text", "help"),
-        canvas_mod.is_canvas_path)
-
-    if verb == "help":
-        console.print(r"[bold]/canvas[/bold] [dim]— whiteboards (.excalidraw)[/dim]")
-        console.print(r"  /canvas                   open a canvas (makes a board if needed)")
-        console.print(r"  /canvas <path>            view it (created if missing) on the infinite canvas")
-        console.print(r"  /canvas list              list the boards under this directory")
-        console.print(r"  /canvas text <path>       show what is on it, as text")
-        console.print(r"  /canvas new <path>        create a named board and open it")
-        console.print(r"  /canvas open \[path]       open the board in Helpwo, where you draw")
-        console.print(r"[dim]In the view: w draws — r/o/d shapes, a arrow, l line, "
-                      r"p pencil, t text; c colour, f fill, 1-3 width; "
-                      r"x deletes, u undoes, b switches board.[/dim]")
-        console.print(r"[dim]`open` starts the local Helpwo gateway for the full editor — "
-                      r"a board changed there while this is open makes the next edit here "
-                      r"refuse rather than overwrite it.[/dim]")
-        return
-
-    if not (raw_args or "").strip():
-        _canvas_quick_start(canvas_mod)
-        return
-
-    if verb == "list":
-        boards = canvas_mod.find_boards(os.getcwd())
-        if not boards:
-            console.print("[dim]No .excalidraw boards under this directory. "
-                          "Type /canvas to start one.[/dim]")
-            return
-        console.print("[bold]Boards[/bold] [dim](run /canvas <path>, or /canvas "
-                      "for a new one)[/dim]")
-        for path in boards:
-            try:
-                scene = canvas_mod.read_scene(path)
-                count = len(canvas_mod.live_elements(scene))
-                pending = sum(t["count"] for t in canvas_mod.count_ai_turns(scene))
-                mark = f" [yellow]{pending} unreviewed from the AI[/yellow]" if pending else ""
-                console.print(f"  [cyan]{os.path.relpath(path)}[/cyan] "
-                              f"[dim]{count} element(s)[/dim]{mark}")
-            except canvas_mod.CanvasError as e:
-                console.print(f"  [cyan]{os.path.relpath(path)}[/cyan] [red]{e}[/red]")
-        return
-
-    if verb == "new":
-        path, _extra = _leading_path_arg(rest)
-        if not path:
-            console.print(r"[yellow]/canvas new <name>.excalidraw[/yellow]")
-            return
-        if not canvas_mod.is_canvas_path(path):
-            path += canvas_mod.CANVAS_EXTENSION
-        if os.path.exists(os.path.expanduser(path)):
-            console.print(f"[yellow]{path} already exists — /canvas {path} to see it[/yellow]")
-            return
-        try:
-            canvas_mod.write_scene(path, canvas_mod.empty_scene())
-        except (canvas_mod.CanvasError, OSError) as e:
-            console.print(f"[red]{e}[/red]")
-            return
-        console.print(f"[green]Created {path}[/green]")
-        if _canvas_can_view():
-            _canvas_view(path, canvas_mod.read_scene(path), canvas_mod)
-        else:
-            console.print("[dim]Open it in Helpwo to draw: "
-                          f"/canvas open {path}[/dim]")
-        return
-
-    if verb == "open":
-        _canvas_open(_leading_path_arg(rest)[0], canvas_mod)
-        return
-
-    if verb and verb != "text":
-        console.print(f"[yellow]/canvas: unknown action '{verb}'. Try /canvas help[/yellow]")
-        return
-
-    path, _extra = _leading_path_arg(rest)
-    if not path:
-        console.print(r"[yellow]/canvas text <path>  —  a board path is required[/yellow]")
-        return
-    try:
-        scene = canvas_mod.read_scene(path)
-    except canvas_mod.CanvasError as e:
-        # A missing board is the one error worth recovering from: the user
-        # named a board they want, so create it instead of sending them to
-        # `new`. Every other error (bad extension, bad JSON) still stops.
-        expanded = os.path.expanduser(path)
-        if (canvas_mod.is_canvas_path(expanded)
-                and not os.path.exists(expanded)):
-            try:
-                canvas_mod.write_scene(expanded, canvas_mod.empty_scene())
-                scene = canvas_mod.empty_scene()
-                console.print(f"[green]Created {path}[/green] "
-                              f"[dim]— draw on it in Helpwo with /canvas open {path}[/dim]")
-            except (canvas_mod.CanvasError, OSError) as create_err:
-                console.print(f"[red]{create_err}[/red]")
-                return
-        else:
-            console.print(f"[red]{e}[/red]")
-            return
-
-    # Looking at a board is the default; the text dump stays one word away.
-    # It is not merely a fallback for a dumb terminal either — the ids in it
-    # are what an edit would name, and no viewport shows you those.
-    if verb != "text" and _canvas_can_view():
-        if _canvas_view(path, scene, canvas_mod):
-            return
-
-    console.print(f"[bold]{path}[/bold]")
-    console.print(canvas_mod.describe_scene(scene), markup=False, highlight=False)
-    pending = canvas_mod.count_ai_turns(scene)
-    if pending:
-        total = sum(t["count"] for t in pending)
-        console.print(f"[yellow]{total} element(s) added by the AI are still "
-                      f"unreviewed — accept or undo them in Helpwo.[/yellow]")
-
-
-def _canvas_can_view() -> bool:
-    """A full-screen view needs a real terminal on both ends."""
-    try:
-        return bool(sys.stdin.isatty() and sys.stdout.isatty())
-    except Exception:
-        return False
-
-
-def _canvas_quick_start(canvas_mod) -> None:
-    """Bare `/canvas`: put a canvas on the screen, with nothing else asked.
-
-    A board is made when there is not already an empty one to reuse, so
-    running this five times leaves one file rather than five. Whatever else
-    is in the directory stays one keystroke away — `b` in the viewer.
-    """
-    try:
-        path, needs_creating = canvas_mod.scratch_board(os.getcwd())
-    except OSError as e:
-        console.print(f"[red]{e}[/red]")
-        return
-    if needs_creating:
-        try:
-            canvas_mod.write_scene(path, canvas_mod.empty_scene())
-        except (canvas_mod.CanvasError, OSError) as e:
-            console.print(f"[red]{e}[/red]")
-            return
-        console.print(f"[green]New board {os.path.relpath(path)}[/green]")
-    else:
-        console.print(f"[dim]Reusing the empty board "
-                      f"{os.path.relpath(path)}[/dim]")
-
-    others = [b for b in canvas_mod.find_boards(os.getcwd())
-              if os.path.abspath(b) != os.path.abspath(path)]
-    try:
-        scene = canvas_mod.read_scene(path)
-    except canvas_mod.CanvasError as e:
-        console.print(f"[red]{e}[/red]")
-        return
-
-    if _canvas_can_view() and _canvas_view(path, scene, canvas_mod):
-        return
-    # No terminal to take over (piped stdin, a test, a dumb terminal): say
-    # what exists instead of opening nothing.
-    console.print(canvas_mod.describe_scene(scene), markup=False, highlight=False)
-    console.print(f"[dim]Draw on it in Helpwo: /canvas open "
-                  f"{os.path.relpath(path)}[/dim]")
-    if others:
-        console.print(f"[dim]{len(others)} other board(s) — /canvas list[/dim]")
-
-
-def _canvas_view(path: str, scene: dict, canvas_mod) -> bool:
-    """Open a board on the infinite canvas. False = fall back to text."""
-    try:
-        import canvas_view
-        import infinite_canvas
-    except Exception as e:                       # pragma: no cover - import guard
-        console.print(f"[dim]canvas view unavailable ({e}); showing text[/dim]")
-        return False
-    data = canvas_mod.to_canvas_scene(scene, title=os.path.basename(path))
-    built = infinite_canvas.scene_from_json(data)
-
-    def load(other_path: str):
-        """Open another board without leaving the session."""
-        other = canvas_mod.to_canvas_scene(
-            canvas_mod.read_scene(other_path),
-            title=os.path.basename(other_path))
-        return (infinite_canvas.scene_from_json(other),
-                os.path.relpath(other_path))
-
-    # Drawing is offered when the board can actually be written; a board that
-    # cannot be opened for editing is still perfectly viewable, so a failure
-    # here costs the drawing keys and nothing else.
-    editor = None
-    try:
-        import canvas_edit
-        editor = canvas_edit.BoardEditor(os.path.expanduser(path), canvas_mod)
-    except Exception as exc:                     # unreadable, or no module
-        console.print(f"[dim]drawing unavailable ({type(exc).__name__}: "
-                      f"{exc})[/dim]")
-
-    def reload_scene():
-        """The scene again, after an edit — one place that rebuilds it."""
-        fresh = canvas_mod.to_canvas_scene(
-            editor.scene, title=os.path.basename(path))
-        return infinite_canvas.scene_from_json(fresh)
-
-    boards = [b for b in canvas_mod.find_boards(os.getcwd())
-              if os.path.abspath(b) != os.path.abspath(os.path.expanduser(path))]
-    hints = [f"w — draw here (r rect · o ellipse · d diamond · t text)"
-             if editor else
-             f"draw on it in Helpwo:  /canvas open {os.path.relpath(path)}",
-             "b — open another board" if boards else "",
-             "q — close"]
-    try:
-        return canvas_view.open_scene(
-            built, title=os.path.relpath(path),
-            allow_empty=True, boards=boards, load_board=load,
-            editor=editor,
-            reload_scene=(reload_scene if editor else None),
-            empty_hint=hints)
-    except Exception as exc:
-        # A viewer that dies takes the screen with it; the board is still
-        # readable, so say what happened and print it rather than leaving the
-        # user with a traceback and nothing.
-        console.print(f"[yellow]canvas view failed "
-                      f"({type(exc).__name__}: {exc}); showing text[/yellow]")
-        return False
-
-
-def _canvas_open(path: str, canvas_mod) -> None:
-    """Hand the user a way into the drawing surface.
-
-    A whiteboard cannot be shown in a terminal, and the gap between "the file
-    exists" and "I can draw on it" is exactly where this feature was invisible.
-    The local Helpwo gateway mounts the working directory as a workspace, so a
-    board created here is already in its file tree — all that was missing was
-    somebody saying so.
-    """
-    if path:
-        if not canvas_mod.is_canvas_path(path):
-            path += canvas_mod.CANVAS_EXTENSION
-        if not os.path.exists(os.path.expanduser(path)):
-            console.print(f"[yellow]No board at {path} — /canvas new {path} first.[/yellow]")
-            return
-
-    try:
-        import helpwo_server
-    except ImportError:
-        console.print("[red]The Helpwo gateway is not available in this build.[/red]")
-        return
-
-    if helpwo_server.is_running():
-        url = helpwo_server.get_url(with_token=True)
-    elif _hosts_helpwo_here():
-        console.print("[yellow]Helpwo is not running in this sub-terminal. "
-                      "Run /helpwo here, then open the board from its file tree.[/yellow]")
-        return
-    else:
-        # Helpwo lives in its own sub-terminal; wait for it, since the whole
-        # point of this command is the URL.
-        try:
-            runtime = _launch_app_subterminal(
-                app_host.HELPWO_APP, persistent=True, options={},
-                agent_registry=None, open_url=False, wait=True) or {}
-        except Exception as e:
-            console.print(f"[red]Could not start it: {type(e).__name__}: {e}[/red]")
-            console.print("[dim]Run /helpwo yourself, then open the board from its file tree.[/dim]")
-            return
-        url = runtime.get("open_url") or ""
-        if not url:
-            if runtime.get("status") == "launching":
-                console.print("[dim]Run /canvas open again once Helpwo reports ready.[/dim]")
-            return
-
-    console.print(f"[bold]Open:[/bold] [cyan]{url}[/cyan]")
-    if path:
-        console.print(f"[dim]This folder is mounted there as a workspace — open "
-                      f"{os.path.relpath(os.path.expanduser(path))} from the file tree "
-                      f"and it opens as a whiteboard.[/dim]")
 
 
 def _gateway_post_json_for_cli(session):
@@ -15545,6 +15322,43 @@ def _memory_manager() -> None:
     browser.run()
 
 
+def _memory_status(entries: list) -> None:
+    """What the store costs, how close it is to its budget, and what is degraded."""
+    import memory_system
+    total = len(entries)
+    budget = memory_system.MEMORY_BUDGET
+    used = sum(1 for e in entries if int(e.get("uses", 0) or 0) > 0)
+    never = total - used
+    console.print(f"Persistent memories visible here: [bold]{total}[/bold]"
+                  f"  •  budget {budget}"
+                  + ("  [yellow](over)[/yellow]" if total > budget else ""))
+    console.print(f"[dim]Used at least once since usage tracking began: {used}; "
+                  f"not yet used: {never}.[/dim]")
+    top = sorted(entries, key=lambda e: int(e.get("uses", 0) or 0), reverse=True)[:3]
+    if top and int(top[0].get("uses", 0) or 0) > 0:
+        console.print("[dim]Most used: " + ", ".join(
+            f"{e.get('name')} ({int(e.get('uses', 0) or 0)})" for e in top) + ".[/dim]")
+    archive = memory_system.archive_dir()
+    if archive.exists():
+        count = len(list(archive.glob("*.md")))
+        if count:
+            console.print(f"[dim]Archived (kept, out of the live set): {count}.[/dim]")
+    try:
+        import embeddings
+        down, reason, left = embeddings.degraded()
+        if down:
+            console.print(
+                f"[yellow]Semantic de-duplication and ranking are degraded[/yellow] "
+                f"[dim]— the embedding endpoint refused "
+                f"({reason or 'no detail'}); retrying in {int(left)}s. "
+                f"New memories can only be matched by exact name until then.[/dim]")
+        elif not embeddings.available():
+            console.print("[dim]Embeddings unavailable (not signed in?); "
+                          "de-duplication falls back to exact-name matching.[/dim]")
+    except Exception:
+        pass
+
+
 def _cmd_memory(parts: list) -> None:
     import memory_system
     sub = parts[1].lower() if len(parts) > 1 else ""
@@ -15582,6 +15396,37 @@ def _cmd_memory(parts: list) -> None:
             if project_entries:
                 console.print(
                     f"[dim]Project memory.json: {len(project_entries)} entries. See /memory project.[/dim]")
+        return
+
+    if sub in ("status", "budget"):
+        _memory_status(persistent_entries)
+        return
+
+    if sub == "compact":
+        # The uncapped pass. The automatic one converges a few entries per
+        # turn on purpose; this is the user saying "do the whole thing now".
+        dry = len(parts) > 2 and parts[2].lower() in ("dry", "--dry-run", "preview")
+        chosen = memory_system.enforce_budget(dry_run=True)
+        if not chosen:
+            console.print("[green]Memory store is within its budget; nothing to archive.[/green]")
+            return
+        console.print(f"[yellow]{len(chosen)} entries are over the budget "
+                      f"({len(persistent_entries)} visible, limit "
+                      f"{memory_system.MEMORY_BUDGET}).[/yellow]")
+        for entry in chosen[:10]:
+            console.print(f"  [dim]{entry.get('name')}[/dim]  "
+                          f"importance {float(entry.get('importance', .5) or .5):.1f}  "
+                          f"uses {int(entry.get('uses', 0) or 0)}")
+        if len(chosen) > 10:
+            console.print(f"  [dim]… and {len(chosen) - 10} more[/dim]")
+        if dry:
+            console.print("[dim]Dry run. Run /memory compact to archive them "
+                          "(files are moved to memory/archive/, never deleted).[/dim]")
+            return
+        archived = memory_system.enforce_budget()
+        console.print(f"[green]Archived {len(archived)} entries to "
+                      f"{memory_system.archive_dir()}[/green]")
+        console.print("[dim]Nothing was deleted; /memory show <name> still reads them.[/dim]")
         return
 
     if sub == "project":
@@ -21089,9 +20934,17 @@ def _report_app_runtime(app: str, runtime: dict, *, open_url: bool) -> None:
     if status == "ready":
         lines = [f"[green]{escape(label)} is running in sub-terminal "
                  f"[bold]{escape(app)}[/bold][/green]"]
+        if runtime.get("mode") == "app":
+            if runtime.get("app_url"):
+                lines.append(f"Project URL: [cyan]{escape(str(runtime['app_url']))}[/cyan]")
+            else:
+                lines.append("[dim]Project URL: not configured — set app_url in the manifest.[/dim]")
+            if runtime.get("url"):
+                lines.append(f"Bridge API: [cyan]{escape(str(runtime['url']))}[/cyan]")
         if runtime.get("open_url"):
-            lines.append(f"URL: [cyan]{escape(str(runtime['open_url']))}[/cyan]")
-        elif runtime.get("url"):
+            url_label = "Bridge login" if runtime.get("mode") in {"app", "session"} else "URL"
+            lines.append(f"{url_label}: [cyan]{escape(str(runtime['open_url']))}[/cyan]")
+        elif runtime.get("url") and runtime.get("mode") != "app":
             lines.append(f"Bridge: [cyan]{escape(str(runtime['url']))}[/cyan]")
         if runtime.get("mode") == "remote" and not runtime.get("linked"):
             lines.append(f"[yellow]{escape(str(runtime.get('message') or ''))}[/yellow]")
@@ -21102,9 +20955,10 @@ def _report_app_runtime(app: str, runtime: dict, *, open_url: bool) -> None:
             f"/t opens the terminal list; /{'helpwo' if app == app_host.HELPWO_APP else 'app'} "
             f"stop{'' if app == app_host.HELPWO_APP else ' ' + app} closes it.[/dim]")
         console.print(Panel("\n".join(lines), title=label, border_style="green"))
-        if open_url and runtime.get("open_url") and _can_open_graphical_browser():
+        browser_url = runtime.get("app_url") or runtime.get("open_url")
+        if open_url and browser_url and _can_open_graphical_browser():
             try:
-                _open_external_url(str(runtime["open_url"]))
+                _open_external_url(str(browser_url))
             except Exception:
                 pass
     elif status == "error":
@@ -21503,10 +21357,14 @@ def _app_start_in_process(name: str, agent_registry: AgentRegistry, session: dic
     if state.get("persistent"):
         app_host.update_state(state_dir, port=bound_port)
     bridge_url = helpwo_server.get_url()
+    bridge_open_url = helpwo_server.get_url(with_token=True, path="/api/local-runtime")
+    bridge_token = helpwo_server.auth_token()
     agent_id = state.get("local_agent_id") or ""
     console.print(Panel(
         f"[green]Hosting application [bold]{escape(manifest.name)}[/bold][/green]\n"
-        f"Bridge: {bridge_url}  agent: {agent_id}\n"
+        f"Project URL: {escape(manifest.app_url) if manifest.app_url else 'not configured (set app_url in the manifest)'}\n"
+        f"Bridge API: {bridge_url}  agent: {agent_id}\n"
+        f"Bridge login: {bridge_open_url}\n"
         f"[dim]POST /api/agents/<id>/send (chat, exec, approval-response, "
         f"terminal operations; session-open/session-close/session-list with payload.user), GET "
         f"/api/agents/<id>/updates. Header 'Authorization: token <token>'. "
@@ -21516,6 +21374,8 @@ def _app_start_in_process(name: str, agent_registry: AgentRegistry, session: dic
         title="App", border_style="green"))
 
     result = {"status": "ready", "mode": "app", "url": bridge_url,
+              "app_url": manifest.app_url,
+              "open_url": bridge_open_url, "token": bridge_token,
               "agent_id": agent_id, "message": msg}
     if manifest.command:
         from pathlib import Path
@@ -21526,7 +21386,8 @@ def _app_start_in_process(name: str, agent_registry: AgentRegistry, session: dic
                 env_extra={
                     "LAINTAS_APP_NAME": manifest.name,
                     "LAINTAS_APP_BRIDGE_URL": bridge_url,
-                    "LAINTAS_APP_TOKEN": state.get("token") or "",
+                    "LAINTAS_APP_BRIDGE_OPEN_URL": bridge_open_url,
+                    "LAINTAS_APP_TOKEN": bridge_token,
                     "LAINTAS_APP_AGENT_ID": agent_id,
                 })
         except Exception as exc:
@@ -21608,8 +21469,9 @@ def _app_session_start_in_process(name: str, options: dict,
         f"Approvals: {agent_registry.app_mode['approval']}",
         title="App session", border_style="green"))
     return {"status": "ready", "mode": "session", "url": helpwo_server.get_url(),
+            "open_url": helpwo_server.get_url(with_token=True, path="/api/local-runtime"),
             "agent_id": state.get("local_agent_id") or "",
-            "token": state.get("token") or "", "message": msg}
+            "token": helpwo_server.auth_token(), "message": msg}
 
 
 def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
@@ -22438,6 +22300,12 @@ def _cmd_compact(parts: list, session: dict) -> bool:
                 f"[dim]{background}; foreground at {_fmt_tokens(info['auto_at'])}; "
                 f"target {_fmt_tokens(info['target_tokens'])} tokens; "
                 f"background task: {info['background_status']}.[/dim]")
+            if info.get("provider_window"):
+                console.print(
+                    f"[dim]Model window {_fmt_tokens(info['provider_window'])}; "
+                    f"budgeting against {_fmt_tokens(info['window'])}, so compaction "
+                    f"fires at ~{info['auto_at_share'] * 100:.0f}% of it "
+                    f"(/config context_trigger_share, or /max).[/dim]")
         return False
 
     # Compact an isolated copy so cancelling a slow summarizer cannot let its
@@ -23912,9 +23780,6 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
     elif action == "/img":
         _cmd_img(raw_args)
 
-    elif action == "/canvas":
-        _cmd_canvas(raw_args)
-
     elif action == "/help":
         _cmd_help(parts)
 
@@ -23929,6 +23794,14 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
 
     elif action == "/login":
         _cmd_login(session, agent_registry)
+
+    elif action == "/password":
+        # Local interactive vault UI. Never takes secret arguments; all
+        # secrets are read from /dev/tty inside the UI so they cannot become
+        # chat history, mirror events, or model-visible tool input.
+        import password_vault_ui as _pv_ui
+        with terminal_arbiter.hold("password-vault", TermMode.EXTERNAL, timeout=10.0):
+            _pv_ui.handle_command(parts[1:])
 
     elif action == "/handoff":
         _cmd_handoff(parts, session)
@@ -24179,6 +24052,11 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict,
     except KeyboardInterrupt:
         console.print("[dim]Command cancelled.[/dim]")
     except Exception as exc:
+        if _is_password_command(cmd):
+            # Vault errors must not reach the generic debug record, which
+            # stores raw command text and exception strings.
+            console.print("[red]Password vault unavailable. No diagnostic contents were recorded.[/red]")
+            return False
         try:
             action = (cmd or "").strip().split(maxsplit=1)[0]
         except Exception:
@@ -27483,6 +27361,13 @@ def main():
             user_input = item
             injected_done = None
             _is_dialogue = False
+        # Injected lines (Helpwo chat, extensions, app bridges) are not local
+        # keystrokes. /password must only open from the local terminal: a
+        # remote trigger would put a hidden passphrase prompt on a screen its
+        # requester cannot see — a phishing surface, and the vault design
+        # (docs/password-vault-design.md) keeps remote/mirrored entry
+        # disabled until it has a trusted input path of its own.
+        _is_injected_line = isinstance(item, _InjectedInput)
 
         if not user_input:
             # Don't set injected_done here — the empty input might be from
@@ -27800,6 +27685,14 @@ def main():
         # conversation message, never a terminal command — even when it
         # starts with "/" — so it skips meta dispatch entirely.
         if user_input.startswith("/") and not _is_dialogue:
+            if (_is_injected_line
+                    and _is_password_command(user_input)):
+                console.print("[yellow]/password can only be opened from the "
+                              "local terminal; remote and injected entry is "
+                              "disabled by design.[/yellow]")
+                if injected_done is not None:
+                    injected_done.set()
+                continue
             should_exit = handle_meta_command(user_input, agent_registry, session, interactive_session)
             current_live_session = getattr(handle_meta_command, '_current_live_session', current_live_session)
             # Full-screen commands such as /agents may reuse or replace the

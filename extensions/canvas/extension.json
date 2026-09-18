@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 2,
+  "name": "canvas",
+  "version": "1.0.0",
+  "entrypoint": "main.py",
+  "description": "Whiteboards in the terminal: view and draw .excalidraw boards, and let the agent draw on them",
+  "toolPrefix": "canvas.",
+  "capabilities": [
+    "fs.read",
+    "fs.write"
+  ],
+  "minCliVersion": "1.29.0"
+}

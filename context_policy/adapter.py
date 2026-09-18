@@ -13,7 +13,8 @@ structure using these helpers + ``summary_prompt``.
 Derived from opencode (``packages/opencode/src/session/overflow.ts`` +
 ``compaction.ts``): ``usable = window - max(maxOutput, buffer)``;
 ``keep_recent = clamp(usable*ratio, min, max)``; overflow when token count >=
-usable. Token estimate ~= chars/4 (opencode ``Token.estimate``).
+usable. The estimate is deliberately CJK-aware because a flat chars/4 estimate
+substantially under-counts Chinese/Japanese/Korean conversations.
 """
 from __future__ import annotations
 
@@ -47,7 +48,10 @@ _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]")
 
 
 def estimate_tokens(text: str) -> int:
-    """CJK-aware conservative token estimate.
+    """Token estimate. CJK packs ~2 chars/token vs ~4 for Latin, so a flat
+    chars/4 under-counts Chinese/Japanese/Korean badly (silent overflow). We
+    count CJK separately. Kept in sync with the TS estimator
+    (src/context/context-policy.ts).
 
     Accepts any value; non-str is JSON-serialized first so callers can pass a
     messages array directly.
@@ -109,16 +113,17 @@ def truncate_tool_output(text: str, policy: Optional[dict] = None) -> str:
     often at the END — a traceback, a failing assertion, a summary line the
     tool prints last. Keeping only the first ``cap`` chars cut exactly those
     off, so the summarizer never saw the reason a call failed. The tail keeps
-    ``tail_ratio`` of the budget; the marker describes the omitted middle.
+    ``tool_output_tail_ratio`` of the budget; the marker describes the omitted
+    middle. Kept in sync with the TS adapter (src/context/context-policy.ts).
     """
     p = policy or load()
     cap = max(0, int(p.get("tool_output_max_chars", 2000)))
     if not isinstance(text, str) or len(text) <= cap:
         return text
+    omitted = len(text) - cap
     ratio = float(p.get("tool_output_tail_ratio", 0.35))
     tail = int(cap * max(0.0, min(1.0, ratio)))
     head = max(0, cap - tail)
-    omitted = len(text) - cap
     return (f"{text[:head]}\n"
             f"[truncated {omitted} chars for compaction]\n"
             f"{text[len(text) - tail:]}")
