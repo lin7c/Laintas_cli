@@ -70,10 +70,6 @@
     "json_store",
     "mode_manager",
     "event_log",
-    "ai_pow",
-    "ai_pow_scoring",
-    "ai_pow_report",
-    "aipow_bridge",
     "session_store",
     "session_lifecycle",
     "usage_tracker",
@@ -111,6 +107,9 @@
     "agent_contract",
     "branch",
     "file_pager",
+    "prompt_budget",
+    "budget_page",
+    "config_file",
     "context_snapshot",
     "prop_ui",
     "vision",
@@ -131,7 +130,8 @@
       "catalog.json"
     ],
     "context_policy": [
-      "policy.json"
+      "policy.json",
+      "budget.json"
     ],
     "diagnostics_adapter": [
       "registry.json"

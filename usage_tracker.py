@@ -75,8 +75,8 @@ def record(*, model: str, prompt_tokens: int, completion_tokens: int,
             "pid": os.getpid(),
         }
         try:
-            import aipow_bridge
-            aipow_bridge.usage(rec)
+            import extension_runtime
+            extension_runtime.emit("model.usage", **rec)
         except Exception:
             pass
         line = json.dumps(rec, ensure_ascii=False) + "\n"

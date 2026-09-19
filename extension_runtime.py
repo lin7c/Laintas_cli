@@ -127,6 +127,33 @@ def _lab_owned(manifest_path: Path) -> bool:
             and install.get("trustedBy") == "evolution-lab")
 
 
+#: Host lifecycle events an extension may observe with `ctx.on`, and what each
+#: payload carries. This is a published contract: add fields freely, never
+#: rename or remove one. Handlers run synchronously on the thread that raised
+#: the event -- `tool.call` arrives BEFORE the tool runs -- so they must be
+#: cheap, and must treat the payload (including nested values such as a tool's
+#: `arguments`) as read-only.
+#:
+#: turn.start       one run_agent_loop invocation begins: session_id, run_id,
+#:                  agent_id, cwd, depth, foreground, human_text (None unless
+#:                  this is a fresh message a person typed)
+#: turn.end         that invocation returned or raised: depth
+#: assistant.reply  model text: text, final, visible (shown to a person),
+#:                  session_id, run_id, agent_id
+#: tool.call        name, call_id, arguments, cwd, source, session_id, run_id,
+#:                  agent_id
+#: tool.result      name, call_id, ok, session_id, run_id
+#: tool.batch_end   one round of tool calls finished: session_id, run_id
+#: model.usage      the usage_tracker record (model, in, out, cachedIn,
+#:                  costCents, official, backend, estimated, ...)
+#: agent.spawn      agent_id, parent_agent_id
+#: skill.used       name, basis
+OBSERVABLE_EVENTS: frozenset = frozenset({
+    "turn.start", "turn.end", "assistant.reply", "tool.call", "tool.result",
+    "tool.batch_end", "model.usage", "agent.spawn", "skill.used",
+})
+
+
 class _Registrar:
     def __init__(self, callback: Callable):
         self._callback = callback
@@ -302,6 +329,17 @@ class ExtensionContext:
     def register_loop(self, handler: Callable) -> None:
         self._runtime.register_loop(self.name, handler)
 
+    def on(self, event: str, handler: Callable[[dict], None]) -> None:
+        """Observe a host lifecycle event (see `OBSERVABLE_EVENTS`).
+
+        Observation only: the return value is ignored, an exception is
+        swallowed, and nothing a handler does can stop the event. Requires the
+        `observe` capability in the manifest, because a handler sees every
+        prompt a person types -- that belongs in front of whoever approves the
+        package.
+        """
+        self._runtime.subscribe(self.name, event, handler)
+
     @property
     def commands(self) -> _Registrar:
         return _Registrar(self.register_command)
@@ -337,6 +375,10 @@ class ExtensionRuntime:
         # arguments name, for path completion.
         self._command_files: dict[str, dict[str, tuple[str, ...]]] = {}
         self._loops: dict[str, list[Callable]] = {}
+        # {"tool.call": ((owner, handler), ...)} -- replaced, never mutated,
+        # so `emit` iterates a snapshot without taking the lock.
+        self._observers: dict[str, tuple[tuple[str, Callable], ...]] = {}
+        self._capabilities: dict[str, frozenset] = {}
         self._tool_prefixes: dict[str, str] = {}
         self._console: Any = None
         self._backend = BackendGateway()
@@ -416,6 +458,29 @@ class ExtensionRuntime:
             raise TypeError("loop handler must be callable")
         self._loops.setdefault(owner, []).append(handler)
 
+    def subscribe(self, owner: str, event: str, handler: Callable) -> None:
+        if event not in OBSERVABLE_EVENTS:
+            raise ValueError(f"unknown event: {event}")
+        if not callable(handler):
+            raise TypeError("event handler must be callable")
+        if "observe" not in self._capabilities.get(owner, frozenset()):
+            raise PermissionError(
+                f"{owner} must declare the 'observe' capability to use ctx.on")
+        with self._lock:
+            self._observers[event] = (
+                *self._observers.get(event, ()), (owner, handler))
+
+    def emit(self, event: str, payload: dict) -> None:
+        """Hand one event to every observer. Never raises."""
+        handlers = self._observers.get(event)
+        if not handlers:
+            return
+        for _owner, handler in handlers:
+            try:
+                handler(dict(payload))
+            except Exception:
+                pass
+
     def _manifest(self, directory: Path) -> dict:
         path = directory / "extension.json"
         try:
@@ -450,6 +515,10 @@ class ExtensionRuntime:
             try:
                 manifest = self._manifest(directory)
                 self._tool_prefixes[name] = str(manifest.get("toolPrefix") or "")
+                declared = manifest.get("capabilities")
+                self._capabilities[name] = frozenset(
+                    str(item) for item in declared
+                ) if isinstance(declared, list) else frozenset()
                 entrypoint = directory / "main.py"
                 if not entrypoint.is_file() or entrypoint.is_symlink():
                     raise ValueError("missing main.py entrypoint")
@@ -521,6 +590,13 @@ class ExtensionRuntime:
             if self._commands.get(command)
         }
         self._loops.pop(name, None)
+        self._observers = {
+            event: kept for event, kept in (
+                (event, tuple(item for item in handlers if item[0] != name))
+                for event, handlers in self._observers.items())
+            if kept
+        }
+        self._capabilities.pop(name, None)
         self._tool_prefixes.pop(name, None)
         get_registry().unregister_source(f"extension:{name}")
         # Prompts leave with the tools they describe.
@@ -617,6 +693,11 @@ class ExtensionRuntime:
                     return result
         return None
 
+    def loaded_module(self, name: str) -> Any:
+        """The entry module of a loaded extension, or None."""
+        loaded = self._loaded.get(name)
+        return loaded.module if loaded else None
+
     def list(self) -> list[dict]:
         return [
             {"name": item.name, "version": item.version, "path": str(item.path)}
@@ -677,3 +758,15 @@ _runtime = ExtensionRuntime()
 
 def get_runtime() -> ExtensionRuntime:
     return _runtime
+
+
+def emit(event: str, **payload: Any) -> None:
+    """Raise a host lifecycle event for observing extensions. Never raises.
+
+    One dictionary lookup when nobody observes it, which is the common case --
+    this sits on the agent loop's hot path.
+    """
+    try:
+        _runtime.emit(event, payload)
+    except Exception:
+        pass

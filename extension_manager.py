@@ -102,6 +102,9 @@ def read_manifest(directory: Path) -> dict:
 #: package that declares nothing on purpose.
 KNOWN_CAPABILITIES: frozenset = frozenset({
     "fs.read", "fs.write", "shell", "network", "model", "browser", "storage",
+    # Subscribes to host lifecycle events (`ctx.on`): sees every prompt typed,
+    # every reply and every tool call's arguments.
+    "observe",
 })
 
 

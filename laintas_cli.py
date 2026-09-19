@@ -10,12 +10,40 @@ Usage:
     laintas-cli --backend URL      # Custom backend URL
 """
 
+import sys
+
+
+def _run_pow_command(argv: list) -> int:
+    """`laintas pow ...` -- AI-PoW's command line, served by the ai-pow extension.
+
+    Git's post-commit hook calls this, which is why the entry point stays here
+    while everything behind it lives in the extension: the hook names a
+    launcher that updates cannot move. Loading goes through the same trust gate
+    as a REPL session.
+    """
+    import extension_runtime
+    runtime = extension_runtime.get_runtime()
+    loaded, message = runtime.load("ai-pow")
+    module = runtime.loaded_module("ai-pow") if loaded else None
+    if module is None or not callable(getattr(module, "cli", None)):
+        print(f"AI-PoW: the ai-pow extension is not available ({message}). "
+              "Install it with: /extensions install ai-pow", file=sys.stderr)
+        return 1
+    return int(module.cli(argv) or 0)
+
+
+# Git's post-commit hook runs `laintas pow --cwd . seal` on every commit:
+# answer it before the rest of the CLI is imported, which costs about a second.
+if __name__ == "__main__" and sys.argv[1:2] == ["pow"]:
+    raise SystemExit(_run_pow_command(sys.argv[2:]))
+
 import asyncio
 import copy
 import io
 import symbols
 import transcript_view
 import textwrap
+import collections
 import os
 import re
 import sys
@@ -26309,19 +26337,18 @@ def _parse_subtask_json(text: str):
 def main():
     """Entry point."""
     if sys.argv[1:2] == ["pow"]:
-        import ai_pow
-        raise SystemExit(ai_pow.main(sys.argv[2:]))
+        raise SystemExit(_run_pow_command(sys.argv[2:]))
     # A terminal the CLI has not run in before starts from the settings last
     # used rather than from nothing. TERMINAL_ID is derived from the tty and
     # POSIX session id when the emulator offers nothing better, and both
-    # change on every SSH login — so without this, every new connection asked
+    # change on every SSH login \u2014 so without this, every new connection asked
     # for the model and mode again.
     try:
         terminal_preferences.seed_new_terminal()
     except Exception:
         pass
     # Put the built-in decision tree on disk the first time, so it can be
-    # read and edited. Only when absent — never over an edited tree.
+    # read and edited. Only when absent \u2014 never over an edited tree.
     try:
         import branches as _branches_boot
         _branches_boot.write_default_tree()

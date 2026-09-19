@@ -1395,28 +1395,75 @@ def verify_bundle(root, path):
         return verify_proof(root, proof, rows())
 
 
+#: A host that vendors this module sets its own stable launcher here, for
+#: example ["laintas", "pow"]. A post-commit hook that names this file breaks
+#: silently the day the vendored copy moves; a launcher does not.
+HOST_INVOCATION = None
+HOOK_HEADER = "#!/bin/sh\n# AI-PoW 0.1 (local integrity only)\n"
+
+
 def invocation():
+    if HOST_INVOCATION:
+        return list(HOST_INVOCATION)
     if getattr(sys, "frozen", False):
         return [sys.executable, "pow"]
     return [sys.executable, str(Path(__file__).resolve())]
 
 
-def install_hook(recorder):
+def _hook_plan(recorder):
     hook = Path(git(recorder.root, "rev-parse", "--git-path", "hooks/post-commit").decode().strip())
     if not hook.is_absolute():
         hook = recorder.root / hook
     command = shlex.join(invocation() + ["--cwd", ".", "seal"])
-    body = "#!/bin/sh\n# AI-PoW 0.1 (local integrity only)\n" + command + " >/dev/null || echo 'AI-PoW: proof not sealed; run aipow status' >&2\nexit 0\n"
+    body = HOOK_HEADER + command + " >/dev/null || echo 'AI-PoW: proof not sealed; run aipow status' >&2\nexit 0\n"
     # A shared/custom hooksPath must not be overwritten or silently used for other worktrees.
     custom = git(recorder.root, "config", "--get", "core.hooksPath", allow_fail=True)
     gd = recorder.directory.parent
     common = git(recorder.root, "rev-parse", "--git-common-dir").decode().strip()
     common = (recorder.root / common).resolve()
     if custom or common != gd:
+        return hook, command, body, "shared"
+    if hook.is_symlink():
+        return hook, command, body, "foreign"
+    if not hook.exists():
+        return hook, command, body, "missing"
+    try:
+        with open(hook, "rb") as source:
+            current = source.read(65537).decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return hook, command, body, "foreign"
+    if current == body:
+        return hook, command, body, "installed"
+    # Only a hook this module wrote is ours to rewrite: the header is ours and
+    # nothing else was added to it.
+    if current.startswith(HOOK_HEADER) and current.count("\n") == body.count("\n"):
+        return hook, command, body, "stale"
+    return hook, command, body, "foreign"
+
+
+def hook_status(recorder):
+    """Whether the post-commit hook will seal proofs with the current launcher."""
+    hook, command, _body, state = _hook_plan(recorder)
+    return {"state": state, "path": str(hook), "command": command}
+
+
+def install_hook(recorder):
+    hook, command, body, state = _hook_plan(recorder)
+    if state == "shared":
         return {"installed": False, "reason": "shared/custom hooks path", "manual_command": command}
-    if hook.exists() or hook.is_symlink():
+    if state == "installed":
+        return {"installed": False, "reason": "already installed", "path": str(hook)}
+    if state == "foreign":
         return {"installed": False, "reason": "existing hook preserved", "manual_command": command}
     hook.parent.mkdir(parents=True, exist_ok=True)
+    if state == "stale":
+        # Our own hook pointing at a launcher that moved: replace it atomically.
+        temporary = hook.with_name(hook.name + ".aipow-" + uuid.uuid4().hex)
+        with open(temporary, "x") as out:
+            out.write(body)
+        temporary.chmod(0o700)
+        os.replace(temporary, hook)
+        return {"installed": True, "replaced": True, "path": str(hook)}
     with open(hook, "x") as out:
         out.write(body)
     hook.chmod(0o700)

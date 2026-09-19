@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 2,
+  "name": "ai-pow",
+  "version": "0.8.1",
+  "entrypoint": "main.py",
+  "description": "AI-PoW: a process score and verifiable work journal for every Git commit, recorded from your sessions",
+  "author": { "name": "laintas" },
+  "license": "MIT",
+  "capabilities": ["observe", "fs.read", "fs.write", "shell"],
+  "minCliVersion": "1.31.0"
+}

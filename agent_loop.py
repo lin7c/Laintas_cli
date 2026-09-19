@@ -4668,9 +4668,8 @@ def spawn_subagent(parent_id: str, task: str, deps,
             parent_agent_id=parent.id,
             terminal_name=agent_scope_terminal(child),
             summary=task, detail=task, status="queued")
-        import aipow_bridge
-        aipow_bridge.emit("agent.spawn", {"agent_id": child.id,
-                                          "parent_agent_id": parent.id})
+        extension_runtime.emit("agent.spawn", agent_id=str(child.id),
+                               parent_agent_id=str(parent.id))
     except Exception:
         pass
 
@@ -10231,13 +10230,17 @@ def run_agent_loop(
         and getattr(deps.console, "render_terminal", True) is not False
     )
     try:
-        import aipow_bridge
-        aipow_bridge.bind(state.get("cwd") or os.getcwd())
-        if not _is_background_agent and not continue_thread:
-            aipow_bridge.message("human.message", original_input,
-                                 session_id=_session_id, run_id=_run_id,
-                                 agent_id=str(agent_id or "main"))
-        aipow_bridge.sample()
+        extension_runtime.emit(
+            "turn.start", session_id=_session_id, run_id=_run_id,
+            agent_id=str(agent_id or "main"),
+            cwd=state.get("cwd") or os.getcwd(),
+            depth=_current_turn_depth(),
+            foreground=not _is_background_agent,
+            # Only a message a person just typed; a continued thread or a
+            # sub-agent's task is not human input.
+            human_text=(original_input
+                        if not _is_background_agent and not continue_thread
+                        else None))
     except Exception:
         pass
     if not _owns_local_render:
@@ -12336,15 +12339,12 @@ def run_agent_loop(
         # structural parsing, do not surface the malformed text as a normal
         # answer; the next turn gets a format nudge instead.
         display_reply = "" if response.get("_parse_failed") else reply
-        if display_reply and _owns_local_render:
-            try:
-                import aipow_bridge
-                aipow_bridge.message("assistant.visible", display_reply,
-                                     channel="commentary" if tool_calls else "final",
-                                     session_id=_session_id, run_id=_run_id,
-                                     agent_id=str(agent_id or "main"))
-            except Exception:
-                pass
+        if display_reply:
+            extension_runtime.emit(
+                "assistant.reply", text=display_reply, final=not tool_calls,
+                visible=bool(_owns_local_render),
+                session_id=_session_id, run_id=_run_id,
+                agent_id=str(agent_id or "main"))
         _reply_rendered_normally = False
         if display_reply:
             if events_cb is not None and not _reply_already_rendered:
@@ -13289,12 +13289,7 @@ def run_agent_loop(
         # Concat all per-call outputs into lastOutput so the next prompt's fallback
         # rendering and shortTermMemory see every result, not just the last.
         if formatted_outputs:
-            try:
-                import aipow_bridge
-                aipow_bridge.sample()
-            except Exception:
-                pass
-            state["lastOutput"] = ("\n---\n".join(formatted_outputs))[: int(get_runtime_config("output_truncate") or 3000) * 2]
+            state["lastOutput"] = ("\n---\n".join(formatted_outputs))[: tool_result_chars("", state) * 2]
             for _row in per_call_rows:
                 event_log.append("tool_result",
                                  name=_row.get("tool", ""),
