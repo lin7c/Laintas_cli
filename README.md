@@ -530,6 +530,140 @@ all read the GitHub release the CI workflow publishes.
 
 The history below is curated from the repository tags and changes, following an Added/Changed/Fixed-style release-note structure rather than reproducing raw commit messages. The tagged public history currently represented in this repository begins at v1.3.0.
 
+### [v1.31.1](https://github.com/lin7c/Laintas_cli/releases/tag/v1.31.1) — 2026-09-19
+
+**Fixed**
+
+- Billing refusal copy is English-only in the source; CN turns keep their
+  localization through the gateway's `lang` pass-through (the v1.29/v1.30
+  mechanism), and a build-breaking f-string escape from the v1.31.0 cycle was
+  removed with it.
+
+### [v1.31.0](https://github.com/lin7c/Laintas_cli/releases/tag/v1.31.0) — 2026-09-19
+
+**Added**
+
+- AI-PoW moved out of the core into the `ai-pow` extension: the four core
+  modules (3,053 lines) become a vendored extension kept byte-identical to the
+  `ai-pow` checkout, core emitters go through `extension_runtime.emit`, and the
+  new `observe` capability gates `ctx.on` subscriptions. `laintas pow ...`
+  stays a launcher entry point so git post-commit hooks survive updates.
+- A unified prompt-budget tree (`prompt_budget.py` + `context_policy/budget.json`)
+  replaces the scattered size configs (`output_truncate`, compact ratios,
+  auxiliary-model shares), exposed via `/budget`.
+- Coded billing refusals: an empty wallet, a spent membership allowance, a busy
+  ledger and an unavailable billing service each get their own headline and a
+  page to check, instead of all arriving as "Payment authorization failed".
+
+**Changed**
+
+- Compactor: first folds go out tagged like every other fold, with a closing
+  instruction after ledger evidence that a majority of first folds came back as
+  conversation continuation; `/compact status` records per-owner failure
+  reasons instead of reading "idle" through every failed summary.
+
+### [v1.30.0](https://github.com/lin7c/Laintas_cli/releases/tag/v1.30.0) — 2026-09-18
+
+**Added**
+
+- The official `canvas` extension, a password vault (`/password`) with
+  encrypted storage and fill, and a recorded-terminal replay on the download
+  site (real session, frame-for-frame).
+- Live per-model context parameters reported by the gateway, and larger
+  summarizer slices for heads split into many folds.
+
+**Changed**
+
+- Memory capture gained a budget with archival eviction and usage
+  de-duplication, and `/model` completion no longer lists concrete model ids.
+
+### [v1.29.4](https://github.com/lin7c/Laintas_cli/releases/tag/v1.29.4) — 2026-09-18
+
+**Changed**
+
+- Hosted-app startup prints the bridge login and the manifest's `app_url` as
+  **Project URL**, and `get_url()` accepts a path so the bridge answers on one
+  port; `/station` no longer wedges and the default port no longer collides.
+
+### [v1.29.3](https://github.com/lin7c/Laintas_cli/releases/tag/v1.29.3) — 2026-09-17
+
+**Fixed**
+
+- The disk-formatter deny rule now matches program position only, so
+  `docker ps --format` and `git log --format` stop being denied; saved configs
+  are migrated off the superseded rule.
+- `/v` source updates verify that newly declared pip dependencies are
+  importable and tell the user exactly what to run when one is missing, instead
+  of crashing later with `ModuleNotFoundError`.
+
+### [v1.29.2](https://github.com/lin7c/Laintas_cli/releases/tag/v1.29.2) — 2026-09-17
+
+**Added**
+
+- Hosted-app operations exposed as agent tools (`app.manifest.put`,
+  `app.start`, `app.stop`, trust management); the PPOS integration retired.
+
+**Fixed**
+
+- `/helpwo --remote` goes online as a runtime environment instead of failing
+  its local-only check.
+
+### [v1.29.1](https://github.com/lin7c/Laintas_cli/releases/tag/v1.29.1) — 2026-09-16
+
+**Added**
+
+- Per-user app sessions: the application asks for a session per user id and
+  gets an isolated sub-terminal with its own agent, auto-approve policy and
+  session limits (see "Many users" above).
+
+### [v1.29.0](https://github.com/lin7c/Laintas_cli/releases/tag/v1.29.0) — 2026-09-16
+
+**Added**
+
+- App sub-terminal hosting: `/app` runs a registered application in its own
+  sub-terminal with its own agent, from trusted manifests.
+- A unified station dispatch service with auto-routing, and `/resume` now
+  forks a new branch instead of taking over the source session.
+
+### [v1.28.1](https://github.com/lin7c/Laintas_cli/releases/tag/v1.28.1) — 2026-09-16
+
+**Fixed**
+
+- An atomic session-lease claim removes the `/resume` dual-instance race; a
+  zip-slip guard protects `/v` source bundles; an SSO open redirect is closed;
+  `/help` layout survives over-long usage strings.
+
+**Removed**
+
+- The deprecated `/focus` command.
+
+### [v1.28.0](https://github.com/lin7c/Laintas_cli/releases/tag/v1.28.0) — 2026-09-15
+
+**Added**
+
+- Slash-command argument contracts and completion providers: commands declare
+  their argument shapes and completions come from the contract instead of
+  hard-coded lists.
+
+### [v1.27.0](https://github.com/lin7c/Laintas_cli/releases/tag/v1.27.0) — 2026-09-14
+
+**Added**
+
+- Retask: work handed to the person as `.retask` checklists.
+
+**Changed**
+
+- The code-map extension is removed: Laintas Code Map is discontinued.
+- Each release is announced through the official messages inbox.
+
+### [v1.26.0](https://github.com/lin7c/Laintas_cli/releases/tag/v1.26.0) — 2026-09-12
+
+**Added**
+
+- Handoff as a portable file and token: hand the work over through any
+  channel, not as a conversation; the AI-PoW modules and an HWO effort pin
+  landed with it.
+
 ### [v1.25.2](https://github.com/lin7c/Laintas_cli/releases/tag/v1.25.2) — 2026-09-09
 
 **Added**
