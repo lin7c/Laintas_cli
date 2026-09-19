@@ -70,12 +70,14 @@ class BillingRefusalTests(unittest.TestCase):
         self.assertGreater(calls, 1)
         self.assertTrue(result["reply"].startswith("Billing busy"))
 
-    def test_chinese_prompt_gets_chinese_refusal(self):
+    def test_chinese_prompt_gets_the_same_english_refusal(self):
+        # Product-authored runtime surfaces are English-only: a CN turn gets
+        # the same coded refusal as an EN one, not a translated headline.
         result, _ = _run(_Refusal(402, BALANCE), prompt="帮我看看这个报错")
-        self.assertTrue(result["reply"].startswith("余额耗尽"))
-        self.assertIn("个人中心", result["reply"])
+        self.assertTrue(result["reply"].startswith("Balance exhausted"))
+        self.assertIn("https://laintas.com/settings", result["reply"])
         result, _ = _run(_Refusal(429, ALLOWANCE), prompt="帮我看看这个报错")
-        self.assertTrue(result["reply"].startswith("会员额度已用完"))
+        self.assertTrue(result["reply"].startswith("Membership allowance used up"))
 
 
 if __name__ == "__main__":

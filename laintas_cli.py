@@ -9156,13 +9156,6 @@ _BILLING_REFUSAL_HEADLINES = {
 }
 # Refusals no retry fixes: they need money, a pack, or the allowance to reset.
 _BILLING_FINAL_CODES = frozenset({"insufficient_balance", "quota_exhausted", "quota_exceeded"})
-_BILLING_REFUSAL_HEADLINES_CN = {
-    "insufficient_balance": "\u4f59\u989d\u8017\u5c3d",
-    "quota_exhausted": "\u4f1a\u5458\u989d\u5ea6\u5df2\u7528\u5b8c",
-    "quota_exceeded": "\u4f1a\u5458\u989d\u5ea6\u5df2\u7528\u5b8c",
-    "billing_busy": "\u8ba1\u8d39\u7e41\u5fd9",
-    "billing_unavailable": "\u8ba1\u8d39\u670d\u52a1\u6682\u65f6\u4e0d\u53ef\u7528",
-}
 _BALANCE_PAGE_URL = "https://laintas.com/settings"
 _ALLOWANCE_PAGE_URL = "https://laintas.com/dashboard"
 
@@ -9178,23 +9171,13 @@ def _billing_refusal_code(response) -> str:
 def _format_billing_refusal(code: str, body: dict, lang: str = "EN") -> str:
     """One line for a coded billing refusal, or "" when it is not one.
 
-    `lang` is the per-turn guess call_backend_stream already makes (CN when the
-    prompt has Chinese in it). The server's detail stays as sent \u2014 it carries
-    the numbers \u2014 and only the headline and the next step are translated.
+    `lang` is accepted for signature stability with call_backend_stream but
+    unused: product-authored runtime surfaces are English-only. The server's
+    detail and remedy pass through as sent \u2014 they carry the numbers.
     """
     if code not in _BILLING_REFUSAL_HEADLINES:
         return ""
     detail = str(body.get("detail") or "").strip()
-    if lang == "CN":
-        action = {
-            "insufficient_balance": f"\u8bf7\u5230\u4e2a\u4eba\u4e2d\u5fc3\u67e5\u770b\u4f59\u989d\u5e76\u5145\u503c\uff1a{_BALANCE_PAGE_URL}",
-            "quota_exhausted": f"\u8bf7\u5230\u63a7\u5236\u53f0\u67e5\u770b\u4f1a\u5458\u989d\u5ea6\u4e0e\u8d85\u989d\u6263\u4f59\u989d\u5f00\u5173\uff1a{_ALLOWANCE_PAGE_URL}",
-            "quota_exceeded": f"\u8bf7\u5230\u63a7\u5236\u53f0\u67e5\u770b\u4f1a\u5458\u989d\u5ea6\u4e0e\u8d85\u989d\u6263\u4f59\u989d\u5f00\u5173\uff1a{_ALLOWANCE_PAGE_URL}",
-            "billing_busy": "\u672a\u6263\u8d39\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5",
-            "billing_unavailable": "\u672a\u6263\u8d39\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5",
-        }[code]
-        line = f"{_BILLING_REFUSAL_HEADLINES_CN[code]} \u2014 {action}"
-        return f"{line}\uff08{detail}\uff09" if detail else line
     headline = _BILLING_REFUSAL_HEADLINES[code]
     remedy = str(body.get("remedy") or "").strip()
     # The page to go to is the part that must survive an older gateway that
