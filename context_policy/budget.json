@@ -1,0 +1,257 @@
+{
+  "version": 1,
+  "calibration": "Shares are sized for a 1M-token model (thread budget ~860K): tool_result 0.02 = ~17K tokens per result, read_page 0.04 = ~34K tokens per page, web_fetch 0.08 = ~69K tokens of page text kept for paging, grep_line 0.0005 = ~430 tokens per matching line. Smaller windows scale down, larger up; nothing is capped.",
+  "description": "Layered context budget. Every node takes `share` of its parent's budget, floored at `min_tokens`; there are no ceilings. A node's children are only constrained once the node itself outgrows its allotment. Level 2 blocks keep their tags in the prompt; level 3 and deeper markers only partition the budget and are removed from what the model receives. Source of truth for laintas_cli/context_policy/budget.json, which is this file with every `hidden` node's children removed. Edit here and re-sync.",
+  "hysteresis": 0.9,
+  "assumed_window": 64000,
+  "assumed_summary_window": 32768,
+  "chars_per_token": 3.5,
+  "output": {
+    "share": 0.25,
+    "min_tokens": 20000
+  },
+  "input": {
+    "children": {
+      "system": {
+        "share": 0.15,
+        "shrink": "truncate",
+        "children": {
+          "platform_safety_policy": {
+            "share": 0.03,
+            "shrink": "none"
+          },
+          "role": {
+            "share": 0.03
+          },
+          "authority": {
+            "share": 0.03,
+            "shrink": "none"
+          },
+          "environment": {
+            "share": 0.02
+          },
+          "context": {
+            "share": 0.05,
+            "children": {
+              "persistentMemory": {
+                "share": 0.4
+              },
+              "durableRules": {
+                "share": 0.4,
+                "shrink": "none"
+              },
+              "globalMemory": {
+                "share": 0.2
+              }
+            }
+          },
+          "skills": {
+            "share": 0.04,
+            "children": {
+              "skills": {
+                "share": 0.5
+              },
+              "skillContext": {
+                "share": 0.5
+              }
+            }
+          },
+          "capabilities": {
+            "share": 0.14,
+            "children": {
+              "tools": {
+                "share": 0.6
+              }
+            }
+          },
+          "execution": {
+            "share": 0.11,
+            "children": {
+              "workflowPhase": {
+                "share": 0.3
+              },
+              "rolePrompt": {
+                "share": 0.3
+              },
+              "confidenceGuidance": {
+                "share": 0.1
+              }
+            }
+          },
+          "orchestration": {
+            "share": 0.05
+          },
+          "verification": {
+            "share": 0.03
+          },
+          "completion": {
+            "share": 0.04
+          },
+          "safety": {
+            "share": 0.02,
+            "shrink": "none"
+          },
+          "durable_user_rules": {
+            "share": 0.03,
+            "shrink": "none"
+          },
+          "durable_rule_protocol": {
+            "share": 0.02,
+            "shrink": "none"
+          },
+          "runtime_ownership": {
+            "share": 0.06,
+            "shrink": "none"
+          },
+          "harness_reminders": {
+            "share": 0.02
+          },
+          "intent_alignment": {
+            "share": 0.05
+          },
+          "laintas_product_protocol": {
+            "share": 0.03,
+            "shrink": "none"
+          },
+          "work_orchestration": {
+            "share": 0.16
+          },
+          "terminal_output_style": {
+            "share": 0.02
+          },
+          "hwo_prompt_overlay": {
+            "share": 0.05
+          },
+          "gateway": {
+            "share": 0.0,
+            "hidden": true
+          }
+        }
+      },
+      "tools": {
+        "share": 0.1,
+        "shrink": "narrow"
+      },
+      "live": {
+        "share": 0.05,
+        "shrink": "truncate",
+        "children": {
+          "task": {
+            "share": 0.15,
+            "shrink": "none"
+          },
+          "objective": {
+            "share": 0.05,
+            "shrink": "none"
+          },
+          "progress": {
+            "share": 0.05
+          },
+          "warnings": {
+            "share": 0.05
+          },
+          "session_memory": {
+            "share": 0.25
+          },
+          "relevant_skills": {
+            "share": 0.1
+          },
+          "sub_terminals": {
+            "share": 0.05
+          },
+          "delegated_work": {
+            "share": 0.1
+          },
+          "files_seen": {
+            "share": 0.03
+          },
+          "active_tasks": {
+            "share": 0.05
+          },
+          "environment_now": {
+            "share": 0.03
+          },
+          "now": {
+            "share": 0.01,
+            "shrink": "none"
+          },
+          "workflow_phase": {
+            "share": 0.03
+          },
+          "behavior_diagnostics": {
+            "share": 0.03
+          },
+          "role_identity": {
+            "share": 0.02
+          }
+        }
+      },
+      "thread": {
+        "rest": true,
+        "params": {
+          "compact_background": 0.7,
+          "compact_foreground": 0.9,
+          "compact_target": 0.5
+        },
+        "children": {
+          "recent_tail": {
+            "share": 0.25,
+            "min_tokens": 2000
+          },
+          "tool_result": {
+            "share": 0.02,
+            "min_tokens": 1000
+          },
+          "read_page": {
+            "share": 0.04,
+            "min_tokens": 2500
+          },
+          "web_fetch": {
+            "share": 0.08,
+            "min_tokens": 5000
+          },
+          "grep_line": {
+            "share": 0.0005,
+            "min_tokens": 60
+          },
+          "pruned_output": {
+            "share": 0.002,
+            "min_tokens": 500
+          }
+        }
+      }
+    }
+  },
+  "aux": {
+    "children": {
+      "summary": {
+        "children": {
+          "output": {
+            "share": 0.02,
+            "min_tokens": 2048
+          },
+          "margin": {
+            "share": 0.05,
+            "min_tokens": 1024
+          }
+        }
+      },
+      "critic": {
+        "children": {
+          "source": {
+            "share": 0.05,
+            "min_tokens": 2000
+          }
+        }
+      },
+      "mem_extract": {
+        "children": {
+          "source": {
+            "share": 0.1,
+            "min_tokens": 2000
+          }
+        }
+      }
+    }
+  }
+}

@@ -64,5 +64,7 @@ def _isolated_compaction_folds():
     import background_compaction
 
     background_compaction.forget_folds()
+    background_compaction._failures.clear()
     yield
     background_compaction.forget_folds()
+    background_compaction._failures.clear()

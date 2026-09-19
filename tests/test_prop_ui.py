@@ -142,3 +142,26 @@ class PropUITests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_gateway_additions_never_reach_the_prop_views():
+    """The gateway's language rule, tool guide and experience are its own;
+    snapshots written before they were excluded must not show them either."""
+    import prop_ui as _prop_ui
+    gateway_text = "\n\nLanguage: answer in the user's language so the user can understand."
+    call = {
+        "system_prompt": "our prompt" + gateway_text + "\n\n<experience>secret</experience>",
+        "messages": [{"role": "system", "content": "our prompt" + gateway_text},
+                     {"role": "user", "content": "hi"}],
+        "tool_schemas": [], "system_sections": [],
+        "metadata": {"verified_gateway_context": True, "gateway_additions": ["language_rule"]},
+        "gateway_context_receipt": {"verified": True, "effective_system_prompt": "our prompt" + gateway_text,
+                                    "messages": [], "additions": ["language_rule"],
+                                    "system_sha256": "abc"},
+    }
+    items = _prop_ui.context_items({"calls": [call]})
+    rendered = "\n".join(str(item.payload.get("content")) for item in items)
+    assert "Language: answer" not in rendered
+    assert "experience" not in rendered
+    assert "gateway_additions" not in rendered and "language_rule" not in rendered
+    assert "our prompt" in rendered and "abc" in rendered   # our text and the proof stay

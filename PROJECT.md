@@ -118,7 +118,7 @@ All tunable parameters are accessible via `get_runtime_config()`/`set_runtime_co
 | `max_tokens` | 0 | Output-token cap to request; 0 = the model's full budget (gateway-resolved per request) |
 | `max_debug_entries` | 50 | Debug ring buffer size |
 | `loop_delay` | 0.2 | Seconds between loop iterations (failures back off adaptively) |
-| `output_truncate` | 3000 | Char limit for `lastOutput` tail |
+| `budget …` | see `context_policy/budget.json` | Layered context budget: every share and floor of the prompt, one word per level (`/config budget system share 0.2`; `/config budget system` lists a level). `/config import|export <file>` moves any settings as one-`/config`-line-per-setting `.config` files. Details in `docs/context-budget.md` |
 | `terminal_tail_lines` | 20 | Lines shown in sub-terminal snapshot |
 | `heartbeat_interval` | 30 | Seconds between agent heartbeats |
 | `search_engine` | `auto` | Search engine chain: `auto` = tavily → google → duckduckgo → cn-bing → laintas_search → laintas_gateway; or an ordered engine list |

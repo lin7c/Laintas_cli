@@ -29,6 +29,39 @@ def test_backend_error_does_not_trigger_a_paid_review_call():
     assert backend.call_count == 1
 
 
+@pytest.mark.parametrize("previous", [None, "No deployment"])
+def test_every_fold_sends_tagged_data_and_ends_with_the_instruction(previous):
+    """The first fold used to go out as the bare transcript, and the summarizer
+    answered the conversation instead of summarizing it."""
+    backend = mock.Mock(return_value={"reply": SUMMARY})
+    loop._llm_summarize(SimpleNamespace(call_backend=backend), {}, "/tmp",
+                        "[User]: why is it idle?", previous, "EN")
+    message = backend.call_args.kwargs["message"]
+    assert "<source-transcript>\n[User]: why is it idle?\n</source-transcript>" in message
+    assert message.endswith(loop._SUMMARY_SOURCE_TAIL)
+    assert ("<trusted-previous-summary>" in message) == bool(previous)
+
+
+def test_a_draft_that_answers_the_transcript_is_redrawn_not_reviewed():
+    replies = iter([{"reply": "I have finished the analysis."}, {"reply": SUMMARY},
+                    {"reply": SUMMARY}])
+    backend = mock.Mock(side_effect=lambda **kw: next(replies))
+    assert loop._summarize_head_in_chunks(
+        SimpleNamespace(call_backend=backend), {}, [{"role": "user", "content": "fix"}],
+        None, "EN", "test") == SUMMARY
+    kinds = [c.kwargs["task_kind"] for c in backend.call_args_list]
+    assert kinds == ["compaction", "compaction", "compaction_review"]
+
+
+def test_two_unstructured_drafts_fail_the_chunk_without_a_review():
+    backend = mock.Mock(return_value={"reply": "I have finished the analysis."})
+    assert loop._summarize_head_in_chunks(
+        SimpleNamespace(call_backend=backend), {}, [{"role": "user", "content": "fix"}],
+        None, "EN", "test") is None
+    kinds = [c.kwargs["task_kind"] for c in backend.call_args_list]
+    assert kinds == ["compaction", "compaction"]
+
+
 def test_review_error_cannot_replace_the_draft_even_with_markdown():
     backend = mock.Mock(return_value={"error": True, "reply": SUMMARY + "\nwrong"})
     assert loop._llm_review_summary(SimpleNamespace(call_backend=backend), {}, "/tmp",
@@ -122,12 +155,15 @@ def test_auxiliary_requests_include_output_limit_and_fit_small_window():
         result = loop._summarize_head_in_chunks(
             SimpleNamespace(call_backend=backend), {},
             [{'role': 'user', 'content': 'Never deploy. ' * 10000}], None, 'EN', 'budget')
+        output = loop._summary_output_limit()
+        margin = loop._summary_margin('any')
     assert result == SUMMARY
     assert len(calls) > 2
+    assert output == 2048                                 # the output floor
     for call in calls:
-        assert call['max_tokens_override'] == 1024
+        assert call['max_tokens_override'] == output
         assert (loop._summary_token_count(call['message'])
-                + loop._summary_token_count(call['system_prompt']) + 1024 + 512 <= 8192)
+                + loop._summary_token_count(call['system_prompt']) + output + margin <= 8192)
 
 
 def test_oversized_previous_summary_fails_without_sending_overbudget_request():
@@ -185,17 +221,15 @@ def test_model_window_switch_and_smaller_real_window(monkeypatch, tmp_path):
     monkeypatch.setattr(loop, '_provider_window_model', None)
     monkeypatch.setattr(loop, '_provider_window_persisted', {})
     monkeypatch.setattr(loop, '_provider_window_key', lambda: 'small')
-    with mock.patch.object(loop, 'get_runtime_config', side_effect=lambda k:
-                           {'model_context_window': 64000, 'context_window_adopt_cap': 200000}.get(k)):
-        loop._note_provider_context_window(32768)
-        assert loop._effective_context_window() == 32768
-        monkeypatch.setattr(loop, '_provider_window_key', lambda: 'large')
-        assert loop._effective_context_window() == 64000
-        loop._note_provider_context_window(1000000)
-        # 0.70 of the real window, then the optional absolute ceiling.
-        assert loop._effective_context_window() == 200000
-        monkeypatch.setattr(loop, '_provider_window_key', lambda: 'small')
-        assert loop._effective_context_window() == 32768
+    loop._note_provider_context_window(32768)
+    assert loop._effective_context_window() == 32768
+    monkeypatch.setattr(loop, '_provider_window_key', lambda: 'large')
+    assert loop._effective_context_window() == loop.budget_scalar('assumed_window')
+    loop._note_provider_context_window(1000000)
+    # The real window: everything below it is the budget tree's business.
+    assert loop._effective_context_window() == 1000000
+    monkeypatch.setattr(loop, '_provider_window_key', lambda: 'small')
+    assert loop._effective_context_window() == 32768
 
 
 def test_huge_latest_user_turn_with_old_history_has_emergency_fallback():
@@ -205,6 +239,7 @@ def test_huge_latest_user_turn_with_old_history_has_emergency_fallback():
     backend = mock.Mock(return_value={'reply': SUMMARY})
     with mock.patch.object(loop, 'compaction_budget', return_value={
             'window': 32000, 'usable': 4000}), \
+            mock.patch.object(loop, '_summary_window', return_value=16_000), \
             mock.patch.object(loop, '_consolidate_memories_on_compact'):
         assert loop._compact_thread_messages(messages, SimpleNamespace(call_backend=backend),
                                               {}, 'EN', {}, force=True)
@@ -233,7 +268,7 @@ def test_observed_auxiliary_window_limits_next_attempt(monkeypatch, tmp_path):
     assert loop._llm_summarize(SimpleNamespace(call_backend=backend), {}, '/tmp',
                                'source', None, 'EN') is None
     assert loop._summary_window(model) == 8192
-    assert loop._summary_output_limit() == 1024
+    assert loop._summary_output_limit() == 2048        # the output floor
 
 
 def test_budget_reserves_what_the_turn_really_sends_not_the_whole_registry():
@@ -280,57 +315,36 @@ def provider_window(monkeypatch):
     loop.reset_runtime_config()
 
 
-def _trigger_share(state, real_window):
-    """The share of the real window the automatic trigger actually sits at."""
+def test_compaction_fires_at_the_thread_share_and_the_knob_moves_it(provider_window):
+    """The thread is what the fixed blocks leave of the input; compaction fires
+    at `compact_foreground` of it."""
+    provider_window(1_000_000, max_output=128_000)
+    state = {"_request_overhead_tokens": 10_849}
     budget = loop.compaction_budget(state)
-    auto_at = int(budget["usable"] * loop.get_runtime_config("compact_auto_ratio"))
-    return (auto_at + budget["overhead"]) / real_window
+    assert budget["output"] == 128_000                     # model ceiling < 25% share
+    assert budget["usable"] == 1_000_000 - 128_000 - 10_849
+    status = loop.session_context_status(state)
+    assert status["auto_at"] == int(budget["usable"] * 0.90)
+    loop.set_runtime_config("budget.thread.compact_foreground", 0.8)
+    assert loop.session_context_status(state)["auto_at"] == int(budget["usable"] * 0.80)
 
 
-def test_the_trigger_lands_on_the_requested_share_of_the_real_window(provider_window):
-    """The flat 200k ceiling made a 1M model compact at ~12% of its window."""
-    provider_window(1_000_000, max_output=128_000)
-    state = {"_request_overhead_tokens": 10_849}
-    assert round(_trigger_share(state, 1_000_000), 2) == 0.60
-
-    loop.set_runtime_config("context_trigger_share", 0.4)
-    assert round(_trigger_share(state, 1_000_000), 2) == 0.40
-
-    loop.reset_runtime_config()
-    loop.apply_max_config()
-    # /max takes the model's whole window; only its own output ceiling is held
-    # back, so the share is what is left after that.
-    assert loop._effective_context_window() == 1_000_000
-    assert _trigger_share(state, 1_000_000) > 0.75
+def test_a_huge_output_ceiling_no_longer_eats_half_a_mid_size_window(provider_window):
+    """131K window, 65K ceiling: the reserve used to be the whole ceiling."""
+    provider_window(131_072, max_output=65_536)
+    assert loop.model_output_reserve() == 32_768
+    loop.set_runtime_config("budget.output.share", 0.5)
+    assert loop.model_output_reserve() == 65_536
 
 
-def test_the_share_holds_across_models_with_different_parameters(provider_window):
-    state = {"_request_overhead_tokens": 10_849}
-    for window, max_output in ((262_144, 32_768), (131_072, 0), (1_050_000, 128_000)):
-        provider_window(window, max_output=max_output)
-        assert round(_trigger_share(state, window), 2) == 0.60
-
-
-def test_a_window_too_small_to_share_is_used_whole(provider_window):
-    """A 32k model has nothing to give back — take all of it, not 60%."""
-    provider_window(32_000, max_output=8_192)
-    assert loop._effective_context_window() == 32_000
-
-
-def test_explicitly_configured_window_still_wins(provider_window):
-    provider_window(1_000_000, max_output=128_000)
-    loop.set_runtime_config("model_context_window", 120_000)
-    assert loop._effective_context_window() == 120_000
-
-
-def test_the_output_reserve_comes_from_the_models_own_ceiling(provider_window):
+def test_the_output_reserve_is_capped_by_what_the_model_or_we_ask_for(provider_window):
     provider_window(1_000_000, max_output=128_000)
     assert loop.model_output_reserve() == 128_000
     loop.set_runtime_config("max_tokens", 32_000)      # what we actually request
     assert loop.model_output_reserve() == 32_000
     loop.reset_runtime_config()
-    provider_window(1_000_000, max_output=0)           # never reported
-    assert loop.model_output_reserve() == loop.ctxpol.load()["buffer_tokens"]
+    provider_window(1_000_000, max_output=0)           # never reported: the share
+    assert loop.model_output_reserve() == 250_000
 
 
 def test_summarizer_window_is_the_models_own_not_a_32k_ceiling(monkeypatch, tmp_path):
@@ -344,8 +358,9 @@ def test_summarizer_window_is_the_models_own_not_a_32k_ceiling(monkeypatch, tmp_
     assert loop._summary_window("gemma-test") == 262_144
 
 
-def test_a_huge_head_grows_its_slices_instead_of_making_thirty_calls(monkeypatch):
-    """Folds are sequential, so slice count is wall-clock, not just cost."""
+def test_a_slice_is_as_large_as_both_windows_allow(monkeypatch):
+    """Folds are sequential, so slice count is wall-clock, not just cost: a
+    slice takes whatever the windows leave rather than a fixed 24k."""
     monkeypatch.setattr(loop, "_summary_window", lambda model: 262_144)
     monkeypatch.setattr(loop, "_valid_structured_summary", lambda summary, lang: True)
     monkeypatch.setattr(loop, "_llm_review_summary", lambda *a, **k: SUMMARY)
@@ -359,4 +374,4 @@ def test_a_huge_head_grows_its_slices_instead_of_making_thirty_calls(monkeypatch
     head = [{"role": "user", "content": "evidence " * 4000} for _ in range(40)]
     assert loop._summarize_head_in_chunks(
         mock.Mock(), {}, head, None, "EN", "traj") == SUMMARY
-    assert 0 < len(sizes) <= loop._MAX_SUMMARY_FOLDS
+    assert len(sizes) == 1

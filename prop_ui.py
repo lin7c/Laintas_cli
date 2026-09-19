@@ -43,6 +43,45 @@ def _item(key: str, title: str, subtitle: str, badge: str,
     )
 
 
+#: Where the gateway's additions begin in a system prompt captured before they
+#: were kept out of snapshots: it always appends the language rule first.
+_GATEWAY_ADDITIONS_START = "\n\nLanguage: answer in the user's language"
+
+
+def without_gateway_additions(text):
+    """Our own system prompt, without what the gateway appended to it.
+
+    New snapshots never hold the gateway's text; this keeps older ones on disk
+    from showing it too.
+    """
+    if not isinstance(text, str):
+        return text
+    cut = text.find(_GATEWAY_ADDITIONS_START)
+    return text[:cut] if cut >= 0 else text
+
+
+def visible_call(call: dict) -> dict:
+    if not isinstance(call, dict):
+        return call
+    out = dict(call)
+    out["system_prompt"] = without_gateway_additions(call.get("system_prompt") or "")
+    out["messages"] = [dict(m, content=without_gateway_additions(m.get("content")))
+                       if isinstance(m, dict) and m.get("role") == "system" else m
+                       for m in (call.get("messages") or [])]
+    out["metadata"] = {k: v for k, v in (call.get("metadata") or {}).items()
+                       if k != "gateway_additions"}
+    out["gateway_context_receipt"] = visible_receipt(call.get("gateway_context_receipt"))
+    return out
+
+
+def visible_receipt(receipt):
+    """The gateway receipt minus the gateway-authored text; hashes stay."""
+    if not isinstance(receipt, dict):
+        return receipt
+    return {k: v for k, v in receipt.items()
+            if k not in ("effective_system_prompt", "messages", "additions")}
+
+
 def context_items(conversation: dict, *, system_only: bool = False
                   ) -> list[resource_ui.UIItem]:
     """Group one conversation around its final provider/model call.
@@ -57,12 +96,15 @@ def context_items(conversation: dict, *, system_only: bool = False
     call_count = len(calls)
     call = calls[-1] if calls else {}
     call_label = f"call {call_count} of {call_count} · latest/final default"
-    metadata = call.get("metadata") or {}
+    metadata = {k: v for k, v in (call.get("metadata") or {}).items()
+                if k != "gateway_additions"}
     verified = bool(metadata.get("verified_gateway_context"))
     verification = "gateway verified" if verified else "local capture · unverified"
-    system_prompt = call.get("system_prompt") or ""
+    system_prompt = without_gateway_additions(call.get("system_prompt") or "")
     sections = list(call.get("system_sections") or [])
-    messages = list(call.get("messages") or [])
+    messages = [dict(m, content=without_gateway_additions(m.get("content")))
+                if isinstance(m, dict) and m.get("role") == "system" else m
+                for m in (call.get("messages") or [])]
     tools = list(call.get("tool_schemas") or [])
 
     items = [
@@ -81,7 +123,7 @@ def context_items(conversation: dict, *, system_only: bool = False
 
     capture_metadata = {
         "metadata": metadata,
-        "gateway_context_receipt": call.get("gateway_context_receipt"),
+        "gateway_context_receipt": visible_receipt(call.get("gateway_context_receipt")),
     }
     call_summary = []
     for number, captured_call in enumerate(calls, 1):
@@ -92,11 +134,11 @@ def context_items(conversation: dict, *, system_only: bool = False
             "tool_count": len(captured_call.get("tool_schemas") or []),
             "system_section_count": len(
                 captured_call.get("system_sections") or []),
-            "metadata": captured_call.get("metadata") or {},
+            "metadata": visible_call(captured_call).get("metadata") or {},
         })
     model_calls = {
         "summary": call_summary,
-        "calls": calls,
+        "calls": [visible_call(c) for c in calls],
     }
     items.extend([
         _item(
@@ -169,3 +211,82 @@ def selected_context(item: Optional[resource_ui.UIItem],
     if detail is not None:
         return "\n".join(line.text for line in detail.lines)
     return ""
+
+
+# ── /prop budget: what the context budget did to a request ───────────────────
+
+def parse_budget_target(raw_args: str) -> Optional[int]:
+    """``/prop budget [N] [output [path]]`` → N (1 = newest); None when not a
+    budget request."""
+    parsed = _parse_budget(raw_args)
+    return None if parsed is None else parsed[0]
+
+
+def budget_output_path(raw_args: str) -> Optional[str]:
+    """The page to write for ``… output [path]``: "" for the default path,
+    None when no page was asked for."""
+    parsed = _parse_budget(raw_args)
+    return None if parsed is None else parsed[1]
+
+
+def _parse_budget(raw_args: str):
+    parts = str(raw_args or "").strip().split()
+    if not parts or parts[0].lower() != "budget":
+        return None
+    rest = parts[1:]
+    index = 1
+    if rest and rest[0].isdigit():
+        index = int(rest.pop(0))
+    output = None
+    if rest and rest[0].lower() == "output":
+        rest.pop(0)
+        output = rest.pop(0) if rest else ""
+    if rest:
+        raise ValueError("Usage: /prop budget [N] [output [path]]")
+    if index < 1:
+        raise ValueError("N must be a positive integer (1 is newest)")
+    return index, output
+
+
+def budget_items(rows: dict) -> list[resource_ui.UIItem]:
+    """One row per block, in tree order. A compressed block's detail shows what
+    the model was sent first and the original under it, so scrolling down is
+    reading what was left out."""
+    items = []
+    for section in ("system", "tools", "live", "thread"):
+        for row in rows.get(section) or []:
+            if ".gateway" in str(row.get("path")):
+                continue                     # never shown to the user
+            triggered = bool(row.get("triggered"))
+            depth = max(0, int(row.get("depth") or 1) - 1)
+            title = "  " * depth + str(row.get("path"))
+            subtitle = (f"{int(row.get('natural') or 0):,} → "
+                        f"{int(row.get('delivered') or 0):,} tokens "
+                        f"(allotted {int(row.get('allotted') or 0):,})")
+            if triggered:
+                content = ("── sent to the model ──\n" + str(row.get("compressed") or "(nothing)")
+                           + "\n\n── original ──\n" + str(row.get("original") or ""))
+            else:
+                content = str(row.get("original") or row.get("compressed") or "")
+            items.append(_item(f"budget:{row.get('path')}", title, subtitle,
+                               "compressed" if triggered else "as is", content))
+    return items
+
+
+def open_budget_browser(rows: dict, *, newest_index: int = 1,
+                        input=None, output=None) -> resource_ui.UIOutcome:
+    items = budget_items(rows)
+    compressed = sum(1 for item in items if item.badge == "compressed")
+    browser = resource_ui.ResourceBrowser(
+        title=(f"Context Budget · newest #{newest_index} · "
+               f"{compressed} block(s) compressed · edit with /config budget · "
+               f"/prop budget {newest_index} output for the tuning page"),
+        load_items=lambda: items,
+        load_detail=item_detail,
+        primary_action="view", primary_label="Inspect",
+        presentation="document",
+        pane_labels=("BLOCKS", "SENT / ORIGINAL"),
+        empty_message="No budget has been recorded yet. Run a prompt first.",
+        input=input, output=output,
+    )
+    return browser.run()

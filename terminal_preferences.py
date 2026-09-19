@@ -214,18 +214,27 @@ def delete(*keys: str) -> None:
         update({}, remove=tuple(keys))
 
 
+#: The layered context budget (`/config budget …`) is the user's own tuning of
+#: how the prompt spends the window, so every key under it persists too.
+PERSISTED_UI_PREFIXES = ("budget.",)
+
+
+def is_persisted(key: str) -> bool:
+    return key in PERSISTED_UI_KEYS or str(key).startswith(PERSISTED_UI_PREFIXES)
+
+
 def get_ui_preferences() -> dict:
     value = get("ui", {})
     if not isinstance(value, dict):
         return {}
     return {
         key: copy.deepcopy(item) for key, item in value.items()
-        if key in PERSISTED_UI_KEYS
+        if is_persisted(key)
     }
 
 
 def set_ui_preference(key: str, value: Any) -> None:
-    if key not in PERSISTED_UI_KEYS:
+    if not is_persisted(key):
         raise KeyError(f"UI preference is not persistent: {key}")
     ui = get_ui_preferences()
     ui[key] = value

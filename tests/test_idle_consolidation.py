@@ -17,6 +17,7 @@ import threading
 import time
 import types
 import unittest
+from unittest import mock
 
 import agent_loop
 
@@ -187,10 +188,9 @@ class MaterialTests(IdleConsolidationCase):
         self.assertEqual(mark, 4)
 
     def test_budget_keeps_the_end_of_the_window(self):
-        saved = agent_loop.get_runtime_config("compact_chunk_tokens")
-        agent_loop.set_runtime_config("compact_chunk_tokens", 4000)
-        self.addCleanup(agent_loop.set_runtime_config,
-                        "compact_chunk_tokens", saved)
+        patch = mock.patch.object(agent_loop, "aux_share", lambda task, part, window=None: 4000)
+        patch.start()
+        self.addCleanup(patch.stop)
         big = [{"role": "user", "content": "x" * 40000},
                {"role": "assistant", "content": "y" * 40000},
                {"role": "user", "content": "the conclusion"}]

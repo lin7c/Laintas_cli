@@ -8,25 +8,16 @@ foreground pruning and compaction.
 Manual `/compact`, `/compact --force`, context-overflow recovery, and
 consecutive output-truncation recovery are all preserved.
 
-## The window the percentages are taken from
+## The budget the percentages are taken from
 
-The budget is not the model's nominal window. `context_trigger_share` (default
-`0.60`) states the share of the model's REAL window we intend to be holding
-when compaction fires, and the window to budget against is solved backwards
-from it through the output reserve, the measured per-request overhead and
-`compact_auto_ratio`. Both model-specific inputs come from the gateway, which
-maintains them per model and reports them on every response in `_budget`
-(`contextWindow`, `providerMax`); they are remembered per model in
-`~/.laintas/model_windows.json` and also picked up from `/api/models`
-(`modelCapabilities`) so a model that has not been called yet is not budgeted
-blind. `/max` raises the share to the whole window — only the model's own
-output ceiling is still held back. `/compact status` prints the share actually
-reached.
-
-A window too small to give anything back (60% of it would not cover the output
-reserve) is used whole instead of scaled. An explicit `model_context_window`
-still wins over all of this, and `context_window_adopt_cap` remains available
-as an optional absolute ceiling (`0` = none).
+The thread's budget is one node of the layered context budget
+(`docs/context-budget.md`): the model's real window minus the `output` reserve
+is the input, and the thread gets what the system prompt, tool schemas and
+live tail leave of it. The window itself is the one the gateway reports per
+model on every response (`_budget.contextWindow`, remembered in
+`~/.laintas/model_windows.json`); nothing solves a smaller window from a
+trigger share any more. `/compact status` prints the share of the real window
+the foreground trigger sits at.
 
 ## Budget and configuration
 
@@ -40,14 +31,14 @@ size, and the current background task state.
 | Runtime config | Default | Purpose |
 | --- | ---: | --- |
 | `compact_background` | `true` | Enable background pre-compaction |
-| `compact_background_ratio` | `0.70` | Background trigger point |
-| `compact_auto_ratio` | `0.90` | Foreground wait / auto-compaction trigger point |
-| `compact_target_ratio` | `0.50` | Target occupancy after pruning; leaves room for next-turn growth |
+| `budget thread compact_background` | `0.70` | Background trigger point |
+| `budget thread compact_foreground` | `0.90` | Foreground wait / auto-compaction trigger point |
+| `budget thread compact_target` | `0.50` | Target occupancy after pruning; leaves room for next-turn growth |
 | `compact_background_cooldown` | `60` | Cooldown seconds between background attempts, kept across user turns |
 | `compact_background_min_tokens` | `2000` | Minimum estimated tokens a background summary must reclaim to be committed |
 | `compact_background_timeout` | `180` | Seconds a background summary may go without finishing a chunk before it is abandoned (a stall budget per chunk, not a total for the job) |
 
-The thresholds must satisfy `target < background < auto <= 1`; invalid
+The thresholds must satisfy `target < background < foreground <= 1`; invalid
 combinations are rejected.
 The target size is an optimization goal — recent messages are never dropped
 outright just to hit a fixed ratio.
@@ -55,15 +46,14 @@ One huge tool result can skip the background band entirely and go straight to
 the foreground fallback.
 
 ```text
-/config compact
+/config budget thread
 /config compact_background false
-/config compact_auto_ratio 1.0
+/config budget thread compact_foreground 1.0
 ```
 
 The last two lines turn pre-compaction off and restore the behavior where
 foreground compaction triggers only at 100% of the usable budget.
-These configs follow the existing runtime-config mechanism; no new global
-persistent settings are added.
+`budget.*` keys persist with the terminal's preferences like UI settings.
 A shared context policy with `auto: false` disables both background and normal
 automatic compaction; explicit manual compaction and overflow recovery are
 unaffected.

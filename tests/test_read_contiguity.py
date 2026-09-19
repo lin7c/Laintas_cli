@@ -75,21 +75,26 @@ class ContiguousReadTests(unittest.TestCase):
 
 
 class BudgetTests(unittest.TestCase):
+    """A result's budget is its share of the thread budget, not a multiple of
+    one fixed character count."""
 
-    def test_read_gets_a_larger_budget_than_shell(self):
-        self.assertGreater(al._tool_output_budget("fs.read", 3000),
-                           al._tool_output_budget("shell.exec", 3000))
-
-    def test_shell_keeps_the_base_budget(self):
-        self.assertEqual(al._tool_output_budget("shell.exec", 3000), 3000)
-
-    def test_budgets_scale_with_the_user_knob(self):
-        self.assertEqual(al._tool_output_budget("fs.read", 6000),
-                         2 * al._tool_output_budget("fs.read", 3000))
+    def test_read_gets_a_page_and_shell_a_result_share(self):
+        state = {"_ctx_page_chars": 40_000, "_ctx_result_chars": 7_000}
+        self.assertEqual(al.tool_result_chars("fs.read", state), 40_000)
+        self.assertEqual(al.tool_result_chars("shell.exec", state), 7_000)
 
     def test_both_tool_taxonomies_get_the_same_budget(self):
-        self.assertEqual(al._tool_output_budget("fs.read", 3000),
-                         al._tool_output_budget("read", 3000))
+        state = {"_ctx_page_chars": 40_000, "_ctx_result_chars": 7_000}
+        self.assertEqual(al.tool_result_chars("fs.read", state),
+                         al.tool_result_chars("read", state))
+
+    def test_the_budget_follows_the_tree_before_anything_is_published(self):
+        small = al.tool_result_chars("shell.exec", {})
+        al.set_runtime_config("budget.thread.tool_result.share", 0.2)
+        try:
+            self.assertGreater(al.tool_result_chars("shell.exec", {}), small)
+        finally:
+            al.reset_runtime_config()
 
 
 class ShellStillCutsItsMiddleTests(unittest.TestCase):

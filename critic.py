@@ -202,7 +202,7 @@ def clip_goal(task: str, *, head: int = 800, tail: int = 700) -> str:
     return f"{text[:head]}\n[...middle omitted...]\n{text[-tail:]}"
 
 
-def summarize_actions(messages, *, max_msgs: int = 14, max_chars: int = 4000,
+def summarize_actions(messages, *, max_msgs: int = 14, max_chars: Optional[int] = None,
                       anchor=None) -> str:
     """Render a compact transcript of the recent thread for the critic: the last
     few messages as ``[step N] role + trimmed content + tool names``.
@@ -225,6 +225,14 @@ def summarize_actions(messages, *, max_msgs: int = 14, max_chars: int = 4000,
     lines = []
     if isinstance(anchor, dict):
         lines.append("[anchor: earlier action] " + _render_message(anchor))
+    if max_chars is None:
+        # The critic's share of the auxiliary model's window (budget tree
+        # `aux.critic.source`), not a fixed 4000 characters.
+        try:
+            import agent_loop as _al
+            max_chars = _al.aux_source_chars("critic")
+        except Exception:
+            max_chars = 4000
     start = max(0, len(messages) - max_msgs)
     for offset, m in enumerate(messages[start:]):
         if not isinstance(m, dict):

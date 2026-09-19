@@ -116,10 +116,32 @@ def forget_folds() -> None:
         _folds.clear()
 
 
+# Why this agent's recent speculative summaries came to nothing. A failed job
+# is released like a finished one, so without this `/compact status` read
+# "idle" through every failure and looked exactly like compaction that never
+# started. Cancellations are not recorded: they are the thread moving on.
+_MAX_FAILURES = 32
+_failures: "OrderedDict[tuple, tuple[int, str]]" = OrderedDict()
+
+
+def _note_outcome(owner, reason):
+    with _lock:
+        if reason is None:
+            _failures.pop(owner, None)
+            return
+        count = _failures.pop(owner, (0, ""))[0] + 1
+        _failures[owner] = (count, reason)
+        while len(_failures) > _MAX_FAILURES:
+            _failures.popitem(last=False)
+
+
 def status(owner):
     with _lock:
         job = _owners.get(owner)
+        failure = _failures.get(owner)
     if job is None:
+        if failure is not None:
+            return f"idle (last {failure[0]} attempt(s) failed: {failure[1]})"
         return "idle"
     if job.cancel.requested() or job.cancelled:
         return "cancelling"
@@ -180,6 +202,10 @@ class Coordinator:
                 # finished summary. Reading the deadline here threw such a
                 # result away and made the main loop redo the whole head.
                 job.cancelled = job.cancel.requested() or job.summary is None
+                if not job.cancel.requested():
+                    _note_outcome(job.owner, None if job.summary is not None
+                                  else "stalled" if time.monotonic() >= job.cancel.deadline
+                                  else "no valid summary")
                 job.done.set()
                 if job.cancelled:
                     _release(job)

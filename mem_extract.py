@@ -84,8 +84,17 @@ MERGE_SYSTEM_PROMPT = (
 
 
 def build_messages(conversation_text: str) -> list:
-    """Return the OpenAI-format messages for the extraction call."""
-    convo = str(conversation_text or "")[:12000]
+    """Return the OpenAI-format messages for the extraction call.
+
+    The source is the `aux.mem_extract.source` share of the auxiliary model's
+    window; callers already cut to it, and this keeps a direct caller bounded.
+    """
+    try:
+        import agent_loop as _al
+        limit = _al.aux_source_chars("mem_extract")
+    except Exception:
+        limit = 12000
+    convo = str(conversation_text or "")[:limit]
     return [{
         "role": "user",
         "content": (

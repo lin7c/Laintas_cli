@@ -158,7 +158,7 @@ class ArgumentCompletionTests(unittest.TestCase):
         self.assertEqual(self._complete("/v enterprise "), ["on", "off", "gateway"])
         self.assertEqual(self._complete("/policy disabled "), ["--yes"])
         self.assertIn("--plain", self._complete("/agents "))
-        self.assertEqual(self._complete("/prop "), ["sys"])
+        self.assertEqual(self._complete("/prop "), ["sys", "budget"])
 
     def test_help_completes_command_names(self):
         self.assertIn("model", self._complete("/help mod"))

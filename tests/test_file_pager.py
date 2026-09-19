@@ -83,9 +83,9 @@ class PageTableTests(unittest.TestCase):
         self.assertEqual([[1, 1], [2, 2]],
                          file_pager.build_page_table(wide, 8_000))
 
-    def test_page_size_follows_context_headroom_within_bounds(self):
-        self.assertEqual(file_pager.PAGE_MIN_CHARS, file_pager.page_chars_for(1_000))
-        self.assertEqual(file_pager.PAGE_MAX_CHARS, file_pager.page_chars_for(10_000_000))
+    def test_page_size_is_the_published_share_without_a_ceiling(self):
+        self.assertEqual(12_345, file_pager.page_chars_for(12_345))
+        self.assertEqual(3_000_000, file_pager.page_chars_for(3_000_000))
         self.assertEqual(file_pager.PAGE_DEFAULT_CHARS, file_pager.page_chars_for(0))
 
 
@@ -140,7 +140,7 @@ class PagedReadTests(unittest.TestCase):
         self.path = os.path.join(self.tmp.name, "module.py")
         with open(self.path, "w", encoding="utf-8") as fh:
             fh.write(_py_source(60))
-        self.state = {"_ctx_headroom_chars": 30_000}
+        self.state = {"_ctx_page_chars": 10_500}
         self.ctx = tools.ToolCtx(cwd=self.tmp.name, agent_id="a1",
                                  state=self.state)
 
@@ -187,21 +187,19 @@ class PagedReadTests(unittest.TestCase):
             self.assertEqual(b + 1, c)
 
     def test_a_whole_page_is_delivered_not_cut_by_the_generic_budget(self):
-        """The page is sized against real headroom; the loop's generic 24k
-        per-result budget would otherwise hand back a page the reader cannot
-        finish, and the two sizings would contradict each other."""
+        """The page is the `read_page` share; the generic per-result budget
+        must not hand back a page the reader cannot finish."""
         roomy = tools.ToolCtx(cwd=self.tmp.name, agent_id="roomy",
-                              state={"_ctx_headroom_chars": 400_000})
+                              state={"_ctx_page_chars": 140_000})
         r = tools._bi_fs_read({"path": self.path}, roomy)
         rendered = agent_loop._format_tool_result_for_loop("fs.read", r, 3000)
         self.assertNotIn("NOT shown", rendered)
         self.assertGreater(len(rendered), 24_000)
-        # Same file, less headroom -> more, smaller pages: the page follows the
-        # room available at the moment the file is opened.
+        # Same file, a smaller share -> more, smaller pages.
         cramped = tools._bi_fs_read(
             {"path": self.path},
             tools.ToolCtx(cwd=self.tmp.name, agent_id="cramped",
-                          state={"_ctx_headroom_chars": 30_000}))
+                          state={"_ctx_page_chars": 10_500}))
         self.assertGreater(cramped["pages"], r["pages"])
 
     def test_offset_or_limit_is_a_targeted_window_and_does_not_page(self):
@@ -247,7 +245,7 @@ class PagedReadTests(unittest.TestCase):
     def test_cursors_are_per_agent_but_the_page_table_is_not_shared_state(self):
         self.read()
         self.read(page="next")
-        other_state = {"_ctx_headroom_chars": 30_000}
+        other_state = {"_ctx_page_chars": 10_500}
         other = tools.ToolCtx(cwd=self.tmp.name, agent_id="a2", state=other_state)
         r = tools._bi_fs_read({"path": self.path}, other)
         self.assertEqual(1, r["page"])
@@ -272,7 +270,7 @@ class ProjectionTests(unittest.TestCase):
         self.path = os.path.join(self.tmp.name, "module.py")
         with open(self.path, "w", encoding="utf-8") as fh:
             fh.write(_py_source(60))
-        self.state = {"_ctx_headroom_chars": 30_000, "_pager_msgs": {}}
+        self.state = {"_ctx_page_chars": 10_500, "_pager_msgs": {}}
         self.ctx = tools.ToolCtx(cwd=self.tmp.name, agent_id="a1",
                                  state=self.state)
         self.thread = [{"role": "user", "content": "review it"}]
@@ -418,8 +416,13 @@ class LoopIntegrationTests(unittest.TestCase):
             with open("big.py", "w", encoding="utf-8") as fh:
                 fh.write(_py_source(260))
             agent_loop.set_runtime_config("paged_reads", True)
+            # Pages are a share of the thread budget, which follows the model
+            # window: pin it, or the result depends on what this machine last
+            # remembered about some real model.
             with mock.patch.object(self.agent_persistence, "AGENTS_DIR",
-                                   os.path.join(self.tmp.name, "agents")):
+                                   os.path.join(self.tmp.name, "agents")), \
+                    mock.patch.object(agent_loop, "_effective_context_window",
+                                      return_value=64_000):
                 self.result = agent_loop.run_agent_loop(
                     deps, "read big.py", {}, {}, [], max_loops_override=8)
                 return self.result
@@ -488,7 +491,7 @@ class VisibilityGateTests(unittest.TestCase):
         self.path = os.path.join(self.tmp.name, "module.py")
         with open(self.path, "w", encoding="utf-8") as fh:
             fh.write(_py_source(60))
-        self.state = {"_ctx_headroom_chars": 30_000}
+        self.state = {"_ctx_page_chars": 10_500}
         self.ctx = tools.ToolCtx(cwd=self.tmp.name, agent_id="a1",
                                  state=self.state)
 
@@ -565,7 +568,7 @@ class BodyCacheTests(unittest.TestCase):
 
     def _ctx(self, agent):
         return tools.ToolCtx(cwd=self.tmp.name, agent_id=agent,
-                             state={"_ctx_headroom_chars": 30_000})
+                             state={"_ctx_page_chars": 10_500})
 
     def test_a_second_agent_gets_the_cached_body_byte_for_byte(self):
         first = tools._bi_fs_read({"path": self.path}, self._ctx("a1"))
@@ -610,7 +613,7 @@ class HandRolledPagingTests(unittest.TestCase):
         self.path = os.path.join(self.tmp.name, "module.py")
         with open(self.path, "w", encoding="utf-8") as fh:
             fh.write(_py_source(60))
-        self.state = {"_ctx_headroom_chars": 30_000}
+        self.state = {"_ctx_page_chars": 10_500}
         self.ctx = tools.ToolCtx(cwd=self.tmp.name, agent_id="walker",
                                  state=self.state)
 
@@ -684,7 +687,7 @@ class RefusedReadTests(unittest.TestCase):
         self.path = os.path.join(self.tmp.name, "module.py")
         with open(self.path, "w", encoding="utf-8") as fh:
             fh.write(_py_source(60))
-        self.state = {"_ctx_headroom_chars": 30_000}
+        self.state = {"_ctx_page_chars": 10_500}
         self.ctx = tools.ToolCtx(cwd=self.tmp.name, agent_id="reader",
                                  state=self.state)
 
@@ -759,7 +762,7 @@ class CacheGeometryTests(unittest.TestCase):
         params.setdefault("path", self.path)
         return tools._bi_fs_read(params, tools.ToolCtx(
             cwd=self.tmp.name, agent_id=agent,
-            state={"_ctx_headroom_chars": headroom}))
+            state={"_ctx_page_chars": int(headroom * 0.35)}))
 
     def test_a_different_page_table_does_not_read_another_agents_page(self):
         small = self._read("a1", 30_000)

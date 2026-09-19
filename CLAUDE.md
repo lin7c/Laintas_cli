@@ -197,7 +197,7 @@ All tunable parameters are accessible via `get_runtime_config()`/`set_runtime_co
 | `max_tokens` | 0 | Output-token cap to REQUEST. 0 = take the model's full budget (the gateway grants `min(provider ceiling, context window - prompt)`). A positive value only lowers that, never raises it |
 | `max_debug_entries` | 50 | Debug ring buffer size |
 | `loop_delay` | 0.2 | Seconds between loop iterations |
-| `output_truncate` | 3000 | Char limit for `lastOutput` tail |
+| `budget …` | see `context_policy/budget.json` | Layered context budget: every share and floor of the prompt, one word per level (`/config budget system share 0.2`; `/config budget system` lists a level). `/config import|export <file>` moves any settings as one-`/config`-line-per-setting `.config` files. Details in `docs/context-budget.md` |
 | `terminal_tail_lines` | 20 | Lines shown in sub-terminal snapshot |
 | `heartbeat_interval` | 30 | Seconds between agent heartbeats |
 | `staleness_limit` | 3 | Consecutive no-command steps before auto-exit |

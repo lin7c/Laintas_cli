@@ -44,17 +44,13 @@ import re
 import threading
 from typing import Optional
 
-#: Page sizing. The page is sized from the context headroom at the moment the
-#: file is FIRST opened, then frozen with the table: a 10k-line file read with
-#: 150k tokens free is three pages, and stays three pages for the rest of the
-#: session even as the thread fills up. Turning a page frees the previous one,
-#: so a big page no longer accumulates — which is exactly what made large reads
-#: expensive before eviction existed.
-PAGE_MIN_CHARS = 8_000
-PAGE_MAX_CHARS = 120_000
-PAGE_HEADROOM_RATIO = 0.35
-#: Fallback when the loop has not published a headroom estimate (tests, tools
-#: called outside a turn). Matches the loop's own per-result fs.read budget.
+#: Page sizing. A page is the budget tree's `read_page` share of the thread
+#: budget (agent_loop publishes it as `_ctx_page_chars`), frozen with the table
+#: when the file is first opened: page numbers must not move under a session
+#: that is quoting them. Turning a page frees the previous one, so a big page
+#: never accumulates. There is no ceiling of its own — the share is the bound.
+#: The default only applies when no loop published a size (tests, tools
+#: called outside a turn).
 PAGE_DEFAULT_CHARS = 24_000
 
 #: Boundaries are nudged onto a structural line so a page does not end halfway
@@ -162,13 +158,9 @@ def _boundary_re(path: str):
     return None
 
 
-def page_chars_for(headroom_chars: int) -> int:
-    """How many characters one page may hold, given the context headroom."""
-    if headroom_chars <= 0:
-        target = PAGE_DEFAULT_CHARS
-    else:
-        target = int(headroom_chars * PAGE_HEADROOM_RATIO)
-    return max(PAGE_MIN_CHARS, min(PAGE_MAX_CHARS, target))
+def page_chars_for(page_chars: int) -> int:
+    """Characters one page may hold: the published share, or the default."""
+    return int(page_chars) if page_chars and page_chars > 0 else PAGE_DEFAULT_CHARS
 
 
 def build_page_table(path: str, page_chars: int) -> list:
@@ -328,7 +320,7 @@ def _trim(store: dict) -> None:
 
 
 def get_file_state(state: dict, path: str, fp: tuple,
-                   headroom_chars: int, seq: float) -> dict:
+                   page_chars: int, seq: float) -> dict:
     """This agent's record for one file, rebuilt when the file changed.
 
     The page table is frozen on creation: page numbers must not move under a
@@ -340,9 +332,13 @@ def get_file_state(state: dict, path: str, fp: tuple,
         entry["seq"] = seq
         return entry
     changed = entry is not None
+    size = page_chars_for(page_chars)
     entry = {
         "fp": list(fp),
-        "pages": build_page_table(path, page_chars_for(headroom_chars)),
+        # Kept with the table: the reader's byte allowance for a page has to
+        # follow the size the table was built with, not a separate constant.
+        "page_chars": size,
+        "pages": build_page_table(path, size),
         "page": 0,             # 0 = never opened
         "pins": [],
         "reads": {},
@@ -551,11 +547,11 @@ def note_window(state: dict, path: str, start: int, end: int) -> int:
     return streak
 
 
-def walk_notice(path: str, start: int, streak: int, headroom_chars: int) -> str:
+def walk_notice(path: str, start: int, streak: int, page_chars: int) -> str:
     """What to tell a caller that is turning pages by hand."""
     if streak < WALK_NOTICE_AFTER:
         return ""
-    pages = build_page_table(path, page_chars_for(headroom_chars))
+    pages = build_page_table(path, page_chars_for(page_chars))
     if not pages:
         return ""
     page = page_of_line(pages, start)

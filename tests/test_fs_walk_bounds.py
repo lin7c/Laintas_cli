@@ -199,7 +199,7 @@ class GrepStreamingTests(unittest.TestCase):
             self.assertIn(f"offset={first['count']}", first["note"])
 
             rendered = agent_loop._format_tool_result_for_loop(
-                "fs.ls", first, 3000)
+                "fs.ls", first, agent_loop.tool_result_chars("fs.ls", ctx.state))
             self.assertNotIn("middle cut", rendered)
             self.assertIsInstance(
                 json.loads(rendered[:rendered.rindex("\n[")]), list)

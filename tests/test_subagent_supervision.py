@@ -392,12 +392,11 @@ class ProviderWindowMemoryTests(unittest.TestCase):
         agent_loop._note_provider_context_window(1_000_000, 128_000)
         self._cold_start()
         agent_loop._model_capabilities_seen.clear()      # only the file remains
-        # Solved from context_trigger_share and the model's own parameters, not
-        # the 64000 default the process would otherwise start from.
+        # The real window, not the 64000 the process would otherwise start from.
         self.assertEqual(
             {"window": 1_000_000, "maxOutput": 128_000},
             agent_loop.model_capability("test-model"))
-        self.assertEqual(794_666, agent_loop._effective_context_window())
+        self.assertEqual(1_000_000, agent_loop._effective_context_window())
 
     def test_nothing_remembered_falls_back_to_the_default(self):
         self._cold_start()

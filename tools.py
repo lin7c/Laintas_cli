@@ -1016,8 +1016,8 @@ def _resolve_page(params: dict, ctx: ToolCtx, abs_path: str) -> tuple:
     except Exception:
         pass
     fp = file_pager.fingerprint(abs_path)
-    headroom = int(state.get("_ctx_headroom_chars") or 0)
-    entry = file_pager.get_file_state(state, abs_path, fp, headroom, time.time())
+    page_chars = int(state.get("_ctx_page_chars") or 0)
+    entry = file_pager.get_file_state(state, abs_path, fp, page_chars, time.time())
     if not entry.get("pages"):
         return None, 0, 0, []
 
@@ -1200,7 +1200,11 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
     abs_path = os.path.abspath(os.path.join(ctx.cwd or os.getcwd(), path)) \
         if not os.path.isabs(path) else path
 
-    max_bytes = int(params.get("max_bytes", 200_000) or 200_000)
+    # A read's allowance is a page — the `read_page` share of the thread
+    # budget — plus the line-number gutter; the loop cuts contiguous reads
+    # on a line and names the next offset, so nothing past it is lost.
+    max_bytes = int(params.get("max_bytes")
+                    or int(_result_budget("fs.read", ctx) * 1.5))
     line_numbers = bool(params.get("line_numbers", True))
 
     # ── Mode selection ────────────────────────────────────────────────────
@@ -1227,10 +1231,15 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
     if _page_state is not None:
         offset, _end = _page_state["pages"][_page_no - 1]
         limit = _end - offset + 1
-        max_bytes = max(max_bytes, 4_000)
+        # The page is the bound: allow what the table was built with, plus the
+        # line-number gutter, so a page is never cut by the generic byte cap.
+        _page_size = int(_page_state.get("page_chars") or 0)
+        max_bytes = max(max_bytes, 4_000, int(_page_size * 1.5))
     else:
         offset = max(1, int(params.get("offset", 1) or 1))
-        limit = max(1, int(params.get("limit", 2000) or 2000))
+        # No line count of its own: to the end of the file, bounded by the
+        # page allowance above.
+        limit = max(1, int(params.get("limit") or sys.maxsize))
 
     # ── Already in front of you? ──────────────────────────────────────────
     # Helpwo refuses a read whose range it has already served; the piece it is
@@ -1265,7 +1274,7 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
                                        offset + limit - 1)
             _walk = _fpw.walk_notice(
                 abs_path, offset, _streak,
-                int(ctx.state.get("_ctx_headroom_chars") or 0))
+                int(ctx.state.get("_ctx_page_chars") or 0))
             if _walk:
                 _page_notice.append(_walk)
         except Exception:
@@ -1393,10 +1402,9 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
         result["page"] = _page_no
         result["pages"] = len(_page_state["pages"])
         result["page_reads"] = _repeat_count
-        # A page is sized from the context headroom; the loop's generic
-        # per-result budget (8 x output_truncate) would then cut it back to
-        # 24k and hand the model a page it cannot finish. The page carries its
-        # own allowance so the two sizings cannot contradict each other.
+        # The page carries its own allowance (the `read_page` share plus room
+        # for the footer) so the page and the per-result budget cannot
+        # contradict each other.
         result["_budget_chars"] = len(body) + 4_000
         import file_pager as _fp2
         _fp2.cache_body(abs_path, _fingerprint_for_cache, _page_no, {
@@ -1759,8 +1767,49 @@ def _bi_fs_write(params: dict, ctx: ToolCtx) -> dict:
 #: loop — which for a JSON array means the model receives syntactically broken
 #: JSON with no way to ask for the rest. Bounded here instead, with an offset,
 #: so the cut is the tool's own and is always resumable.
-FS_LS_DEFAULT_LIMIT = 100
-FS_LS_MAX_LIMIT = 5000
+
+
+def _result_budget(tool_name: str, ctx) -> int:
+    """This result's share of the thread budget, in characters — the same
+    figure the loop renders it with, so a tool that fits itself to it is
+    never cut again downstream. Shares are calibrated on a 1M-token model
+    (context_policy/budget.json) and scale with the window; no tool carries a
+    fixed count or byte limit of its own."""
+    state = getattr(ctx, "state", None)
+    try:
+        import agent_loop as _al
+        return _al.tool_result_chars(tool_name, state if isinstance(state, dict) else None)
+    except Exception:
+        return 24_000
+
+
+def _listing_entry_chars(entry) -> int:
+    """What one entry costs in the loop's rendering (a JSON array, indent=2)."""
+    text = json.dumps(entry, ensure_ascii=False, indent=2, default=str)
+    return len(text) + 2 * (text.count("\n") + 1) + 2
+
+
+def _take_within_budget(entries, budget: int, *, skip: int = 0, limit=None):
+    """``(taken, next_offset)`` from an iterable of entries.
+
+    Skips the first ``skip``, then takes entries while the rendered array
+    stays within ``budget`` characters (always at least one, so a single huge
+    entry still arrives) and, if the caller asked for one, ``limit`` of them.
+    ``next_offset`` is where a follow-up call resumes, or None at the end.
+    Lazy: an iterable that walks a tree stops walking as soon as it is full.
+    """
+    taken, used, index = [], 2, 0
+    for entry in entries:
+        if index < skip:
+            index += 1
+            continue
+        cost = _listing_entry_chars(entry)
+        if taken and (used + cost > budget or (limit is not None and len(taken) >= limit)):
+            return taken, index
+        taken.append(entry)
+        used += cost
+        index += 1
+    return taken, None
 
 
 def _bi_fs_ls(params: dict, ctx: ToolCtx) -> dict:
@@ -1769,22 +1818,28 @@ def _bi_fs_ls(params: dict, ctx: ToolCtx) -> dict:
         if not os.path.isabs(path) else path
     try:
         offset = max(0, int(params.get("offset", 0) or 0))
-        limit = int(params.get("limit", FS_LS_DEFAULT_LIMIT)
-                    or FS_LS_DEFAULT_LIMIT)
+        limit = params.get("limit")
+        limit = max(1, int(limit)) if limit not in (None, "") else None
     except (TypeError, ValueError):
         return {"ok": False, "error": "offset and limit must be integers"}
-    limit = max(1, min(limit, FS_LS_MAX_LIMIT))
     try:
         names = sorted(os.listdir(abs_path))
-        entries = []
-        for name in names[offset:offset + limit]:
-            full = os.path.join(abs_path, name)
-            entries.append({
-                "name": name,
-                "type": "dir" if os.path.isdir(full) else "file",
-                "size": os.path.getsize(full) if os.path.isfile(full) else None,
-            })
-        _fs_ls_fit_budget(entries)
+
+        def _described(chosen):
+            for name in chosen:
+                full = os.path.join(abs_path, name)
+                yield {
+                    "name": name,
+                    "type": "dir" if os.path.isdir(full) else "file",
+                    "size": os.path.getsize(full) if os.path.isfile(full) else None,
+                }
+
+        # As many entries as this result's share holds (or `limit`, if the
+        # caller asked for fewer), described lazily so a huge directory is
+        # not stat()ed past the point the answer is full.
+        entries, _next = _take_within_budget(
+            _described(names[offset:]),
+            max(1_000, _result_budget("fs.ls", ctx) - 400), limit=limit)
         result = {"ok": True, "result": entries, "path": abs_path,
                   "count": len(entries), "total": len(names), "offset": offset}
         if offset + len(entries) < len(names):
@@ -1795,35 +1850,6 @@ def _bi_fs_ls(params: dict, ctx: ToolCtx) -> dict:
         return result
     except OSError as e:
         return {"ok": False, "error": str(e)}
-
-
-def _fs_ls_fit_budget(entries: list) -> None:
-    """Drop trailing entries until the rendered array fits the loop's budget.
-
-    A count alone cannot do this: 100 entries is 6k characters with short names
-    and 12k with long ones. What the count could not prevent is the generic
-    middle-truncation upstream, which for a JSON array means the model gets two
-    half-arrays with an unknown number of entries missing between them and no
-    offset that recovers them. Trimming here keeps the array intact and keeps
-    the resume offset honest, because `count` is computed after this runs.
-    """
-    if not entries:
-        return
-    try:
-        import agent_loop as _al
-        budget = _al._tool_output_budget(
-            "fs.ls", int(_al.get_runtime_config("output_truncate") or 3000))
-    except Exception:
-        budget = 6000
-    budget = max(1_000, budget - 400)           # room for the metadata footer
-    for _ in range(64):                         # bounded; each pass drops ≥1/8
-        size = len(json.dumps(entries, ensure_ascii=False, indent=2,
-                              default=str))
-        if size <= budget or len(entries) <= 1:
-            return
-        keep = max(1, min(len(entries) - 1,
-                          int(len(entries) * budget / size)))
-        del entries[keep:]
 
 
 def _bi_time_now(params: dict, ctx: ToolCtx) -> dict:
@@ -2804,7 +2830,11 @@ def _walk_files(root: str, limit: "_WalkLimit", *, max_depth: int = _FS_MAX_DEPT
             limit.reason = "deadline"
             return
         try:
-            with os.scandir(current) as entries:
+            with os.scandir(current) as listing:
+                # Name order, not the filesystem's: a result served in pages
+                # (`offset`) must list the same entries in the same order on
+                # every call, and a truncated walk must be reproducible.
+                entries = sorted(listing, key=lambda item: item.name)
                 children = []
                 for entry in entries:
                     limit.entries += 1
@@ -2858,7 +2888,24 @@ def _bi_fs_grep(params: dict, ctx: ToolCtx) -> dict:
     search_path = params.get("path", ".")
     include = params.get("include", "**/*")
     exclude = params.get("exclude", "")
-    max_results = int(params.get("max_results", 100))
+    # No count of its own: matches are taken until this result's share of the
+    # thread budget is full, and `offset` resumes after them. `max_results`
+    # stays available for a caller that wants fewer.
+    try:
+        max_results = params.get("max_results")
+        max_results = max(1, int(max_results)) if max_results not in (None, "") else None
+        offset = max(0, int(params.get("offset") or 0))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "offset and max_results must be integers"}
+    budget = max(1_000, _result_budget("fs.grep", ctx) - 400)
+    # How much of one matching line is shown: the `grep_line` share
+    # (`/config budget thread grep_line share`), not a fixed 500 characters.
+    try:
+        import agent_loop as _al
+        _state = getattr(ctx, "state", None)
+        line_chars = max(1, _al.thread_chars("grep_line", _state if isinstance(_state, dict) else None))
+    except Exception:
+        line_chars = 500
     case_sensitive = params.get("case_sensitive", True)
     # The size ceiling only guards the directory walk against generated blobs;
     # a file the caller named is always read (line by line, so size is not a
@@ -2886,9 +2933,7 @@ def _bi_fs_grep(params: dict, ctx: ToolCtx) -> dict:
     exclude_patterns = ([e for e in exclude.split(",") if e.strip()]
                         + _fs_active_excludes(abs_path))
 
-    results = []
     files_scanned = 0
-    truncated = False
     skipped = []
 
     limit = _WalkLimit(abs_path)
@@ -2929,23 +2974,21 @@ def _bi_fs_grep(params: dict, ctx: ToolCtx) -> dict:
 
         files = _candidates()
 
-    for filepath in files:
-        if len(results) >= max_results:
-            truncated = True
-            break
+    def _matches():
+        nonlocal files_scanned
+        for filepath in files:
+            yield from _file_matches(filepath)
 
+    def _file_matches(filepath):
+        nonlocal files_scanned
         # Check exclusions
         try:
             rel = os.path.relpath(filepath, abs_path) if os.path.isdir(abs_path) else os.path.basename(filepath)
         except ValueError:
             rel = filepath
-        excluded = False
         for exc in exclude_patterns:
             if fnmatch.fnmatch(filepath, exc) or fnmatch.fnmatch(rel, exc):
-                excluded = True
-                break
-        if excluded:
-            continue
+                return
 
         # Check file size
         try:
@@ -2953,34 +2996,37 @@ def _bi_fs_grep(params: dict, ctx: ToolCtx) -> dict:
             if fsize > max_file_size and not explicit_file:
                 skipped.append({"file": os.path.relpath(filepath, base_dir),
                                 "reason": f"larger than max_file_size ({fsize} bytes)"})
-                continue
+                return
         except OSError as exc:
             skipped.append({"file": os.path.relpath(filepath, base_dir),
                             "reason": f"unreadable: {exc.strerror or exc}"})
-            continue
+            return
 
         try:
             with open(filepath, "r", encoding="utf-8", errors="replace") as f:
                 for lineno, line in enumerate(f, 1):
                     if regex.search(line):
-                        results.append({
+                        text = line.rstrip('\n')
+                        yield {
                             "file": os.path.relpath(filepath, base_dir),
                             "line": lineno,
-                            "content": line.rstrip('\n')[:500],
-                        })
-                        if len(results) >= max_results:
-                            truncated = True
-                            break
+                            "content": (text[:line_chars] + "…") if len(text) > line_chars else text,
+                        }
         except OSError as exc:
             skipped.append({"file": os.path.relpath(filepath, base_dir),
                             "reason": f"unreadable: {exc.strerror or exc}"})
-            continue
+            return
         files_scanned += 1
+
+    results, next_offset = _take_within_budget(
+        _matches(), budget, skip=offset, limit=max_results)
+    truncated = next_offset is not None
 
     payload = {
         "ok": True,
         "result": results,
         "matches": len(results),
+        "offset": offset,
         "files_scanned": files_scanned,
         "truncated": truncated or bool(limit.reason) or bool(skipped),
         "entries_scanned": limit.entries,
@@ -2988,6 +3034,11 @@ def _bi_fs_grep(params: dict, ctx: ToolCtx) -> dict:
         # not `path` -- joining them onto `path` doubles the directory.
         "paths_relative_to": base_dir,
     }
+    if next_offset is not None:
+        # Said where to resume: a result that stopped at its share without
+        # naming the next offset would read as "these are all the matches".
+        payload["note"] = (f"more matches than this result holds - continue "
+                           f"with offset={next_offset}")
     notes = []
     if limit.reason:
         notes.append(_walk_incomplete_note(limit))
@@ -3083,7 +3134,15 @@ def _bi_fs_glob(params: dict, ctx: ToolCtx) -> dict:
 
     patterns = params.get("pattern", "**/*")
     base_path = params.get("path", ".")
-    max_results = int(params.get("max_results", 200))
+    # Like fs.grep: no count of its own. Every match is found (the walk has
+    # its own guard against runaway trees), sorted, then served from `offset`
+    # for as long as this result's share of the thread budget holds.
+    try:
+        max_results = params.get("max_results")
+        max_results = max(1, int(max_results)) if max_results not in (None, "") else None
+        offset = max(0, int(params.get("offset") or 0))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "offset and max_results must be integers"}
 
     if isinstance(patterns, str):
         patterns = [p.strip() for p in patterns.split(",") if p.strip()]
@@ -3110,9 +3169,6 @@ def _bi_fs_glob(params: dict, ctx: ToolCtx) -> dict:
     # One walk for every pattern, not one per pattern: the traversal is the
     # expensive half, and the patterns are cheap predicates on each path.
     for path, is_dir in _walk_files(walk_root, limit, max_depth=max_depth):
-        if len(results) >= max_results:
-            truncated = True
-            break
         rel_to_base = os.path.relpath(path, abs_base).replace(os.sep, "/")
         if not any(match(rel_to_base) for match in matchers):
             continue
@@ -3134,14 +3190,24 @@ def _bi_fs_glob(params: dict, ctx: ToolCtx) -> dict:
 
     # Sort: dirs first, then by path
     results.sort(key=lambda x: (0 if x["type"] == "dir" else 1, x["path"]))
+    total = len(results)
+    results, next_offset = _take_within_budget(
+        results, max(1_000, _result_budget("fs.glob", ctx) - 400),
+        skip=offset, limit=max_results)
+    truncated = next_offset is not None
 
     payload = {
         "ok": True,
         "result": results,
         "matches": len(results),
+        "total": total,
+        "offset": offset,
         "truncated": truncated or bool(limit.reason),
         "entries_scanned": limit.entries,
     }
+    if next_offset is not None:
+        payload["note"] = (f"{total - next_offset} more match(es) - continue "
+                           f"with offset={next_offset}")
     if limit.reason:
         # Said out loud, because "no matches" and "gave up before reaching
         # them" are the same empty list and must not read the same way.
@@ -3412,7 +3478,19 @@ def _bi_web_fetch(params: dict, ctx: ToolCtx) -> dict:
     if not url:
         return {"ok": False, "error": "missing 'url'"}
 
-    max_bytes = int(params.get("max_bytes", 65536))
+    # The page text kept is the `web_fetch` share of the thread budget
+    # (~69K tokens on a 1M model) — more than one result shows, because the
+    # loop keeps both ends of it and saves the whole text for paging. The raw
+    # download cap never enters the context and stays web_search's own.
+    if params.get("max_bytes"):
+        max_bytes = int(params["max_bytes"])
+    else:
+        try:
+            import agent_loop as _al
+            _state = getattr(ctx, "state", None)
+            max_bytes = _al.thread_chars("web_fetch", _state if isinstance(_state, dict) else None)
+        except Exception:
+            max_bytes = 65536
     timeout = int(params.get("timeout", 15))
     identity = (params.get("identity") or "").strip() or None
 
@@ -4251,7 +4329,7 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
     # two-agent batch wasted most of the budget while a six-agent batch
     # overflowed it — and 400 chars is barely a paragraph, so the findings the
     # batch exists to collect were cut off mid-sentence.
-    _result_budget = int(_al.get_runtime_config("output_truncate") or 3000)
+    _result_budget = _al.tool_result_chars("agent.wait")
     _per_child = max(400, (_result_budget - 200) // max(1, len(child_ids)))
 
     def _fit(text: str, limit: int) -> str:
@@ -5716,7 +5794,9 @@ def _bi_terminal_read(params: dict, ctx: ToolCtx) -> dict:
     try:
         cursor = (int(requested_cursor) if requested_cursor is not None
                   else int(cursors.get(key, 0)))
-        max_chars = max(1, min(int(params.get("max_chars", 4000)), 20000))
+        # The tool_result share, not a fixed 4000/20000: the cursor pages
+        # through the rest either way.
+        max_chars = max(1, int(params.get("max_chars") or _result_budget("terminal.read", ctx)))
     except (TypeError, ValueError):
         return {"ok": False, "error": "cursor and max_chars must be integers"}
     cursor = max(0, min(cursor, len(full)))
@@ -7143,6 +7223,7 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
 
     lock = getattr(session, "command_lock", None)
     entered = False
+    _capture = None
     try:
         if lock is not None:
             lock.acquire()
@@ -7168,6 +7249,17 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
                     "result": "", "returncode": -1, "via": via,
                     "_shell_stuck": True,
                 }
+        # Everything this command prints, however much: the session buffer
+        # keeps only its recent tail, and a long output used to lose its
+        # beginning (start marker included) before it was read.
+        _begin_capture = getattr(session, "begin_capture", None)
+        if callable(_begin_capture):
+            _candidate = _begin_capture()
+            _text = getattr(_candidate, "text", None)
+            # Only a real capture: a session stand-in without one falls back
+            # to reading the session buffer, as before.
+            if callable(_text) and isinstance(_text(), str):
+                _capture = _candidate
         session.send_keys(wrapped + "\n")
         # Idle clock: `timeout` bounds SILENCE, not runtime. A command that
         # keeps printing keeps its lease for as long as it needs.
@@ -7187,7 +7279,9 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
             try:
                 session.read_output(timeout=0.1)
                 output_from_fn = getattr(session, "output_from", None)
-                if (isinstance(_output_total, int)
+                if _capture is not None:
+                    new_content = _capture.text()
+                elif (isinstance(_output_total, int)
                         and callable(output_from_fn)):
                     new_content = (
                         output_from_fn(old_len) if old_len
@@ -7263,6 +7357,11 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
                 "via": via, "_shell_stuck": not recovered,
                 "terminal_recovered": bool(recovered)}
     finally:
+        if _capture is not None:
+            try:
+                session.end_capture(_capture)
+            except Exception:
+                pass
         if entered:
             lock.release()
 
@@ -8588,13 +8687,15 @@ def _bi_browser_snapshot(params: dict, ctx: ToolCtx) -> dict:
     sess, err = _browser_resolve_session(params)
     if sess is None:
         return {"ok": False, "error": err}
-    max_chars = int(params.get("max_chars", 5000) or 5000)
+    # No cut of its own: the whole page text goes to the loop, which keeps
+    # both ends within this result's share and saves the rest for paging.
+    max_chars = int(params.get("max_chars") or 0)
     try:
         def _job(page):
             text = page.inner_text("body")
             url = page.url
             title = page.title()
-            if len(text) > max_chars:
+            if max_chars and len(text) > max_chars:
                 text = text[:max_chars] + f"\n... (truncated, {len(text)} total chars)"
             result = f"url: {url}\ntitle: {title}\n\n{text}"
             refs = []
@@ -9632,8 +9733,9 @@ def register_builtin_tools() -> None:
                                 "description": "targeted window: 1-based starting line"},
                     "limit": {"type": "integer",
                                 "description": "targeted window: max lines to return"},
-                    "max_bytes": {"type": "integer", "default": 200000,
-                                  "description": "hard byte cap on the returned payload"},
+                    "max_bytes": {"type": "integer",
+                                  "description": "optional byte cap; by default one page, "
+                                                 "the page share of the context budget"},
                     "line_numbers": {"type": "boolean", "default": True,
                                        "description": "prepend each line with 'N\u2192 '"},
                 },
@@ -9690,9 +9792,9 @@ def register_builtin_tools() -> None:
                     "path": {"type": "string", "default": "."},
                     "offset": {"type": "integer", "minimum": 0, "default": 0,
                                "description": "skip this many entries (continue a listing)"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 5000,
-                              "default": 100,
-                              "description": "max entries to return"},
+                    "limit": {"type": "integer", "minimum": 1,
+                              "description": "optional: at most this many entries; by default as "
+                                             "many as fit this result's share of the context budget"},
                 },
             },
             invoke=_bi_fs_ls,
@@ -9824,7 +9926,11 @@ def register_builtin_tools() -> None:
                                                "one with '/' is anchored ('src/*.ts' = only directly under src)"},
                     "exclude": {"type": "string", "default": "",
                                 "description": "comma-separated glob patterns to exclude"},
-                    "max_results": {"type": "integer", "default": 100},
+                    "max_results": {"type": "integer",
+                                    "description": "optional: at most this many matches; by default as "
+                                                   "many as fit this result's share of the context budget"},
+                    "offset": {"type": "integer", "minimum": 0, "default": 0,
+                               "description": "skip this many matches (continue where the note says)"},
                     "case_sensitive": {"type": "boolean", "default": True},
                     "max_file_size": {"type": "integer", "default": _GREP_MAX_FILE_SIZE,
                                       "description": "bytes; larger files in a directory walk are skipped and listed "
@@ -9844,7 +9950,11 @@ def register_builtin_tools() -> None:
                     "pattern": {"type": "string", "default": "**/*",
                                 "description": "comma-separated glob patterns (e.g., '**/*.py' or 'src/**/*.ts')"},
                     "path": {"type": "string", "default": ".", "description": "base directory for search"},
-                    "max_results": {"type": "integer", "default": 200},
+                    "max_results": {"type": "integer",
+                                    "description": "optional: at most this many paths; by default as "
+                                                   "many as fit this result's share of the context budget"},
+                    "offset": {"type": "integer", "minimum": 0, "default": 0,
+                               "description": "skip this many paths (continue where the note says)"},
                 },
                 "required": [],
             },
@@ -9894,8 +10004,10 @@ def register_builtin_tools() -> None:
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "URL to fetch"},
-                    "max_bytes": {"type": "integer", "default": 65536,
-                                  "description": "max characters of text to return (the raw download cap is separate and larger)"},
+                    "max_bytes": {"type": "integer",
+                                  "description": "optional: characters of page text to keep; by default "
+                                                 "the web_fetch share of the context budget. Past what one "
+                                                 "result shows, the full text is saved and can be paged with read"},
                     "timeout": {"type": "integer", "default": 15,
                                 "description": "request timeout in seconds"},
                     "identity": {
@@ -11097,7 +11209,9 @@ def register_builtin_tools() -> None:
                 "properties": {
                     "name": {"type": "string", "description": "Terminal name"},
                     "cursor": {"type": "integer", "description": "Optional explicit cursor"},
-                    "max_chars": {"type": "integer", "default": 4000},
+                    "max_chars": {"type": "integer",
+                                  "description": "optional: characters per read; by default "
+                                                 "this result's share of the context budget. The cursor continues the rest"},
                 },
                 "required": ["name"],
             },
@@ -11149,7 +11263,9 @@ def register_builtin_tools() -> None:
                                                "as long as it keeps printing."},
                     "poll_interval": {"type": "number", "default": 0.2},
                     "cursor": {"type": "integer", "description": "Optional explicit output cursor"},
-                    "max_chars": {"type": "integer", "default": 4000},
+                    "max_chars": {"type": "integer",
+                                  "description": "optional: characters per read; by default "
+                                                 "this result's share of the context budget. The cursor continues the rest"},
                 },
                 "required": ["name"],
             },
@@ -11672,7 +11788,9 @@ def register_builtin_tools() -> None:
                 "type": "object",
                 "properties": {
                     "session": {"type": "string", "description": "session name (uses most recent if omitted)"},
-                    "max_chars": {"type": "integer", "default": 5000, "description": "max text length"},
+                    "max_chars": {"type": "integer",
+                                  "description": "optional text cut; by default the whole page, sized "
+                                                 "to this result's share of the context budget with the rest saved for paging"},
                 },
             },
             invoke=_bi_browser_snapshot,

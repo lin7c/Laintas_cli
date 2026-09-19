@@ -33,7 +33,9 @@ def env(monkeypatch):
         "window": 30000, "usable": 10000, "reserved": 12000, "overhead": 2000})
     monkeypatch.setattr(loop, "_thread_tokens", lambda ms: sum(
         len(m.get("content", "")) + 50 for m in ms))
-    monkeypatch.setattr(loop.ctxpol, "keep_recent_tokens", lambda usable: 1000)
+    _share = loop.thread_share
+    monkeypatch.setattr(loop, "thread_share", lambda name, budget:
+                        1000 if name == "recent_tail" else _share(name, budget))
     monkeypatch.setattr(loop, "_consolidate_memories_on_compact", mock.Mock())
     deps = SimpleNamespace(call_backend=mock.Mock(), console=mock.Mock(render_terminal=False))
     entered, release = threading.Event(), threading.Event()
@@ -64,7 +66,7 @@ def env(monkeypatch):
         assert not job.thread.is_alive()
     bg.current.reset(token)
     loop.reset_runtime_config()
-    assert bg.status(loop._compaction_owner(state)) == "idle"
+    assert bg.status(loop._compaction_owner(state)).startswith("idle")
     bg.forget_folds()
     bg._parked.clear()
 
@@ -170,6 +172,19 @@ def test_failed_background_job_falls_back_at_hard_threshold(env, monkeypatch):
     monkeypatch.setattr(loop, "_compact_thread_messages", fallback)
     assert env.check()
     fallback.assert_called_once()
+
+
+def test_failed_attempts_are_reported_instead_of_plain_idle(env):
+    """A failed job is released like a finished one; status used to read
+    "idle" through every failure."""
+    owner = loop._compaction_owner(env.state)
+    env.summarizer.side_effect = lambda *a, **k: None
+    env.check()
+    assert env.coordinator.job.done.wait(2)
+    env.coordinator.take(0)
+    assert bg.status(owner) == "idle (last 1 attempt(s) failed: no valid summary)"
+    bg._note_outcome(owner, None)
+    assert bg.status(owner) == "idle"
 
 
 def test_failed_attempt_is_not_repeated_at_every_checkpoint(env):
@@ -324,9 +339,9 @@ def test_background_summary_must_reclaim_enough_tokens(env):
     assert env.messages == before
 
 
-@pytest.mark.parametrize("key,value", [("compact_background_ratio", .95),
-    ("compact_target_ratio", .75), ("compact_auto_ratio", .6),
-    ("compact_background_ratio", float("nan")), ("compact_background_timeout", 0)])
+@pytest.mark.parametrize("key,value", [("budget.thread.compact_background", .95),
+    ("budget.thread.compact_target", .75), ("budget.thread.compact_foreground", .6),
+    ("budget.thread.compact_background", float("nan")), ("compact_background_timeout", 0)])
 def test_invalid_thresholds_are_rejected(env, key, value):
     with pytest.raises(ValueError):
         loop.set_runtime_config(key, value)

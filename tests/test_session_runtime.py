@@ -23,6 +23,12 @@ import session_store
 import task_manager
 
 
+
+def _fixed_recent_tail(tokens):
+    """thread_share with the recent tail pinned, everything else untouched."""
+    original = agent_loop.thread_share
+    return lambda name, budget: tokens if name == "recent_tail" else original(name, budget)
+
 class SubTerminalSessionTests(unittest.TestCase):
     def test_tmux_exit_marker_preserves_real_status_but_is_hidden_from_output(self):
         session = laintas_cli.SubTerminalSession("printf final; exit 13")
@@ -705,7 +711,7 @@ class AgentTerminationTests(unittest.TestCase):
                     mock.patch.object(agent_loop, "_summarize_head_in_chunks", side_effect=summarize), \
                     mock.patch.object(agent_loop, "compaction_budget", return_value={
                         "window": 30000, "usable": 10000, "reserved": 12000, "overhead": 2000}), \
-                    mock.patch.object(agent_loop.ctxpol, "keep_recent_tokens", return_value=1000), \
+                    mock.patch.object(agent_loop, "thread_share", _fixed_recent_tail(1000)), \
                     mock.patch.object(agent_loop, "_thread_tokens", side_effect=lambda ms:
                         sum(len(m.get("content", "")) + 50 for m in ms)):
                 result = agent_loop.run_agent_loop(deps, "continue", {}, {
@@ -772,7 +778,6 @@ class AgentTerminationTests(unittest.TestCase):
         deps, _calls = self._summary_deps()
         shown = []
         deps.status = self._recording_status(shown)
-        agent_loop.set_runtime_config("model_context_window", 32000)
         # A real 4k thread budget, after output reserve and fixed overhead.
         budget_patch = mock.patch.object(agent_loop, "compaction_budget", return_value={
             "window": 32000, "reserved": 12000, "overhead": 8000, "usable": 4000})
@@ -794,7 +799,7 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(len(shown), 1)
         self.assertIn("Esc/Ctrl+C cancel", shown[0])
-        self.assertIn("/config model_context_window", shown[0])
+        self.assertIn("/config budget thread compact_foreground", shown[0])
         self.assertIn("/config compact_review_effort none", shown[0])
 
     def test_manual_compaction_does_not_open_a_second_status(self):
@@ -818,15 +823,18 @@ class AgentTerminationTests(unittest.TestCase):
             yield updates.append
 
         deps.status = status
-        agent_loop.set_runtime_config("compact_chunk_tokens", 4000)
+        self._small_summarizer()
         head = [{"role": "user", "content": "word " * 5000},
-                {"role": "assistant", "content": "word " * 5000}]
-        count = len(agent_loop._summary_source_chunks(head, 4000))
+                {"role": "assistant", "content": "word " * 5000},
+                {"role": "user", "content": "word " * 5000}]
         with agent_loop._compaction_status(deps, "Compacting") as progress:
             result = agent_loop._summarize_head_in_chunks(
                 deps, {}, head,
                 None, "EN", "", progress=progress)
         self.assertTrue(result)
+        count = max(int(x.split("Chunk 1/")[1].split(" ")[0])
+                    for x in updates if "Chunk 1/" in x)
+        self.assertGreater(count, 1)
         self.assertTrue(any(f"Chunk 1/{count} · generating summary" in x for x in updates))
         self.assertTrue(any(f"Chunk {count}/{count} · reviewing summary" in x for x in updates))
         self.assertIn(f"Chunks completed: {count}/{count}", updates[-1])
@@ -854,7 +862,7 @@ class AgentTerminationTests(unittest.TestCase):
                 "window": 20000, "usable": 10000}), \
                 mock.patch.object(agent_loop, "_thread_tokens", side_effect=lambda ms:
                                   sum(len(m.get("content", "")) + 10 for m in ms)), \
-                mock.patch.object(agent_loop.ctxpol, "keep_recent_tokens", return_value=2000):
+                mock.patch.object(agent_loop, "thread_share", _fixed_recent_tail(2000)):
             self.assertTrue(agent_loop._compact_thread_messages(messages, deps, {}, "EN", state))
             self.assertIn("CONVERSATION SUMMARY", messages[0]["content"])
             self.assertEqual(messages[1]["role"], "assistant")
@@ -875,7 +883,7 @@ class AgentTerminationTests(unittest.TestCase):
                 "window": 20000, "usable": 10000}), \
                 mock.patch.object(agent_loop, "_thread_tokens", side_effect=lambda ms:
                                   8000 + len(ms[2]["content"]) if len(ms) > 8 else 100), \
-                mock.patch.object(agent_loop.ctxpol, "keep_recent_tokens", return_value=2000), \
+                mock.patch.object(agent_loop, "thread_share", _fixed_recent_tail(2000)), \
                 mock.patch.object(agent_loop.ctxpol, "truncate_tool_output", return_value="short"):
             self.assertTrue(agent_loop._compact_thread_messages(
                 messages, deps, {}, "EN", {"_thread_messages": messages}))
@@ -893,6 +901,13 @@ class AgentTerminationTests(unittest.TestCase):
                 self.assertEqual(calls[1]["task_kind"], "compaction_review")
                 self.assertEqual(calls[1].get("effort_override"), expected)
                 self.assertIsNone(calls[0].get("effort_override"))
+
+    def _small_summarizer(self, window=16_000):
+        """A summarizer window small enough that a long head needs several
+        slices: a slice is whatever the window leaves, nothing else."""
+        patch = mock.patch.object(agent_loop, "_summary_window", lambda model: window)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     @staticmethod
     def _multi_chunk_thread():
@@ -916,7 +931,7 @@ class AgentTerminationTests(unittest.TestCase):
             return recorded(**kwargs)
 
         deps.call_backend = backend
-        agent_loop.set_runtime_config("compact_chunk_tokens", 4000)
+        self._small_summarizer()
         messages = self._multi_chunk_thread()
         before = copy.deepcopy(messages)
 
@@ -934,7 +949,7 @@ class AgentTerminationTests(unittest.TestCase):
         event = threading.Event()
         event.set()
         deps, calls = self._summary_deps()
-        agent_loop.set_runtime_config("compact_chunk_tokens", 4000)
+        self._small_summarizer()
         messages = self._multi_chunk_thread()
 
         changed = agent_loop._compact_thread_messages(
@@ -945,22 +960,26 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_status_trigger_and_headroom_share_one_budget(self):
-        agent_loop.set_runtime_config("model_context_window", 200000)
         with mock.patch.object(agent_loop, "_per_request_overhead_tokens",
                                return_value=50000), \
+             mock.patch.object(agent_loop, "_effective_context_window",
+                               return_value=200000), \
              mock.patch.object(agent_loop, "model_capability",
-                               return_value={}):  # unreported model: policy buffer is the reserve
+                               return_value={}):  # unreported ceiling: the output share is the reserve
             budget = agent_loop.compaction_budget({})
             status = agent_loop.session_context_status({"_thread_messages": []})
             state = {}
             agent_loop._publish_context_headroom([], state)
-        self.assertEqual(budget["usable"], 130000)   # 200k - 20k reserve - 50k overhead
+        self.assertEqual(budget["usable"], 100000)   # 200k - 25% output - 50k overhead
         self.assertEqual(status["usable"], budget["usable"])
-        self.assertEqual(state["_ctx_headroom_chars"], int(130000 * 3.5))
+        # Pages and results are shares of that same thread budget.
+        self.assertEqual(state["_ctx_page_chars"],
+                         int(agent_loop.thread_share("read_page", 100000) * 3.5))
+        self.assertEqual(state["_ctx_result_chars"],
+                         int(agent_loop.thread_share("tool_result", 100000) * 3.5))
 
     def test_policy_auto_off_stops_automatic_but_not_forced_compaction(self):
         policy = dict(agent_loop.ctxpol.load(), auto=False)
-        agent_loop.set_runtime_config("model_context_window", 32000)
         # A real 4k thread budget, after output reserve and fixed overhead.
         budget_patch = mock.patch.object(agent_loop, "compaction_budget", return_value={
             "window": 32000, "reserved": 12000, "overhead": 8000, "usable": 4000})
@@ -981,7 +1000,6 @@ class AgentTerminationTests(unittest.TestCase):
 
     def test_automatic_compaction_also_consolidates_memories(self):
         agent_loop.set_runtime_config("mem_extract_on_compact", True)
-        agent_loop.set_runtime_config("model_context_window", 32000)
         # A real 4k thread budget, after output reserve and fixed overhead.
         budget_patch = mock.patch.object(agent_loop, "compaction_budget", return_value={
             "window": 32000, "reserved": 12000, "overhead": 8000, "usable": 4000})
@@ -1030,8 +1048,7 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertNotIn("Auto-compact", manual)
         self.assertIn("/config compact_review_effort none", manual)
         auto = agent_loop.compaction_status_text(auto=True, usable=150000, window=200000)
-        self.assertIn("/config context_trigger_share", auto)
-        self.assertIn("/max", auto)
+        self.assertIn("/config budget thread compact_foreground", auto)
         agent_loop.set_runtime_config("compact_review_effort", "none")
         self.assertNotIn("compact_review_effort",
                          agent_loop.compaction_status_text(auto=False))
@@ -1060,8 +1077,6 @@ class AgentTerminationTests(unittest.TestCase):
             {"role": "assistant", "content": "second"},
         ]
         with mock.patch.object(agent_loop, "_summary_source_chunks", return_value=["first", "second"]), \
-                mock.patch.object(agent_loop, "get_runtime_config",
-                                  side_effect=lambda key: 6000 if key == "compact_chunk_tokens" else None), \
                 mock.patch.object(agent_loop, "_llm_summarize",
                                   side_effect=[self._STRUCTURED_SUMMARY, None]) as summarize, \
                 mock.patch.object(agent_loop, "_llm_review_summary",
