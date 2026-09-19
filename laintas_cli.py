@@ -9173,7 +9173,7 @@ def _format_billing_refusal(code: str, body: dict, lang: str = "EN") -> str:
 
     `lang` is accepted for signature stability with call_backend_stream but
     unused: product-authored runtime surfaces are English-only. The server's
-    detail and remedy pass through as sent \u2014 they carry the numbers.
+    detail and remedy pass through as sent — they carry the numbers.
     """
     if code not in _BILLING_REFUSAL_HEADLINES:
         return ""
@@ -9187,7 +9187,7 @@ def _format_billing_refusal(code: str, body: dict, lang: str = "EN") -> str:
     if page and page not in remedy:
         remedy = (f"{remedy} " if remedy else "") + f"Check it at {page}."
     line = f"{headline}: {detail}" if detail else headline
-    return f"{line} \u2014 {remedy}" if remedy else line
+    return f"{line} — {remedy}" if remedy else line
 
 def call_backend_stream(
     session: dict,
@@ -9245,7 +9245,7 @@ def call_backend_stream(
                             if str(effort_override or "").strip().lower() in _EFFORT_PIN_VALUES
                             else str(get_runtime_config("reasoning_effort"))),
         # Billing attribution: without this the gateway books the call under
-        # its default product ("helpwo") \u2014 quota and /usage stats then miss it.
+        # its default product ("helpwo") — quota and /usage stats then miss it.
         "source": "cli",
         # Which machine this turn ran on. The gateway's experience labels each
         # episode with it, so work on the Windows laptop and on a server that
@@ -9259,7 +9259,7 @@ def call_backend_stream(
         # Ask the gateway for the list of model ids an HWO `@model` pin may
         # name. Only the gateway knows which accounts an operator has switched
         # on, and this CLI has no other place that tells the model what is
-        # pinnable \u2014 without it a workflow either pins an id that fails the
+        # pinnable — without it a workflow either pins an id that fails the
         # step or never pins at all. The gateway adds it only when this request
         # actually carries the hwo tool.
         "injectModelPins": bool(tools_enabled),
@@ -9284,7 +9284,7 @@ def call_backend_stream(
     # model for this one call.
     selected_model = model_override or get_selected_model()
     if selected_model:
-        # model_override=="auto" \u2192 send empty model so the gateway triggers
+        # model_override=="auto" → send empty model so the gateway triggers
         # embedding-based auto-routing (/api/chat/stream on the gateway side).
         payload["model"] = "" if model_override == "auto" else selected_model
     if provider_override:
@@ -9335,7 +9335,7 @@ def call_backend_stream(
     headers, cookies = backend_profiles.request_auth(backend_profile, session)
 
     try:
-        # \u2500\u2500 Retry loop for transient failures (opencode retry.ts pattern) \u2500\u2500
+        # ── Retry loop for transient failures (opencode retry.ts pattern) ──
         # Retries on: Timeout, ConnectionError, HTTP 429, HTTP 5xx.
         # Does NOT retry on: 4xx (except 429), context-overflow (handled by
         # reactive compaction in agent_loop), or InterruptedError.
@@ -9359,7 +9359,7 @@ def call_backend_stream(
                     # CLI -> nginx -> gateway -> model upstream, and a
                     # scale-to-zero upstream boots in ~250s while the gateway
                     # retries through it. At 120s this end gave up first and
-                    # reported "Response ended prematurely" \u2014 a timeout dressed
+                    # reported "Response ended prematurely" — a timeout dressed
                     # up as a broken response. nginx sits at 360s; this stays
                     # above it so whichever layer is genuinely stuck is the one
                     # that reports it.
@@ -9401,7 +9401,7 @@ def call_backend_stream(
                 }
 
             # Check if retryable (429 or 5xx). A spent allowance is answered with
-            # 429 too, and waiting seconds does not bring back a monthly quota \u2014
+            # 429 too, and waiting seconds does not bring back a monthly quota —
             # retrying it only delays the explanation.
             _retryable = ((response.status_code == 429 or response.status_code >= 500)
                           and _billing_refusal_code(response) not in _BILLING_FINAL_CODES)
@@ -9427,7 +9427,7 @@ def call_backend_stream(
                     time.sleep(_delay)
                 continue
 
-            # Non-retryable error \u2014 return immediately
+            # Non-retryable error — return immediately
             try:
                 err_data = response.json()
                 # Headline + detail + remedy, and "refused" rather than "Server
@@ -9443,7 +9443,7 @@ def call_backend_stream(
                 if _title and _title not in _msg:
                     _msg = f"{_title}: {_msg}"
                 if err_data.get("remedy"):
-                    _msg += f" \u2014 {err_data['remedy']}"
+                    _msg += f" — {err_data['remedy']}"
                 _prefix = "Request refused" if response.status_code < 500 else "Server Error"
                 return {"reply": f"{_prefix}: {_msg}", "command": "", "rules": "", "done": True, "error": True,
                         "error_code": _code}
@@ -9489,7 +9489,7 @@ def call_backend_stream(
             if evt.get("error"):
                 if accumulated:
                     # Content was already streamed and the failure came after
-                    # it. Keep the content \u2014 but do NOT let it pass as a
+                    # it. Keep the content — but do NOT let it pass as a
                     # finished turn: an upstream that dies mid-answer (a key
                     # that cuts long thinking streams, a dropped provider
                     # connection) leaves a partial that reads like a complete
@@ -9504,12 +9504,12 @@ def call_backend_stream(
                 # headline. Dropping the detail turned an explained failure
                 # back into an opaque one.
                 _detail = str(evt.get("details") or "").strip()
-                return {"reply": f"Server Error: {evt['error']}" + (f" \u2014 {_detail}" if _detail else ""),
+                return {"reply": f"Server Error: {evt['error']}" + (f" — {_detail}" if _detail else ""),
                         "tool_calls": [], "done": True, "error": True,
                         "error_code": str(evt.get("code") or "")}
             if "_budget" in evt:
                 # The gateway's answer to "how many output tokens do I actually
-                # have?" \u2014 the clamped ceiling, plus the window room left after
+                # have?" — the clamped ceiling, plus the window room left after
                 # this prompt. Arrives before any content.
                 budget_info = dict(evt["_budget"] or {})
                 continue
@@ -9544,7 +9544,7 @@ def call_backend_stream(
                     _diag_events.append(k)
             _choices = evt.get("choices")
             # Capture the OpenAI-native finish_reason (provider passes it through
-            # verbatim \u2014 "stop" / "tool_calls" / "length"). Authoritative signal
+            # verbatim — "stop" / "tool_calls" / "length"). Authoritative signal
             # for whether the turn ended vs. expects tool results back.
             if isinstance(_choices, list) and _choices:
                 _fr = _choices[0].get("finish_reason")
@@ -9614,7 +9614,7 @@ def call_backend_stream(
 
         # An interrupt that lands while the stream is idle ends the generator
         # without yielding, so the in-loop check above never runs. Report it
-        # here or a cancelled turn would be mistaken for a finished one \u2014 and
+        # here or a cancelled turn would be mistaken for a finished one — and
         # for a *truncated* one, since `got_any_event` is false when the
         # interrupt arrived during thinking.
         if interrupt_event is not None and interrupt_event.is_set():
@@ -9636,10 +9636,10 @@ def call_backend_stream(
 
         # Output-truncation signal: the model ran right up against the token
         # ceiling. When a big single-response write (e.g. a whole-file fs.write)
-        # exceeds max_tokens, the JSON never closes and parsing fails \u2014 but the
+        # exceeds max_tokens, the JSON never closes and parsing fails — but the
         # cause is length, not formatting, so it needs a different nudge.
         # finish_reason == "length" is the provider's OWN truncation signal and
-        # the authoritative one \u2014 trust it first.
+        # the authoritative one — trust it first.
         #
         # The completion-token heuristic below is only a *fallback* for backends
         # that omit finish_reason. It must never override a clean stop: on
@@ -9650,7 +9650,7 @@ def call_backend_stream(
         _completion_tokens = int((billing_info or {}).get("completionTokens", 0) or 0)
         # Compare against what the gateway GRANTED, not what we asked for. The
         # request is clamped against the provider ceiling and the remaining
-        # window, so the local config value is not the limit in force \u2014 using
+        # window, so the local config value is not the limit in force — using
         # it made the heuristic both miss real truncations (granted < asked)
         # and invent false ones (granted > asked). Fall back to the local
         # value only for gateways too old to report a budget.
@@ -9676,7 +9676,7 @@ def call_backend_stream(
         # provider said. Measured against the live gateway: a turn cut off in
         # the middle of an fs.write reported finish_reason "tool_calls", not
         # "length", with 1790 bytes of arguments ending in an unterminated
-        # string \u2014 so both the provider signal and the completion-token
+        # string — so both the provider signal and the completion-token
         # heuristic (which only applies when the finish is NOT clean) missed it,
         # and the call ran with args={}. Of 56 calls in one session that all
         # stopped exactly at the 512-token ceiling, only 2 were being flagged.
@@ -9687,25 +9687,25 @@ def call_backend_stream(
         # empty and reasoning is not", which mis-fires on the single most common
         # case: a truncated tool call puts its bytes in delta.tool_calls[].
         # arguments, never in delta.content, so `reply` is empty on a plain
-        # output overrun too \u2014 and a reasoning model always has reasoning text.
+        # output overrun too — and a reasoning model always has reasoning text.
         # The overrun was therefore reported as reasoning exhaustion and the
         # model got told to think less instead of to write in chunks.
         # Decide it here, where the two channels are still distinguishable.
-        #   "tool_args"  \u2014 cut off mid tool-call; the write was too big
-        #   "reasoning"  \u2014 reasoning ate the budget, nothing came out
-        #   "output"     \u2014 prose ran past the ceiling
+        #   "tool_args"  — cut off mid tool-call; the write was too big
+        #   "reasoning"  — reasoning ate the budget, nothing came out
+        #   "output"     — prose ran past the ceiling
         # An upstream that cut the stream after partial content is a truncated
-        # turn no matter what finish_reason says \u2014 there usually is none.
+        # turn no matter what finish_reason says — there usually is none.
         if _upstream_cut:
             _truncated_turn = True
         # Unparseable arguments are not, by themselves, evidence of a token
         # overrun. A model that emits invalid JSON, or a proxy that drops
         # bytes mid-frame, produces the same damaged call while finishing far
-        # under the granted ceiling \u2014 and the "output hit the token limit,
+        # under the granted ceiling — and the "output hit the token limit,
         # write fewer lines" remedy is then both wrong and useless, because
         # there was no limit involved. Separate the two where the evidence
         # allows: well under the grant, with no provider truncation signal,
-        # means malformed, not too long. (Deliberately conservative \u2014 a
+        # means malformed, not too long. (Deliberately conservative — a
         # completion anywhere near the ceiling stays classified as a real
         # overrun, since a genuinely cut-off write can still report a clean
         # finish_reason.)
@@ -9730,7 +9730,7 @@ def call_backend_stream(
             else:
                 _truncation_kind = "output"
 
-        # \u2500\u2500 Local usage accounting (/usage) \u2014 every completed call lands here
+        # ── Local usage accounting (/usage) — every completed call lands here
         # regardless of tool/prose outcome. Backends that send no _billing
         # (external/unmetered) get chars/4 estimates so stats still move.
         # When auto-routing is active, streamed_model holds the real model name
@@ -9773,15 +9773,15 @@ def call_backend_stream(
                             else streamed_model if streamed_model not in ("", "auto")
                             else selected_model)
         # ONLY the user's own turn may name the model on the prompt. Every
-        # auxiliary call goes through this same function on its own model \u2014
+        # auxiliary call goes through this same function on its own model —
         # compaction, its review pass, intent routing, the critic, memory
-        # extraction, vision \u2014 and each of them used to write its model into
+        # extraction, vision — and each of them used to write its model into
         # the status cache. So the prompt would sit there reading
         # "@cf/google/gemma-4-26b-a4b-it" (the vision family the gateway picked
         # for one image the turn happened to look at) while every actual
         # request went to the model the user had selected. Nothing reset it:
         # the next main-loop call only overwrites it if it echoes a name, so a
-        # wrong label survived until the following turn \u2014 which is exactly why
+        # wrong label survived until the following turn — which is exactly why
         # it looked intermittent.
         if _effective_model and _is_foreground_turn(task_kind):
             _update_status_cache(model=_effective_model)
@@ -9790,7 +9790,7 @@ def call_backend_stream(
         # Content is always prose now (tool calls come natively); surface it.
         prose_reply = raw_text
 
-        # \u2500\u2500 1. NATIVE PATH (primary) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        # ── 1. NATIVE PATH (primary) ───────────────────────────────────────
         # Model invoked tools through the OpenAI function-calling channel
         # (delta.tool_calls). This is the normal end-to-end mode: the backend
         # passes the provider's native tool_calls straight through.
@@ -9798,13 +9798,13 @@ def call_backend_stream(
             # L4: If the turn was truncated mid-tool-call, the JSON arguments
             # of THAT call are incomplete and _native_to_tool_calls falls back
             # to args={}. Drop the damaged calls so they are not silently
-            # executed with empty/invalid arguments \u2014 but keep the intact ones.
+            # executed with empty/invalid arguments — but keep the intact ones.
             #
             # Dropping the whole turn is what turned one over-long write into a
             # dead end: a batch is normally "read A, read B, write C", so
             # discarding A and B as well left the turn with nothing to show,
             # the thread unchanged, and the model with every reason to emit the
-            # exact same batch again \u2014 cut at the exact same place. Three of
+            # exact same batch again — cut at the exact same place. Three of
             # those in a row is the "cut off 3 consecutive times (tool_args)"
             # stop. Executing the intact prefix advances the conversation, so
             # the retry is a genuinely different request.
@@ -9845,7 +9845,7 @@ def call_backend_stream(
                 "_diag_events": _diag_events + ["parsed_native_tool_calls"],
             }
 
-        # \u2500\u2500 2. Tagged-tool-call compat \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        # ── 2. Tagged-tool-call compat ─────────────────────────────────────
         # Older/regressed models may emit <tool_calls>...</tool_calls> as text
         # instead of using the native channel. Convert so the loop continues.
         tagged_tool_calls = _extract_tagged_tool_calls(accumulated)
@@ -9880,7 +9880,7 @@ def call_backend_stream(
                 "_diag_events": _diag_events + ["parsed_tagged_tool_calls"],
             }
 
-        # \u2500\u2500 3. PROSE FINAL \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        # ── 3. PROSE FINAL ─────────────────────────────────────────────────
         # No tool calls anywhere: return the provider text verbatim.  Do not
         # fabricate a "(no response)" reply because that converts an empty or
         # malformed provider turn into a successful prose completion.
@@ -9928,7 +9928,7 @@ def call_backend_stream(
             "stream_dropped", f"Error: {e}", locals(), tool_name_map)
 
 
-# \u2500\u2500 Agent Registration with Helpwo Backend \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# ── Agent Registration with Helpwo Backend ─────────────────────────────
 
 class TerminalSession:
     """A real PTY shell bridged to the browser over a WebSocket relay.
@@ -9937,8 +9937,8 @@ class TerminalSession:
     one-writer pattern): the reader thread pumps PTY output up, the main
     thread pumps browser input + resizes down into the PTY. Frames are JSON
     text; payload bytes are base64 so arbitrary/binary output survives intact:
-      host \u2192 browser : {"t":"o","d":<b64>}  output    {"t":"exit"}
-      browser \u2192 host : {"t":"i","d":<b64>}  input     {"t":"resize","cols","rows"}
+      host → browser : {"t":"o","d":<b64>}  output    {"t":"exit"}
+      browser → host : {"t":"i","d":<b64>}  input     {"t":"resize","cols","rows"}
     """
 
     def __init__(self, backend_url, agent_id, agent_secret, session_id, cols, rows,
@@ -9986,7 +9986,7 @@ class TerminalSession:
 
         # requests (used for /helpwo's HTTP registration) bundles its own
         # certifi CA store, so it works even when the OS trust store is
-        # missing/broken \u2014 a common state on minimal Linux installs. The
+        # missing/broken — a common state on minimal Linux installs. The
         # websockets library has no such fallback: left to its default
         # ssl.create_default_context(), it trusts the OS store only, and
         # fails with CERTIFICATE_VERIFY_FAILED in exactly that situation.
@@ -10019,7 +10019,7 @@ class TerminalSession:
         self._set_winsize(self.cols, self.rows)
         # A CDN/WAF in front of the backend (Cloudflare Free, in our case)
         # intermittently rejects the WebSocket *upgrade* from this non-browser
-        # client with HTTP 400 \u2014 the plain-HTTPS siblings (register/heartbeat
+        # client with HTTP 400 — the plain-HTTPS siblings (register/heartbeat
         # via `requests`) sail through, but the WS handshake gets fingerprinted
         # and flaked ~1-in-N. It succeeds on retry the vast majority of the
         # time, so retry a few times with short backoff instead of failing the
@@ -10064,7 +10064,7 @@ class TerminalSession:
             self._cleanup()
 
     def _read_input_loop(self):
-        """Main thread: browser \u2192 PTY (input + resize)."""
+        """Main thread: browser → PTY (input + resize)."""
         import base64
         for message in self._ws:  # iterates until the socket closes
             try:
@@ -10084,7 +10084,7 @@ class TerminalSession:
                     pass
 
     def _pump_output(self):
-        """Reader thread: PTY \u2192 browser. Sole writer of the WebSocket."""
+        """Reader thread: PTY → browser. Sole writer of the WebSocket."""
         import base64
         while not self._closed.is_set():
             try:
@@ -10154,8 +10154,8 @@ class AgentRegistry:
             paths, "PROCESS_INSTANCE_ID",
             getattr(paths, "INSTANCE_ID", f"pid-{os.getpid()}"),
         )
-        # \u2500\u2500 Sub-terminal identity (two-end handshake with Helpwo) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-        # depth 0 = primary CLI (auto-registers = "online"). depth \u2265 1 = a
+        # ── Sub-terminal identity (two-end handshake with Helpwo) ────────
+        # depth 0 = primary CLI (auto-registers = "online"). depth ≥ 1 = a
         # nested CLI inside a sub-terminal: it registers ONLY when the user
         # runs /helpwo --remote there (or Helpwo asked for it via term-new), carrying
         # terminal_meta so Helpwo can show the CLI-side name/definition.
@@ -10164,8 +10164,8 @@ class AgentRegistry:
         self.terminal_meta: Optional[dict] = None
         # A nested CLI that exists to BE a runtime environment (the Helpwo
         # app sub-terminal behind /helpwo --remote) rather than a terminal
-        # handed to Helpwo. It registers like a Windows kernel does \u2014 a
-        # workspace, no terminal identity, no parent \u2014 because Helpwo files
+        # handed to Helpwo. It registers like a Windows kernel does — a
+        # workspace, no terminal identity, no parent — because Helpwo files
         # anything carrying `terminal` under the terminal dock and keeps it
         # out of the runtime-environment picker.
         self.as_environment: bool = False
@@ -10208,7 +10208,7 @@ class AgentRegistry:
         self._remote_running = {"task": 0, "control": 0}
         self._remote_stopping = threading.Event()
 
-        # \u2500\u2500 Async event bus (Phase 1) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        # ── Async event bus (Phase 1) ───────────────────────────────────
         # _event_q holds batches of events (each item is a list[dict]).
         # _sender_thread coalesces batches into single POSTs in the background
         # so the REPL/handlers never block on HTTP. _sender_stop tells it to
@@ -10217,14 +10217,14 @@ class AgentRegistry:
         self._sender_thread: Optional[threading.Thread] = None
         self._sender_stop = threading.Event()
 
-        # \u2500\u2500 Active request tracking (Phase A1) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-        # Maps reqId \u2192 threading.Event for abort signalling.
+        # ── Active request tracking (Phase A1) ───────────────────────────
+        # Maps reqId → threading.Event for abort signalling.
         self._active_requests: dict[str, threading.Event] = {}
-        # Maps reqId \u2192 threading.Event + decision for approval flow.
+        # Maps reqId → threading.Event + decision for approval flow.
         self._pending_approvals: dict[str, tuple[threading.Event, dict]] = {}
         self._active_req_lock = threading.RLock()
 
-        # \u2500\u2500 WebRTC peer-to-peer file channel (lazy) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        # ── WebRTC peer-to-peer file channel (lazy) ─────────────────────
         self._webrtc = None  # WebrtcManager | False(unavailable) | None(not yet)
         self._rtc_config: dict = {}
 
@@ -10440,7 +10440,7 @@ class AgentRegistry:
         if self._heartbeat_thread is None or not self._heartbeat_thread.is_alive():
             self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
             self._heartbeat_thread.start()
-        # Start the async event sender alongside heartbeat \u2014 _push_events
+        # Start the async event sender alongside heartbeat — _push_events
         # becomes non-blocking only once this thread is alive.
         self._start_event_sender()
 
@@ -10484,7 +10484,7 @@ class AgentRegistry:
             try:
                 self._do_post_events(batch)
             except Exception:
-                # Never let a POST exception kill the sender \u2014 that would
+                # Never let a POST exception kill the sender — that would
                 # silently break every subsequent _push_events call.
                 pass
 
@@ -10589,14 +10589,14 @@ class AgentRegistry:
         """Start background thread to poll for incoming messages from Helpwo UI.
 
         Args:
-            agent_state_cb: callable() \u2192 dict \u2014 returns current agent state
-            chat_history_cb: callable() \u2192 list \u2014 returns current chat history
+            agent_state_cb: callable() → dict — returns current agent state
+            chat_history_cb: callable() → list — returns current chat history
         """
         if (not self.agent_id or
                 (get_backend_profile().sends_laintas_credentials and not self._session)):
             return
         # Reconnect (/helpwo --remote again, /name) must not stack a second poll
-        # thread \u2014 the existing loop re-reads self.agent_id each iteration.
+        # thread — the existing loop re-reads self.agent_id each iteration.
         if self._message_poll_thread is not None and self._message_poll_thread.is_alive():
             return
         self._message_poll_thread = threading.Thread(
@@ -10626,7 +10626,7 @@ class AgentRegistry:
                     for msg in messages:
                         # Dispatch in a worker so a long-running handler
                         # (chat/delegate can run for minutes) never stalls
-                        # the poll loop \u2014 term-new/term-close/abort from
+                        # the poll loop — term-new/term-close/abort from
                         # Helpwo must stay responsive throughout.
                         kind = msg.get("kind")
                         control = kind in self.REMOTE_CONTROL_KINDS
@@ -10663,8 +10663,8 @@ class AgentRegistry:
         """Dispatch an incoming message by 'kind' per HelpwoAI protocol.
 
         Backwards-compatible: if a message has no 'kind' field, it is treated
-        as a legacy chat message (content \u2192 run_agent_loop / system command).
-        Exactly one 'final' event must be pushed per reqId \u2014 handlers below
+        as a legacy chat message (content → run_agent_loop / system command).
+        Exactly one 'final' event must be pushed per reqId — handlers below
         enforce this; the catch-all also pushes a fail-final on exception.
         """
         self._processing_message.set()
@@ -10730,7 +10730,7 @@ class AgentRegistry:
     def _handle_rtc_offer(self, req_id: str, payload: dict):
         """Accept a WebRTC offer from the browser and answer it, establishing a
         peer-to-peer DataChannel so file transfers bypass the relay server.
-        Does NOT push a 'final' \u2014 the answer/error is delivered as its own event
+        Does NOT push a 'final' — the answer/error is delivered as its own event
         (rtc-answer / rtc-error / rtc-unavailable) keyed to this reqId."""
         mgr = self._ensure_webrtc()
         if mgr is None:
@@ -10748,7 +10748,7 @@ class AgentRegistry:
         Plain messages run their own agent loop in this worker thread (the
         local prompt stays usable; Helpwo streams the events). The shared
         chat history keeps continuity with the local conversation. Slash
-        commands are the exception \u2014 they must execute in the main loop, so
+        commands are the exception — they must execute in the main loop, so
         they still go through REPL injection.
         """
         content = payload.get("message", "")
@@ -10766,12 +10766,12 @@ class AgentRegistry:
 
         # An application's message is conversation, never a command line: a
         # leading "/" would otherwise run as a slash command in this REPL
-        # (/policy disabled, /mode act always, \u2026).
+        # (/policy disabled, /mode act always, …).
         if content.lstrip().startswith("/") and self.app_mode is None:
             done = threading.Event()
             _inject_input(content, done)
             if not done.wait(timeout=120):
-                self._push_final(req_id, "fail", "processing timeout \u2014 main loop busy")
+                self._push_final(req_id, "fail", "processing timeout — main loop busy")
                 return
             state = agent_state_cb() if callable(agent_state_cb) else {}
             summary = state.get("lastReply", "") or state.get("lastOutput", "") or "done"
@@ -10891,7 +10891,7 @@ class AgentRegistry:
     def _handle_exec(self, req_id: str, payload: dict):
         """Run a shell command in a PTY and stream stdout under req_id.
 
-        Pushes cmd-start \u2192 stdout chunks \u2192 cmd-end \u2192 final. PTY merges
+        Pushes cmd-start → stdout chunks → cmd-end → final. PTY merges
         stderr into stdout; splitting is deferred to a later phase.
         """
         cmd = payload.get("command")
@@ -10904,13 +10904,13 @@ class AgentRegistry:
             self._push_final(req_id, "fail", "missing 'command' in payload")
             return
 
-        # \u2500\u2500 Security policy check \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        # ── Security policy check ──────────────────────────────────────
         import policy as _policy
         decision = _policy.evaluate(cmd, cwd, req_id=req_id,
                                     agent_id=self.agent_id)
         if decision.action == "deny":
             self._push_final(req_id, "fail", f"Blocked by policy: {decision.reason}")
-            console.print(f"[red]BLOCKED remote exec: {cmd[:100]} \u2014 {decision.reason}[/red]")
+            console.print(f"[red]BLOCKED remote exec: {cmd[:100]} — {decision.reason}[/red]")
             return
         if (decision.action == "needs_approval"
                 or not get_runtime_config("allow_remote_exec_without_approval")):
@@ -10973,7 +10973,7 @@ class AgentRegistry:
             if chunk:
                 line_buf += chunk
             if line_buf:
-                # Final flush \u2014 may not end in newline (e.g. trailing prompt).
+                # Final flush — may not end in newline (e.g. trailing prompt).
                 self._push(req_id, "stdout", line_buf)
             sess.close()
             rc = sess._returncode
@@ -11006,7 +11006,7 @@ class AgentRegistry:
             return
 
         # One approval for the whole run (same gate as remote exec); the
-        # per-step browser policy is then auto-approved below \u2014 the user
+        # per-step browser policy is then auto-approved below — the user
         # already said yes to exactly this set of tests/targets.
         if not get_runtime_config("allow_remote_exec_without_approval"):
             targets = ", ".join(sorted({str(t.get("target", "?"))[:80]
@@ -11119,14 +11119,14 @@ class AgentRegistry:
                 with _ur.urlopen(req, timeout=8) as resp:
                     body = resp.read().decode("utf-8", "replace")
             except Exception:
-                return True, "robots.txt unreachable \u2014 treated as allowed"
+                return True, "robots.txt unreachable — treated as allowed"
             rp = _rp.RobotFileParser()
             rp.parse(body.splitlines())
             allowed = rp.can_fetch("*", url)
             return allowed, ("allowed by robots.txt" if allowed
                              else "DISALLOWED by robots.txt")
         except Exception as e:
-            return True, f"robots check error ({e}) \u2014 treated as allowed"
+            return True, f"robots check error ({e}) — treated as allowed"
 
     def _handle_analyze_site(self, req_id: str, payload: dict):
         """Capture a public web page for Helpwo's analyze_site tool (analysis &
@@ -11161,7 +11161,7 @@ class AgentRegistry:
                 req_id,
                 f"ANALYZE SITE (reference only): {url}\n"
                 f"robots: {robots_note}\n"
-                f"\u26a0 Downloads another site's rendered UI + observed API for "
+                f"⚠ Downloads another site's rendered UI + observed API for "
                 f"analysis. Only do this for pages you are authorized to access.",
                 os.getcwd(), timeout=300,
             )
@@ -11293,7 +11293,7 @@ class AgentRegistry:
                 except Exception:
                     pass
 
-                # Rendered DOM (size-capped) \u2192 host temp file.
+                # Rendered DOM (size-capped) → host temp file.
                 dom_path = None
                 try:
                     dom = page.evaluate("() => document.documentElement.outerHTML") or ""
@@ -11317,7 +11317,7 @@ class AgentRegistry:
                     shot_desktop = None
 
                 # Mobile full-page screenshot (best-effort; viewport resize may
-                # no-op on some CDP setups \u2014 never fail the run over it).
+                # no-op on some CDP setups — never fail the run over it).
                 shot_mobile = None
                 try:
                     page.set_viewport_size({"width": mweb, "height": 844})
@@ -11331,7 +11331,7 @@ class AgentRegistry:
                 except Exception:
                     shot_mobile = None
 
-                # Observed API log \u2192 host temp JSON file.
+                # Observed API log → host temp JSON file.
                 api_path = None
                 api_count = 0
                 try:
@@ -11357,7 +11357,7 @@ class AgentRegistry:
                 }
                 self._push_final(
                     req_id, "success",
-                    f"analyzed {final_url} \u2014 {api_count} API call(s), "
+                    f"analyzed {final_url} — {api_count} API call(s), "
                     f"{len(assets)} first-party asset(s)",
                     meta={"report": report},
                 )
@@ -11454,7 +11454,7 @@ class AgentRegistry:
                 self._push_final(req_id, "fail", "terminal session is already open")
                 return
 
-        # The relay must be dialed at the SAME Helpwo host the browser is on \u2014
+        # The relay must be dialed at the SAME Helpwo host the browser is on —
         # that host's nginx carries the /term WebSocket-upgrade config and
         # reaches the same gateway. The CLI's own get_backend_url() may point
         # at a different laintas origin (e.g. the main site) whose nginx has
@@ -11479,7 +11479,7 @@ class AgentRegistry:
             scheme = "http" if raw_host.split(":", 1)[0] in ("localhost", "127.0.0.1") else "https"
             backend_url = f"{scheme}://{raw_host}"
         console.print(Panel(
-            f"[bold cyan]Browser opened a terminal[/bold cyan]\n[dim]session {session_id} {symbols.BULLET} {cols}\u00d7{rows}[/dim]\n[dim]relay: {backend_url}[/dim]",
+            f"[bold cyan]Browser opened a terminal[/bold cyan]\n[dim]session {session_id} {symbols.BULLET} {cols}×{rows}[/dim]\n[dim]relay: {backend_url}[/dim]",
             title="Remote Terminal", border_style="cyan",
         ))
         try:
@@ -11601,7 +11601,7 @@ class AgentRegistry:
             self._push_final(req_id, "fail", f"no sub-terminal named '{name}'")
             return
         # PTY-backed nested CLIs can survive a polite close when their stdin
-        # EOF handling wedges \u2014 grab the child pid first and force-kill after.
+        # EOF handling wedges — grab the child pid first and force-kill after.
         child_pid = None
         try:
             child_pid = getattr(getattr(info.session, "_pty", None), "pid", None)
@@ -11641,9 +11641,9 @@ class AgentRegistry:
             request_command_approval=lambda cmd, reason: self._request_approval(
                 req_id, cmd, os.getcwd()) == "approve",
             request_file_write_approval=lambda path, diff, reason: self._request_approval(
-                req_id, f"WRITE {path} \u2014 {reason}", os.getcwd()) == "approve",
+                req_id, f"WRITE {path} — {reason}", os.getcwd()) == "approve",
             request_file_delete_approval=lambda path, preview, reason: self._request_approval(
-                req_id, f"DELETE {path} \u2014 {reason}\n{preview}", os.getcwd(),
+                req_id, f"DELETE {path} — {reason}\n{preview}", os.getcwd(),
                 destructive=True) == "approve",
         )
 
@@ -11673,7 +11673,7 @@ class AgentRegistry:
             self._push_final(req_id, "fail", "missing 'goal' in delegate payload")
             return
 
-        # Register the abort event BEFORE the approval prompt \u2014 an abort that
+        # Register the abort event BEFORE the approval prompt — an abort that
         # lands while we're waiting for approval must find the request (it
         # also force-rejects the pending approval, see _handle_abort).
         abort_ev = threading.Event()
@@ -11700,7 +11700,7 @@ class AgentRegistry:
         loop_input = goal
         if context:
             loop_input = (
-                "[BRIEFING FROM HELPWO \u2014 background from the caller's conversation]\n"
+                "[BRIEFING FROM HELPWO — background from the caller's conversation]\n"
                 + context[:6000]
                 + "\n[END BRIEFING] The briefing is background only. "
                   "Your task is ONLY the goal below.\n\n"
@@ -11721,7 +11721,7 @@ class AgentRegistry:
 
         session = self._session or {}
         # Isolation: a delegated loop should see only its goal + the caller's
-        # briefing \u2014 NOT whatever conversation happens to sit in this CLI's
+        # briefing — NOT whatever conversation happens to sit in this CLI's
         # local REPL. Mirrors how local Helpwo sub-agents are isolated from
         # their parent's history. (chat kind still uses the local history.)
         chat_history = []
@@ -11841,7 +11841,7 @@ class AgentRegistry:
 
         console.print(
             f"[dim green]Approval response for {target}: "
-            f"{decision}" + (f" \u2014 {feedback}" if feedback else "") + "[/dim green]"
+            f"{decision}" + (f" — {feedback}" if feedback else "") + "[/dim green]"
         )
         self._push_final(req_id, "success", f"approval {decision} applied to {target}")
 
@@ -11924,7 +11924,7 @@ class AgentRegistry:
         try:
             self._event_q.put_nowait(events)
         except queue.Full:
-            # Drop oldest to make room \u2014 recovering connectivity matters more
+            # Drop oldest to make room — recovering connectivity matters more
             # than preserving stale telemetry.
             try:
                 self._event_q.get_nowait()
@@ -11935,7 +11935,7 @@ class AgentRegistry:
             except queue.Full:
                 pass
 
-    # \u2500\u2500 Per-request push helpers (HelpwoAI protocol) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    # ── Per-request push helpers (HelpwoAI protocol) ─────────────────────
     def _push(self, req_id: str, type_: str, content: str = "", meta: dict = None):
         """Push a single typed event under a request id."""
         self._push_events(
@@ -11972,7 +11972,7 @@ class AgentRegistry:
             self._remote_control_executor = None
         self._close_remote_terminals()
 
-        # Flush queued events (\u22642s) then stop the sender thread so the
+        # Flush queued events (≤2s) then stop the sender thread so the
         # final unregister POST is the last thing we do.
         if self._sender_thread is not None and self._sender_thread.is_alive():
             self._flush_events(timeout=2.0)
@@ -12002,7 +12002,7 @@ class AgentRegistry:
         self.agent_secret = ""
 
 
-# \u2500\u2500 Debug Display \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# ── Debug Display ───────────────────────────────────────────────────────
 
 def show_debug_browser_interactive() -> None:
     """Browse debug entries without leaving or rebuilding the full-screen UI."""
@@ -12019,7 +12019,7 @@ def show_debug_browser_interactive() -> None:
                 key=f"{entry.timestamp}-{entry.loop}-{index}",
                 badge="AI" if is_ai else "CMD",
                 title=" ".join(str(summary).split())[:110] or "(no response)",
-                subtitle=f"{entry.timestamp[-19:]} \u00b7 {entry.current_path}",
+                subtitle=f"{entry.timestamp[-19:]} · {entry.current_path}",
                 status="error" if entry.error or entry.exec_returncode not in (0, None) else "",
                 status_style="class:error", payload=entry,
                 search_text=" ".join((entry.user_input, entry.exec_stdout,
@@ -12054,7 +12054,7 @@ def show_debug_browser_interactive() -> None:
                 entry.response_raw, ensure_ascii=False, indent=2, default=str)))
         return _ui_multisection_detail(
             f"Debug #{entry.loop}", sections,
-            f"{entry.timestamp} \u00b7 {entry.current_path}")
+            f"{entry.timestamp} · {entry.current_path}")
 
     resource_ui.ResourceBrowser(
         title="Debug Activity", load_items=_load_items,
@@ -12075,7 +12075,7 @@ def show_debug_detail(index: int) -> None:
 
     # Build a multi-panel detail view
     header = (
-        f"[bold cyan]#{e.loop}[/bold cyan] \u2014 {ts}   "
+        f"[bold cyan]#{e.loop}[/bold cyan] — {ts}   "
         f"Path: [dim]{e.current_path}[/dim]"
     )
     console.print(Panel(header, title=f"Debug Entry #{index + 1}"))
@@ -12139,7 +12139,7 @@ def show_debug_detail(index: int) -> None:
         console.print(Panel("\n\n".join(lines), title="Command Execution"))
 
 
-# \u2500\u2500 Terminal Manager \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# ── Terminal Manager ───────────────────────────────────────────────────
 
 def _show_terminal_detail(name: str, cmd: str, sess, created: float, alive: bool) -> None:
     """Show detailed information about a terminal."""
@@ -12268,14 +12268,14 @@ def _show_terminal_manager_once(primary_session=None):
             "Command",
             str(command or "(none)"),
             "",
-            f"Output \u00b7 {len(output)} characters buffered",
+            f"Output · {len(output)} characters buffered",
             screen or "(no output yet)",
         ]
         detail = resource_ui.UIDetail.text(
             item.title, "\n".join(metadata),
-            "Live output \u00b7 refreshes automatically")
+            "Live output · refreshes automatically")
         for index, line in enumerate(detail.lines):
-            if line.text in {"Command", f"Output \u00b7 {len(output)} characters buffered"}:
+            if line.text in {"Command", f"Output · {len(output)} characters buffered"}:
                 detail.lines[index] = resource_ui.UILine(line.text, "class:detail.heading")
         return detail
 
@@ -12345,7 +12345,7 @@ def _show_skill_detail(name: str) -> None:
     if tools:
         lines.append(f"[bold]Tools ({len(tools)}):[/bold]")
         for t in tools:
-            lines.append(f"  [cyan]{t.name}[/cyan] \u2014 {t.description}")
+            lines.append(f"  [cyan]{t.name}[/cyan] — {t.description}")
     else:
         lines.append("[bold]Tools:[/bold] [dim](documentation-only / not loaded)[/dim]")
     console.print(Panel("\n".join(lines), title=f"Skill: {name}"))
@@ -12360,7 +12360,7 @@ def show_skill_manager() -> None:
         for skill in skills_mod.list_skills():
             name = str(skill["name"])
             scope = str(skill.get("scope") or skills_mod.SCOPE_USER)
-            # The badge answers "where does this apply and who wrote it" \u2014
+            # The badge answers "where does this apply and who wrote it" —
             # the two questions a learned, repo-scoped skill raises and an
             # installed one does not.
             badge = ("LEARNED" if skill.get("learned")
@@ -12413,11 +12413,11 @@ def show_skill_manager() -> None:
                      scope, scope)
         origin = ("written by the agent" if item.payload.get("learned")
                   else "installed")
-        section("Scope", f"{where}  \u2022  {origin}")
+        section("Scope", f"{where}  •  {origin}")
 
         if item.payload.get("status") == "stale":
             section("Status",
-                    "STALE \u2014 a file this skill was learned from has changed:\n"
+                    "STALE — a file this skill was learned from has changed:\n"
                     + str(item.payload.get("stale_reason") or "")
                     + "\n\nIt is still offered, flagged, because the lesson may "
                       "well still hold; only re-reading the source can say.")
@@ -12462,7 +12462,7 @@ def show_skill_manager() -> None:
                         files.append(f"{path.relative_to(skill_dir)}  ({size} bytes)")
             except OSError:
                 pass
-        section(f"FILES \u00b7 {len(files)}", "\n".join(files) or "(none)")
+        section(f"FILES · {len(files)}", "\n".join(files) or "(none)")
 
         tool_lines = []
         for tool in tools:
@@ -12477,11 +12477,11 @@ def show_skill_manager() -> None:
                 "schema:",
                 json.dumps(tool.schema, ensure_ascii=False, indent=2, default=str),
             ])
-        section(f"REGISTERED TOOLS \u00b7 {len(tools)}",
-                "\n".join(tool_lines) or "(none \u2014 documentation-only or not loaded)",
+        section(f"REGISTERED TOOLS · {len(tools)}",
+                "\n".join(tool_lines) or "(none — documentation-only or not loaded)",
                 "json")
 
-        subtitle = "  \u2022  ".join(filter(None, (
+        subtitle = "  •  ".join(filter(None, (
             item.status, str(getattr(meta, "version", "") or "unversioned"),
             skill_dir_text or "unknown path")))
         return resource_ui.UIDetail(
@@ -12523,7 +12523,7 @@ def show_skill_manager() -> None:
     ).run()
 
 
-# \u2500\u2500 Meta Commands \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# ── Meta Commands ──────────────────────────────────────────────────────
 
 def observe_session(session, display_name: str = "", display_cmd: str = "") -> None:
     """Read-only observation mode for a sub-terminal session.
@@ -12572,9 +12572,9 @@ def observe_session(session, display_name: str = "", display_cmd: str = "") -> N
             lines.append(("bold cyan", f"{symbols.DOT} Observing: {cmd_display}\n"))
         else:
             _ended[0] = True
-            lines.append(("bold red", f"\u25a0 Session ended: {cmd_display}\n"))
+            lines.append(("bold red", f"■ Session ended: {cmd_display}\n"))
         lines.append((f"dim", f"Read-only  {symbols.BULLET}  q/Esc to return to terminal 0\n"))
-        lines.append(("dim", "\u2500" * 60 + "\n\n"))
+        lines.append(("dim", "─" * 60 + "\n\n"))
 
         output = session.full_output
         if not output:
@@ -12644,7 +12644,7 @@ def _enter_session_raw(session, display_name: str = "", display_cmd: str = "") -
     All keystrokes are forwarded to the session. Type /back or /q in the
     sub-terminal to detach without closing it. Ctrl+\\ also detaches.
 
-    Session output streams directly to the terminal \u2014 exactly like
+    Session output streams directly to the terminal — exactly like
     using a real terminal.
     """
     if not session:
@@ -12693,17 +12693,17 @@ def _enter_session_raw(session, display_name: str = "", display_cmd: str = "") -
     # Sync window size before entering so programs render correctly
     _sync_winsize()
 
-    # Clear screen and show a minimal header (no pending-output replay \u2014
+    # Clear screen and show a minimal header (no pending-output replay —
     # stale ANSI absolute-position sequences cause cursor misalignment).
     sys.stdout.write("\033[2J\033[H")
-    sys.stdout.write(f"\033[2m{symbols.DOT} {cmd_display}  \u2502  /back or /q detach  \u2502  Ctrl+\\ force-detach\033[0m\n")
-    sys.stdout.write("\u2500" * 60 + "\n")
+    sys.stdout.write(f"\033[2m{symbols.DOT} {cmd_display}  │  /back or /q detach  │  Ctrl+\\ force-detach\033[0m\n")
+    sys.stdout.write("─" * 60 + "\n")
     sys.stdout.flush()
 
     # Trigger the sub-terminal to redraw its current content
     try:
         import os as _os
-        _os.write(mfd, b'\x0c')   # Ctrl+L \u2014 most shells/apps redraw on this
+        _os.write(mfd, b'\x0c')   # Ctrl+L — most shells/apps redraw on this
     except OSError:
         pass
 
@@ -12730,7 +12730,7 @@ def _enter_session_raw(session, display_name: str = "", display_cmd: str = "") -
         # they must not be parsed into keys and re-serialised on the way. The
         # arbiter still owns the fd, which is what stops the agent loop's
         # background reader from eating half of what the user types in here.
-        # It also clears O_NONBLOCK, which prompt_toolkit can leave set \u2014 a
+        # It also clears O_NONBLOCK, which prompt_toolkit can leave set — a
         # non-blocking fd makes select() report readable forever while read()
         # raises EAGAIN, and this loop degraded to read-only "observe" mode.
         with terminal_arbiter.hold("subterm", TermMode.RAW,
@@ -12740,7 +12740,7 @@ def _enter_session_raw(session, display_name: str = "", display_cmd: str = "") -
                 if data is not None:
                     if not data:
                         break                     # EOF on stdin
-                    # Ctrl+\ (byte 0x1c) \u2192 force detach
+                    # Ctrl+\ (byte 0x1c) → force detach
                     if b'\x1c' in data:
                         detached = True
                         break
@@ -12793,7 +12793,7 @@ def _enter_session_raw(session, display_name: str = "", display_cmd: str = "") -
                         except (OSError, BrokenPipeError):
                             break
                 else:
-                    # EOF \u2014 sub-terminal exited
+                    # EOF — sub-terminal exited
                     session_died = True
                     break
     except TerminalBusy as exc:
@@ -12893,7 +12893,7 @@ def handle_version_command(parts: list) -> None:
         if manifest.get("notes"):
             console.print(f"  [dim]{manifest['notes']}[/dim]")
     else:
-        console.print(f"[dim]Latest is v{remote_ver} \u2014 you are up to date.[/dim]")
+        console.print(f"[dim]Latest is v{remote_ver} — you are up to date.[/dim]")
 
     if sub != "update":
         if available:
@@ -12904,9 +12904,9 @@ def handle_version_command(parts: list) -> None:
         console.print("[dim]Nothing to update. Use [bold]/v update --force[/bold] to re-apply the latest.[/dim]")
         return
 
-    # \u2500\u2500 apply \u2500\u2500
+    # ── apply ──
     if updater.is_frozen():
-        console.print("[yellow]Binary install \u2014 replacing the whole executable "
+        console.print("[yellow]Binary install — replacing the whole executable "
                       "(partial update only applies to source installs).[/yellow]")
         new_path = updater.apply_frozen_update(manifest, channel_dir, console.print)
         if new_path:
@@ -12922,27 +12922,27 @@ def handle_version_command(parts: list) -> None:
 
     changed = updater.plan_changed_files(manifest)
     if not changed:
-        console.print("[green]All files already match the latest \u2014 nothing to download.[/green]")
+        console.print("[green]All files already match the latest — nothing to download.[/green]")
         return
 
     # A source install that is also a git checkout is where this CLI is
     # developed. "Differs from the release" and "you edited it" are the same
-    # sha256 mismatch, so applying here silently reverts local work \u2014 which is
+    # sha256 mismatch, so applying here silently reverts local work — which is
     # what used to happen, days after a fix was written, with the update
     # reporting success. The checkout updates with git.
     if updater.is_source_checkout() and not overwrite_checkout:
         console.print(
-            f"[yellow]{updater.install_dir()} is a git checkout \u2014 not updating "
+            f"[yellow]{updater.install_dir()} is a git checkout — not updating "
             f"it from the release.[/yellow]")
         console.print(f"[dim]These {len(changed)} file(s) differ from v{remote_ver}; "
                       f"applying the release would overwrite them:[/dim]")
         for name, _sha in changed[:20]:
             console.print(f"  [muted]{escape(name)}[/muted]")
         if len(changed) > 20:
-            console.print(f"  [muted]\u2026 and {len(changed) - 20} more[/muted]")
+            console.print(f"  [muted]… and {len(changed) - 20} more[/muted]")
         console.print("[dim]Update this checkout with [bold]git pull[/bold]. "
                       "To overwrite it with the release anyway: [bold]/v update "
-                      "--overwrite-local[/bold] \u2014 that one keeps a copy of the "
+                      "--overwrite-local[/bold] — that one keeps a copy of the "
                       "replaced files under .laintas-update-backup/.[/dim]")
         return
 
@@ -12950,7 +12950,7 @@ def handle_version_command(parts: list) -> None:
     ok = updater.apply_source_update(manifest, changed, channel_dir, console.print,
                                      allow_checkout=overwrite_checkout)
     if not ok:
-        console.print("[red]Update failed \u2014 no changes applied.[/red]")
+        console.print("[red]Update failed — no changes applied.[/red]")
         return
 
     console.print(f"[green]Updated to v{remote_ver} "
@@ -12981,7 +12981,7 @@ class SlashArgRule:
 
 
 def _handle_enterprise(parts: list) -> None:
-    """Handle ``/v enterprise [on|off|gateway]`` \u2014 the organisation layer.
+    """Handle ``/v enterprise [on|off|gateway]`` — the organisation layer.
 
     Enterprise is not a separate program. Turning it on installs a signed
     package that this process loads straight away, after which `/org`, the
@@ -12998,10 +12998,10 @@ def _handle_enterprise(parts: list) -> None:
     if target not in ("on", "off", "gateway") or len(words) > 1:
         console.print(
             "[yellow]Usage: /v enterprise [on|off|gateway] \\[--force][/yellow]\n"
-            "  [dim]on      \u2014 Install or update the organisation layer (default)[/dim]\n"
-            "  [dim]off     \u2014 Remove it and go back to a personal CLI[/dim]\n"
-            "  [dim]gateway \u2014 Download the self-hosted gateway bundle[/dim]\n"
-            "  [dim]--force \u2014 Allow replacing the installed version with an older one[/dim]"
+            "  [dim]on      — Install or update the organisation layer (default)[/dim]\n"
+            "  [dim]off     — Remove it and go back to a personal CLI[/dim]\n"
+            "  [dim]gateway — Download the self-hosted gateway bundle[/dim]\n"
+            "  [dim]--force — Allow replacing the installed version with an older one[/dim]"
         )
         return
 
@@ -13009,7 +13009,7 @@ def _handle_enterprise(parts: list) -> None:
         removed = enterprise_installer.uninstall_extension(
             runtime=extension_runtime.get_runtime())
         console.print(
-            "[green]Organisation layer removed \u2014 /org and organisation rules "
+            "[green]Organisation layer removed — /org and organisation rules "
             "are gone.[/green]" if removed else
             "[dim]No organisation layer was installed.[/dim]")
         return
@@ -13349,7 +13349,7 @@ def _parse_slash_command(cmd: str) -> tuple[str, str, list[str]]:
         args = shlex.split(raw_args) if raw_args else []
     except ValueError as exc:
         if action in _FREE_TEXT_TAIL_COMMANDS:
-            # The tail is a question in prose \u2014 "what's wrong here?" is
+            # The tail is a question in prose — "what's wrong here?" is
             # an unclosed quote to shlex, not a mistake by the user.
             return action, raw_args, [action, *raw_args.split()]
         raise SlashCommandUsageError(
@@ -13520,13 +13520,13 @@ def _employee_capability_text(agent: AgentInfo) -> str:
         "company default")
     assignment = agent.active_assignment
     assignment_text = (
-        f"{assignment.id} [{assignment.status}] \u2014 {assignment.task}"
+        f"{assignment.id} [{assignment.status}] — {assignment.task}"
         if assignment else "(none)"
     )
     last_assignment = (agent.assignment_history[-1]
                        if agent.assignment_history else None)
     last_text = (
-        f"{last_assignment.get('id')} [{last_assignment.get('status')}] \u2014 "
+        f"{last_assignment.get('id')} [{last_assignment.get('status')}] — "
         f"{str(last_assignment.get('result') or last_assignment.get('error') or '')[:240]}"
         if last_assignment else "(none)"
     )
@@ -14149,7 +14149,7 @@ def _fmt_cents(cents: int) -> str:
 
 
 def _usage_daily_values(daily: list, days: int) -> list[int]:
-    """Calls per day (balance + subscription), zero-filled, oldest \u2192 newest."""
+    """Calls per day (balance + subscription), zero-filled, oldest → newest."""
     by_date = {d.get("date", ""): (int(d.get("calls", 0) or 0)
                                    + int(d.get("sub_calls", 0) or 0))
                for d in daily if isinstance(d, dict)}
@@ -14176,14 +14176,14 @@ def _fmt_mb(byte_count: int) -> str:
 
 def _usage_allowance_bar(used: int, limit: int, figures: str, note: str | int = ""):
     """One allowance as a proportional bar, the two numbers, and what it is made
-    of. Amber before it bites and red once it does \u2014 a bar that only changes
+    of. Amber before it bites and red once it does — a bar that only changes
     colour after the allowance is gone gives no warning at all."""
     ratio = min(1.0, used / limit) if limit > 0 else 0.0
     filled = round(ratio * 16)
     style = "error" if ratio >= 1 else "warning" if ratio >= 0.9 else "agent"
     bar = Text()
-    bar.append("\u2501" * filled, style=style)
-    bar.append("\u254c" * (16 - filled), style="rule")
+    bar.append("━" * filled, style=style)
+    bar.append("╌" * (16 - filled), style="rule")
     bar.append(f"  {figures}", style="bold")
     if note:
         bar.append(f"  {note}", style="muted")
@@ -14191,7 +14191,7 @@ def _usage_allowance_bar(used: int, limit: int, figures: str, note: str | int = 
 
 
 def _usage_allowance_tight(state, used_key: str, limit_key: str) -> bool:
-    """True once an allowance is 90% gone \u2014 the point where saying so is help
+    """True once an allowance is 90% gone — the point where saying so is help
     rather than advertising."""
     if not isinstance(state, dict):
         return False
@@ -14265,7 +14265,7 @@ def _usage_top_ups(session: dict) -> tuple[dict, str]:
 
 
 def _usage_pack_label(what: str, pack: dict) -> str:
-    """`+100 MB storage for $1.00 a month` \u2014 quantity in the pack's own unit."""
+    """`+100 MB storage for $1.00 a month` — quantity in the pack's own unit."""
     qty = int(pack.get("quantity") or 0)
     size = _fmt_mb(qty) if what == "storage" else f"{qty:,} calls"
     return f"+{size} for {_fmt_cents(int(pack.get('monthly_cents') or 0))} a month"
@@ -14281,10 +14281,10 @@ def _usage_buy_pack(what: str, session: dict) -> None:
 
 
 def _usage_sparkline(values: list[int]) -> str:
-    blocks = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
+    blocks = "▁▂▃▄▅▆▇█"
     peak = max(values) or 1
     return "".join(
-        "[rule]\u2581[/rule]" if v == 0
+        "[rule]▁[/rule]" if v == 0
         else f"[accent]{blocks[min(7, max(0, round(v / peak * 7)))]}[/accent]"
         for v in values)
 
@@ -14295,10 +14295,10 @@ _USAGE_BAR_W = 14
 def _usage_bar(value: int, peak: int, style: str = "accent") -> str:
     """Proportional horizontal bar, one row per model."""
     if peak <= 0:
-        return "[rule]" + "\u254c" * _USAGE_BAR_W + "[/rule]"
+        return "[rule]" + "╌" * _USAGE_BAR_W + "[/rule]"
     filled = 0 if value <= 0 else max(1, round(value / peak * _USAGE_BAR_W))
-    return (f"[{style}]{'\u2501' * filled}[/{style}]"
-            f"[rule]{'\u254c' * (_USAGE_BAR_W - filled)}[/rule]")
+    return (f"[{style}]{'━' * filled}[/{style}]"
+            f"[rule]{'╌' * (_USAGE_BAR_W - filled)}[/rule]")
 
 
 def _usage_cache_cell(totals: dict, dimmed: bool, row_style: str) -> Text:
@@ -14310,14 +14310,14 @@ def _usage_cache_cell(totals: dict, dimmed: bool, row_style: str) -> Text:
     call is paying the full input rate for text the provider already has.
 
     Shown as a percentage because the absolute number means nothing without the
-    input total next to it. `\u2014` means the backend reported no cache figures at
+    input total next to it. `—` means the backend reported no cache figures at
     all (an unmetered backend, or records written before cache accounting), and
     is deliberately distinct from a real 0%.
     """
     total_in = int(totals.get("in", 0) or 0)
     cached = int(totals.get("cachedIn", 0) or 0)
     if dimmed or total_in <= 0 or cached <= 0:
-        return Text("\u2014", style=row_style or "muted")
+        return Text("—", style=row_style or "muted")
     pct = cached * 100.0 / total_in
     # Two thirds is roughly where a stable prefix lands once the conversation
     # tail is the only uncached part; below a third, the prefix itself is
@@ -14328,7 +14328,7 @@ def _usage_cache_cell(totals: dict, dimmed: bool, row_style: str) -> Text:
 
 def _usage_section(marker_style: str, title: str, note: str = "") -> Text:
     head = Text()
-    head.append("\u258d", style=marker_style)
+    head.append("▍", style=marker_style)
     head.append(f" {title}", style="bold")
     if note:
         head.append(f"   {note}", style="muted")
@@ -14426,7 +14426,7 @@ def _cmd_training(parts: list, session: dict) -> None:
         raise SlashCommandUsageError(
             "Usage: /training [status|on|off]")
 
-    with _safe_status("[dim]Checking training-data sharing\u2026[/dim]"):
+    with _safe_status("[dim]Checking training-data sharing…[/dim]"):
         state = _training_control_request(session, "GET")
     if state is None:
         return
@@ -14456,7 +14456,7 @@ def _cmd_training(parts: list, session: dict) -> None:
     }
     if action == "on":
         payload["confirm_scope"] = scope
-    with _safe_status("[dim]Saving training-data preference\u2026[/dim]"):
+    with _safe_status("[dim]Saving training-data preference…[/dim]"):
         updated = _training_control_request(session, "PUT", payload)
     if updated is None:
         return
@@ -14474,7 +14474,7 @@ def _cmd_training(parts: list, session: dict) -> None:
 
 
 def _show_usage_command(args: list, session: dict) -> None:
-    """/usage \u2014 local token accounting + Laintas backend usage.
+    """/usage — local token accounting + Laintas backend usage.
 
     The backend figures cover EVERY product, not just the CLI: the call
     allowance is one pool shared across them, so splitting the spend by
@@ -14546,7 +14546,7 @@ def _show_usage_command(args: list, session: dict) -> None:
 
         try:
             with _safe_status(
-                    f"[dim]Fetching usage\u2026 {symbols.BULLET} Esc/Ctrl+C cancel[/dim]"):
+                    f"[dim]Fetching usage… {symbols.BULLET} Esc/Ctrl+C cancel[/dim]"):
                 usage, bal, fail, sub = run_cancellable_blocking(
                     _fetch_backend_usage)
         except BlockingOperationCancelled:
@@ -14556,14 +14556,14 @@ def _show_usage_command(args: list, session: dict) -> None:
 
     body: list = []
 
-    # \u2500\u2500 LOCAL \u2014 token accounting, works for every backend \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    # ── LOCAL — token accounting, works for every backend ────────────
     summary = usage_tracker.summarize(days=days)
     range_totals = summary["range"]["totals"]
     body.append(_usage_section(f"accent", "LOCAL", f"this machine {symbols.BULLET} all projects"))
     body.append(Text())
 
     if range_totals["calls"] == 0 and summary["session"]["totals"]["calls"] == 0:
-        body.append(Text("  no calls recorded yet \u2014 stats begin with your next AI request",
+        body.append(Text("  no calls recorded yet — stats begin with your next AI request",
                          style="muted"))
     else:
         scope = Table(box=None, show_edge=False, pad_edge=False, padding=(0, 1))
@@ -14582,7 +14582,7 @@ def _show_usage_command(args: list, session: dict) -> None:
                 Text(approx + _fmt_tokens(t["in"]), style=row_style),
                 _usage_cache_cell(t, dimmed, row_style),
                 Text(approx + _fmt_tokens(t["out"]), style=row_style),
-                Text("\u2014" if dimmed else _fmt_cents(t["costCents"]),
+                Text("—" if dimmed else _fmt_cents(t["costCents"]),
                      style=row_style or ("success" if t["costCents"] == 0 else "")),
             )
         body.append(Padding(scope, (0, 0, 0, 1)))
@@ -14610,15 +14610,15 @@ def _show_usage_command(args: list, session: dict) -> None:
                     str(m["calls"]),
                     f"{approx}{_fmt_tokens(total)}",
                     _fmt_cents(m["costCents"]),
-                    model_tiers.get(str(name).lower(), "\u2014"),
+                    model_tiers.get(str(name).lower(), "—"),
                 )
             body.append(Padding(mt, (0, 0, 0, 1)))
         if range_totals["estimated"]:
-            body.append(Text("  ~ estimated \u2014 backend sent no token counts (chars/4)",
+            body.append(Text("  ~ estimated — backend sent no token counts (chars/4)",
                              style="muted"))
         # Truncations are recovered silently during a task, so this is where a
         # persistent pattern becomes visible. Shown only when it is actually
-        # happening, and phrased as a rate \u2014 one truncated call in a hundred is
+        # happening, and phrased as a rate — one truncated call in a hundred is
         # noise, one in five means the model or the ceiling is wrong.
         _trunc = range_totals.get("truncated", 0)
         if _trunc:
@@ -14639,14 +14639,14 @@ def _show_usage_command(args: list, session: dict) -> None:
                 f"limit ({_rate:.0f}%){_detail}",
                 style="warning" if _rate >= 10 else "muted"))
 
-    # \u2500\u2500 LAINTAS \u2014 backend usage, same gateway endpoints Helpwo uses \u2500\u2500
+    # ── LAINTAS — backend usage, same gateway endpoints Helpwo uses ──
     footnotes: list[str] = []
     if not local_only:
         body.append(Text())
         if not profile.sends_laintas_credentials:
             body.append(_usage_section("warning", "BACKEND", profile.base_url))
             body.append(Text())
-            body.append(Text(f"  {profile.billing_label} \u2014 not billed by Laintas; "
+            body.append(Text(f"  {profile.billing_label} — not billed by Laintas; "
                              "local stats above are authoritative", style="muted"))
         elif not session.get("userId"):
             body.append(_usage_section("warning", "LAINTAS", "not logged in"))
@@ -14735,7 +14735,7 @@ def _show_usage_command(args: list, session: dict) -> None:
                         f"incl {_fmt_mb(int(store.get('base_bytes') or 0))}"
                         f" + {_fmt_mb(int(store['extra_bytes']))} bought"))
 
-                # Where to buy more, stated once, next to the bars it grows \u2014
+                # Where to buy more, stated once, next to the bars it grows —
                 # the two commands are the whole answer to "I ran out".
                 label = "add-ons"
                 for what, state in (("calls", call_quota), ("storage", store)):
@@ -14766,11 +14766,11 @@ def _show_usage_command(args: list, session: dict) -> None:
                         f"5h rolling window nearly used up - recovers {cd}"
                         if cd else "5h rolling window nearly used up")
                 if _usage_allowance_tight(store, "used_bytes", "limit_bytes"):
-                    footnotes.append("storage nearly full \u2014 /usage buy storage "
+                    footnotes.append("storage nearly full — /usage buy storage "
                                      "(one store, shared with Helpwo)")
                 if sub_calls:
                     footnotes.append("subscription calls carry no token counts on the "
-                                     "backend \u2014 LOCAL tokens are authoritative")
+                                     "backend — LOCAL tokens are authoritative")
 
                 pricing_note = _usage_pricing_note(bal)
                 if pricing_note:
@@ -14796,10 +14796,10 @@ def _show_usage_command(args: list, session: dict) -> None:
     ))
 
 
-# \u2500\u2500 Meta-command handlers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# ── Meta-command handlers ──────────────────────────────────────────────
 # _handle_meta_command_impl is a big elif-chain dispatcher (one branch per
 # slash command). Extracting each branch's body into its own _cmd_* function
-# is a gradual, mechanical decomposition of that function \u2014 each extraction
+# is a gradual, mechanical decomposition of that function — each extraction
 # preserves the exact original control flow (explicit `return` where the
 # original branch returned early, none where it originally fell through to
 # the dispatcher's final `return False`), it just gives the branch body a
@@ -14831,7 +14831,7 @@ def _cmd_quit(action: str, raw_args: str, agent_registry: AgentRegistry) -> bool
         console.print(f"[yellow]Usage: {action}[/yellow]")
         return False
     if _IN_SUB_TERMINAL:
-        # Running inside a sub-terminal \u2014 detach like /back instead of quitting
+        # Running inside a sub-terminal — detach like /back instead of quitting
         sys.stdout.write("\x1b]777;LAINTAS_DETACH\x07")
         sys.stdout.flush()
         console.print("[green]Detaching...[/green]")
@@ -14862,7 +14862,7 @@ def _split_verb(raw_args: str, verbs: tuple, is_path) -> tuple:
     """Split "<verb> <rest>" or "<path> <rest>" without needing a flag.
 
     The rule /img and the canvas extension both follow: **the verbs are a small closed set,
-    and anything else is a path.** Not the other way round \u2014 deciding by "does
+    and anything else is a path.** Not the other way round — deciding by "does
     this look like a file?" turns every mistyped or extension-less path into
     "unknown action", which sends the user to the help text when what they
     needed was "no such file".
@@ -14888,7 +14888,7 @@ def _leading_path_arg(text: str) -> tuple:
     """Split "<path> <rest>" where the path may contain spaces. (path, rest).
 
     The dispatcher's argv already honours quotes, but /img and the canvas
-    extension keep a free-text tail and so read the raw string \u2014 and splitting that on the
+    extension keep a free-text tail and so read the raw string — and splitting that on the
     first space turned `"my shot.png"` into the path `"my`. Accepted, in
     order: a quoted path, backslash-escaped spaces, and an unquoted name with
     spaces when some prefix of the words names a file that exists (a macOS
@@ -14918,7 +14918,7 @@ def _leading_path_arg(text: str) -> tuple:
 def _img_candidates(limit: int = 12) -> list:
     """Recently-touched images worth offering, newest first.
 
-    Typing the path is the actual friction in a terminal \u2014 the file the user
+    Typing the path is the actual friction in a terminal — the file the user
     wants is almost always a screenshot they just took or an image sitting in
     the working directory, and neither has a name they remember.
     """
@@ -14943,7 +14943,7 @@ def _img_candidates(limit: int = 12) -> list:
 
 
 def _cmd_img(raw_args: str) -> None:
-    """/img \u2014 read an image, either by asking about it or by transcribing it."""
+    """/img — read an image, either by asking about it or by transcribing it."""
     import vision
 
     args = (raw_args or "").strip()
@@ -14964,7 +14964,7 @@ def _cmd_img(raw_args: str) -> None:
         or tok.lower().endswith(".pdf"))
 
     if verb == "help":
-        console.print(r"[bold]/img[/bold] [dim]\u2014 read an image[/dim]")
+        console.print(r"[bold]/img[/bold] [dim]— read an image[/dim]")
         console.print(r"  /img                      \[list] images here and recent screenshots")
         console.print(r"  /img <path> \[question]    ask a vision model about it")
         console.print(r"  /img text <path>          transcribe it word for word (also .pdf)")
@@ -14975,7 +14975,7 @@ def _cmd_img(raw_args: str) -> None:
     if verb == "list" or not args:
         candidates = _img_candidates()
         if not candidates:
-            console.print(r"[yellow]Usage: /img <path> \[question]   \u00b7   /img <path> --text[/yellow]")
+            console.print(r"[yellow]Usage: /img <path> \[question]   ·   /img <path> --text[/yellow]")
             console.print("[dim]No images found in the working directory or among recent screenshots.[/dim]")
             return
         console.print(r"[bold]Recent images[/bold] [dim](run /img <path> \[question])[/dim]")
@@ -14992,7 +14992,7 @@ def _cmd_img(raw_args: str) -> None:
     as_text = verb == "text"
     path, question = _leading_path_arg(rest)
     if not path:
-        console.print(r"[yellow]/img text <path>  \u2014  a file path is required[/yellow]")
+        console.print(r"[yellow]/img text <path>  —  a file path is required[/yellow]")
         return
 
     session = load_session()
@@ -15002,7 +15002,7 @@ def _cmd_img(raw_args: str) -> None:
                 console.print("[dim]`text` transcribes the whole document; the "
                               "question is ignored. Drop it to ask about the "
                               "image instead.[/dim]")
-            with _safe_status("[dim]Transcribing\u2026[/dim]"):
+            with _safe_status("[dim]Transcribing…[/dim]"):
                 out = vision.image_to_text(
                     path, session=session,
                     post_json=_gateway_post_json_for_cli(session))
@@ -15010,13 +15010,13 @@ def _cmd_img(raw_args: str) -> None:
             if out.get("pages"):
                 header += f" [dim]({out['pages']} page(s))[/dim]"
         else:
-            with _safe_status("[dim]Looking\u2026[/dim]"):
+            with _safe_status("[dim]Looking…[/dim]"):
                 out = vision.describe_image(
                     path, question, session=session,
                     call_backend=_vision_backend_for_cli(session))
             header = (f"[bold]{escape(path)}[/bold] "
                       f"[dim]read by {out.get('model', '?')}"
-                      f"{' \u00b7 cached' if out.get('cached') else ''}[/dim]")
+                      f"{' · cached' if out.get('cached') else ''}[/dim]")
     except vision.VisionError as e:
         console.print(f"[red]{e}[/red]")
         # The module's own message names the agent-facing tool, which is not
@@ -15050,20 +15050,20 @@ def _open_retask_view(path: str = "") -> None:
 
 
 def _cmd_retask(raw_args: str) -> None:
-    """/retask \u2014 the work the AI handed to you, and what it will check."""
+    """/retask — the work the AI handed to you, and what it will check."""
     import retask as retask_mod
     cwd = os.getcwd()
     verb, rest = _split_verb(raw_args, ("list", "done", "help"),
                              lambda p: p.endswith(retask_mod.EXTENSION))
 
     if verb == "help":
-        console.print(r"[bold]/retask[/bold] [dim]\u2014 checklists of work the AI hands to you[/dim]")
+        console.print(r"[bold]/retask[/bold] [dim]— checklists of work the AI hands to you[/dim]")
         console.print(r"  /retask                  open the current checklist (also Alt+R)")
         console.print(r"  /retask <file.retask>    open a specific one")
         console.print(r"  /retask list             every checklist in this workspace")
         console.print(r"  /retask done <id> \[note] say a task is finished; the AI checks it")
-        console.print(r"[dim]In the view: \u2191\u2193 select \u00b7 Enter fold \u00b7 y copy the task \u00b7 "
-                      r"s I finished this \u00b7 m mouse on/off \u00b7 q close. Mouse is off so you "
+        console.print(r"[dim]In the view: ↑↓ select · Enter fold · y copy the task · "
+                      r"s I finished this · m mouse on/off · q close. Mouse is off so you "
                       r"can select and copy text directly.[/dim]")
         return
 
@@ -15161,7 +15161,7 @@ def _cmd_new_session_notice() -> None:
 def _cmd_login(session: dict, agent_registry: AgentRegistry) -> None:
     choice = choose_login_method()
     if choice == "remote":
-        console.print(f"[dim]Starting browser login\u2026 {symbols.BULLET} Esc/Ctrl+C cancel[/dim]")
+        console.print(f"[dim]Starting browser login… {symbols.BULLET} Esc/Ctrl+C cancel[/dim]")
         try:
             new_session = run_cancellable_blocking(
                 lambda cancel: login_via_browser(cancel_event=cancel))
@@ -15175,18 +15175,18 @@ def _cmd_login(session: dict, agent_registry: AgentRegistry) -> None:
         session.clear()
         session.update(new_session)
         # Refresh the Helpwo link only if this terminal was already
-        # linked \u2014 logging in never auto-links (two-end handshake).
+        # linked — logging in never auto-links (two-end handshake).
         if agent_registry.agent_id:
             agent_registry.register(session, quiet=True)
         console.print(f"[green]Logged in as {new_session.get('userEmail') or new_session.get('userName') or new_session['userId']}[/green]")
 
 
 def _cmd_model_aux(args: list, session: dict) -> None:
-    """`/model aux [id|reset]` \u2014 pick the model for compaction/critic/memory.
+    """`/model aux [id|reset]` — pick the model for compaction/critic/memory.
 
     Shares the terminal picker deliberately: the auxiliary model is chosen from
     the same catalogue as any other, so anything the gateway serves is a valid
-    choice here \u2014 Gemma for long-context compaction by default, but
+    choice here — Gemma for long-context compaction by default, but
     deepseek-v4-flash or whatever else is equally selectable.
     """
     current = str(get_runtime_config("aux_model") or "")
@@ -15198,7 +15198,7 @@ def _cmd_model_aux(args: list, session: dict) -> None:
     if args and args[0].lower() in ("reset", "clear", "default"):
         _apply("", "")
         console.print(
-            "[green]Auxiliary model cleared \u2014 compaction, the critic and memory "
+            "[green]Auxiliary model cleared — compaction, the critic and memory "
             "extraction will use the terminal's own model again.[/green]")
         return
     if args:
@@ -15208,7 +15208,7 @@ def _cmd_model_aux(args: list, session: dict) -> None:
 
     try:
         with _safe_status(
-                f"[dim]Fetching available models\u2026 {symbols.BULLET} Esc/Ctrl+C cancel[/dim]"):
+                f"[dim]Fetching available models… {symbols.BULLET} Esc/Ctrl+C cancel[/dim]"):
             models, _endpoint = run_cancellable_blocking(
                 lambda cancel: fetch_available_models(session, cancel_event=cancel))
     except BlockingOperationCancelled:
@@ -15243,8 +15243,8 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
     """Manage deployment-model overrides without changing agent base models."""
     args = [_normalize_slash_arg(item) for item in parts[1:]]
     # `/model aux` targets the auxiliary model instead of a terminal's. It is a
-    # different axis entirely \u2014 compaction, the critic and memory extraction do
-    # not belong to any one terminal \u2014 so it short-circuits before the terminal
+    # different axis entirely — compaction, the critic and memory extraction do
+    # not belong to any one terminal — so it short-circuits before the terminal
     # resolution below rather than pretending "aux" is a terminal name.
     if args and args[0].lower() == "aux":
         _cmd_model_aux(args[1:], session)
@@ -15302,12 +15302,12 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
         current_provider = str(terminal.provider_override or "")
         # _safe_status, not console.status(): the shared console writes through
         # repl_mirror.TeeFile, and console.status's default redirect_stdout=True
-        # makes TeeFile feed the Live's own output back into itself \u2014 a loop that
+        # makes TeeFile feed the Live's own output back into itself — a loop that
         # deadlocks Live.__exit__, so the fetch looks frozen and Esc/Ctrl+C never
         # register. _safe_status runs the spinner with redirect_stdout=False.
         try:
             with _safe_status(
-                    f"[dim]Fetching available models\u2026 {symbols.BULLET} Esc/Ctrl+C cancel[/dim]"):
+                    f"[dim]Fetching available models… {symbols.BULLET} Esc/Ctrl+C cancel[/dim]"):
                 models, endpoint = run_cancellable_blocking(
                     lambda cancel: fetch_available_models(
                         session, cancel_event=cancel))
@@ -15384,7 +15384,7 @@ def _cmd_name(raw_args: str, session: dict, agent_registry: AgentRegistry) -> No
         config["agentName"] = name
         save_config(config)
         console.print(f"[green]Agent name set to: {name}[/green]")
-        # Re-register under the new name only if already linked \u2014
+        # Re-register under the new name only if already linked —
         # renaming never auto-links (two-end handshake).
         if agent_registry.agent_id:
             agent_registry.unregister()
@@ -15454,8 +15454,8 @@ def _memory_manager() -> None:
         meta = data.get("meta", {})
         category = memory_system.CATEGORY_LABELS.get(
             entry.get("type"), entry.get("type") or "memory")
-        subtitle = (f"{memory_system.scope_label(entry.get('scope'))}  \u2022  {category}"
-                    f"  \u2022  importance {float(entry.get('importance', .5) or .5):.1f}")
+        subtitle = (f"{memory_system.scope_label(entry.get('scope'))}  •  {category}"
+                    f"  •  importance {float(entry.get('importance', .5) or .5):.1f}")
         description = str(meta.get("description") or "").strip()
         body = str(data.get("body") or "(empty)")
         content = f"{description}\n\n{body}" if description else body
@@ -15466,14 +15466,14 @@ def _memory_manager() -> None:
         status = str(meta.get("status") or memory_system.STATUS_ACTIVE)
         if status == memory_system.STATUS_STALE:
             reason = str(meta.get("stale_reason") or "the cited source changed")
-            banner.append(f"> **STALE \u2014 unverified, not wrong.** {reason}\n>\n"
+            banner.append(f"> **STALE — unverified, not wrong.** {reason}\n>\n"
                           f"> Re-read the source, then re-save with fresh "
                           f"`evidence` to clear this.")
         elif status == memory_system.STATUS_SUPERSEDED:
             successor = str(meta.get("superseded_by") or "")
             banner.append(f"> **SUPERSEDED**"
                           + (f" by `{successor}`." if successor
-                             else " \u2014 retired with no replacement.")
+                             else " — retired with no replacement.")
                           + " Kept for the record; not current knowledge.")
         evidence = memory_system.parse_evidence(meta.get("evidence"))
         if evidence:
@@ -15525,7 +15525,7 @@ def _memory_status(entries: list) -> None:
     used = sum(1 for e in entries if int(e.get("uses", 0) or 0) > 0)
     never = total - used
     console.print(f"Persistent memories visible here: [bold]{total}[/bold]"
-                  f"  \u2022  budget {budget}"
+                  f"  •  budget {budget}"
                   + ("  [yellow](over)[/yellow]" if total > budget else ""))
     console.print(f"[dim]Used at least once since usage tracking began: {used}; "
                   f"not yet used: {never}.[/dim]")
@@ -15544,7 +15544,7 @@ def _memory_status(entries: list) -> None:
         if down:
             console.print(
                 f"[yellow]Semantic de-duplication and ranking are degraded[/yellow] "
-                f"[dim]\u2014 the embedding endpoint refused "
+                f"[dim]— the embedding endpoint refused "
                 f"({reason or 'no detail'}); retrying in {int(left)}s. "
                 f"New memories can only be matched by exact name until then.[/dim]")
         elif not embeddings.available():
@@ -15613,7 +15613,7 @@ def _cmd_memory(parts: list) -> None:
                           f"importance {float(entry.get('importance', .5) or .5):.1f}  "
                           f"uses {int(entry.get('uses', 0) or 0)}")
         if len(chosen) > 10:
-            console.print(f"  [dim]\u2026 and {len(chosen) - 10} more[/dim]")
+            console.print(f"  [dim]… and {len(chosen) - 10} more[/dim]")
         if dry:
             console.print("[dim]Dry run. Run /memory compact to archive them "
                           "(files are moved to memory/archive/, never deleted).[/dim]")
@@ -15722,7 +15722,7 @@ def _shared_storage_client(session: dict):
 
     if not session.get("userId"):
         raise shared_storage.SharedStorageError(
-            "Not signed in. Run /login \u2014 shared storage is per Laintas account.")
+            "Not signed in. Run /login — shared storage is per Laintas account.")
     return shared_storage.SharedStorage(get_backend_profile(), session)
 
 
@@ -15783,14 +15783,14 @@ def _cmd_shared(parts: list, session: dict) -> None:
             "pull <remote> \\[local]|rm <path>|mkdir <path>|mv <from> <to>|"
             "cp <from> <to>|usage]\n"
             "[dim]Files land in the same storage Helpwo mounts as "
-            "\"Laintas Storage\" \u2014 push here, open it there.[/dim]")
+            "\"Laintas Storage\" — push here, open it there.[/dim]")
         return
 
     try:
         client = _shared_storage_client(session)
 
         if sub in ("", "usage"):
-            with _safe_status("[dim]Reading storage\u2026[/dim]"):
+            with _safe_status("[dim]Reading storage…[/dim]"):
                 usage = client.usage()
             _shared_print_usage(usage)
             if sub == "":
@@ -15799,7 +15799,7 @@ def _cmd_shared(parts: list, session: dict) -> None:
 
         if sub in ("list", "ls"):
             prefix = ss.clean_remote_path(args[0]) if args else ""
-            with _safe_status("[dim]Listing\u2026[/dim]"):
+            with _safe_status("[dim]Listing…[/dim]"):
                 entries = client.list(prefix)
             _shared_print_listing(entries, prefix)
             return
@@ -15818,7 +15818,7 @@ def _cmd_shared(parts: list, session: dict) -> None:
                     else os.path.basename(os.path.abspath(local))
                 files = ss.walk_local(local)
                 if not files:
-                    console.print("[dim]Nothing to push \u2014 the folder has no files.[/dim]")
+                    console.print("[dim]Nothing to push — the folder has no files.[/dim]")
                     return
                 total = 0
                 for index, (full, relative) in enumerate(files, start=1):
@@ -15832,7 +15832,7 @@ def _cmd_shared(parts: list, session: dict) -> None:
             else:
                 remote = ss.clean_remote_path(args[1]) if len(args) > 1 \
                     else os.path.basename(local)
-                with _safe_status(f"[dim]Pushing {escape(os.path.basename(local))}\u2026[/dim]"):
+                with _safe_status(f"[dim]Pushing {escape(os.path.basename(local))}…[/dim]"):
                     size = client.push_file(local, remote)
                 console.print(
                     f"[green]Pushed {escape(remote)} ({ss.human_bytes(size)}).[/green]")
@@ -15847,10 +15847,10 @@ def _cmd_shared(parts: list, session: dict) -> None:
             local = os.path.expanduser(args[1]) if len(args) > 1 else os.path.basename(remote)
             if os.path.isdir(local):
                 local = os.path.join(local, os.path.basename(remote))
-            with _safe_status(f"[dim]Pulling {escape(remote)}\u2026[/dim]"):
+            with _safe_status(f"[dim]Pulling {escape(remote)}…[/dim]"):
                 size = client.pull_file(remote, local)
             console.print(
-                f"[green]Pulled {escape(remote)} \u2192 {escape(local)} "
+                f"[green]Pulled {escape(remote)} → {escape(local)} "
                 f"({ss.human_bytes(size)}).[/green]")
             return
 
@@ -15873,7 +15873,7 @@ def _cmd_shared(parts: list, session: dict) -> None:
                 if answer.lower() not in ("y", "yes"):
                     console.print("[dim]Cancelled.[/dim]")
                     return
-            with _safe_status("[dim]Deleting\u2026[/dim]"):
+            with _safe_status("[dim]Deleting…[/dim]"):
                 removed = client.remove(target)
             console.print(f"[green]Deleted {escape(target)} ({removed} objects).[/green]")
             return
@@ -15891,7 +15891,7 @@ def _cmd_shared(parts: list, session: dict) -> None:
                 console.print("[yellow]Usage: /shared mv <from> <to>[/yellow]")
                 return
             client.move(args[0], args[1])
-            console.print(f"[green]Moved {escape(args[0])} \u2192 {escape(args[1])}[/green]")
+            console.print(f"[green]Moved {escape(args[0])} → {escape(args[1])}[/green]")
             return
 
         if sub in ("cp", "copy"):
@@ -15899,10 +15899,10 @@ def _cmd_shared(parts: list, session: dict) -> None:
                 console.print("[yellow]Usage: /shared cp <from> <to>[/yellow]")
                 return
             client.copy(args[0], args[1])
-            console.print(f"[green]Copied {escape(args[0])} \u2192 {escape(args[1])}[/green]")
+            console.print(f"[green]Copied {escape(args[0])} → {escape(args[1])}[/green]")
             return
 
-        console.print(f"[yellow]Unknown subcommand: {escape(sub)}[/yellow] \u2014 run /shared help")
+        console.print(f"[yellow]Unknown subcommand: {escape(sub)}[/yellow] — run /shared help")
 
     except ss.SharedStorageError as exc:
         console.print(f"[red]{escape(str(exc))}[/red]")
@@ -15961,13 +15961,13 @@ def _handoff_print_one(env: dict, cwd: str) -> None:
             # envelope describes is not in any commit, so pulling the named
             # branch gets the successor a tree without it.
             console.print(
-                "[yellow]  the tree was dirty when this was written \u2014 the work is "
+                "[yellow]  the tree was dirty when this was written — the work is "
                 "not in that commit, only on the author's disk[/yellow]")
 
     drifted = handoff.contract_drifted(env, cwd)
     if drifted is True:
         console.print("[yellow]the API contract changed since this handoff was "
-                      "written \u2014 re-read .laintas/contract/[/yellow]")
+                      "written — re-read .laintas/contract/[/yellow]")
     elif drifted is False:
         console.print("[dim]API contract unchanged since it was written[/dim]")
 
@@ -15986,7 +15986,7 @@ def _handoff_print_one(env: dict, cwd: str) -> None:
 
     if state["contested"]:
         who = ", ".join(escape(c["actor"]) for c in state["contested"])
-        console.print(f"[red]also claimed by {who} \u2014 {escape(state['holder'])} holds it "
+        console.print(f"[red]also claimed by {who} — {escape(state['holder'])} holds it "
                       f"(earliest claim wins); agree before both of you work[/red]")
 
     events = env.get("events") or []
@@ -15994,11 +15994,11 @@ def _handoff_print_one(env: dict, cwd: str) -> None:
         console.print("[dim]log:[/dim]")
         for event in events[-8:]:
             when = time.strftime("%m-%d %H:%M", time.localtime(event["ts"]))
-            note = f" \u2014 {escape(event['note'])}" if event["note"] else ""
+            note = f" — {escape(event['note'])}" if event["note"] else ""
             console.print(f"  [dim]{when}[/dim] {escape(event['actor'])} "
                           f"[bold]{event['kind']}[/bold]{note}")
         if len(events) > 8:
-            console.print(f"  [dim]\u2026 {len(events) - 8} earlier[/dim]")
+            console.print(f"  [dim]… {len(events) - 8} earlier[/dim]")
 
 
 def _handoff_print_list(envs: list, cwd: str) -> None:
@@ -16017,7 +16017,7 @@ def _handoff_print_list(envs: list, cwd: str) -> None:
     for env in envs:
         state = handoff.project(env)
         result = handoff.remaining(env, cwd)
-        left = "\u2014" if not result["checked"] else (
+        left = "—" if not result["checked"] else (
             "[green]0[/green]" if result["ok"] else f"[yellow]{len(result['gaps'])}[/yellow]")
         table.add_row(
             env["id"], env["title"], _handoff_state_label(state), left,
@@ -16031,7 +16031,7 @@ def _cmd_handoff(parts: list, session: dict) -> None:
     A handoff envelope lives at .laintas/handoff/<id>.json and is meant to be
     committed. It carries where the work sits, what is still outstanding (which
     is re-checked against the workspace every time it is read, never trusted
-    from the file), and what not to try again \u2014 but never the transcript.
+    from the file), and what not to try again — but never the transcript.
 
     `sync` reconciles it through Laintas storage for people who are not sharing
     a repository remote. That is a fetch-merge-push, so two people can both
@@ -16050,9 +16050,9 @@ def _cmd_handoff(parts: list, session: dict) -> None:
             "Usage: [bold]/handoff[/bold] [list|new <title>|show <id>|claim <id>|"
             "release <id>|note <id> <text>|close <id>|reopen <id>|"
             "sync \\[id]|export <id> \\[file]|import <token|file>|remote|fetch <remote-path>]\n"
-            "[dim]An envelope in .laintas/handoff/ \u2014 committable, mergeable, and "
+            "[dim]An envelope in .laintas/handoff/ — committable, mergeable, and "
             "re-verified against the workspace instead of believed.[/dim]\n"
-            "[dim]new: add \"don't do X\" notes with --avoid \"\u2026\" (repeatable), "
+            "[dim]new: add \"don't do X\" notes with --avoid \"…\" (repeatable), "
             "and name the successor with --to <who>.[/dim]")
         return
 
@@ -16105,7 +16105,7 @@ def _cmd_handoff(parts: list, session: dict) -> None:
                 # Claiming does not always win, and being told so immediately is
                 # the whole point of surfacing a contest rather than locking.
                 console.print(
-                    f"[red]{escape(state['holder'])} claimed this first \u2014 your claim is "
+                    f"[red]{escape(state['holder'])} claimed this first — your claim is "
                     f"recorded but does not hold it. Talk to them before working.[/red]")
             else:
                 console.print(f"[green]{sub} recorded on {escape(env['id'])}.[/green]")
@@ -16120,7 +16120,7 @@ def _cmd_handoff(parts: list, session: dict) -> None:
                 console.print("[dim]Nothing here to sync.[/dim]")
                 return
             for env in targets:
-                with _safe_status(f"[dim]Syncing {env['id']}\u2026[/dim]"):
+                with _safe_status(f"[dim]Syncing {env['id']}…[/dim]"):
                     result = handoff.sync(env["id"], client, cwd)
                 gained = result["gained"]
                 detail = (f"[green]+{gained} new event(s) from the shared copy[/green]"
@@ -16140,7 +16140,7 @@ def _cmd_handoff(parts: list, session: dict) -> None:
                 console.print("[dim]Attach it to mail or chat. The other side runs "
                               "/handoff import <file>.[/dim]")
                 return
-            console.print(f"[dim]Send this to them \u2014 any channel. "
+            console.print(f"[dim]Send this to them — any channel. "
                           f"{len(token)} chars, no account or link needed:[/dim]")
             # Printed without markup or highlighting so what they copy is
             # exactly what was generated; line wrapping is harmless because
@@ -16164,7 +16164,7 @@ def _cmd_handoff(parts: list, session: dict) -> None:
             if handoff.foreign_repo(incoming, cwd):
                 console.print(
                     "[yellow]This handoff was written against a different "
-                    "repository \u2014 its outstanding checks are paths, and they will "
+                    "repository — its outstanding checks are paths, and they will "
                     "fail here for reasons that are not about the work.[/yellow]")
             existed = handoff.handoff_path(incoming["id"], cwd).exists()
             env = handoff.import_envelope(incoming, cwd)
@@ -16175,7 +16175,7 @@ def _cmd_handoff(parts: list, session: dict) -> None:
 
         if sub == "remote":
             client = _shared_storage_client(session)
-            with _safe_status("[dim]Listing shared handoffs\u2026[/dim]"):
+            with _safe_status("[dim]Listing shared handoffs…[/dim]"):
                 found = handoff.list_remote(client, cwd=cwd)
             if not found:
                 console.print("[dim]No handoffs in storage for this repository.[/dim]")
@@ -16187,13 +16187,13 @@ def _cmd_handoff(parts: list, session: dict) -> None:
 
         if sub == "fetch":
             client = _shared_storage_client(session)
-            with _safe_status("[dim]Fetching\u2026[/dim]"):
+            with _safe_status("[dim]Fetching…[/dim]"):
                 env = handoff.fetch(args[0], client, cwd)
             console.print(f"[green]Fetched {escape(env['id'])}.[/green]")
             _handoff_print_one(env, cwd)
             return
 
-        console.print(f"[yellow]Unknown subcommand: {escape(sub)}[/yellow] \u2014 run /handoff help")
+        console.print(f"[yellow]Unknown subcommand: {escape(sub)}[/yellow] — run /handoff help")
 
     except handoff.HandoffError as exc:
         console.print(f"[red]{escape(str(exc))}[/red]")
@@ -16292,8 +16292,8 @@ def _cmd_prop(raw_args: str, session: dict) -> None:
             }],
         }
 
-    # Everything below \u2014 the browser and the assistant that reads the
-    # snapshot \u2014 sees the calls without the gateway's own additions.
+    # Everything below — the browser and the assistant that reads the
+    # snapshot — sees the calls without the gateway's own additions.
     conversation = dict(conversation, calls=[
         prop_ui.visible_call(call) for call in (conversation.get("calls") or [])])
     calls = list(conversation.get("calls") or [])
@@ -16402,7 +16402,7 @@ def _cmd_prop(raw_args: str, session: dict) -> None:
             message=f"Draft {patch['id']} created; active prompt unchanged",
             detail=resource_ui.UIDetail.text(
                 "PROMPT LAB DRAFT", summary,
-                subtitle="Proposal only \u00b7 explicit review and activation required"))
+                subtitle="Proposal only · explicit review and activation required"))
 
     prop_ui.open_browser(
         conversation, system_only=system_only, newest_index=newest_index,
@@ -16434,7 +16434,7 @@ def _cmd_bash(parts: list, raw_args: str) -> bool:
             "(marker-poll + cwd sync), bypassing the interactive whitelist below\n"
             "[bold]/bash list[/bold]              show the interactive-terminal whitelist\n"
             "[bold]/bash add <command>[/bold]     force <command> through full PTY passthrough "
-            "(vim-style \u2014 use for full-screen/raw-keystroke programs)\n"
+            "(vim-style — use for full-screen/raw-keystroke programs)\n"
             "[bold]/bash remove <command>[/bold]  let <command> use term0/marker-poll instead\n\n"
             f"[dim]Current whitelist: {wl}[/dim]",
             title="/bash", border_style="cyan",
@@ -16477,7 +16477,7 @@ def _cmd_bash(parts: list, raw_args: str) -> bool:
                 console.print(stdout)
             returncode = result.get("returncode")
             rc_text = f" {symbols.BULLET} exit {returncode}" if returncode is not None else ""
-            console.print(f"[dim]cwd \u2192 {os.getcwd()}{rc_text}[/dim]")
+            console.print(f"[dim]cwd → {os.getcwd()}{rc_text}[/dim]")
     return False
 
 
@@ -16485,13 +16485,13 @@ def _print_mode_activation_note(name: str) -> None:
     """Print the posture note for a mode that was just activated.
 
     Shared by the `/mode <name>` and the interactive selector paths so the two
-    never drift. Only one note is shown \u2014 timed confirmation, auto-approve, and
+    never drift. Only one note is shown — timed confirmation, auto-approve, and
     read-only are mutually exclusive postures.
     """
     timeout = mode_manager.get_auto_confirm_timeout()
     if timeout is not None:
         console.print(
-            f"[yellow]\u21b3 AUTO confirmation windows: {int(timeout)}s ordinary, "
+            f"[yellow]↳ AUTO confirmation windows: {int(timeout)}s ordinary, "
             f"{int(mode_manager.get_auto_confirm_timeout(destructive=True) or 0)}s "
             f"deletion. Choose No before the timer expires to stop an action."
             f"[/yellow]")
@@ -16499,7 +16499,7 @@ def _print_mode_activation_note(name: str) -> None:
     auto_approve = mode_manager.get_auto_approve()
     if auto_approve != "none":
         console.print(
-            f"[dim]\u21b3 {name.upper()}* \u2014 auto-approving {auto_approve} "
+            f"[dim]↳ {name.upper()}* — auto-approving {auto_approve} "
             f"this session.[/dim]")
         return
     if mode_manager.is_read_only_mode():
@@ -16507,7 +16507,7 @@ def _print_mode_activation_note(name: str) -> None:
                   "and checks your work. "
                   if name == "study" else
                   "No file writes or commands. ")
-        console.print(f"[dim]\u21b3 {detail}Use /mode act to switch back.[/dim]")
+        console.print(f"[dim]↳ {detail}Use /mode act to switch back.[/dim]")
 
 
 def _cmd_mode(raw_args: str, parts: list) -> bool:
@@ -16547,13 +16547,13 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
             f"[bold]Plan Mode: [green]ENTERED[/green][/bold]\n\n"
             f"Task: {task}\n"
             f"Plan file: {plan['file']}\n\n"
-            f"[dim]The AI will explore and design \u2014 no code will be executed.[/dim]\n"
+            f"[dim]The AI will explore and design — no code will be executed.[/dim]\n"
             f"[dim]When ready, the review menu will offer execute, revise, or exit.[/dim]",
             title="Plan Mode", border_style="green",
         ))
 
     elif sub in ("act", "always", "act-always"):
-        # `/mode act always` (or `/mode always`) \u2192 ACT with every file write
+        # `/mode act always` (or `/mode always`) → ACT with every file write
         # and command auto-approved for this session (shown as ACT*). Plain
         # `/mode act` restores confirmations by clearing that session state,
         # giving a mid-session way to turn auto-approve back off.
@@ -16569,7 +16569,7 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
             _session_approval_state["all_writes"] = True
             _session_approval_state["all_commands"] = True
             console.print(
-                "[green]ACT [bold]always-approve[/bold] \u2014 file writes and "
+                "[green]ACT [bold]always-approve[/bold] — file writes and "
                 "commands are auto-approved this session ([bold]ACT*[/bold]).[/green]\n"
                 "[dim]Run /mode act to turn confirmations back on.[/dim]")
         else:
@@ -16618,7 +16618,7 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
             _allow = item.get("allowed_tools")
             if _allow is not None:
                 _bits.append(f"tools: {', '.join(_allow[:4])}"
-                             + ("\u2026" if len(_allow) > 4 else ""))
+                             + ("…" if len(_allow) > 4 else ""))
             if item.get("denied_tools"):
                 _bits.append(f"deny: {', '.join(item['denied_tools'][:3])}")
             if item.get("auto_approve", "none") != "none":
@@ -16672,7 +16672,7 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
                 f"[/{'green' if ok else 'red'}]")
             if ok and _auto != "none":
                 console.print(
-                    f"[yellow]\u26a0 Mode '{name}' auto-approves {_auto} \u2014 "
+                    f"[yellow]⚠ Mode '{name}' auto-approves {_auto} — "
                     f"file writes/commands run without confirmation while it's "
                     f"active (shown as {name.upper()}*). Hard deny rules still apply.[/yellow]")
 
@@ -16776,7 +16776,7 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
 
 
 def _cmd_windows(parts: list) -> None:
-    """`/windows` \u2014 the Windows machine this CLI is running inside of.
+    """`/windows` — the Windows machine this CLI is running inside of.
 
     Install and start are separate commands on purpose. Installing puts a
     program on the user's disk; starting it with `write` hands the agent the
@@ -16812,7 +16812,7 @@ def _cmd_windows(parts: list) -> None:
                        else "machine-read" if tiers.get("machineRead")
                        else "workspace only")
         else:
-            granted = "\u2014"
+            granted = "—"
         tools = state.get("tools") or []
         lines = [
             f"Installed    {'yes' if state['installed'] else 'no'}"
@@ -16833,7 +16833,7 @@ def _cmd_windows(parts: list) -> None:
 
     if sub == "install":
         force = any(p.lower() in ("--force", "-f") for p in parts[2:])
-        console.print("[dim]checking helpwo.laintas.com\u2026[/dim]")
+        console.print("[dim]checking helpwo.laintas.com…[/dim]")
         last = [-1]
 
         def progress(done: int, total: int) -> None:
@@ -16886,9 +16886,9 @@ def _cmd_windows(parts: list) -> None:
         console.print(Panel(
             f"Started in its own window.\n{note}\n\n"
             "The first run signs in through your browser. Leave that window "
-            "open \u2014 closing it disconnects the machine, and that is also how "
+            "open — closing it disconnects the machine, and that is also how "
             "you revoke access in a hurry.",
-            title=f"Windows kernel \u00b7 {result['tier']}",
+            title=f"Windows kernel · {result['tier']}",
             border_style="yellow" if result["tier"] == "write" else "cyan"))
         return
 
@@ -16911,7 +16911,7 @@ def _cmd_trust(parts: list) -> None:
         style = "green" if status.get("trusted") else "yellow"
         hashes = status.get("hashes") or {}
         details = "\n".join(
-            f"  {name}: {digest[:16]}\u2026" for name, digest in sorted(hashes.items())
+            f"  {name}: {digest[:16]}…" for name, digest in sorted(hashes.items())
         ) or "  (no executable project customization)"
         console.print(Panel(
             f"Project: {status.get('realpath', os.getcwd())}\n"
@@ -17130,9 +17130,9 @@ def _cmd_policy(parts: list) -> bool:
             if sub == "enforce":
                 console.print("[dim]Commands matching approval rules will now prompt before execution.[/dim]")
             elif sub == "disabled":
-                console.print("[yellow]\u26a0 All policy checks bypassed \u2014 commands run without approval.[/yellow]")
+                console.print("[yellow]⚠ All policy checks bypassed — commands run without approval.[/yellow]")
             elif sub == "audit":
-                console.print("[dim]Policy advisory only \u2014 deny rules still block, approvals are advisory.[/dim]")
+                console.print("[dim]Policy advisory only — deny rules still block, approvals are advisory.[/dim]")
     elif sub == "reset":
         _reset_session_approvals()
         console.print("[green]Session auto-approvals cleared.[/green]")
@@ -17187,7 +17187,7 @@ def show_plan_picker() -> None:
     def load_detail(item):
         plan = item.payload
         content = _pm.read_plan(plan.get("name")) or "(empty)"
-        subtitle = "  \u2022  ".join(filter(None, (
+        subtitle = "  •  ".join(filter(None, (
             str(plan.get("name") or ""), str(plan.get("status") or "draft"),
             str(plan.get("file") or ""))))
         return _ui_text_detail(item.title, content, subtitle, kind="markdown")
@@ -17283,7 +17283,7 @@ def _cmd_plan(raw_args: str, parts: list) -> None:
             f"[bold]Plan Mode: [green]ENTERED[/green][/bold]\n\n"
             f"Task: {task}\n"
             f"Plan file: {plan['file']}\n\n"
-            f"[dim]The AI will now explore and design \u2014 no code will be executed.[/dim]\n"
+            f"[dim]The AI will now explore and design — no code will be executed.[/dim]\n"
             f"[dim]When the plan is ready, run [bold]/plan approve[/bold].[/dim]",
             title="Plan Mode",
             border_style="green",
@@ -17349,18 +17349,18 @@ def _cmd_plan(raw_args: str, parts: list) -> None:
         if plans:
             console.print(f"[bold]Saved Plans:[/bold]")
             for p in plans:
-                console.print(f"  [cyan]{p['name']}[/cyan] \u2014 {p['title'][:80]}")
+                console.print(f"  [cyan]{p['name']}[/cyan] — {p['title'][:80]}")
         else:
             console.print("[dim]No saved plans.[/dim]")
     else:
         console.print("Usage:\n"
-                      "  [bold]/plan enter <task>[/bold] \u2014 Enter plan mode\n"
-                      "  [bold]/plan submit[/bold]       \u2014 Submit immutable revision for review\n"
-                      "  [bold]/plan revise <feedback>[/bold] \u2014 Ask AI to revise\n"
-                      "  [bold]/plan approve[/bold]      \u2014 Approve and execute\n"
-                      "  [bold]/plan exit[/bold]         \u2014 Exit without approving\n"
-                      "  [bold]/plan status[/bold]       \u2014 Show current plan\n"
-                      "  [bold]/plan list[/bold]         \u2014 List saved plans")
+                      "  [bold]/plan enter <task>[/bold] — Enter plan mode\n"
+                      "  [bold]/plan submit[/bold]       — Submit immutable revision for review\n"
+                      "  [bold]/plan revise <feedback>[/bold] — Ask AI to revise\n"
+                      "  [bold]/plan approve[/bold]      — Approve and execute\n"
+                      "  [bold]/plan exit[/bold]         — Exit without approving\n"
+                      "  [bold]/plan status[/bold]       — Show current plan\n"
+                      "  [bold]/plan list[/bold]         — List saved plans")
 
 
 def _cmd_evolve(raw_args: str, parts: list, session: dict) -> None:
@@ -17407,7 +17407,7 @@ def _cmd_evolve(raw_args: str, parts: list, session: dict) -> None:
             console.print(
                 f"  [cyan]{branch.get('id')}[/cyan] "
                 f"[{branch.get('intent')}] [dim]{branch.get('status')}[/dim] "
-                f"\u2014 {str(branch.get('description') or '')[:80]}")
+                f"— {str(branch.get('description') or '')[:80]}")
     elif sub == "open":
         branch_id = parts[2] if len(parts) > 2 else ""
         if not branch_id and sys.stdin.isatty():
@@ -17444,7 +17444,7 @@ def _cmd_evolve(raw_args: str, parts: list, session: dict) -> None:
             console.print(
                 f"  [cyan]{candidate.get('id')}[/cyan] "
                 f"[{candidate.get('intent')}] [dim]{candidate.get('status')}[/dim] "
-                f"\u2014 {candidate.get('target_type')}:{candidate.get('name')}")
+                f"— {candidate.get('target_type')}:{candidate.get('name')}")
     elif sub == "review":
         candidate_id = parts[2] if len(parts) > 2 else evolution_lab.active_candidate_id()
         candidate = evolution_lab.read_candidate(candidate_id)
@@ -17609,7 +17609,7 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
             for branch in branches:
                 console.print(
                     f"  [cyan]{branch.get('id')}[/cyan] "
-                    f"[dim]{branch.get('status')}[/dim] \u2014 "
+                    f"[dim]{branch.get('status')}[/dim] — "
                     f"{_escape(str(branch.get('description') or '')[:80])}")
     elif sub == "open":
         branch_id = parts[2] if len(parts) >= 3 else ""
@@ -17668,7 +17668,7 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
             for patch in patches:
                 console.print(
                     f"  [cyan]{patch.get('id')}[/cyan] "
-                    f"[dim]{patch.get('status')}[/dim] \u2014 "
+                    f"[dim]{patch.get('status')}[/dim] — "
                     f"{_escape(str(patch.get('title') or ''))}")
     elif sub == "review":
         patch_id = parts[2] if len(parts) >= 3 else prompt_lab.active_patch_id()
@@ -17848,7 +17848,7 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
             else:
                 console.print(Panel(
                     f"[bold]Feedback captured.[/bold] (ID: {entry['id']})\n\n"
-                    f"[yellow]Optimizer spawn failed \u2014 max depth may be reached.[/yellow]\n"
+                    f"[yellow]Optimizer spawn failed — max depth may be reached.[/yellow]\n"
                     f"[dim]Run [bold]/prompt optimize {entry['id']}[/bold] later from the REPL.[/dim]",
                     title="Prompt Optimization", border_style="yellow"))
         else:
@@ -17941,7 +17941,7 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
                 console.print(f"  [cyan]{c['id']}[/cyan] "
                               f"[dim]{c['status']}[/dim] "
                               f"{ctype}{extra} "
-                              f"\u2014 {c.get('feedback', '')[:40]}")
+                              f"— {c.get('feedback', '')[:40]}")
         else:
             console.print("[dim]No candidates. Run /prompt feedback or /prompt fail to start.[/dim]")
     elif sub == "export" and len(parts) >= 3:
@@ -17999,7 +17999,7 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
                     title="Failure category",
                     full_screen=False,
                     selected_index=0,
-                    hint=f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  \u21b5 select  Esc/q keep unspecified",
+                    hint=f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ select  Esc/q keep unspecified",
                 )
                 category = ("" if category_choice in (None, "Unspecified")
                             else category_choice)
@@ -18054,7 +18054,7 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
                     console.print(
                         f"  [cyan]{p['id']}[/cyan] "
                         f"[dim]{p['status']}[/dim] "
-                        f"\u2014 {p.get('skill_name', '?')}/"
+                        f"— {p.get('skill_name', '?')}/"
                         f"{p.get('skill_file', '?')} "
                         f"({p.get('mode', '?')})")
             else:
@@ -18153,24 +18153,24 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
                     console.print(f"[{color}]{msg}[/{color}]")
         else:
             console.print("Usage:\n"
-                          "  [bold]/prompt skill list[/bold]            \u2014 List skill patches\n"
-                          "  [bold]/prompt skill review <id>[/bold]     \u2014 Review a skill patch\n"
-                          "  [bold]/prompt skill apply <id> [--force][/bold] \u2014 Apply a skill patch\n"
-                          "  [bold]/prompt skill discard <id>[/bold]    \u2014 Discard a skill patch")
+                          "  [bold]/prompt skill list[/bold]            — List skill patches\n"
+                          "  [bold]/prompt skill review <id>[/bold]     — Review a skill patch\n"
+                          "  [bold]/prompt skill apply <id> [--force][/bold] — Apply a skill patch\n"
+                          "  [bold]/prompt skill discard <id>[/bold]    — Discard a skill patch")
     else:
         console.print("Usage:\n"
-                      "  [bold]/prompt feedback <desc>[/bold]    \u2014 Capture feedback & spawn optimizer\n"
-                      "  [bold]/prompt fail[/bold]                \u2014 Show failure template (v3)\n"
-                      "  [bold]/prompt optimize <id>[/bold]       \u2014 Spawn optimizer for a feedback id\n"
-                      "  [bold]/prompt status[/bold]              \u2014 Show optimization status\n"
-                      "  [bold]/prompt review [id][/bold]         \u2014 Review cli.prop candidate patch\n"
-                      "  [bold]/prompt apply [id] [--force][/bold] \u2014 Apply candidate to cli.prop\n"
-                      "  [bold]/prompt discard [id][/bold]        \u2014 Strip applied cli.prop patch\n"
-                      "  [bold]/prompt list[/bold]                \u2014 List all candidates (cli.prop + skill)\n"
-                      "  [bold]/prompt skill list|review|apply|discard <id>[/bold] \u2014 Manage skill patches\n"
-                      "  [bold]/prompt export <id> [path][/bold]  \u2014 Export portable pack\n"
-                      "  [bold]/prompt install <path|url>[/bold]  \u2014 Import a shared pack\n"
-                      "  [bold]/prompt publish <id>[/bold]        \u2014 Publish to community")
+                      "  [bold]/prompt feedback <desc>[/bold]    — Capture feedback & spawn optimizer\n"
+                      "  [bold]/prompt fail[/bold]                — Show failure template (v3)\n"
+                      "  [bold]/prompt optimize <id>[/bold]       — Spawn optimizer for a feedback id\n"
+                      "  [bold]/prompt status[/bold]              — Show optimization status\n"
+                      "  [bold]/prompt review [id][/bold]         — Review cli.prop candidate patch\n"
+                      "  [bold]/prompt apply [id] [--force][/bold] — Apply candidate to cli.prop\n"
+                      "  [bold]/prompt discard [id][/bold]        — Strip applied cli.prop patch\n"
+                      "  [bold]/prompt list[/bold]                — List all candidates (cli.prop + skill)\n"
+                      "  [bold]/prompt skill list|review|apply|discard <id>[/bold] — Manage skill patches\n"
+                      "  [bold]/prompt export <id> [path][/bold]  — Export portable pack\n"
+                      "  [bold]/prompt install <path|url>[/bold]  — Import a shared pack\n"
+                      "  [bold]/prompt publish <id>[/bold]        — Publish to community")
 
 
 
@@ -18201,7 +18201,7 @@ def _cmd_work(parts: list) -> None:
             console.print("[dim]No WorkGraph history in this project.[/dim]")
         for item in items:
             console.print(
-                f"  [cyan]{item['id']}[/cyan] [dim]{item['status']}[/dim] \u2014 "
+                f"  [cyan]{item['id']}[/cyan] [dim]{item['status']}[/dim] — "
                 f"{item['objective'][:100]}")
     elif sub == "resume":
         work_id = parts[2] if len(parts) >= 3 else ""
@@ -18231,7 +18231,7 @@ def _cmd_work(parts: list) -> None:
                     "Objective",
                     str(item.get("objective") or "(none)"),
                     "",
-                    f"Steps \u00b7 {len(steps)}",
+                    f"Steps · {len(steps)}",
                 ]
                 lines.extend(
                     f"{step.get('status', 'pending'):12} {step.get('title') or step.get('objective') or step.get('id')}"
@@ -18297,8 +18297,8 @@ def _task_ui_progress(value) -> Text:
     width = 10
     filled = width if progress >= 100 else int(progress / 100 * width)
     meter = Text()
-    meter.append("\u2501" * filled, style="success" if progress >= 100 else "accent")
-    meter.append("\u2500" * (width - filled), style="muted")
+    meter.append("━" * filled, style="success" if progress >= 100 else "accent")
+    meter.append("─" * (width - filled), style="muted")
     meter.append(f" {progress:>3}%", style="white")
     return meter
 
@@ -18309,7 +18309,7 @@ def _task_ui_progress(value) -> Text:
 _live_task_snapshots: dict[str, dict[str, tuple]] = {}
 
 _LIVE_TASK_STATUS_UI = {
-    "in_progress": ("\u25b6", "warning"),
+    "in_progress": ("▶", "warning"),
     "pending": (f"{symbols.DOT_OPEN}", "white"),
     "blocked": ("!", "error"),
     "completed": (f"{symbols.OK}", "success"),
@@ -18320,7 +18320,7 @@ def display_live_task_list(tasks: list[dict], agent_id: str) -> None:
     """Print only the tasks that changed since the previous render.
 
     Reprinting the full list after every mutation floods the scrollback with
-    near-duplicate panels (the classic ``0/1``, ``0/2`` \u2026 ``2/6`` stack). We
+    near-duplicate panels (the classic ``0/1``, ``0/2`` … ``2/6`` stack). We
     instead diff against a remembered snapshot and emit a single line per
     changed task, reprinting the header line only on first render or when a
     task actually completes.
@@ -18349,7 +18349,7 @@ def display_live_task_list(tasks: list[dict], agent_id: str) -> None:
         if previous.get(tid) != value
     }
     if not changed:
-        return  # identical re-emit \u2014 nothing new to show
+        return  # identical re-emit — nothing new to show
     _live_task_snapshots[key] = current
 
     completed = sum(1 for v in current.values() if v[0] == "completed")
@@ -18377,19 +18377,19 @@ def display_live_task_list(tasks: list[dict], agent_id: str) -> None:
 
 _LIVE_RETASK_STATUS_UI = {
     "todo": (f"{symbols.DOT_OPEN}", "white"),
-    "doing": ("\u25b6", "warning"),
+    "doing": ("▶", "warning"),
     "submitted": ("?", "accent"),
     "done": (f"{symbols.OK}", "success"),
-    "rejected": ("\u2717", "error"),
-    "skipped": ("\u2013", "muted"),
+    "rejected": ("✗", "error"),
+    "skipped": ("–", "muted"),
 }
 
 
 def display_live_retask(summary: dict) -> None:
     """Print the checklist lines a retask change touched.
 
-    Same shape as display_live_task_list \u2014 a header with the running count,
-    then one line per changed task \u2014 plus the latest note under a task the
+    Same shape as display_live_task_list — a header with the running count,
+    then one line per changed task — plus the latest note under a task the
     check just passed or turned back, because "why not" is the part the
     person needs.
     """
@@ -18409,7 +18409,7 @@ def display_live_retask(summary: dict) -> None:
         note = str(change.get("note") or "")
         if note and status in ("done", "rejected", "submitted"):
             note = re.sub(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} ", "", note)
-            console.print(Text(f"      \u2514 {note}", style="error" if status == "rejected" else "muted"))
+            console.print(Text(f"      └ {note}", style="error" if status == "rejected" else "muted"))
 
 
 def _render_task_todolist(tasks: list[dict], cwd: str) -> None:
@@ -18452,10 +18452,10 @@ def _render_task_todolist(tasks: list[dict], cwd: str) -> None:
         str(item.get("id")): item.get("status", "pending") for item in tasks
     }
     status_ui = {
-        "in_progress": ("\u25b6", "warning"),
+        "in_progress": ("▶", "warning"),
         "completed": (f"{symbols.OK}", "success"),
         "blocked": ("!", "error"),
-        "skipped": ("\u2013", "muted"),
+        "skipped": ("–", "muted"),
         "pending": (f"{symbols.DOT_OPEN}", "white"),
     }
     for task in ordered:
@@ -18469,7 +18469,7 @@ def _render_task_todolist(tasks: list[dict], cwd: str) -> None:
         ]
         subject = Text()
         if task.get("parent_id") or task.get("parentId"):
-            subject.append("\u21b3 ", style="muted")
+            subject.append("↳ ", style="muted")
         subject.append(str(task.get("subject") or "(untitled task)"), style="white")
         if blocked:
             subject.append(f"  blocked by {', '.join(blocked)}", style="muted")
@@ -18561,8 +18561,8 @@ def _render_task_agent_tree(tasks: list[dict], cwd: str,
     rank = {"in_progress": 0, "pending": 1, "blocked": 2,
             "completed": 3, "skipped": 4}
     status_ui = {
-        "in_progress": ("\u25b6", "warning"), "completed": (f"{symbols.OK}", "success"),
-        "blocked": ("!", "error"), "skipped": ("\u2013", "muted"),
+        "in_progress": ("▶", "warning"), "completed": (f"{symbols.OK}", "success"),
+        "blocked": ("!", "error"), "skipped": ("–", "muted"),
         "pending": (f"{symbols.DOT_OPEN}", "white"),
     }
     parent_by_agent = {
@@ -18598,7 +18598,7 @@ def _render_task_agent_tree(tasks: list[dict], cwd: str,
         info = get_agent(agent_id)
         agent_label = agent_id
         if index > 0:
-            agent_label = "  " * max(0, agent_depth(agent_id) - 1) + "\u2514\u2500 " + agent_id
+            agent_label = "  " * max(0, agent_depth(agent_id) - 1) + "└─ " + agent_id
         if info is not None and info.status:
             agent_label += f" [{info.status}]"
         for task_index, task in enumerate(owned):
@@ -18681,7 +18681,7 @@ def _cmd_task(raw_args: str, parts: list) -> None:
                 items.append(resource_ui.UIItem(
                     key=str(task.get("id") or ""),
                     title=str(task.get("subject") or "Untitled task"),
-                    subtitle=(f"{task.get('owner_agent_id') or 'unowned'}  \u2022  "
+                    subtitle=(f"{task.get('owner_agent_id') or 'unowned'}  •  "
                               f"{task.get('progress', 0)}%"),
                     badge=source,
                     status=status.replace("_", " "),
@@ -18922,17 +18922,17 @@ def _cmd_task(raw_args: str, parts: list) -> None:
 
     else:
         console.print("[yellow]Usage: [bold]/task[/bold] [list|mine|agent|add|show|start|done|del|progress|note|subtask][/yellow]\n"
-                      "  [bold]/task[/bold]               \u2014 current agent + descendants\n"
-                      "  [bold]/task mine[/bold]          \u2014 current agent only\n"
-                      "  [bold]/task agent <id>[/bold]    \u2014 one descendant agent\n"
-                      "  [bold]/task add <subject>[/bold] \u2014 create a task\n"
-                      "  [bold]/task show <id>[/bold]      \u2014 show task details\n"
-                      "  [bold]/task start <id>[/bold]    \u2014 mark as in_progress\n"
-                      "  [bold]/task done <id>[/bold]     \u2014 mark as completed\n"
-                      "  [bold]/task progress <id> <n>[/bold] \u2014 update progress\n"
-                      "  [bold]/task note <id> <text>[/bold]  \u2014 append a note\n"
-                      "  [bold]/task subtask <id> <subject>[/bold] \u2014 create child task\n"
-                      "  [bold]/task del <id>[/bold]      \u2014 delete a task")
+                      "  [bold]/task[/bold]               — current agent + descendants\n"
+                      "  [bold]/task mine[/bold]          — current agent only\n"
+                      "  [bold]/task agent <id>[/bold]    — one descendant agent\n"
+                      "  [bold]/task add <subject>[/bold] — create a task\n"
+                      "  [bold]/task show <id>[/bold]      — show task details\n"
+                      "  [bold]/task start <id>[/bold]    — mark as in_progress\n"
+                      "  [bold]/task done <id>[/bold]     — mark as completed\n"
+                      "  [bold]/task progress <id> <n>[/bold] — update progress\n"
+                      "  [bold]/task note <id> <text>[/bold]  — append a note\n"
+                      "  [bold]/task subtask <id> <subject>[/bold] — create child task\n"
+                      "  [bold]/task del <id>[/bold]      — delete a task")
 
 
 
@@ -18999,7 +18999,7 @@ def _cmd_workflow(raw_args: str, parts: list) -> None:
             current = wf.current
             phase_info = ""
             if current:
-                phase_info = f"\nCurrent: [bold]{current.name}[/bold] \u2014 {current.description}"
+                phase_info = f"\nCurrent: [bold]{current.name}[/bold] — {current.description}"
                 if current.allowed_tools:
                     phase_info += f"\nAllowed tools: {', '.join(current.allowed_tools)}"
                 if current.spawn_agents:
@@ -19012,7 +19012,7 @@ def _cmd_workflow(raw_args: str, parts: list) -> None:
                 history.append(f"  {phase.name}: {summary or '(completed)'}")
             history_text = ("\n\nCompleted phases:\n" + "\n".join(history)) if history else ""
             console.print(Panel(
-                f"[bold]{wf.name}[/bold] \u2014 {wf.description}\n\n"
+                f"[bold]{wf.name}[/bold] — {wf.description}\n\n"
                 f"Progress: {wf.progress_str}{phase_info}{history_text}",
                 title="Active Workflow",
                 border_style="cyan",
@@ -19032,7 +19032,7 @@ def _cmd_workflow(raw_args: str, parts: list) -> None:
                 else:
                     console.print("[yellow]No active workflow or already completed.[/yellow]")
             else:
-                console.print(f"[green]Advanced to phase: [bold]{new_phase.name}[/bold] \u2014 {new_phase.description}[/green]")
+                console.print(f"[green]Advanced to phase: [bold]{new_phase.name}[/bold] — {new_phase.description}[/green]")
     elif sub == "approve":
         _, summary_raw = _raw_tail_after_word(raw_args)
         summary = _decode_text_arg(summary_raw)
@@ -19050,7 +19050,7 @@ def _cmd_workflow(raw_args: str, parts: list) -> None:
                 else:
                     console.print(
                         f"[green]Approved; advanced to [bold]{new_phase.name}[/bold] "
-                        f"\u2014 {new_phase.description}[/green]")
+                        f"— {new_phase.description}[/green]")
     elif sub == "end":
         _, summary_raw = _raw_tail_after_word(raw_args)
         summary = _decode_text_arg(summary_raw)
@@ -19067,12 +19067,12 @@ def _cmd_workflow(raw_args: str, parts: list) -> None:
             console.print(f"  [cyan]{t}[/cyan]")
     else:
         console.print("Usage:\n"
-                      "  [bold]/workflow start <name> \"<desc>\"[/bold] \u2014 Start a workflow\n"
-                      "  [bold]/workflow status[/bold]                \u2014 Show current workflow\n"
-                      "  [bold]/workflow advance [summary][/bold]    \u2014 Advance to next phase\n"
-                      "  [bold]/workflow approve [summary][/bold]    \u2014 Confirm a gated phase\n"
-                      "  [bold]/workflow end [summary][/bold]        \u2014 End workflow\n"
-                      "  [bold]/workflow list[/bold]                  \u2014 List available workflows")
+                      "  [bold]/workflow start <name> \"<desc>\"[/bold] — Start a workflow\n"
+                      "  [bold]/workflow status[/bold]                — Show current workflow\n"
+                      "  [bold]/workflow advance [summary][/bold]    — Advance to next phase\n"
+                      "  [bold]/workflow approve [summary][/bold]    — Confirm a gated phase\n"
+                      "  [bold]/workflow end [summary][/bold]        — End workflow\n"
+                      "  [bold]/workflow list[/bold]                  — List available workflows")
 
 
 
@@ -19083,7 +19083,7 @@ def _cmd_debug(parts: list) -> None:
             clear_debug_logs()
             console.print("[green]Debug log cleared.[/green]")
         elif len(parts) >= 3 and sub.isdigit():
-            # /debug <N> <filename> \u2014 save latest N entries to file
+            # /debug <N> <filename> — save latest N entries to file
             try:
                 n = int(sub)
                 if n <= 0:
@@ -19343,7 +19343,7 @@ def _browse_detail_trace(chat_history: list, conversation_number: int = 1) -> No
                                          or trace.get("path") or "(no target)")),
                 subtitle=("Assistant output" if is_ai else
                           f"{trace.get('elapsed_seconds', 0):g}s"
-                          + (f" \u00b7 exit {trace.get('returncode')}"
+                          + (f" · exit {trace.get('returncode')}"
                              if trace.get("returncode") is not None else "")),
                 status=("" if is_ai or trace.get("ok") else "failed"),
                 status_style="class:error",
@@ -19393,7 +19393,7 @@ def _browse_detail_trace(chat_history: list, conversation_number: int = 1) -> No
             kind="json" if content.lstrip().startswith(("{", "[")) else "text")
 
     resource_ui.ResourceBrowser(
-        title=f"Detail Trace #{conversation_number} \u00b7 {prompt}",
+        title=f"Detail Trace #{conversation_number} · {prompt}",
         load_items=_load_items, load_detail=_load_detail,
         presentation="timeline",
         pane_labels=("EVENTS", "RAW EVIDENCE"),
@@ -19549,7 +19549,7 @@ def _cmd_station(parts: list, agent_registry: AgentRegistry, session: dict) -> b
             agents, terminals = service.snapshot()
             console.print(f"Station: {len(agents)} agents, {len(terminals)} terminals")
             for agent in agents:
-                console.print(f"{agent.id}: {agent.status} \u00b7 {agent.deployment or 'not stationed'}")
+                console.print(f"{agent.id}: {agent.status} · {agent.deployment or 'not stationed'}")
             return False
         selected_key = ""
         while True:
@@ -19694,7 +19694,7 @@ def _cmd_send(raw_args: str) -> bool:
                 console.print(f"[dim]Sent to [bold]{name}[/bold]: {cmd[:80]}[/dim]")
                 if wait_seconds >= 0.3:
                     console.print(
-                        f"[dim]Waiting up to {wait_seconds:g}s for new output\u2026[/dim]")
+                        f"[dim]Waiting up to {wait_seconds:g}s for new output…[/dim]")
                 deadline = time.time() + wait_seconds
                 while time.time() < deadline:
                     remaining = deadline - time.time()
@@ -19702,7 +19702,7 @@ def _cmd_send(raw_args: str) -> bool:
                 output = term.session.full_output[old_len:]
             if output.strip():
                 preview = output[-2000:]
-                suffix = "" if len(output) <= 2000 else f"\n[dim]\u2026 {len(output) - 2000} earlier new chars omitted[/dim]"
+                suffix = "" if len(output) <= 2000 else f"\n[dim]… {len(output) - 2000} earlier new chars omitted[/dim]"
                 console.print(Panel(preview + suffix, title=f"{name} new output"))
             elif wait_seconds == 0:
                 console.print("[dim]Sent asynchronously; use /term to inspect later output.[/dim]")
@@ -19739,7 +19739,7 @@ def _cmd_hire(parts: list, session: dict) -> bool:
     if base_model or hire_options.get("choose_model"):
         try:
             with _safe_status(
-                    f"[dim]Fetching available models\u2026 {symbols.BULLET} Esc/Ctrl+C cancel[/dim]"):
+                    f"[dim]Fetching available models… {symbols.BULLET} Esc/Ctrl+C cancel[/dim]"):
                 models, _endpoint = run_cancellable_blocking(
                     lambda cancel: fetch_available_models(
                         session, cancel_event=cancel))
@@ -19807,7 +19807,7 @@ def _cmd_hire(parts: list, session: dict) -> bool:
     deployment_text = requested_terminal or "private temporary terminal on assignment"
     console.print(Panel(
         _employee_capability_text(agent_info),
-        title=f"Hired employee: {agent_info.name} \u2192 {deployment_text}",
+        title=f"Hired employee: {agent_info.name} → {deployment_text}",
         border_style="green",
     ))
     if requested_terminal:
@@ -19989,7 +19989,7 @@ def _cmd_agents_plain(parts: list) -> None:
             def _render(a):
                 markers = []
                 if a.id == input_target_id:
-                    markers.append("[bold green]\u2190 input[/bold green]")
+                    markers.append("[bold green]← input[/bold green]")
                 row = ui_rows.get(a.id, {})
                 if row.get("unseen_output_events"):
                     markers.append(
@@ -20002,32 +20002,32 @@ def _cmd_agents_plain(parts: list) -> None:
                 return marker, status_str, inbox_str, name_part
 
             if buckets["primary"]:
-                console.print("[bold]\u2500\u2500 Primary \u2500\u2500[/bold]")
+                console.print("[bold]── Primary ──[/bold]")
                 for a in buckets["primary"]:
                     marker, st_s, inb, np = _render(a)
                     console.print(f"  [bold]{a.id}[/bold]{np}{st_s}{inb}{marker}")
             if buckets["pool"]:
                 idle_count = sum(a.status in {"idle", "ready", "error"}
                                  for a in buckets["pool"])
-                console.print(f"[bold]\u2500\u2500 Pool ({idle_count} available) \u2500\u2500[/bold]")
+                console.print(f"[bold]── Pool ({idle_count} available) ──[/bold]")
                 for a in buckets["pool"]:
                     marker, st_s, inb, np = _render(a)
                     console.print(f"  [bold]{a.id}[/bold]{np}{st_s}{inb}{marker}")
             if buckets["deployed"]:
-                console.print(f"[bold]\u2500\u2500 Deployed ({len(buckets['deployed'])}) \u2500\u2500[/bold]")
+                console.print(f"[bold]── Deployed ({len(buckets['deployed'])}) ──[/bold]")
                 for a in buckets["deployed"]:
                     marker, st_s, inb, np = _render(a)
                     home = agent_deployment_terminal(a) or "?"
                     parent_term = getattr(a, "parent_terminal", None) or "?"
-                    console.print(f"  [bold]{a.id}[/bold]{np} \u2192 [cyan]{home}[/cyan] [dim](parent={parent_term})[/dim]{st_s}{inb}{marker}")
+                    console.print(f"  [bold]{a.id}[/bold]{np} → [cyan]{home}[/cyan] [dim](parent={parent_term})[/dim]{st_s}{inb}{marker}")
             if buckets["subagent"]:
-                console.print(f"[bold]\u2500\u2500 Subagents ({len(buckets['subagent'])}) \u2500\u2500[/bold]")
+                console.print(f"[bold]── Subagents ({len(buckets['subagent'])}) ──[/bold]")
                 for a in buckets["subagent"]:
                     marker, st_s, inb, np = _render(a)
                     parent = a.parent_id or "?"
                     console.print(f"  [bold]{a.id}[/bold]{np} [dim](depth={a.depth}, parent={parent})[/dim]{st_s}{inb}{marker}")
             if buckets["other"]:
-                console.print("[bold]\u2500\u2500 Other \u2500\u2500[/bold]")
+                console.print("[bold]── Other ──[/bold]")
                 for a in buckets["other"]:
                     marker, st_s, inb, np = _render(a)
                     console.print(f"  [bold]{a.id}[/bold]{np}{st_s}{inb}{marker}")
@@ -20159,14 +20159,14 @@ def _attach_primary_runtime_view(agent, *, show_result: bool = True):
         _set_run_input_state("running")
         try:
             with _safe_status(
-                    f"[#3fb950]Thinking\u2026 {symbols.BULLET} primary runtime[/#3fb950]",
+                    f"[#3fb950]Thinking… {symbols.BULLET} primary runtime[/#3fb950]",
                     spinner="dots"):
                 while worker.is_alive():
                     worker.join(timeout=0.1)
         except KeyboardInterrupt:
             agent.abort_event.set()
             with _safe_status(
-                    "[yellow]Interrupting primary runtime\u2026[/yellow]",
+                    "[yellow]Interrupting primary runtime…[/yellow]",
                     spinner="dots"):
                 while worker.is_alive():
                     worker.join(timeout=0.1)
@@ -20181,7 +20181,7 @@ def _attach_primary_runtime_view(agent, *, show_result: bool = True):
     return agent.runtime_session
 
 
-# \u2500\u2500 Agents view: the full-screen /agents UI is only a display + input
+# ── Agents view: the full-screen /agents UI is only a display + input
 # router. It runs in a background thread; every submitted line is injected
 # into the main REPL loop (the single executor) via _inject_input, exactly
 # like a locally typed line or a Helpwo remote message.
@@ -20200,7 +20200,7 @@ def _agents_view_controller():
 def _enter_agents_view(controller) -> None:
     """Hand the physical terminal to the /agents view.
 
-    The shared console keeps printing \u2014 into the mirror only \u2014 at the width
+    The shared console keeps printing — into the mirror only — at the width
     of the Focus pane so mirrored lines wrap correctly inside the view.
     """
     _agents_view_state["controller"] = controller
@@ -20237,7 +20237,7 @@ def _agents_repl_submit(text: str) -> tuple[bool, str]:
         return False, ""
     # Echo the accepted line into the mirror the way the prompt would.
     repl_mirror.hub.write(
-        _mirror_target_agent_id(), f"\x1b[2m\u203a {text}\x1b[0m\n")
+        _mirror_target_agent_id(), f"\x1b[2m› {text}\x1b[0m\n")
     _inject_input(text, threading.Event(), kind="dialogue")
     return True, "Sent"
 
@@ -20249,7 +20249,7 @@ def _open_agents_view(session: dict, agent_registry=None,
 
     Callable from ANY thread, which is the point: the view is where work is
     dispatched to other Agents, and the moment a person most needs it is
-    while a turn is running \u2014 when the main thread is inside the loop and
+    while a turn is running — when the main thread is inside the loop and
     cannot dispatch anything. The view runs in its own thread either way.
 
     ``on_close`` runs once the terminal has come back, in the view's thread.
@@ -20274,7 +20274,7 @@ def _open_agents_view(session: dict, agent_registry=None,
         # Only re-point the registry at the REPL's live objects when the
         # primary is idle. Mid-run the loop owns state and history, and
         # `handle_meta_command`'s copies are whatever the last command left
-        # behind \u2014 assigning those over a running turn swaps the objects out
+        # behind — assigning those over a running turn swaps the objects out
         # from under it.
         if (current is not None and current.role == "primary"
                 and current.status not in {
@@ -20307,7 +20307,7 @@ def _open_agents_view(session: dict, agent_registry=None,
             mirror=repl_mirror.hub)
 
         # The view is only a display + router: it runs in its own thread
-        # while the main thread stays where it was \u2014 back in the REPL loop
+        # while the main thread stays where it was — back in the REPL loop
         # executing whatever the view injects, or still inside the turn that
         # was running when the view was opened.
         _enter_agents_view(controller)
@@ -20443,7 +20443,7 @@ def _cmd_tell(raw_args: str) -> None:
             raw = decoded if raw != decoded and not raw.lstrip().startswith(("{", "[")) else raw
         body.setdefault("from", "user")
         if send_to_agent(target_id, body):
-            console.print(f"[green]\u2192 {target_id}:[/green] {raw[:120]}")
+            console.print(f"[green]→ {target_id}:[/green] {raw[:120]}")
         else:
             console.print(f"[red]Agent '{target_id}' not found or inbox full.[/red]")
 
@@ -20484,7 +20484,7 @@ def _cmd_tools() -> None:
         for src in sorted(groups):
             console.print(f"[bold]{src}[/bold]")
             for t in groups[src]:
-                console.print(f"  [cyan]{t.name}[/cyan] \u2014 {t.description}")
+                console.print(f"  [cyan]{t.name}[/cyan] — {t.description}")
 
 
 
@@ -20502,7 +20502,7 @@ def _safe_input_line(prompt: str = "") -> Optional[str]:
             return None
 
     if not sys.stdin.isatty():
-        # Non-TTY: fall back to plain input() \u2014 Esc is not meaningful here.
+        # Non-TTY: fall back to plain input() — Esc is not meaningful here.
         return _fallback()
 
     buf: list[str] = []
@@ -20612,7 +20612,7 @@ def _cmd_tool(raw_args: str, session: dict, agent_registry: AgentRegistry) -> No
 
 
 def _cmd_skill(parts: list) -> bool:
-    # No subcommand \u2192 open the interactive manager (same style as /term).
+    # No subcommand → open the interactive manager (same style as /term).
     sub = (parts[1].lower() if len(parts) > 1 else "manager")
     if sub == "manager":
         show_skill_manager()
@@ -20630,7 +20630,7 @@ def _cmd_skill(parts: list) -> bool:
                 if meta.description:
                     console.print(f"  [dim]{meta.description}[/dim]")
                 for t in tools:
-                    console.print(f"  [cyan]{t.name}[/cyan] \u2014 {t.description}")
+                    console.print(f"  [cyan]{t.name}[/cyan] — {t.description}")
                 if not tools:
                     console.print("  [yellow](standby/documentation-only)[/yellow]")
     elif sub in ("trust", "revoke"):
@@ -20685,7 +20685,7 @@ def _cmd_skill(parts: list) -> bool:
                             (Path(meta.dir_path) / skills_mod.SKILL_MANIFEST,))
                         console.print(
                             f"[green]Trusted {skill_name} at "
-                            f"{trusted['sha256'][:16]}\u2026[/green]")
+                            f"{trusted['sha256'][:16]}…[/green]")
                     else:
                         console.print("[yellow]Skill not trusted.[/yellow]")
     elif sub in ("load", "unload"):
@@ -20820,7 +20820,7 @@ def _cmd_mcp(parts: list) -> bool:
                         "mcp", server_name, cfg_path)
                     console.print(
                         f"[green]Trusted MCP server {server_name} at "
-                        f"{trusted['sha256'][:16]}\u2026[/green]")
+                        f"{trusted['sha256'][:16]}…[/green]")
                 else:
                     console.print("[yellow]MCP server not trusted.[/yellow]")
     elif sub == "tools":
@@ -20836,7 +20836,7 @@ def _cmd_mcp(parts: list) -> bool:
                 console.print(f"[dim]No tools for mcp:{srv_name} (not connected?)[/dim]")
             else:
                 for t in ts:
-                    console.print(f"  [cyan]{t.name}[/cyan] \u2014 {t.description}")
+                    console.print(f"  [cyan]{t.name}[/cyan] — {t.description}")
     elif sub == "connect":
         server_name = parts[2] if len(parts) >= 3 else ""
         if not server_name and sys.stdin.isatty():
@@ -20892,7 +20892,7 @@ def _disconnect_from_helpwo(agent_registry: AgentRegistry) -> None:
 
     if getattr(agent_registry, "depth", 0) == 0 or agent_registry.as_environment:
         name = agent_registry.agent_name
-        agent_registry._last_agent_id = ""  # explicit \u2014 don't resurrect
+        agent_registry._last_agent_id = ""  # explicit — don't resurrect
         agent_registry.workspace_path = None
         agent_registry.unregister()
         agent_registry.agent_id = None
@@ -20902,7 +20902,7 @@ def _disconnect_from_helpwo(agent_registry: AgentRegistry) -> None:
                       f"Run /helpwo to connect again.[/yellow]")
     else:
         name = (agent_registry.terminal_meta or {}).get("name", agent_registry.agent_name)
-        agent_registry._last_agent_id = ""  # explicit \u2014 don't resurrect
+        agent_registry._last_agent_id = ""  # explicit — don't resurrect
         agent_registry.unregister()
         agent_registry.agent_id = None
         agent_registry.agent_secret = ""
@@ -20924,14 +20924,14 @@ def _hosts_helpwo_here() -> bool:
     """Whether /helpwo acts in THIS process rather than launching a sub-terminal.
 
     The main terminal (depth 0) never serves Helpwo itself: Helpwo gets its
-    own sub-terminal and its own agent. Inside a sub-terminal \u2014 the Helpwo
-    one, or any other nested CLI \u2014 it runs where it is typed.
+    own sub-terminal and its own agent. Inside a sub-terminal — the Helpwo
+    one, or any other nested CLI — it runs where it is typed.
     """
     return _REPL_PROCESS_DEPTH > 0 or _HOSTED_APP.get("name") == app_host.HELPWO_APP
 
 
 def _parse_helpwo_flags(parts: list) -> Optional[dict]:
-    """/helpwo flags \u2192 options, or None after saying what was wrong."""
+    """/helpwo flags → options, or None after saying what was wrong."""
     import helpwo_server
 
     opts = {"port": None, "dist": None, "remote": False, "host": "127.0.0.1"}
@@ -20965,7 +20965,7 @@ def _parse_helpwo_flags(parts: list) -> Optional[dict]:
             if i + 1 >= len(args):
                 console.print("[red]--host requires an address.[/red]")
                 return None
-            # Loopback only, and not as caution \u2014 as correctness. A browser
+            # Loopback only, and not as caution — as correctness. A browser
             # withholds Web Crypto, Service Workers, File System Access and the
             # clipboard outside a secure context, and plain HTTP on a routable
             # address is not one, so the terminal, the AI and the browser
@@ -21043,17 +21043,17 @@ def _helpwo_start_in_process(opts: dict, agent_registry: AgentRegistry,
         else:
             dist_path = helpwo_server._find_dist()
             if dist_path is None:
-                # No local build available \u2014 fall back to the hosted web
+                # No local build available — fall back to the hosted web
                 # app instead of a bare error, so /helpwo always gets you
                 # to a working Helpwo one way or another.
                 remote = True
 
-    # --remote is "expose this environment where I am right now" \u2014 every call
+    # --remote is "expose this environment where I am right now" — every call
     # re-shares the CURRENT cwd as the environment's workspace, not just the
     # first one. cd elsewhere and re-run /helpwo --remote and the environment
     # follows you there.
     #
-    # Local mode has no such standing "where am I" question \u2014 it only shares
+    # Local mode has no such standing "where am I" question — it only shares
     # automatically the first time (nothing shared yet); once a workspace has
     # been established (a prior /helpwo --remote), local mode leaves it alone
     # rather than silently overwriting it.
@@ -21075,7 +21075,7 @@ def _helpwo_start_in_process(opts: dict, agent_registry: AgentRegistry,
         if state and state.get("persistent") and not agent_registry.agent_id:
             agent_registry._last_agent_id = str(state.get("remote_agent_id") or "")
         # Best-effort link: a failed handshake (not logged in, backend
-        # unreachable) shouldn't block opening the web app itself \u2014 same
+        # unreachable) shouldn't block opening the web app itself — same
         # graceful-degradation as local mode, which starts the server either
         # way and only warns that no agent is registered.
         linked = connect_terminal_to_helpwo(agent_registry, session, quiet=False,
@@ -21103,12 +21103,12 @@ def _helpwo_start_in_process(opts: dict, agent_registry: AgentRegistry,
     ok, msg = helpwo_server.start_server(agent_registry, port=port, **start_kwargs)
     if not ok and state and not opts.get("port") and not persisted_port:
         # First launch for this folder and the default port is taken: take
-        # any free one. It is remembered below, so the browser origin \u2014 and
-        # with it everything Helpwo stored \u2014 stays the same from now on.
+        # any free one. It is remembered below, so the browser origin — and
+        # with it everything Helpwo stored — stays the same from now on.
         ok, msg = helpwo_server.start_server(agent_registry, port=0, **start_kwargs)
     if not ok:
         if persisted_port and not opts.get("port"):
-            msg += (f" \u2014 this folder's Helpwo always uses port {persisted_port} so its "
+            msg += (f" — this folder's Helpwo always uses port {persisted_port} so its "
                     f"browser data stays reachable; free it, or pass --port N to move "
                     f"(data stored under the old port stays with the old port)")
         console.print(f"[red]{msg}[/red]")
@@ -21126,11 +21126,11 @@ def _helpwo_start_in_process(opts: dict, agent_registry: AgentRegistry,
     console.print(f"  Dist: [dim]{helpwo_server._dist_dir()}[/dim]")
 
     # Loopback-only by construction, so there is no insecure-origin case left
-    # to warn about \u2014 only the question of how to reach it from elsewhere.
+    # to warn about — only the question of how to reach it from elsewhere.
     console.print(f"  [dim]Remote machine? Forward the port from your own computer:[/dim]")
     console.print(f"  [dim]  ssh -N -L {bound_port}:127.0.0.1:{bound_port} <user>@<this-host>[/dim]")
     console.print(
-        f"  [dim]then open the URL above \u2014 loopback is a secure context, so every "
+        f"  [dim]then open the URL above — loopback is a secure context, so every "
         f"browser feature keeps working. To share the environment itself instead, "
         f"use /helpwo --remote.[/dim]")
 
@@ -21138,7 +21138,7 @@ def _helpwo_start_in_process(opts: dict, agent_registry: AgentRegistry,
     if agent_registry and agent_registry.agent_id:
         console.print(f"  Cloud link: [dim]{agent_registry.agent_name} ({agent_registry.agent_id})[/dim]")
     else:
-        console.print("  Cloud link: [dim]off \u2014 use /helpwo --remote to expose this environment to the hosted app[/dim]")
+        console.print("  Cloud link: [dim]off — use /helpwo --remote to expose this environment to the hosted app[/dim]")
 
     console.print("[dim]  /helpwo stop to stop the gateway and go offline.[/dim]")
 
@@ -21181,7 +21181,7 @@ def _report_app_runtime(app: str, runtime: dict, *, open_url: bool) -> None:
             if runtime.get("app_url"):
                 lines.append(f"Project URL: [cyan]{escape(str(runtime['app_url']))}[/cyan]")
             else:
-                lines.append("[dim]Project URL: not configured \u2014 set app_url in the manifest.[/dim]")
+                lines.append("[dim]Project URL: not configured — set app_url in the manifest.[/dim]")
             if runtime.get("url"):
                 lines.append(f"Bridge API: [cyan]{escape(str(runtime['url']))}[/cyan]")
         if runtime.get("open_url"):
@@ -21277,7 +21277,7 @@ def _launch_app_subterminal(app: str, *, persistent: bool, options: dict,
         f"[dim]Starting {escape(label)} in sub-terminal [bold]{escape(app)}[/bold] "
         f"with its own agent"
         f"{' (login, data and conversation persist for this folder)' if persistent else ''}"
-        f"\u2026[/dim]")
+        f"…[/dim]")
 
     def _await() -> dict:
         runtime = app_host.wait_runtime(directory, launch_id, timeout=90.0,
@@ -21297,7 +21297,7 @@ def _subterminal_exit_details(sub) -> dict:
     """Exit code and the last lines a dead sub-terminal printed.
 
     Without them "exited before it was ready" is all anyone learns, and the
-    reason \u2014 a traceback, an argparse error \u2014 is gone with the PTY.
+    reason — a traceback, an argparse error — is gone with the PTY.
     """
     details: dict = {}
     try:
@@ -21507,7 +21507,7 @@ def _bootstrap_hosted_app(args, agent_registry: AgentRegistry, session: dict) ->
     """Inside an app sub-terminal: start the application, then report back.
 
     The report is the runtime file the launching terminal is waiting on. It is
-    written on every path, failure included \u2014 a parent left waiting on a
+    written on every path, failure included — a parent left waiting on a
     process that quietly gave up is the failure this file exists to prevent.
     """
     from pathlib import Path
@@ -21639,7 +21639,7 @@ def _app_start_in_process(name: str, agent_registry: AgentRegistry, session: dic
             return {"status": "error",
                     "message": f"could not start '{manifest.command}': {exc}"}
         console.print(f"[dim]Started: {escape(manifest.command)} (pid {proc.pid}); "
-                      f"output \u2192 {log_path}[/dim]")
+                      f"output → {log_path}[/dim]")
         result.update({"app_pid": proc.pid, "log": str(log_path)})
     return result
 
@@ -21698,7 +21698,7 @@ def _app_session_start_in_process(name: str, options: dict,
                 busy = any(agent.status in {"queued", "running", "thinking", "waiting"}
                            for agent in _al.get_all_agents())
                 if not busy and helpwo_server.idle_seconds() >= limit:
-                    console.print(f"[dim]Idle for {idle_minutes} min \u2014 closing session.[/dim]")
+                    console.print(f"[dim]Idle for {idle_minutes} min — closing session.[/dim]")
                     os.kill(os.getpid(), _signal.SIGTERM)
                     return
 
@@ -21732,8 +21732,8 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
     From the main terminal this creates the sub-terminal ``helpwo``: a nested
     CLI whose agent serves only Helpwo, so Helpwo's conversation is never this
     terminal's. Its folder is Helpwo's workspace, and what Helpwo keys its data
-    by \u2014 login token, port (the browser origin), agent id, the agent's own
-    conversation \u2014 is kept per folder, so a restart picks up where it was.
+    by — login token, port (the browser origin), agent id, the agent's own
+    conversation — is kept per folder, so a restart picks up where it was.
 
     Inside a sub-terminal (including that one) it serves Helpwo in place, as
     before: local mode is loopback and offline-capable; ``--remote``
@@ -21787,7 +21787,7 @@ def _cmd_app(parts: list, agent_registry: AgentRegistry) -> None:
 
     Any application described by a manifest (~/.laintas/apps/*.json, or the
     project's .laintas/apps/*.json) runs the way Helpwo does: in its own
-    sub-terminal, with its own agent. Helpwo itself is not one of them \u2014 it
+    sub-terminal, with its own agent. Helpwo itself is not one of them — it
     has /helpwo.
     """
     sub = parts[1].lower() if len(parts) >= 2 else "list"
@@ -21798,8 +21798,8 @@ def _cmd_app(parts: list, agent_registry: AgentRegistry) -> None:
         if not manifests:
             console.print("[dim]No applications registered. Add a manifest to "
                           f"{app_host.user_manifest_dir()} or ./.laintas/apps/.[/dim]")
-            console.print('[dim]  {"name": "myapp", "description": "\u2026", '
-                          '"command": "node server.js", "prompt": "\u2026", '
+            console.print('[dim]  {"name": "myapp", "description": "…", '
+                          '"command": "node server.js", "prompt": "…", '
                           '"persistence": "none"}[/dim]')
         else:
             table = RichTable(box=box.SIMPLE, show_edge=False)
@@ -21896,13 +21896,13 @@ def _cmd_term(parts: list, agent_registry: AgentRegistry, interactive_session) -
             console.print("[red]The primary terminal term0 cannot be renamed.[/red]")
         elif rename_terminal(parts[2], parts[3]):
             console.print(
-                f"[green]Terminal renamed: [bold]{parts[2]}[/bold] \u2192 "
+                f"[green]Terminal renamed: [bold]{parts[2]}[/bold] → "
                 f"[bold]{parts[3]}[/bold][/green]")
         else:
             console.print(
                 f"[red]Could not rename '{parts[2]}': source missing or target already exists.[/red]")
     elif len(parts) == 2:
-        # /t <name> or /term <name> \u2014 create sub-terminal (no agent stationed)
+        # /t <name> or /term <name> — create sub-terminal (no agent stationed)
         name = parts[1]
         if not re.fullmatch(r"[A-Za-z0-9._-]+", name) or name.lower() == "term0":
             console.print(
@@ -21948,7 +21948,7 @@ def _cmd_term(parts: list, agent_registry: AgentRegistry, interactive_session) -
     elif len(parts) > 2:
         console.print("[yellow]Usage: /term \\[name|rename <old> <new>][/yellow]")
     else:
-        # /t or /term (no args) \u2014 list terminals browser
+        # /t or /term (no args) — list terminals browser
         show_terminal_manager(interactive_session, agent_registry)
 
     return False
@@ -22037,9 +22037,9 @@ def _config_display_key(key: str) -> str:
 
 
 def _resolve_budget_words(words: list, described: dict):
-    """Map `/config budget \u2026` words onto ``(key, value, prefix)``.
+    """Map `/config budget …` words onto ``(key, value, prefix)``.
 
-    ``key`` is set when the words (or all but the last) name a key exactly \u2014
+    ``key`` is set when the words (or all but the last) name a key exactly —
     then the last word is the value; otherwise ``prefix`` is the dotted level
     the words name, for listing. Dots are accepted too, but never shown.
     """
@@ -22049,7 +22049,7 @@ def _resolve_budget_words(words: list, described: dict):
     exact = dotted(words)
     if exact in described:
         return exact, None, None
-    # The last word is a value (0.2, truncate) \u2014 never split it on its dots.
+    # The last word is a value (0.2, truncate) — never split it on its dots.
     head = dotted(words[:-1])
     if len(words) >= 2 and head in described:
         return head, str(words[-1]), None
@@ -22107,7 +22107,7 @@ def _cmd_config_import(args: list) -> None:
         console.print(f"[red]Cannot read {escape(str(path))}: {escape(exc.strerror or str(exc))}[/red]")
         return
     except ValueError as exc:
-        console.print(f"[red]Nothing changed \u2014 {escape(str(exc))}[/red]")
+        console.print(f"[red]Nothing changed — {escape(str(exc))}[/red]")
         return
     keys = list(dict.fromkeys(key for key, _value, _n in entries))
     persisted = {key: get_runtime_config(key) for key in keys
@@ -22145,7 +22145,7 @@ def _cmd_config_export(args: list) -> None:
 
 
 def _cmd_config_budget(words: list) -> None:
-    """`/config budget [level \u2026] [key [value]] | reset`."""
+    """`/config budget [level …] [key [value]] | reset`."""
     if len(words) == 2 and words[1].lower() == "reset":
         keys = [k for k in describe_runtime_config() if k.startswith("budget.")]
         for key in keys:
@@ -22198,7 +22198,7 @@ def _cmd_config(parts: list) -> None:
             "Runtime Configuration"))
         if budget_keys:
             changed = sum(1 for k in budget_keys if described[k]["overridden"])
-            console.print(f"[dim]budget \u2026 \u2014 {len(budget_keys)} context-budget levels"
+            console.print(f"[dim]budget … — {len(budget_keys)} context-budget levels"
                           f"{f' ({changed} changed)' if changed else ''}: /config budget[/dim]")
         console.print("[dim]Set with /config <key> <value>; restore with /config reset.[/dim]")
         console.print("[dim]Narrow the list with a prefix, e.g. /config search[/dim]")
@@ -22212,7 +22212,7 @@ def _cmd_config(parts: list) -> None:
         _apply_ui_theme("dark")
         console.print("[green]Runtime config reset to defaults.[/green]")
     elif len(parts) == 2:
-        # /config <key> \u2014 show one; /config <prefix> \u2014 show the group.
+        # /config <key> — show one; /config <prefix> — show the group.
         # 76 keys in one alphabetical table buries any subsystem's handful of
         # them in three separate places, so an unmatched word is treated as a
         # prefix before it is treated as a mistake.
@@ -22296,7 +22296,7 @@ def _web_status() -> None:
             str(index), name, meta.get("cost", ""),
             f"[green]yes[/green]" if usable else "[yellow]no[/yellow]",
             meta.get("reason") or meta.get("describe", ""))
-    # Registered but not in the active chain \u2014 otherwise a user who set
+    # Registered but not in the active chain — otherwise a user who set
     # search_engine by hand cannot see what they excluded.
     for name in sorted(set(health) - set(chain)):
         meta = health[name]
@@ -22376,7 +22376,7 @@ def _web_engines(parts: list) -> None:
             console.print(f"[green]Wrote a starter engine file to {path}[/green]")
             console.print("[dim]Edit it, then /web engines to see the result.[/dim]")
         else:
-            console.print(f"[yellow]{path} already exists \u2014 edit it in place.[/yellow]")
+            console.print(f"[yellow]{path} already exists — edit it in place.[/yellow]")
         return
     if len(parts) >= 3:
         console.print(r"[yellow]Usage: /web engines \[init][/yellow]")
@@ -22427,7 +22427,7 @@ def _web_test(parts: list) -> None:
 
     # Plain words, no operators. A probe using site: or a bang reports a
     # healthy engine as broken whenever that engine simply does not support
-    # the operator \u2014 cn.bing returns nothing at all for site: queries \u2014 and
+    # the operator — cn.bing returns nothing at all for site: queries — and
     # the point here is to test the engine, not its query syntax.
     probe = "python urllib parse documentation"
     console.print(f"[dim]Query: {probe!r}  "
@@ -22450,7 +22450,7 @@ def _web_test(parts: list) -> None:
             # Full count with no snippets is the half-broken parser case.
             if results and with_snippet == 0:
                 verdict = "[yellow]degraded[/yellow]"
-                detail = "results have no snippets \u2014 the parser is likely stale"
+                detail = "results have no snippets — the parser is likely stale"
             else:
                 verdict = "[green]ok[/green]"
                 detail = ""
@@ -22589,7 +22589,7 @@ def _cmd_identity(parts: list) -> None:
                 checked)
         console.print(table)
         if not identity_store.enabled():
-            console.print("[yellow]Use is disabled \u2014 /config identity_enabled true[/yellow]")
+            console.print("[yellow]Use is disabled — /config identity_enabled true[/yellow]")
         console.print("[dim]Values are never displayed.[/dim]")
 
     elif sub == "check":
@@ -22603,7 +22603,7 @@ def _cmd_identity(parts: list) -> None:
         elif out.get("signed_in"):
             console.print(f"[green]{name}: still signed in[/green]")
         else:
-            console.print(f"[yellow]{name}: signed out \u2014 {out.get('detail', '')}[/yellow]")
+            console.print(f"[yellow]{name}: signed out — {out.get('detail', '')}[/yellow]")
             console.print("[dim]Sign in again in the live view, then "
                           f"/identity capture {name}[/dim]")
 
@@ -22640,9 +22640,9 @@ def _cmd_identity(parts: list) -> None:
 
 def _cmd_max() -> None:
     # Crank every capacity knob to its ceiling and lift every auto-exit
-    # circuit breaker. Process-global \u2192 applies to all agents. /config reset reverts.
+    # circuit breaker. Process-global → applies to all agents. /config reset reverts.
     applied = apply_max_config()
-    console.print("[green]MAX mode \u2014 all limits lifted (applies to every agent):[/green]")
+    console.print("[green]MAX mode — all limits lifted (applies to every agent):[/green]")
     for k, v in applied.items():
         console.print(f"  [cyan]{k}[/cyan] = {v}")
     console.print("[dim]Note: max_tokens may be capped lower by the provider. Revert with /config reset.[/dim]")
@@ -22753,9 +22753,9 @@ def _cmd_compact(parts: list, session: dict) -> bool:
         session_id=str(compact_state.get("_session_id") or ""),
     )
     console.print(
-        f"[green]Context compacted: {_fmt_tokens(result['tokens'])} \u2192 "
+        f"[green]Context compacted: {_fmt_tokens(result['tokens'])} → "
         f"{_fmt_tokens(result['after_tokens'])} tokens"
-        f" {symbols.BULLET} {result['messages']} \u2192 {result['after_messages']} messages[/green]")
+        f" {symbols.BULLET} {result['messages']} → {result['after_messages']} messages[/green]")
     return False
 
 
@@ -22957,13 +22957,13 @@ def _told_browse_history_legacy(chat: list) -> None:
         mem = Console(file=buf, force_terminal=True,
                       width=shutil.get_terminal_size().columns,
                       highlight=False)
-        mem.print("[bold]\u2500\u2500 prompt \u2500\u2500[/bold]")
+        mem.print("[bold]── prompt ──[/bold]")
         text = item["user"] if source == "session" else str(item.get("text", ""))
         mem.print(f"[cyan]{escape(str(text))}[/cyan]")
         mem.print()
         if source == "session":
             replies = item["replies"]
-            mem.print("[bold]\u2500\u2500 reply \u2500\u2500[/bold]")
+            mem.print("[bold]── reply ──[/bold]")
             if replies:
                 for reply in replies:
                     mem.print(RichMarkdown(str(reply))
@@ -22972,17 +22972,17 @@ def _told_browse_history_legacy(chat: list) -> None:
             else:
                 mem.print("[dim](no reply recorded)[/dim]")
         else:
-            mem.print("[dim]journal records prompts only \u2014 no reply stored[/dim]")
+            mem.print("[dim]journal records prompts only — no reply stored[/dim]")
         mem.print(f"[dim]{symbols.ARROW_U}{symbols.ARROW_D}/wheel/PgUp/PgDn scroll  q/Esc/Enter back[/dim]")
 
         # Scroll model: prompt_toolkit Windows scroll by *following the
-        # cursor* \u2014 each render recomputes vertical_scroll so the cursor
+        # cursor* — each render recomputes vertical_scroll so the cursor
         # stays visible.  A plain FormattedTextControl has a fixed (0,0)
         # cursor, which snaps any manual scrolling back to the top.  So the
         # viewer keeps a real cursor line in ``pos`` and moves that; the
         # Window then scrolls to keep it visible.  The mouse wheel is wired
         # by subclassing (the ``@control.mouse_handler`` decorator idiom is
-        # a no-op \u2014 the method is not a decorator factory).
+        # a no-op — the method is not a decorator factory).
         from prompt_toolkit.data_structures import Point as _ptk_point
         from prompt_toolkit.layout.containers import (
             ScrollOffsets as _ptk_offsets)
@@ -23056,14 +23056,14 @@ def _told_browse_history_legacy(chat: list) -> None:
         other = "journal" if source == "session" else "session"
         result = select_dialog(
             labels,
-            title=f"History \u2014 {src_label} ({len(items)})",
+            title=f"History — {src_label} ({len(items)})",
             full_screen=True,
             search=True,
             selected_index=sel_idx,
             action_keys={"tab": "source"},
             enter_action="view",
-            hint=(f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  \u21b5 view  type to filter  "
-                  f"tab \u2192 {other}  q/Esc back"),
+            hint=(f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ view  type to filter  "
+                  f"tab → {other}  q/Esc back"),
         )
         if result is None:
             return
@@ -23144,7 +23144,7 @@ def _told_browse_history(chat: list) -> None:
             tools = [event for event in record["events"]
                      if event.get("role") in {"tool", "shell", "knowledge"}]
             subtitle = (f"{len(replies)} AI repl{'y' if len(replies) == 1 else 'ies'}"
-                        f"  \u2022  {len(tools)} tool event{'s' if len(tools) != 1 else ''}")
+                        f"  •  {len(tools)} tool event{'s' if len(tools) != 1 else ''}")
             rows.append(resource_ui.UIItem(
                 key=record["key"], badge=record["source"],
                 title=prompt[:110],
@@ -23173,7 +23173,7 @@ def _told_browse_history(chat: list) -> None:
                 kind = str(event.get("message_kind") or "").upper()
                 heading = f"AI REPLY {reply_number}"
                 if kind:
-                    heading += f"  \u2022  {kind}"
+                    heading += f"  •  {kind}"
             elif role in {"TOOL", "SHELL", "KNOWLEDGE"}:
                 heading = role
                 trace = event.get("trace") or {}
@@ -23182,7 +23182,7 @@ def _told_browse_history(chat: list) -> None:
                              or trace.get("display_name")
                              or trace.get("tool"))
                 if tool_name:
-                    heading += f"  \u2022  {tool_name}"
+                    heading += f"  •  {tool_name}"
             else:
                 heading = role
             lines.extend([
@@ -23294,8 +23294,8 @@ def _cmd_told(parts: list) -> bool:
                     f"{escape(scoped_agent_name)}.[/yellow]")
             else:
                 console.print(
-                    f"[bold]\u2500\u2500 {escape(scoped_agent_name)} {symbols.BULLET} complete "
-                    f"conversation ({len(replayable)} events) \u2500\u2500[/bold]")
+                    f"[bold]── {escape(scoped_agent_name)} {symbols.BULLET} complete "
+                    f"conversation ({len(replayable)} events) ──[/bold]")
                 _print_resume_events(replayable)
             return False
         if not _user_msgs:
@@ -23335,7 +23335,7 @@ def _cmd_told(parts: list) -> bool:
             owner = f"{scoped_agent_name} {symbols.BULLET} " if scoped_agent_id else ""
             label = (f"{owner}last turn" if len(recent) == 1
                      else f"{owner}last {len(recent)} turns")
-            console.print(f"[bold]\u2500\u2500 {label} \u2500\u2500[/bold]")
+            console.print(f"[bold]── {label} ──[/bold]")
             for idx, (u, a) in enumerate(recent, 1):
                 console.print(f"[bold]You:[/bold]        [cyan]{escape(strip_ansi(u))}[/cyan]")
                 console.print(f"[bold]Assistant:[/bold]   [green]{escape(strip_ansi(a))}[/green]")
@@ -23421,7 +23421,7 @@ def _workflow_result(kind: str, result: dict) -> None:
     paused = bool(result.get("paused"))
     symbol, status, style = (
         (f"{symbols.OK}", "complete", "success") if ok
-        else (("\u2161", "paused", "warning") if paused
+        else (("Ⅱ", "paused", "warning") if paused
               else (f"{symbols.FAIL}", "failed", "error"))
     )
     heading = Text()
@@ -23459,7 +23459,7 @@ def _cmd_hwo(parts: list, session: dict) -> None:
                 if kind == "workflow_started":
                     console.print(f"[dim]HWO {event.get('runId')} started[/dim]")
                 elif kind == "step_started":
-                    _workflow_event_line("\u25b6", f"{event.get('stepId', '?')} started", "warning")
+                    _workflow_event_line("▶", f"{event.get('stepId', '?')} started", "warning")
                 elif kind == "step_completed":
                     _workflow_event_line(f"{symbols.OK}", f"{event.get('stepId', '?')} completed", "success")
                 elif kind == "step_failed":
@@ -23505,7 +23505,7 @@ def _cmd_hwo(parts: list, session: dict) -> None:
         # Without a file these used to fall through to the blank editor.
         console.print(f"[yellow]Usage: /hwo {sub} <file.hwo>[/yellow]")
     else:
-        # /hwo  \u2014 blank TUI
+        # /hwo  — blank TUI
         root_name = current.name if current else "primary"
         hwo_ui_mod.run_hwo_ui(
             root_name,
@@ -23530,13 +23530,13 @@ def _cmd_hwg(parts: list, session: dict) -> None:
             agent_scope_terminal(current) if current else "term0")
         kind = event.get("type")
         if kind == "node_started":
-            _workflow_event_line("\u25b6", f"HWG node #{event.get('node', '?')} started", "warning")
+            _workflow_event_line("▶", f"HWG node #{event.get('node', '?')} started", "warning")
         elif kind == "node_completed":
             _workflow_event_line(f"{symbols.OK}", f"HWG node #{event.get('node', '?')} completed", "success")
         elif kind == "node_failed":
             _workflow_event_line(f"{symbols.FAIL}", f"HWG node #{event.get('node', '?')} failed", "error")
         elif kind == "workflow_paused":
-            _workflow_event_line("\u2161", f"HWG paused at node #{event.get('node', '?')}", "warning")
+            _workflow_event_line("Ⅱ", f"HWG paused at node #{event.get('node', '?')}", "warning")
     if sub in ("run", "compile") and len(parts) >= 3:
         path = " ".join(parts[2:])
         if sub == "compile":
@@ -23612,7 +23612,7 @@ def _cmd_hwg(parts: list, session: dict) -> None:
 
 
 def _cmd_version(action: str, parts: list) -> None:
-    # /v, /version \u2192 show version + check; /update is shorthand for /v update.
+    # /v, /version → show version + check; /update is shorthand for /v update.
     if action == "/update":
         if not parts[1:]:
             handle_version_command(["/v", "update"])
@@ -23657,13 +23657,13 @@ def _cmd_extensions(parts: list, session: dict) -> None:
             console.print("[dim]No extensions installed.[/dim]")
             return
         for entry in entries:
-            trust_marker = "[green]\u2713[/green]" if entry["trusted"] else "[yellow]![/yellow]"
+            trust_marker = "[green]✓[/green]" if entry["trusted"] else "[yellow]![/yellow]"
             console.print(
                 f"  {trust_marker} [cyan]{entry['name']}[/cyan] "
                 f"v{entry['version']}  [dim]{entry['scope']}[/dim]  "
                 f"[dim]{entry.get('source', '')}[/dim]  "
                 f"{entry['description']}")
-        console.print("\n[dim]\u2713 = trusted  ! = untrusted[/dim]")
+        console.print("\n[dim]✓ = trusted  ! = untrusted[/dim]")
         return
 
     if sub in {"available", "search"}:
@@ -23697,7 +23697,7 @@ def _cmd_extensions(parts: list, session: dict) -> None:
             if entry["source"] != current_source:
                 current_source = entry["source"]
                 heading = ("OFFICIAL EXTENSIONS" if current_source == "official"
-                           else "COMMUNITY EXTENSIONS \u2014 UNREVIEWED")
+                           else "COMMUNITY EXTENSIONS — UNREVIEWED")
                 style = "bold green" if current_source == "official" else "bold yellow"
                 console.print(f"\n[{style}]{heading}[/{style}]")
             identifier = escape(entry["id"])
@@ -23778,7 +23778,7 @@ def _cmd_extensions(parts: list, session: dict) -> None:
         console.print(
             f"[bold]{escape(facts['name'])}[/bold] "
             f"{escape(facts['version'])}"
-            + (f" \u2014 {escape(facts['publisher'])}" if facts["publisher"] else ""))
+            + (f" — {escape(facts['publisher'])}" if facts["publisher"] else ""))
         if facts["description"]:
             console.print(f"  {escape(facts['description'])}")
         console.print(f"  [dim]path[/dim]      {escape(facts['path'])} "
@@ -23881,7 +23881,7 @@ def _print_message(item, position: int, *, full: bool = True) -> None:
     so a message looks the same wherever it is printed.
     """
     style = startup_mail.LEVEL_STYLES.get(item.level, "muted")
-    flag = "" if item.read else "[accent]\u2022[/accent] "
+    flag = "" if item.read else "[accent]•[/accent] "
     console.print(f"  [accent.dim]{position}.[/accent.dim] {flag}"
                   f"[{style}]{escape(item.title)}[/{style}]")
     if not full:
@@ -23899,7 +23899,7 @@ def _print_messages(*, hint: bool = True) -> None:
     """Print the whole list under the L> mark.
 
     Printing is never reading. Only opening a message in the reader,
-    /messages read and /messages seen change what the mark counts \u2014 so this
+    /messages read and /messages seen change what the mark counts — so this
     can be shown as often as you like, and the fallback path cannot silently
     consume the unread state it failed to let you browse.
     """
@@ -23941,7 +23941,7 @@ def _build_mailbox_browser(*, input=None,
 
     That last one was a real bug. Passing primary_action="read" without an
     action of that name makes ResourceBrowser._primary fall through to
-    app.exit() \u2014 so Enter, the most obvious key in a list, closed the whole
+    app.exit() — so Enter, the most obvious key in a list, closed the whole
     reader the instant it opened. Every other browser in this file leaves the
     default "view", which opens the detail pane. This one does too now.
     """
@@ -24069,11 +24069,11 @@ def _resolve_message(reference: str):
 
 
 def _cmd_messages(parts: list) -> None:
-    """``/messages`` \u2014 the same notices the L> mark holds, from the keyboard.
+    """``/messages`` — the same notices the L> mark holds, from the keyboard.
 
     The reader (Alt+0, or no argument here) is the good way to work through
-    them. These subcommands exist for the places it cannot run \u2014 a
-    sub-terminal, a piped session, --execute \u2014 and for saying exactly which
+    them. These subcommands exist for the places it cannot run — a
+    sub-terminal, a piped session, --execute — and for saying exactly which
     message to act on instead of arrowing to it.
     """
     action = parts[1].strip().lower() if len(parts) > 1 else ""
@@ -24140,7 +24140,7 @@ def _cmd_messages(parts: list) -> None:
 def _show_mailbox() -> None:
     """Open the messages, falling back to a printout if the browser can't run.
 
-    KeyboardInterrupt is left alone \u2014 Ctrl+C is the user talking. Everything
+    KeyboardInterrupt is left alone — Ctrl+C is the user talking. Everything
     else, SystemExit included, is caught: a message list is a widget, and a
     widget must never be able to end the session. An uncaught SystemExit from
     inside a full-screen app would take the whole CLI down with it, which
@@ -24430,7 +24430,7 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
     return False
 
 
-# \u2500\u2500 Command palette registry \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# ── Command palette registry ───────────────────────────────────────────
 # Generated from COMMAND_SPECS so help, completion, and palette cannot drift.
 
 def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict,
@@ -24441,7 +24441,7 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict,
             cmd, agent_registry, session, interactive_session)
     except SlashCommandUsageError as exc:
         # escape(): usage strings are full of "[list|read <n>]", and Rich
-        # reads a bracket as a style tag \u2014 every optional-argument group was
+        # reads a bracket as a style tag — every optional-argument group was
         # being swallowed, so "/training bogus extra" answered "Usage:
         # /training " and told the user nothing.
         console.print(f"[yellow]{escape(str(exc))}[/yellow]")
@@ -24485,17 +24485,17 @@ _COMMANDS = [
 
 
 def show_command_palette():
-    """Interactive full-screen command selector \u2014 fuzzy filter, arrow keys, Enter.
+    """Interactive full-screen command selector — fuzzy filter, arrow keys, Enter.
 
     Returns the selected command string (e.g. \"/help\") or None if cancelled.
     """
     items = [(f"[cyan]{name}[/cyan]", desc) for name, desc in _COMMANDS]
     chosen = select_dialog(
         items,
-        title="Commands \u2014 type to filter",
+        title="Commands — type to filter",
         full_screen=True,
         search=True,
-        hint=f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  \u21b5 select  Esc cancel",
+        hint=f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ select  Esc cancel",
     )
     if chosen is None:
         return None
@@ -24555,7 +24555,7 @@ def show_help(command: str = ""):
         # onto unindented continuation lines. A borderless Table wraps both
         # columns with a hanging indent and keeps descriptions aligned.
         table = RichTable.grid(padding=(0, 2))
-        # Long usage strings (/helpwo, /usage \u2026) may exceed any sane column
+        # Long usage strings (/helpwo, /usage …) may exceed any sane column
         # width; let them fold within the column rather than overflow="ignore",
         # which renders past the column edge and overwrites the description.
         table.add_column(style="accent.dim", max_width=64, overflow="fold")
@@ -24570,11 +24570,11 @@ def show_help(command: str = ""):
         rows = []
         if title == "Basics":
             rows.extend([
-                ("ls, git, \u2026", "PATH commands run directly"),
-                ("<text>", "plain text \u2192 AI agent loop"),
+                ("ls, git, …", "PATH commands run directly"),
+                ("<text>", "plain text → AI agent loop"),
                 ("Alt+0", "read the messages behind the L> mark"),
-                ("Alt+1..9", "select a status slot; \u2191\u2193 change it, Enter apply"),
-                ("Alt+A", "open the /agents view, including mid-task \u2014 "
+                ("Alt+1..9", "select a status slot; ↑↓ change it, Enter apply"),
+                ("Alt+A", "open the /agents view, including mid-task — "
                           "hand work to another agent while this one runs"),
             ])
         for spec in COMMAND_SPECS:
@@ -24605,7 +24605,7 @@ def show_help(command: str = ""):
             _print_group("Extensions", ext_rows)
 
 
-# \u2500\u2500 LoopDeps factory (lazy init after all functions defined) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# ── LoopDeps factory (lazy init after all functions defined) ─────────
 
 _loop_deps: Optional[LoopDeps] = None
 
@@ -24638,7 +24638,7 @@ def get_loop_deps() -> LoopDeps:
     return _loop_deps
 
 
-# \u2500\u2500 Main \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# ── Main ───────────────────────────────────────────────────────────────
 
 #: Name of the colleague every session starts with. Undeployed: it exists so
 #: the prompt's agent slot has a second value, not because it has work.
@@ -24648,7 +24648,7 @@ def get_loop_deps() -> LoopDeps:
 DEFAULT_SUB_AGENT_NAME = "scout"
 
 #: What `scout` is for. Written onto the agent only when it has no prompt of
-#: its own, so a user who edited theirs keeps it \u2014 pushing defaults over an
+#: its own, so a user who edited theirs keeps it — pushing defaults over an
 #: edited copy is a mistake this codebase has already paid for once.
 #:
 #: Deliberately short. The how-to-work half lives in the task branches
@@ -24664,7 +24664,7 @@ You work on code that already exists and that someone else has to keep
 working on afterwards. That shapes what a good result looks like:
 
 - Read the surrounding code before you change it, and make your change look
-  like the code around it \u2014 its naming, its error handling, its level of
+  like the code around it — its naming, its error handling, its level of
   comment. A correct change in a foreign style still costs the reader.
 - Evidence over recall. Before you state how something behaves, open it. A
   confident answer about a function you did not read is the expensive kind of
@@ -24672,7 +24672,7 @@ working on afterwards. That shapes what a good result looks like:
 - Finish the change, including the check that it works. An edit you have not
   run is a claim, not a result; say which check you ran and what it said.
 - Report what you did not do. Scope you left out, a test you could not run, a
-  bug you found and deliberately did not fix \u2014 those belong in the answer, not
+  bug you found and deliberately did not fix — those belong in the answer, not
   in the next person's afternoon.
 """
 
@@ -24696,7 +24696,7 @@ that it does not.
 
 - A split you cannot justify costs more than doing it in order. Parts that
   need the same files, or where one is only waiting on another's answer, are
-  one part \u2014 saying so is the right result, not a failure to find work to
+  one part — saying so is the right result, not a failure to find work to
   parallelise.
 - You answer for the joined result, not for the parts. Whatever each part
   reports, the thing that was asked for either works or it does not, and
@@ -24709,9 +24709,9 @@ that it does not.
 """
 
 _LOGO_LINES = [
-    " \u2577    \u256d\u2500\u256e  \u252c  \u2577 \u2577 \u250c\u252c\u2510  \u256d\u2500\u256e  \u256d\u2500\u256e",
-    " \u2502    \u251c\u2500\u2524  \u2502  \u2502\u2572\u2502  \u2502   \u251c\u2500\u2524  \u2570\u2500\u256e",
-    " \u2570\u2500\u2500  \u2575 \u2575  \u2534  \u2575 \u2575  \u2534   \u2575 \u2575  \u2570\u2500\u256f",
+    " ╷    ╭─╮  ┬  ╷ ╷ ┌┬┐  ╭─╮  ╭─╮",
+    " │    ├─┤  │  │╲│  │   ├─┤  ╰─╮",
+    " ╰──  ╵ ╵  ┴  ╵ ╵  ┴   ╵ ╵  ╰─╯",
 ]
 
 
@@ -24720,7 +24720,7 @@ def _shorten_path(p: str, max_len: int = 48) -> str:
     if p.startswith(home):
         p = "~" + p[len(home):]
     if len(p) > max_len:
-        p = "\u2026" + p[-(max_len - 1):]
+        p = "…" + p[-(max_len - 1):]
     return p
 
 
@@ -24802,7 +24802,7 @@ def show_banner(agent_name: str, session: dict = None):
         for key, value in rows:
             console.print(
                 f"  [muted]{key.rjust(label_width)}[/muted]  "
-                f"[accent.dim]\u2502[/accent.dim] {value}"
+                f"[accent.dim]│[/accent.dim] {value}"
             )
 
     # The advisory block that used to live here (usage tips, training-data
@@ -24811,7 +24811,7 @@ def show_banner(agent_name: str, session: dict = None):
     # with Alt+0. Startup shows one line, not six.
     startup_mail.post(
         "tips", "How input is routed",
-        f"PATH commands run directly {symbols.BULLET} plain text \u2192 AI",
+        f"PATH commands run directly {symbols.BULLET} plain text → AI",
         action="/help for commands, /mode plan, /policy approvals")
     if bool(getattr(
             backend_profile, "sends_laintas_credentials",
@@ -24832,7 +24832,7 @@ def show_banner(agent_name: str, session: dict = None):
     else:
         # The other half of the same trade, and the half nobody guesses. Once
         # an application asks for mouse reporting, the terminal forwards every
-        # click and drag to it instead of running its own selection \u2014 that is
+        # click and drag to it instead of running its own selection — that is
         # how VT mouse mode works everywhere, not something this CLI chose.
         # Every terminal offers the same escape hatch, and a user who does not
         # know it concludes that selection is simply broken.
@@ -24840,7 +24840,7 @@ def show_banner(agent_name: str, session: dict = None):
             "mouse", "Hold Shift to select text with the mouse",
             "Status slots are clickable while mouse reporting is on, and in "
             "exchange the terminal hands clicks to this CLI instead of "
-            "selecting text. Shift plus drag selects as usual \u2014 that works in "
+            "selecting text. Shift plus drag selects as usual — that works in "
             "Windows Terminal, and in every other terminal that supports "
             "mouse reporting.",
             action="/config enable_mouse false to turn clicking off")
@@ -24941,7 +24941,7 @@ def _install_terminal_watchdog(shutdown_fn, *, startup_cwd=None,
                                interval: float = 30.0, grace: float = 8.0):
     """Exit when the controlling terminal or launch directory disappears.
 
-    The REPL already turns a dead terminal into EOF and shuts down \u2014 but only
+    The REPL already turns a dead terminal into EOF and shuts down — but only
     while it is actually reading from it. A session parked anywhere else (a
     lock, a queue, a remote poll, an agent view) never reaches that code, and
     signal handlers cannot rescue it: Python runs them on the main thread at a
@@ -25004,8 +25004,8 @@ def _install_terminal_watchdog(shutdown_fn, *, startup_cwd=None,
                     continue
             except Exception:
                 continue
-            # Give the ordinary shutdown its chance \u2014 it unregisters the agent
-            # and saves the session \u2014 but never wait on it indefinitely, since
+            # Give the ordinary shutdown its chance — it unregisters the agent
+            # and saves the session — but never wait on it indefinitely, since
             # a stuck main thread is the reason this thread exists at all.
             threading.Thread(target=attempt_clean_shutdown, daemon=True).start()
             time.sleep(grace)
@@ -25053,18 +25053,18 @@ def _simple_prompt(cwd: str) -> str:
         raise
 
 
-# \u2500\u2500 Remote Message Injection \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# ── Remote Message Injection ──────────────────────────────────────────────
 # Messages from HelpwoAI (poll thread) are injected into the main REPL loop
-# so they go through the exact same input\u2192route\u2192execute pipeline as local
+# so they go through the exact same input→route→execute pipeline as local
 # user input. A wakeup pipe unblocks the main thread when a message arrives.
 
 class _InjectedInput:
     """A message injected from the remote poll thread into the main loop.
 
     kind:
-      "line"     \u2014 treated exactly like a locally typed line (meta command /
+      "line"     — treated exactly like a locally typed line (meta command /
                    shell passthrough / AI, decided by the normal router).
-      "dialogue" \u2014 a conversation message for the current Agent: the REPL
+      "dialogue" — a conversation message for the current Agent: the REPL
                    skips shell classification and routes it to the agent loop
                    (used by the /agents view after slash commands have been
                    rejected by that view).
@@ -25123,7 +25123,7 @@ def _get_input(cwd: str):
     """Return user input or an _InjectedInput from the remote queue.
 
     Checks the wakeup pipe non-blockingly so that remote messages queued
-    between prompts are processed immediately. Does NOT block on stdin \u2014
+    between prompts are processed immediately. Does NOT block on stdin —
     prompt_toolkit handles its own blocking read after the prompt is shown.
     """
     if (_terminal_agents.configured
@@ -25156,7 +25156,7 @@ def _get_input(cwd: str):
             try:
                 return _injected_input_queue.get_nowait()
             except queue.Empty:
-                pass  # spurious wakeup \u2014 fall through to prompt
+                pass  # spurious wakeup — fall through to prompt
 
     return _simple_prompt(cwd) if _USE_SIMPLE_PROMPT else pt_prompt(cwd)
 
@@ -25169,10 +25169,10 @@ def _parse_agent_target(text: str) -> tuple[str, str]:
     return match.group(1), match.group(2).strip()
 
 
-# \u2500\u2500 Background stdin reader for supplementary input during agent loop \u2500\u2500
+# ── Background stdin reader for supplementary input during agent loop ──
 # When the agent loop is running, the user can type additional instructions,
 # or press Esc to soft-interrupt (the same interrupt Ctrl+C triggers, but
-# wired straight to the loop's interrupt event \u2014 never a signal, so Esc can
+# wired straight to the loop's interrupt event — never a signal, so Esc can
 # never kill the process; force exit stays exclusive to double Ctrl+C).
 # A background thread owns stdin via prompt_toolkit (falling back to line
 # mode without a tty) and hand-rolls just enough line editing to keep
@@ -25184,7 +25184,7 @@ _bg_reader_stop = threading.Event()
 # that is still releasing, short enough that a genuinely stuck holder is
 # reported rather than waited on forever.
 _BG_READER_BUSY_RETRY_SECONDS = 30.0
-# (queue, interrupt_event) the live reader was started on \u2014 the pair the
+# (queue, interrupt_event) the live reader was started on — the pair the
 # running loop actually drains and checks. Restarts reuse it.
 _bg_reader_args: tuple = ()
 # Set for the duration of a foreground turn. Alt+A opens the /agents view
@@ -25216,7 +25216,7 @@ def _queue_supplementary(target_queue: queue.Queue, line: str,
         return False
     _set_run_input_state("queued")
     console.print(
-        f"[accent.dim]\u21b3[/accent.dim] [muted]Queued instruction"
+        f"[accent.dim]↳[/accent.dim] [muted]Queued instruction"
         f"{f' from {escape(source)}' if source != 'local' else ''}: "
         f"{escape(agent_loop_crop_for_ui(line, 80))}[/muted]")
     return True
@@ -25274,8 +25274,8 @@ def _bg_reader_prompt_mode(target_queue: queue.Queue,
                     for _attempt in (0, 1):
                         try:
                             line = _bg_prompt_session.prompt(
-                                [("class:prompt-gutter", "  \u2502 "),
-                                 ("class:prompt-caret", "\u203a ")],
+                                [("class:prompt-gutter", "  │ "),
+                                 ("class:prompt-caret", "› ")],
                                 style=_build_prompt_style(),
                                 erase_when_done=True,
                                 complete_while_typing=False,
@@ -25335,7 +25335,7 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
     """Supplementary input + Esc-to-interrupt while the agent loop runs.
 
     Holds the terminal through the arbiter, so this reader cannot coexist
-    with the approval prompt or the REPL \u2014 the previous version read fd 0
+    with the approval prompt or the REPL — the previous version read fd 0
     directly and raced them for bytes, which is how keystrokes vanished and
     how half-parsed escape sequences ended up rendered as literal text.
 
@@ -25366,8 +25366,8 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
     # opened below.
     open_view = False
     # The hold can lose a race with a prompt that has not finished releasing
-    # the terminal. That used to end the reader for the rest of the turn \u2014
-    # silently \u2014 so Esc did nothing at all and the user had no way to know.
+    # the terminal. That used to end the reader for the rest of the turn —
+    # silently — so Esc did nothing at all and the user had no way to know.
     # Keep trying while the stop event is clear, and say so if we give up.
     # ``hold`` is a context manager: TerminalBusy comes out of __enter__, not
     # out of the call, so entry is done by hand here to tell "could not take
@@ -25386,7 +25386,7 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
             _hold_cm = None
             if time.monotonic() >= _busy_deadline:
                 # Degrading to line mode would put a second reader back on
-                # fd 0 \u2014 the exact bug the arbiter exists to prevent \u2014 so
+                # fd 0 — the exact bug the arbiter exists to prevent — so
                 # give the escape hatch instead of a rival reader.
                 console.print(
                     "\n[yellow]Esc is unavailable for this turn: another "
@@ -25467,12 +25467,12 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
         _open_agents_view_from_run()
 
 
-# \u2500\u2500 Alt+A during a run: go to the /agents view \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-# The view is where work is handed to another Agent \u2014 selecting one there and
+# ── Alt+A during a run: go to the /agents view ──────────────────────────
+# The view is where work is handed to another Agent — selecting one there and
 # typing calls start_agent_assignment, which runs it on its own thread in its
 # own private PTY. That is the parallelism; nothing else in the CLI dispatches
 # it. But the view is a slash command, and slash commands are dispatched by
-# the main thread after _get_input() returns \u2014 which never happens while a
+# the main thread after _get_input() returns — which never happens while a
 # turn is running. So the one situation that needs the multi-agent surface was
 # the one situation that could not reach it.
 #
@@ -25507,7 +25507,7 @@ def _start_bg_input_reader(target_queue: queue.Queue,
     """Start a background thread that reads stdin for supplementary messages
     and Esc-to-interrupt during run_agent_loop().
 
-    Only active during the agent loop \u2014 the normal REPL prompt uses
+    Only active during the agent loop — the normal REPL prompt uses
     prompt_toolkit which owns stdin.
 
     target_queue: the queue to put supplementary messages into (should be
@@ -25523,7 +25523,7 @@ def _start_bg_input_reader(target_queue: queue.Queue,
 
     # A stop event per thread, captured in the closure. The single global
     # event this replaces was cleared on every start, which un-stopped any
-    # reader that had not yet noticed it should quit \u2014 resurrecting an
+    # reader that had not yet noticed it should quit — resurrecting an
     # orphan that then competed with its own replacement for stdin.
     stop_event = threading.Event()
     _bg_reader_stop = stop_event
@@ -25531,7 +25531,7 @@ def _start_bg_input_reader(target_queue: queue.Queue,
     def _reader():
         try:
             if sys.stdin.isatty():
-                # Prefer cbreak mode when an interrupt_event is wired \u2014
+                # Prefer cbreak mode when an interrupt_event is wired —
                 # it avoids prompt_toolkit's stdin ownership and its
                 # potential race with Rich Live output (patch_stdout).
                 # Fall back to prompt_toolkit only when cbreak fails.
@@ -25563,8 +25563,8 @@ def _restart_bg_input_reader() -> None:
     the module-level user queue/event. For a primary Agent the run does not
     watch those: _run_agent_loop_with_interrupt starts the reader on
     ``active_agent.message_queue`` / ``active_agent.abort_event`` and hands
-    the same pair to run_agent_loop. So after the first approval of a turn \u2014
-    and any shell command or file write raises one \u2014 supplementary typing
+    the same pair to run_agent_loop. So after the first approval of a turn —
+    and any shell command or file write raises one — supplementary typing
     went into a queue nobody drains and Esc set an event nobody checks.
     """
     if not _bg_reader_args:
@@ -25604,12 +25604,12 @@ def _stop_bg_input_reader() -> bool:
     return stopped
 
 
-# \u2500\u2500 Session-level approval state \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# ── Session-level approval state ─────────────────────────────────────────
 # Lets the user pick "always" at an approval prompt to auto-approve the rest
-# of the session \u2014 mirrors Claude Code / Cursor's "yes, and don't ask again".
+# of the session — mirrors Claude Code / Cursor's "yes, and don't ask again".
 # Reset on /exit, /reload, or a fresh process start.
 #
-# "all_commands"/"all_writes" are a deliberate, visible BLANKET override \u2014
+# "all_commands"/"all_writes" are a deliberate, visible BLANKET override —
 # only ever set by an explicit mode choice (`/mode act always`, or a custom
 # mode's `auto_approve` posture), never by a one-off prompt. Approving a
 # single write/command with "Always" instead records that exact target in
@@ -25633,7 +25633,7 @@ def _flush_deferred_notices() -> None:
     """Print notices queued by render callbacks, from a safe place.
 
     Anything a prompt_toolkit callable wants to tell the user has to be
-    queued and emitted here \u2014 between prompts, with no application running.
+    queued and emitted here — between prompts, with no application running.
     """
     global _approval_star_announced, _approval_star_pending
     if _approval_star_pending and not _approval_star_announced:
@@ -25664,7 +25664,7 @@ def _sync_session_approval_from_mode():
     """Set session auto-approve flags from the active mode's auto_approve posture.
 
     Called after switching modes so a mode's declared auto-approve (none/writes/
-    commands/all) takes effect immediately \u2014 and switching to a plain mode
+    commands/all) takes effect immediately — and switching to a plain mode
     (auto_approve=none) clears any prior auto-approve.
     """
     try:
@@ -25698,8 +25698,8 @@ def _arrow_approval_prompt(title: str, body_lines: list[str],
             return f"[#7aa2f7]{esc}[/#7aa2f7]"
         return f"[#c0c0c0]{esc}[/#c0c0c0]"
 
-    # Split "action \u2014 question" back into the action word for the header.
-    _action = title.split(" \u2014 ")[0] if " \u2014 " in title else title
+    # Split "action — question" back into the action word for the header.
+    _action = title.split(" — ")[0] if " — " in title else title
     _target = body_lines[0] if body_lines else ""
     _header_color = "#f85149" if destructive else "#e3b341"
 
@@ -25741,7 +25741,7 @@ def _read_single_key_choice(*, allow_always: bool,
     """Block for one y/n/a keypress (no Enter needed, no line redraw).
 
     Returns "yes"/"no"/"always", or None on Esc/Ctrl+C/EOF. Bare Enter
-    counts as "no" \u2014 same fail-safe default as the arrow selector's
+    counts as "no" — same fail-safe default as the arrow selector's
     initial highlight. If auto_confirm_seconds elapses with no keypress,
     returns "yes" (matches _arrow_approval_prompt's auto_confirm_index=0,
     which is always the approve option).
@@ -25782,7 +25782,7 @@ def _read_single_key_choice(*, allow_always: bool,
                 # any other key: keep waiting
     except TerminalBusy as busy:
         # Fail closed: an approval we cannot ask about is not an approval.
-        # Distinguishable from Esc on purpose \u2014 a denial nobody was asked
+        # Distinguishable from Esc on purpose — a denial nobody was asked
         # about must be reported as such, not silently counted as "the user
         # said no" (which is how sub-agent approvals became invisible).
         _diag_busy = getattr(busy, "owner", "") or "another component"
@@ -25794,7 +25794,7 @@ def _requesting_agent_label() -> str:
 
     The thread-local identity is authoritative: it is bound around every
     agent loop (primary, sub-agent, grandchild, employee assignment). The
-    thread-name fallback exists only for callers that pre-date it \u2014 and it
+    thread-name fallback exists only for callers that pre-date it — and it
     strips the whole prefix, because agent ids contain '-' and rsplit gave
     "2" for "laintas-sched-AI-2", a key that matched no agent anywhere.
     """
@@ -25808,7 +25808,7 @@ def _requesting_agent_label() -> str:
     # Last resort for a caller with no bound identity (a runner outside the
     # agent loop, e.g. Agents Mode's own executor): the globally selected
     # agent is a worse answer than the thread's own, but a real registry id
-    # beats a placeholder \u2014 consumers look the id up and treat a miss as
+    # beats a placeholder — consumers look the id up and treat a miss as
     # "that agent is gone", which silently denies the prompt.
     current = get_current_agent()
     return current.id if current is not None else "agent"
@@ -25821,7 +25821,7 @@ def _compact_parallel_approval_prompt(title: str, body: str, question: str, *,
                                       allow_always: bool, destructive: bool,
                                       auto_confirm_seconds) -> str:
     """Compact approval prompt used while a spawn_parallel status table is on
-    screen \u2014 the sub-agent counterpart of _arrow_approval_prompt.
+    screen — the sub-agent counterpart of _arrow_approval_prompt.
 
     Same decision semantics (respects /mode's auto-confirm timeout, same
     yes/no/always outcomes); only the render differs: a short header plus a
@@ -25831,7 +25831,7 @@ def _compact_parallel_approval_prompt(title: str, body: str, question: str, *,
     Two things it must get right, both of which it used to get wrong:
       * The background stdin reader owns the terminal for the whole run.
         Not stopping it first meant every sub-agent approval sat 2s on a
-        TerminalBusy and was then silently recorded as a denial \u2014 the user
+        TerminalBusy and was then silently recorded as a denial — the user
         was never asked, and (with deny_exits_loop) the child died on the
         spot with an empty reply.
       * A prompt nobody could see is not a decision. When the terminal
@@ -25848,8 +25848,8 @@ def _compact_parallel_approval_prompt(title: str, body: str, question: str, *,
     # the exact same bracket-injection failure mode fixed earlier in the
     # AI narration line (agent_loop.py _stripped MarkupError).
     _opts = ("y" + ("/a" if allow_always else "") + "/n")
-    _cmd_disp = _cmd if len(_cmd) <= 70 else _cmd[:67] + "\u2026"
-    _action = title.split(" \u2014 ")[0] if " \u2014 " in title else (title or "approve")
+    _cmd_disp = _cmd if len(_cmd) <= 70 else _cmd[:67] + "…"
+    _action = title.split(" — ")[0] if " — " in title else (title or "approve")
     _body_rest = [ln for ln in body.split("\n")[1:]]
 
     # Serialized: two children hitting an approval at once must not both
@@ -25862,7 +25862,7 @@ def _compact_parallel_approval_prompt(title: str, body: str, question: str, *,
         _reader_was_running = _stop_bg_input_reader() and _reader_was_running
         try:
             console.print(
-                f"  [bold {_color}]\u26a0 {escape(_action)}[/bold {_color}] "
+                f"  [bold {_color}]⚠ {escape(_action)}[/bold {_color}] "
                 f"[agent]{escape(_agent_label)}[/agent]: "
                 f"[dim]{escape(_cmd_disp)}[/dim]  ({_opts})",
                 highlight=False)
@@ -25871,7 +25871,7 @@ def _compact_parallel_approval_prompt(title: str, body: str, question: str, *,
                 if not _ln.strip():
                     continue
                 if _shown >= _PARALLEL_APPROVAL_BODY_LINES:
-                    console.print("    [muted]\u2026[/muted]", highlight=False)
+                    console.print("    [muted]…[/muted]", highlight=False)
                     break
                 console.print(f"    [#c0c0c0]{escape(_ln[:160])}[/#c0c0c0]",
                               highlight=False)
@@ -25885,13 +25885,13 @@ def _compact_parallel_approval_prompt(title: str, body: str, question: str, *,
             if choice and choice.startswith("unavailable:"):
                 _holder = choice.split(":", 1)[1]
                 console.print(
-                    f"  [yellow]\u21b3 denied \u2014 could not ask you: the terminal is "
+                    f"  [yellow]↳ denied — could not ask you: the terminal is "
                     f"held by {escape(_holder)}[/yellow]", highlight=False)
                 choice = None
             else:
                 console.print(
-                    f"  [dim]\u21b3 {choice or 'no'}[/dim]" if choice != "always"
-                    else "  [dim]\u21b3 always (auto-approved for this session)[/dim]",
+                    f"  [dim]↳ {choice or 'no'}[/dim]" if choice != "always"
+                    else "  [dim]↳ always (auto-approved for this session)[/dim]",
                     highlight=False)
         finally:
             if _reader_was_running:
@@ -25920,21 +25920,21 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
     # the view's y/n approval UI instead ("always" is not offered there).
     _view_controller = _agents_view_controller()
     if _view_controller is not None:
-        # The asker is whoever is running on THIS thread \u2014 not whichever
+        # The asker is whoever is running on THIS thread — not whichever
         # agent the view happens to have selected. Misattributing it put a
         # sub-agent's prompt under a stranger's name and left the view's
         # abort-cancels-the-prompt check watching the wrong agent.
         try:
             approved = _view_controller._request_approval(
                 _requesting_agent_label(),
-                "confirm", f"{title} \u2014 {question}", body)
+                "confirm", f"{title} — {question}", body)
         except Exception:
             approved = False
         return "yes" if approved else "no"
 
     if not sys.stdin.isatty():
         console.print(
-            f"[yellow]Approval required but no interactive TTY available \u2014 denying.[/yellow]")
+            f"[yellow]Approval required but no interactive TTY available — denying.[/yellow]")
         return "no"
 
     auto_confirm_seconds = mode_manager.get_auto_confirm_timeout(
@@ -25953,7 +25953,7 @@ def _prompt_for_approval(title: str, body: str, question: str, *,
                          auto_confirm_seconds) -> str:
     # A spawn_parallel batch keeps its own live-updating status table on
     # screen. The arrow-key selector below runs its own prompt_toolkit
-    # render loop with no awareness of that table's cursor bookkeeping \u2014
+    # render loop with no awareness of that table's cursor bookkeeping —
     # letting both draw at once corrupts the screen (reported: exiting mid
     # parallel-agents view left duplicated/garbled frames). Route through a
     # compact one-line prompt instead: identical policy decision and /mode
@@ -26005,10 +26005,10 @@ def _prompt_for_approval(title: str, body: str, question: str, *,
             allow_always=allow_always,
             auto_confirm_seconds=auto_confirm_seconds)
         if _key_choice and _key_choice.startswith("unavailable:"):
-            # Denying is right; doing it silently is not \u2014 the user never saw
+            # Denying is right; doing it silently is not — the user never saw
             # this prompt and would otherwise read the refusal as their own.
             console.print(
-                f"  [yellow]\u21b3 denied \u2014 could not ask you: the terminal is held "
+                f"  [yellow]↳ denied — could not ask you: the terminal is held "
                 f"by {escape(_key_choice.split(':', 1)[1])}[/yellow]",
                 highlight=False)
             return None
@@ -26065,7 +26065,7 @@ def request_command_approval(command: str, reason: str) -> bool:
         )
 
 
-    # Destructive git (clean/reset --hard/push --force/branch -D/stash drop\u2026)
+    # Destructive git (clean/reset --hard/push --force/branch -D/stash drop…)
     # gets a fresh Yes/No for the same reason deletion does: a blanket
     # "approve all" the user granted for ordinary commands must not silently
     # cover a command that throws away their uncommitted work or rewrites a
@@ -26078,16 +26078,16 @@ def request_command_approval(command: str, reason: str) -> bool:
     choice = _blocking_approval_prompt(
         "approve",
         f"{command}\n{reason}" if reason else command,
-        "Destructive git command \u2014 run it?" if destructive_git else "Run this command?",
+        "Destructive git command — run it?" if destructive_git else "Run this command?",
         allow_always=not destructive_git,
     )
     if choice == "always":
-        # Remember this EXACT command, not a blanket "approve everything" \u2014
+        # Remember this EXACT command, not a blanket "approve everything" —
         # a one-off approval shouldn't silently cover unrelated commands the
         # user never saw. Use `/mode act always` for a deliberate blanket
         # auto-approve instead.
         _session_approval_state["approved_commands"].add(command)
-        console.print(f"[dim]\u21b3 `{command}` auto-approved for this session.[/dim]")
+        console.print(f"[dim]↳ `{command}` auto-approved for this session.[/dim]")
         return True
     return choice == "yes"
 
@@ -26148,12 +26148,12 @@ def request_file_write_approval(path: str, diff_preview: str, reason: str) -> bo
         allow_always=True,
     )
     if choice == "always":
-        # Remember this EXACT path, not a blanket "approve everything" \u2014 a
+        # Remember this EXACT path, not a blanket "approve everything" — a
         # one-off approval shouldn't silently cover every other file the
         # user never saw a diff for. Use `/mode act always` for a
         # deliberate blanket auto-approve instead.
         _session_approval_state["approved_write_paths"].add(path)
-        console.print(f"[dim]\u21b3 Writes to {path} auto-approved for this session.[/dim]")
+        console.print(f"[dim]↳ Writes to {path} auto-approved for this session.[/dim]")
         return True
     return choice == "yes"
 
@@ -26180,7 +26180,7 @@ def _show_plan_approval_menu() -> bool:
         # The review menu is a full-screen UI; it cannot share the terminal
         # with the /agents view. Leave the plan pending for the main CLI.
         console.print(
-            "[yellow]A plan is ready for review \u2014 press Esc to leave the "
+            "[yellow]A plan is ready for review — press Esc to leave the "
             "/agents view and approve it in the main CLI.[/yellow]")
         return False
     plan = _pm.get_current_plan()
@@ -26190,7 +26190,7 @@ def _show_plan_approval_menu() -> bool:
     if approved:
         console.print(
             f"[green]{symbols.OK} Revision {approved['revision']} approved. Executing exact SHA "
-            f"{approved['content_sha'][:12]}\u2026[/green]")
+            f"{approved['content_sha'][:12]}…[/green]")
         return True
     return False
 
@@ -26273,7 +26273,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
     """Run the foreground agent loop with soft-interrupt support.
 
     Wraps run_agent_loop() with:
-    1. Temporary SIGINT handler: first Ctrl+C \u2192 soft interrupt, second \u2192 force exit.
+    1. Temporary SIGINT handler: first Ctrl+C → soft interrupt, second → force exit.
     2. Module-level interrupt event reset before/after each call.
 
     Returns the same dict as run_agent_loop().
@@ -26335,7 +26335,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
         # Ctrl+C forces an exit (escape hatch).
         now = time.time()
         if now - _last_ctrl_c[0] <= 1.5:
-            # Double Ctrl+C \u2192 force exit (escape hatch)
+            # Double Ctrl+C → force exit (escape hatch)
             console.print("\n[red]Force exit.[/red]")
             _stop_bg_input_reader()
             # Restore and call original handler
@@ -26357,7 +26357,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
     # a signal, so Esc can never kill the CLI).
     _start_bg_input_reader(_msg_queue, _interrupt_event)
 
-    # Everything the loop prints is Agent conversation \u2014 record it into the
+    # Everything the loop prints is Agent conversation — record it into the
     # /agents mirror. Output outside a run (banner, prompts, idle chatter)
     # stays off Agent screens.
     repl_mirror.hub.start_recording()
@@ -26370,7 +26370,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
     response = None
     run_error = ""
 
-    # \u2500\u2500 Auto-Pilot: heuristic classification + decomposition + auto-exec \u2500\u2500
+    # ── Auto-Pilot: heuristic classification + decomposition + auto-exec ──
     effective_input = user_input
     try:
         if get_runtime_config("auto_pilot_enabled"):
@@ -26463,7 +26463,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
         # A turn that deleted its own working directory leaves every later
         # path call raising ENOENT, so "the session was preserved" would be a
         # lie: the next command would crash the same way. Move first, then
-        # report \u2014 the recovery names the deleted directory, which the
+        # report — the recovery names the deleted directory, which the
         # traceback (pointing at getcwd) does not.
         try:
             _recover_deleted_cwd()
@@ -26518,7 +26518,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
         _foreground_run_active = False
         _foreground_run_thread = None
         # Esc stops the AGENT the user was talking to. Everything that turn
-        # started underneath it has to stop with it \u2014 a sub-agent runs on its
+        # started underneath it has to stop with it — a sub-agent runs on its
         # own thread watching its OWN abort_event, which setting the parent's
         # never touched. This runs before the event is cleared below, and
         # before the reader is torn down, so an Esc pressed during teardown
@@ -26596,7 +26596,7 @@ def _run_execute_mode(task: str, session: dict, depth: int, session_id: str = No
     # Apply the active mode's auto-approve posture before the loop starts.
     # Interactive sessions reach this through /mode and /auto; --execute never
     # did, so a mode declaring auto_approve="writes" still stopped at the first
-    # write and \u2014 with no TTY to ask \u2014 failed closed. That made every
+    # write and — with no TTY to ask — failed closed. That made every
     # unattended caller (cron, CI, this file's own reason for existing)
     # unusable with any tool that writes.
     _sync_session_approval_from_mode()
@@ -26709,14 +26709,14 @@ def main():
     # A terminal the CLI has not run in before starts from the settings last
     # used rather than from nothing. TERMINAL_ID is derived from the tty and
     # POSIX session id when the emulator offers nothing better, and both
-    # change on every SSH login \u2014 so without this, every new connection asked
+    # change on every SSH login — so without this, every new connection asked
     # for the model and mode again.
     try:
         terminal_preferences.seed_new_terminal()
     except Exception:
         pass
     # Put the built-in decision tree on disk the first time, so it can be
-    # read and edited. Only when absent \u2014 never over an edited tree.
+    # read and edited. Only when absent — never over an edited tree.
     try:
         import branches as _branches_boot
         _branches_boot.write_default_tree()
@@ -26724,7 +26724,7 @@ def main():
         pass
     import argparse
 
-    parser = argparse.ArgumentParser(description="Laintas CLI \u2014 Autonomous AI agent")
+    parser = argparse.ArgumentParser(description="Laintas CLI — Autonomous AI agent")
     parser.add_argument("--version", "-V", action="version",
                         version=f"laintas-cli {__version__}")
     parser.add_argument("--name", type=str, help="Set agent name (shows in Helpwo AGNETS)")
@@ -26742,7 +26742,7 @@ def main():
     parser.add_argument("--simple-prompt", action="store_true", default=False,
                         help="Use plain input() instead of prompt_toolkit")
     parser.add_argument("--monitor-only", action="store_true", default=False,
-                        help="Start as a remote executor only \u2014 register, heartbeat, "
+                        help="Start as a remote executor only — register, heartbeat, "
                              "and poll HelpwoAI for tasks. No local REPL.")
     parser.add_argument("--resume", action="store_true", default=False,
                         help="Resume the saved conversation for this directory on startup")
@@ -26800,7 +26800,7 @@ def main():
             except Exception:
                 pass
 
-    # \u2500\u2500 Cross-instance coordination: register this process in the peer
+    # ── Cross-instance coordination: register this process in the peer
     # registry so other laintas_cli instances sharing this cwd can see it.
     # atexit deregisters on every exit path (sys.exit, REPL end, exception).
     # Single instance: one atomic write at startup + mtime refresh per turn.
@@ -26820,7 +26820,7 @@ def main():
         if args.laintas.rstrip("/") != LAINTAS_BASE:
             parser.error("custom authentication origins are no longer allowed")
 
-    # All REPL instances use full-color console \u2014 sub-terminals are full
+    # All REPL instances use full-color console — sub-terminals are full
     # laintas-cli instances and should look identical to the main terminal.
 
     # Initialize unified home directory and auto-migrate old layout
@@ -26835,9 +26835,9 @@ def main():
     evolution_lab.reconcile_workspace()
 
     # Reclaim sub-agent worktrees whose owning process is gone. Teardown is
-    # skipped on three paths \u2014 a merge conflict and a merge exception both
+    # skipped on three paths — a merge conflict and a merge exception both
     # leave the checkout "for manual review", and a killed CLI never reaches
-    # teardown at all \u2014 and nothing revisited them, so they accumulated until
+    # teardown at all — and nothing revisited them, so they accumulated until
     # a full copy of the repo per orphan dominated both disk and every
     # recursive search. Startup is the one moment a previous run is provably
     # over. Content is archived as a patch first; see worktree_manager.
@@ -26856,13 +26856,13 @@ def main():
                     f"a patch under .laintas/worktrees/.reaped/.[/dim]")
             if _reaped["error"]:
                 # A sweep that fails must not look like a sweep that found
-                # nothing \u2014 that silence is how the orphans went unnoticed.
+                # nothing — that silence is how the orphans went unnoticed.
                 console.print(f"[dim]Worktree sweep incomplete: "
                               f"{_reaped['error']}[/dim]")
         except Exception as _exc:
             console.print(f"[dim]Worktree sweep skipped: {_exc}[/dim]")
 
-    # Hint (never auto-overwrite \u2014 see ensure_files_exist) when the saved
+    # Hint (never auto-overwrite — see ensure_files_exist) when the saved
     # cli.prop no longer matches what this version would generate, so an
     # upgraded default prompt template doesn't silently go unused.
     if args.depth == 0:
@@ -26909,7 +26909,7 @@ def main():
     if args.depth == 0 and not _active_backend.sends_laintas_credentials:
         console.print(
             f"[yellow]Backend mode: {_active_backend.kind} "
-            f"({_active_backend.base_url}) \u2014 external/unmetered; "
+            f"({_active_backend.base_url}) — external/unmetered; "
             "Laintas credentials are not sent.[/yellow]")
 
     # Project extensions receive a narrow inference gateway, never the raw
@@ -26929,13 +26929,13 @@ def main():
 
         Not by starting a second agent loop beside it. That was the mistake:
         a worker-thread loop is never the tty owner, so it renders nothing, and
-        it keeps its own history \u2014 a parallel session that happens to share a
+        it keeps its own history — a parallel session that happens to share a
         directory. What a channel should do is exactly what the user does,
         which is put the text in the prompt and press enter.
 
         `_inject_input` already is that: the same queue `/agents` and the
         Helpwo bridge use to hand a line to the single executor. The main loop
-        then routes it normally \u2014 meta command, shell passthrough, or agent \u2014
+        then routes it normally — meta command, shell passthrough, or agent —
         renders it as the foreground turn, and shares the one conversation.
         The result comes back the way the Helpwo bridge takes it, off
         `agent_state` once the loop signals `done`.
@@ -26981,7 +26981,7 @@ def main():
             console.print(f"[yellow]Extension {_ext_name}: {_ext_message}[/yellow]")
 
     # The organisation layer, when this machine has one. Installed means enabled
-    # \u2014 there is no second switch to get out of sync with what is on disk.
+    # — there is no second switch to get out of sync with what is on disk.
     # A failure here is reported and survived: a member who cannot load their
     # organisation's package still gets their CLI, and the server still decides
     # what they are allowed to do without a verified policy digest.
@@ -27013,7 +27013,7 @@ def main():
             startup_mail.post("extensions", "Extension runtime failed to start",
                               str(_ext_exc), action="/extensions", level="warn")
 
-    # \u2500\u2500 Non-interactive execution mode \u2500\u2500
+    # ── Non-interactive execution mode ──
     if args.execute:
         if (_active_backend.sends_laintas_credentials
                 and not session.get("userId")):
@@ -27021,7 +27021,7 @@ def main():
             sys.exit(1)
         sys.exit(run_execute_mode(args.execute, session, args.depth, args.session_id))
 
-    # \u2500\u2500 Simple prompt (PTY subprocess mode) \u2500\u2500
+    # ── Simple prompt (PTY subprocess mode) ──
     global _IN_SUB_TERMINAL, _USE_SIMPLE_PROMPT
     _USE_SIMPLE_PROMPT = args.simple_prompt or not sys.stdin.isatty()
     _IN_SUB_TERMINAL = args.depth > 0
@@ -27029,7 +27029,7 @@ def main():
     # Show banner (skip in child terminals to avoid Rich output in PTY)
     if args.depth == 0:
         show_banner(agent_name, session if session else None)
-        # Best-effort, short-timeout update check \u2014 never blocks startup for
+        # Best-effort, short-timeout update check — never blocks startup for
         # more than ~1.5s and stays silent on any network/parse failure.
         try:
             import updater as _updater_check
@@ -27118,7 +27118,7 @@ def main():
         handle_meta_command._current_live_session = current_live_session
 
         # "Is there a session to resume here" used to be answered by parsing
-        # every resume blob for this cwd \u2014 whole conversations, 60MB across 62
+        # every resume blob for this cwd — whole conversations, 60MB across 62
         # files on a working machine, ~2.1s before the first prompt could be
         # drawn. The advisory needs the newest one's size and age, which
         # latest_resume_summary gets in ~0.03s. /resume still uses the full
@@ -27139,7 +27139,7 @@ def main():
                            f"{_summary['turn_count']}")
 
         # Closing a stale recovery-journal admission means reading a journal
-        # that only grows \u2014 16MB here, ~1s \u2014 and nothing before the first
+        # that only grows — 16MB here, ~1s — and nothing before the first
         # prompt depends on the answer, so it runs behind it. Deferred rather
         # than merely threaded: this is CPU-bound JSON parsing, and a Python
         # thread doing that holds the GIL in slices the main thread waits for,
@@ -27214,7 +27214,7 @@ def main():
 
     if session.get("userId") or not _active_backend.sends_laintas_credentials:
         if args.depth == 0 and args.monitor_only:
-            # Monitor mode IS the remote-executor role \u2014 it must be online.
+            # Monitor mode IS the remote-executor role — it must be online.
             agent_registry.register(session, name=agent_name)
             agent_registry.start_heartbeat()
             agent_registry.start_message_poll(
@@ -27304,7 +27304,7 @@ def main():
         # A registry with exactly one agent in it makes the prompt's agent
         # slot a control with nothing to control: Alt+select it and there is
         # no second value to cycle to. Every session therefore starts with two
-        # colleagues already registered \u2014 both undeployed, holding no terminal
+        # colleagues already registered — both undeployed, holding no terminal
         # lease, costing nothing until one is actually addressed. Switching to
         # one (Alt+select the agent slot, or /agent <name>) gives it its own
         # conversation and its own state; /hire adds more.
@@ -27349,8 +27349,8 @@ def main():
                     "parts that can run at once, and builds a workflow graph "
                     "when it does. Neither owns a terminal or does anything "
                     "until you address it.",
-                    action=(f"Alt+1 selects the agent slot \u2014 then up/down "
-                            f"and Enter \u2014 or /agent {DECOMPOSER_SUB_AGENT_NAME}"))
+                    action=(f"Alt+1 selects the agent slot — then up/down "
+                            f"and Enter — or /agent {DECOMPOSER_SUB_AGENT_NAME}"))
             except Exception as _default_agent_exc:
                 startup_mail.post(
                     "default-sub-agent",
@@ -27433,7 +27433,7 @@ def main():
 
     set_trigger_wake_callback(_trigger_wake_cb)
 
-    # \u2500\u2500 Phase 2: Register LLM decomposition callback for auto-pilot \u2500\u2500
+    # ── Phase 2: Register LLM decomposition callback for auto-pilot ──
     def _decompose_cb(task: str, strategy: str, timeout: float):
         """Decompose a task into subtasks via backend LLM with timeout."""
         try:
@@ -27494,7 +27494,7 @@ def main():
                 # Servers initialise one after another, up to ~20s each, and
                 # the results only print once all of them are done.
                 if _get_mcp_mod().CONFIG_PATH.exists():
-                    with _safe_status("[dim]Connecting MCP servers\u2026[/dim]"):
+                    with _safe_status("[dim]Connecting MCP servers…[/dim]"):
                         _mcp_results = _get_mcp_mod().get_manager().connect_all_enabled()
                 else:
                     _mcp_results = _get_mcp_mod().get_manager().connect_all_enabled()
@@ -27617,7 +27617,7 @@ def main():
         # SIGTERM/SIGHUP land while prompt_toolkit holds the terminal in raw
         # mode, and sys.exit() unwinds through daemon threads that never get
         # to run their restore. Without this the user's shell is left with
-        # ICANON and ECHO off \u2014 typing invisible, Enter doing nothing \u2014 which
+        # ICANON and ECHO off — typing invisible, Enter doing nothing — which
         # is what a dropped SSH connection used to leave behind.
         terminal_arbiter.reset_to_pristine()
         sys.exit(0)
@@ -27625,7 +27625,7 @@ def main():
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
     # tmux kill-window (parent's unregister_terminal / Helpwo term-close)
-    # delivers SIGHUP \u2014 unregister from Helpwo before dying instead of
+    # delivers SIGHUP — unregister from Helpwo before dying instead of
     # leaving a stale agent until the 60s heartbeat timeout.
     signal.signal(signal.SIGHUP, shutdown)
 
@@ -27636,7 +27636,7 @@ def main():
         _install_terminal_watchdog(
             shutdown, startup_cwd=_startup_cwd_identity)
 
-    # \u2500\u2500 Create term0: a real persistent bash session \u2500\u2500
+    # ── Create term0: a real persistent bash session ──
     # Direct user terminal commands route through this via marker-poll.
     # Agent shell.exec stays an isolated synchronous subprocess; deployment is
     # lifecycle ownership and never grants a shared PTY command channel.
@@ -27662,7 +27662,7 @@ def main():
         console.print(f"[dim yellow]term0 bash session init failed: {_e}[/dim yellow]")
         _term0_session = None
 
-    # \u2500\u2500 Monitor-only mode (no interactive REPL) \u2500\u2500
+    # ── Monitor-only mode (no interactive REPL) ──
     # Runs purely as a remote executor: heartbeat + /poll loop already
     # started above when the agent registered. Here we just park the main
     # thread until SIGINT/SIGTERM. See HELPWO_INTEGRATION_PLAN.md phase D.
@@ -27678,7 +27678,7 @@ def main():
         console.print(Panel(
             f"[green]Monitor-only mode active[/green]\n"
             f"Agent: [bold]{agent_registry.agent_name}[/bold] ({agent_registry.agent_id})\n"
-            f"Listening for remote exec/query/delegate requests\u2026\n"
+            f"Listening for remote exec/query/delegate requests…\n"
             f"[dim]Ctrl+C to exit.[/dim]",
             title="laintas-cli monitor",
             border_style="green",
@@ -27727,9 +27727,9 @@ def main():
     # Main interactive loop
 
     while True:
-        # \u2500\u2500 the directory we are standing in may have been deleted \u2500\u2500
+        # ── the directory we are standing in may have been deleted ──
         _repl_cwd = _recover_deleted_cwd()
-        # \u2500\u2500 term0 health check \u2500\u2500
+        # ── term0 health check ──
         _ensure_term0_alive()
         try:
             item = _get_input(str(_repl_cwd or paths.live_cwd()))
@@ -27768,13 +27768,13 @@ def main():
         # Injected lines (Helpwo chat, extensions, app bridges) are not local
         # keystrokes. /password must only open from the local terminal: a
         # remote trigger would put a hidden passphrase prompt on a screen its
-        # requester cannot see \u2014 a phishing surface, and the vault design
+        # requester cannot see — a phishing surface, and the vault design
         # (docs/password-vault-design.md) keeps remote/mirrored entry
         # disabled until it has a trusted input path of its own.
         _is_injected_line = isinstance(item, _InjectedInput)
 
         if not user_input:
-            # Don't set injected_done here \u2014 the empty input might be from
+            # Don't set injected_done here — the empty input might be from
             # a prompt interruption by a remote message. If a remote message
             # is queued, the next iteration will pick it up and process it
             # before setting injected_done.
@@ -27790,7 +27790,7 @@ def main():
                     "queued", "running", "thinking", "waiting"}):
             interactive_session = _runtime_owner.runtime_session
 
-        # Ctrl+D \u2192 exit
+        # Ctrl+D → exit
         if user_input.strip() == "/exit" and not _is_dialogue:
             if args.depth == 0:
                 _persist_session_state(
@@ -27813,7 +27813,7 @@ def main():
             return
 
         # /resume switches logical sessions; /fork explicitly creates branches.
-        # /resume [N|all|latest] \u2014 the argument controls how many messages to
+        # /resume [N|all|latest] — the argument controls how many messages to
         # echo after restoring (N, default 20; 0 = silent; "all" = full). When
         # multiple sessions are saved, a full-screen picker chooses which one;
         # "latest" skips the picker and restores the newest directly.
@@ -27845,7 +27845,7 @@ def main():
                 # Direct restore of the newest session (no picker).
                 _blob = _choices[0]
             else:
-                # Multiple saved sessions \u2014 open the full-screen picker.
+                # Multiple saved sessions — open the full-screen picker.
                 _blob = show_resume_picker(_session_start_cwd)
             if _blob:
                 switched = _switch_resume_session(
@@ -27876,7 +27876,7 @@ def main():
             # /fork is intercepted before meta dispatch, so the "/fork [name]"
             # argument rule never ran here: "/fork a b" silently made a fork
             # named "a b", and quotes became part of the name. A name with a
-            # space is still possible \u2014 quote it.
+            # space is still possible — quote it.
             try:
                 _fork_words = (shlex.split(_fork_parts[1])
                                if len(_fork_parts) > 1 else [])
@@ -27885,7 +27885,7 @@ def main():
             if _fork_words is None or len(_fork_words) > 1:
                 console.print(
                     "[yellow]Usage: /fork \\[name][/yellow] "
-                    "[dim]\u2014 quote a name that contains spaces[/dim]")
+                    "[dim]— quote a name that contains spaces[/dim]")
                 if injected_done is not None:
                     injected_done.set()
                 continue
@@ -27916,7 +27916,7 @@ def main():
                 if _lineage_exists:
                     console.print(
                         f"[red]Fork already exists at path: "
-                        f"{' \u203a '.join(_new_lineage)}[/red]")
+                        f"{' › '.join(_new_lineage)}[/red]")
                     console.print("[dim]Choose a different name or delete the existing fork first.[/dim]")
                     if injected_done is not None:
                         injected_done.set()
@@ -27995,7 +27995,7 @@ def main():
                 handle_meta_command._last_chat_history = chat_history
                 handle_meta_command._last_original_input = None
                 _n = _resume_turn_count({"chat_history": chat_history})
-                _branch_path = " \u203a ".join(_branch_lineage) or _auto_branch
+                _branch_path = " › ".join(_branch_lineage) or _auto_branch
                 console.print(
                     f"[green]Started a new branched session[/green] "
                     f"[magenta]{_branch_path}[/magenta] "
@@ -28013,7 +28013,7 @@ def main():
                 # mistyped line; "/clear screen" used to wipe the context.
                 console.print(
                     f"[yellow]Usage: {escape(_new_parts[0].lower())}[/yellow] "
-                    "[dim]\u2014 takes no arguments[/dim]")
+                    "[dim]— takes no arguments[/dim]")
                 if injected_done is not None:
                     injected_done.set()
                 continue
@@ -28086,8 +28086,8 @@ def main():
                 )
 
         # Check for meta commands. Dialogue input from the /agents view is a
-        # conversation message, never a terminal command \u2014 even when it
-        # starts with "/" \u2014 so it skips meta dispatch entirely.
+        # conversation message, never a terminal command — even when it
+        # starts with "/" — so it skips meta dispatch entirely.
         if user_input.startswith("/") and not _is_dialogue:
             if (_is_injected_line
                     and _is_password_command(user_input)):
@@ -28184,7 +28184,7 @@ def main():
                                        interactive_session.returncode,
                                        interactive_session.full_output)
                 agent_state["lastOutput"] = interactive_session.full_output
-                # Session exited \u2014 let the agent loop process final output
+                # Session exited — let the agent loop process final output
                 if session.get("userId") or not _active_backend.sends_laintas_credentials:
                     def local_events_cb(events: list):
                         _agent = get_current_agent()
@@ -28208,7 +28208,7 @@ def main():
             else:
                 display_command_output(interactive_session.command, -1, new_output)
                 agent_state["lastOutput"] = interactive_session.full_output
-                # Session still alive \u2014 ask AI to process the new output
+                # Session still alive — ask AI to process the new output
                 if session.get("userId") or not _active_backend.sends_laintas_credentials:
                     def local_events_cb(events: list):
                         _agent = get_current_agent()
@@ -28232,7 +28232,7 @@ def main():
             if (response.get("msg")
                     and not response.get("_history_recorded")):
                 chat_history.append({"role": "assistant", "content": response["msg"]})
-            # \u2500\u2500 Cross-interaction state preservation \u2500\u2500
+            # ── Cross-interaction state preservation ──
             _prepared_state = prepare_state_for_repl(response.get("state", {}))
             agent_state = _bind_current_agent_runtime(
                 _prepared_state, chat_history, interactive_session,
@@ -28260,7 +28260,7 @@ def main():
         # Preserve input semantics in the resume record. Shell commands are
         # terminal activity, not user-to-agent prompts, even though both are
         # physically typed by the user. Dialogue input always goes to the
-        # Agent \u2014 typing "ls" in the /agents view asks the Agent, it does
+        # Agent — typing "ls" in the /agents view asks the Agent, it does
         # not shell out directly.
         chat_history.append({
             "role": "user",
@@ -28295,7 +28295,7 @@ def main():
             [{"type": "user", "content": user_input}],
             agent_scope_terminal(_event_agent) if _event_agent else "term0")
 
-        # Route first word against PATH/builtins \u2192 system command or AI
+        # Route first word against PATH/builtins → system command or AI
         # All REPL instances (depth 0 and depth > 0) execute system commands
         # directly. Natural language goes to AI.
         if _system_input:
@@ -28336,13 +28336,13 @@ def main():
             # Remote-injected commands (from Helpwo Activity terminal): use
             # subprocess capture so stdout can be forwarded to the event stream.
             # pty_passthrough directly inherits the local tty and returns
-            # stdout="" \u2014 nothing to forward.  Local commands keep pty_passthrough
+            # stdout="" — nothing to forward.  Local commands keep pty_passthrough
             # so interactive programs (vim, claude) still work normally.
             if injected_done is not None and agent_registry.agent_id:
                 import subprocess as _sub
                 _cd_m = re.match(r'^\s*cd(?:\s+(.+))?\s*$', user_input)
                 if _cd_m:
-                    # cd is a shell builtin \u2014 handle it in the Python process too
+                    # cd is a shell builtin — handle it in the Python process too
                     _cd_target = (_cd_m.group(1) or "").strip() or os.path.expanduser("~")
                     try:
                         os.chdir(os.path.expanduser(_cd_target))
@@ -28368,7 +28368,7 @@ def main():
             else:
                 # Local user: ordinary commands route through term0's persistent
                 # bash (marker-poll + cwd sync) so cd/export/pushd actually persist
-                # across commands \u2014 term0's bash state IS what "current directory"
+                # across commands — term0's bash state IS what "current directory"
                 # means here. Commands in the interactive whitelist (vim, claude,
                 # ssh, ...) get full PTY passthrough so they keep native terminal
                 # control (raw keystrokes, resize, full-screen redraw).
@@ -28385,7 +28385,7 @@ def main():
                     # Esc reaches a running command. Until this existed the
                     # only key that did anything during a term0 command was
                     # Ctrl+C, and outside an AI run SIGINT is still bound to
-                    # `shutdown` \u2014 so the one available interrupt killed the
+                    # `shutdown` — so the one available interrupt killed the
                     # whole CLI. The reader owns the terminal in CBREAK for
                     # the command's lifetime and hands Esc to the poll loop
                     # as an event, never a signal.
@@ -28418,7 +28418,7 @@ def main():
                             _stop_bg_input_reader()
                     _sync_cwd_from_term0(_term0_info.session)
                     # marker-poll captures output but doesn't echo to the user's
-                    # terminal (unlike pty_passthrough, which echoes directly) \u2014
+                    # terminal (unlike pty_passthrough, which echoes directly) —
                     # print so the user sees command output. Routed through the
                     # mirror tee so /agents shows it and stdout ownership holds.
                     _stdout = result.get("stdout", "")
@@ -28443,7 +28443,7 @@ def main():
                     # program; impossible while the /agents view owns it.
                     console.print(
                         "[yellow]Interactive terminal programs can't run "
-                        "inside the /agents view \u2014 press Esc to return to "
+                        "inside the /agents view — press Esc to return to "
                         "the main CLI first.[/yellow]")
                     result = {"stdout": "", "stderr": "",
                               "returncode": -1, "success": False}
@@ -28467,7 +28467,7 @@ def main():
                     if output_preview:
                         agent_registry._push_events([{"type": "system", "kind": "output", "content": output_preview}])
 
-            # \u2500\u2500 Debug: log command execution \u2500\u2500
+            # ── Debug: log command execution ──
             loop_id = next_debug_loop()
             add_debug_log(DebugEntry(
                 timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -28518,7 +28518,7 @@ def main():
                                       existing_session=interactive_session)
             interactive_session = response.get("session")
 
-            # \u2500\u2500 Store context for /continue \u2500\u2500
+            # ── Store context for /continue ──
             handle_meta_command._last_agent_state = response.get("state", agent_state)
             handle_meta_command._last_chat_history = chat_history
             handle_meta_command._last_original_input = user_input
@@ -28537,7 +28537,7 @@ def main():
                 _marker_poll_exec(
                     _t0.session, f"cd -- {shlex.quote(_desired_cwd)}")
 
-            # \u2500\u2500 Plan approval menu \u2500\u2500
+            # ── Plan approval menu ──
             # If the agent ran in plan mode, offer a rich review menu.
             # On approval, re-run the same task in act mode to execute.
             if _show_plan_approval_menu():
@@ -28562,7 +28562,7 @@ def main():
         if response.get("msg") and not response.get("_history_recorded"):
             chat_history.append({"role": "assistant", "content": response["msg"]})
 
-        # \u2500\u2500 Cross-interaction state preservation \u2500\u2500
+        # ── Cross-interaction state preservation ──
         # Preserve recent context across REPL interactions so the model
         # doesn't lose track of what it was doing.
         _prepared_state = prepare_state_for_repl(response.get("state", {}))
