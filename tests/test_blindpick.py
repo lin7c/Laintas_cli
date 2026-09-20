@@ -8,6 +8,7 @@ on whichever round happened to be oldest.
 
 import importlib.util
 import json
+import os
 import threading
 import time
 import subprocess
@@ -54,6 +55,12 @@ class BlindpickTestCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.cwd = Path(self.tmp.name)
         self.addCleanup(self.tmp.cleanup)
+        # The extension resolves paths from the live process cwd (it follows
+        # the CLI's cd), so isolation means chdir into the temp dir — a fake
+        # ctx.cwd alone leaves every path pointing at the real repository.
+        self._prev_cwd = os.getcwd()
+        os.chdir(self.cwd)
+        self.addCleanup(os.chdir, self._prev_cwd)
         self.main = _load("main")
         self.ctx = _Ctx(self.cwd)
         self.main._ctx = self.ctx
@@ -708,9 +715,9 @@ class RetentionTests(BlindpickTestCase):
         (self.repo / "f.txt").write_text("one\n")
         self._git("add", "-A")
         self._git("commit", "-qm", "base")
-        # The sweep resolves the repo from the extension's cwd, the way it
-        # does in a real session.
-        self.ctx.cwd = str(self.repo)
+        # The sweep resolves the repo from the live working directory, the
+        # way it does in a real session: cd into the repo, then /blindpick.
+        os.chdir(self.repo)
 
     def _git(self, *args):
         return subprocess.run(["git", *args], cwd=self.repo,
@@ -867,6 +874,75 @@ class GitBackedTests(BlindpickTestCase):
         row = {"repo_root": str(self.repo), "incumbent_base": "",
                "incumbent_result": "", "incumbent_diff": "stored copy"}
         self.assertEqual("stored copy", self.main._side_diff(row, "incumbent"))
+
+
+class WorkDirTests(BlindpickTestCase):
+    """State must follow cd, and --dir must retarget it — not the frozen
+    startup directory the old _ctx.cwd pinning gave every path."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = self.cwd / "repo"
+        self.repo.mkdir()
+        run = lambda *a: subprocess.run(
+            ["git", *a], cwd=self.repo, capture_output=True, check=True)
+        run("init", "-q")
+        run("config", "user.email", "t@example.com")
+        run("config", "user.name", "t")
+
+    def test_work_root_follows_the_process_cwd(self):
+        os.chdir(self.repo)
+        self.assertEqual(str(self.repo), self.main._work_root())
+
+    def test_override_beats_the_process_cwd(self):
+        self.assertTrue(self.main._set_dir_override(str(self.repo)))
+        os.chdir(self.cwd)
+        self.assertEqual(str(self.repo), self.main._work_root())
+        self.assertEqual(self.repo / ".laintas", self.main._project_dir())
+
+    def test_clear_returns_to_the_live_cwd(self):
+        self.main._set_dir_override(str(self.repo))
+        self.assertTrue(self.main._set_dir_override(None))
+        self.assertEqual(str(self.cwd), self.main._work_root())
+
+    def test_invalid_dir_arguments_are_refused(self):
+        self.assertIsNone(self.main._resolve_dir_arg(str(self.cwd / "nope")))
+        self.assertIn("Not a directory", self.ctx.text)
+        # The temp dir exists but is not inside a repository.
+        self.assertIsNone(self.main._resolve_dir_arg(str(self.cwd)))
+        self.assertIn("not inside a Git repository", self.ctx.text)
+
+    def test_state_is_reloaded_from_the_new_directory(self):
+        (self.repo / ".laintas").mkdir()
+        (self.repo / ".laintas" / "blindpick_state.json").write_text(
+            json.dumps({"challenger": "repo-model"}), encoding="utf-8")
+        self.assertTrue(self.main._set_dir_override(str(self.repo)))
+        self.assertEqual("repo-model", self.main._challenger_label())
+
+    def test_running_round_blocks_the_switch(self):
+        # The worker thread keeps writing to the rounds file after the
+        # command returns; flipping the directory mid-round orphans it.
+        self._round(round_id="run" * 3, status="running")
+        self.assertFalse(self.main._set_dir_override(str(self.repo)))
+        self.assertIn("still running", self.ctx.text)
+
+    def test_leading_dir_flag_retargets_before_dispatch(self):
+        self.main.handle(["blindpick", "--dir", str(self.repo), "dir"])
+        self.assertIn("Work dir set to", self.ctx.text)
+        self.assertEqual(str(self.repo), self.main._work_root())
+
+    def test_dir_flag_without_a_value_is_usage_not_crash(self):
+        self.main.handle(["blindpick", "--dir"])
+        self.assertIn("Usage", self.ctx.text)
+
+    def test_task_text_may_contain_dir_without_being_eaten(self):
+        # Only the LEADING position is a flag: a task is free-form text.
+        seen = []
+        self.main._run_round = lambda task: seen.append(task) or True
+        self.main._state["challenger"] = "m2"
+        self.main._incumbent = lambda: ("m1", "m1", "")
+        self.main.handle(["blindpick", "run", "fix", "--dir", "handling"])
+        self.assertEqual(["fix --dir handling"], seen)
 
 
 if __name__ == "__main__":

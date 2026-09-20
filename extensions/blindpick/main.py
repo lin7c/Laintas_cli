@@ -20,6 +20,8 @@ Two modes
         /blindpick ratings                Elo over every judged round
         /blindpick export [path]          judged rounds as DPO preference pairs
         /blindpick reset                  clear rounds and worktrees
+        /blindpick dir [<path>|--clear]   show or switch the target directory
+        /blindpick --dir <path> <sub>     run a subcommand against another repo
 
 Why this shape (and what the old version got wrong)
 ---------------------------------------------------
@@ -132,8 +134,81 @@ def _hint(text: str) -> None:
 
 # ── state ──────────────────────────────────────────────────────────────────
 
+# ── the working directory ──────────────────────────────────────────────────
+#
+# _ctx.cwd is frozen at setup() — the CLI's `cd` only calls os.chdir() and
+# never refreshes it, so every path in this module used to stay pinned to
+# the startup directory for the whole session. The work dir is therefore
+# resolved live: an explicit override when the user points elsewhere with
+# --dir / `dir`, else the process cwd (which `cd` does update).
+
+_dir_override: Optional[str] = None
+
+
+def _work_root() -> str:
+    """The directory state lives in and repo resolution starts from."""
+    if _dir_override:
+        return _dir_override
+    try:
+        return str(Path.cwd())
+    except OSError:
+        return str(getattr(_ctx, "cwd", "") or "")
+
+
+def _reset_state() -> None:
+    global _state
+    _state = {"challenger": "", "challenger_provider": "",
+              "keep_rounds": KEEP_ROUNDS, "keep_days": KEEP_DAYS}
+
+
+def _set_dir_override(path: Optional[str]) -> bool:
+    """Point the extension at another directory for the rest of the session.
+
+    The override persists rather than applying to one command: a round runs
+    on a background thread that keeps writing its rounds file after the
+    command returns, so a directory that flips back mid-round would orphan
+    every later status update. State is reloaded, never merged — each
+    directory's .laintas holds its own challenger, and a challenger
+    silently following the user into another repo is worse than an empty
+    one. Returns False (and changes nothing) while a round is running.
+    """
+    global _dir_override
+    target = str(path) if path else None
+    if target != _dir_override and _in_progress() is not None:
+        _say("[red]A round is still running against "
+             f"{_work_root()}; wait for it to finish before switching directories.[/red]")
+        return False
+    _dir_override = target
+    _reset_state()
+    _load_state()
+    return True
+
+
+def _resolve_dir_arg(value: str) -> Optional[str]:
+    """Validate a --dir/dir argument: an existing directory inside a repo."""
+    raw = str(value or "").strip()
+    if not raw:
+        _say("[red]Usage: /blindpick --dir <directory> <subcommand>[/red]")
+        return None
+    try:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        path = path.resolve()
+    except (OSError, RuntimeError) as exc:
+        _say(f"[red]Cannot use {raw}: {exc}[/red]")
+        return None
+    if not path.is_dir():
+        _say(f"[red]Not a directory: {path}[/red]")
+        return None
+    if not _repo_root(str(path)):
+        _say(f"[red]{path} is not inside a Git repository.[/red]")
+        return None
+    return str(path)
+
+
 def _project_dir() -> Path:
-    return Path(_ctx.cwd) / ".laintas"
+    return Path(_work_root()) / ".laintas"
 
 
 def _rounds_path() -> Path:
@@ -455,7 +530,7 @@ def _sweep_orphan_branches(max_age: float = ORPHAN_MAX_AGE) -> list[str]:
     and never one younger than the grace period (a branch whose round row has
     not been written yet is seconds old, not a day).
     """
-    root = _repo_root(str(_ctx.cwd))
+    root = _repo_root(_work_root())
     if not root:
         return []
     live = {str(row.get(f"{side}_branch") or "")
@@ -491,7 +566,7 @@ def _sweep_orphan_branches(max_age: float = ORPHAN_MAX_AGE) -> list[str]:
 
 def _gc_orphans() -> None:
     """Reclaim worktrees left behind by a killed CLI or an old version."""
-    root = _repo_root(str(_ctx.cwd))
+    root = _repo_root(_work_root())
     if not root:
         return
     wt_dir = Path(root) / ".laintas" / "worktrees"
@@ -535,14 +610,13 @@ def _run_round(task: str) -> bool:
         _say(f"[red]The challenger matches the current model ({incumbent_label}). "
              f"Choose a different challenger or switch the current model.[/red]")
         return False
-    root = _repo_root(str(_ctx.cwd))
+    root = _repo_root(_work_root())
     if not root:
         _say(
-            f"[red]Cannot start a round: the startup directory is not inside a Git repository.[/red]\n"
-            f"Blindpick resolves the repository from the CLI working directory at startup; "
-            f"changing directories later does not update it (detected: {_ctx.cwd}).\n"
-            f"Quit, restart the CLI from the repository root or a subdirectory, and run /blindpick again. "
-            f"Use [bold]/quit[/bold]; [red]/exit[/red] also clears sign-in state."
+            f"[red]Cannot start a round: {_work_root()} is not inside a Git repository.[/red]\n"
+            "Blindpick follows the CLI working directory, so cd into the repository and retry, "
+            "or target it explicitly: [bold]/blindpick --dir <path> run <task>[/bold] "
+            "(see /blindpick dir)."
         )
         return False
     code, _, _ = _git(root, "rev-parse", "--verify", "HEAD")
@@ -1313,6 +1387,9 @@ def _round_summary(row: dict) -> str:
 def _cmd_status() -> None:
     incumbent_label, _, _ = _incumbent()
     challenger = _challenger_label()
+    _say(f"Work dir       [bold]{_work_root()}[/bold]"
+         + ("  [dim](--dir override)[/dim]" if _dir_override
+            else "  [dim](follows cd)[/dim]"))
     _say(f"Current model  [bold]{incumbent_label}[/bold]")
     if challenger:
         _say(f"Challenger    [bold]{challenger}[/bold]")
@@ -1585,11 +1662,35 @@ def _resolve_round(token: str = "") -> Optional[dict]:
     return None
 
 
+def _cmd_dir(args: list) -> None:
+    """Show, set, or clear the directory rounds run against."""
+    if not args:
+        root = _repo_root(_work_root())
+        suffix = ("  [dim](--dir override)[/dim]" if _dir_override
+                  else "  [dim](follows cd)[/dim]")
+        _say(f"Work dir     [bold]{_work_root()}[/bold]{suffix}")
+        _say("Repository   " + (root or "[red]not inside a Git repository[/red]"))
+        _say(f"State        {_rounds_path().parent}")
+        _say("Switch with /blindpick dir <path> or --dir <path> <subcommand>; "
+             "/blindpick dir --clear follows cd again.")
+        return
+    if args[0] == "--clear":
+        if _set_dir_override(None):
+            _say(f"[green]Cleared; following the live directory again: "
+                 f"{_work_root()}[/green]")
+        return
+    resolved = _resolve_dir_arg(" ".join(args))
+    if resolved is not None and _set_dir_override(resolved):
+        _say(f"[green]Work dir set to {resolved} for this session; "
+             f"state reloaded from it.[/green]")
+
+
 # Printed with _say_raw: Rich would parse "[id]" as a style tag and eat it,
 # which is how the usage line lost the very argument it documents.
 _USAGE = ("Subcommands: challenger · run <task> · show [id] · "
           "pick a|b|tie|bad [id] · discard [id] · delete <id> · "
-          "prune [--all] · status · ratings · export [path] · reset; "
+          "prune [--all] · status · ratings · export [path] · reset · "
+          "dir [path|--clear]; --dir <path> <sub> targets another repository; "
           "use no arguments to open the full-screen arena.")
 _PICK_USAGE = "Usage: /blindpick pick a|b|tie|bad [round id]"
 
@@ -1597,6 +1698,19 @@ _PICK_USAGE = "Usage: /blindpick pick a|b|tie|bad [round id]"
 def handle(parts, raw_line: str = "") -> None:
     """Dispatch /blindpick [<sub> ...]."""
     argv = [str(p).strip() for p in parts[1:] if str(p).strip()]
+    # A leading --dir/-C retargets state before the subcommand runs. Only
+    # the leading position is parsed: task text is free-form and must be
+    # allowed to contain "--dir" without being eaten as a flag.
+    if argv and argv[0] in ("--dir", "-C"):
+        if len(argv) < 2:
+            _say("Usage: /blindpick --dir <directory> <subcommand>")
+            return
+        resolved = _resolve_dir_arg(argv[1])
+        if resolved is None or not _set_dir_override(resolved):
+            return
+        _say(f"[green]Work dir set to {resolved} for this session; "
+             f"state reloaded from it.[/green]")
+        argv = argv[2:]
     if not argv:
         if sys.stdin.isatty():
             _open_arena()
@@ -1636,6 +1750,8 @@ def handle(parts, raw_line: str = "") -> None:
             _settle(row, "discarded")
     elif action == "status":
         _cmd_status()
+    elif action == "dir":
+        _cmd_dir(argv[1:])
     elif action == "ratings":
         _cmd_ratings()
     elif action == "export":
@@ -1665,6 +1781,8 @@ def setup(ctx) -> None:
             ("ratings", "Show cumulative ratings and position bias"),
             ("export [path]", "Export judged rounds as DPO preference pairs"),
             ("reset", "Clear round records"),
+            ("dir [path|--clear]", "Show, set, or clear the working-directory override"),
+            ("--dir <path> <sub>", "Target another repository for this session"),
         ])
     try:
         _reap_interrupted()

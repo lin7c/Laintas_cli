@@ -2,12 +2,20 @@
   "schemaVersion": 1,
   "extensions": [
     {
+      "id": "laintas/ai-pow",
+      "name": "ai-pow",
+      "version": "0.8.1",
+      "description": "AI-PoW: a process score and verifiable work journal for every Git commit, recorded from your sessions",
+      "url": "https://cli.laintas.com/extensions/official/ai-pow-0.8.1.lext",
+      "sha256": "5a30cd1e5735c6247522ce713ac06a755aefc46130ac1a295398ead221c34c6b"
+    },
+    {
       "id": "laintas/blindpick",
       "name": "blindpick",
-      "version": "3.1.0",
+      "version": "3.2.0",
       "description": "Run the same task with two models, compare them blind, and apply only the selected result",
-      "url": "https://cli.laintas.com/extensions/official/blindpick-3.1.0.lext",
-      "sha256": "4ec2f1e650a46ea8b824fcc98eff4526e08af21357d7adce3463b2cd39179c3d"
+      "url": "https://cli.laintas.com/extensions/official/blindpick-3.2.0.lext",
+      "sha256": "f1a0f747ebc8bc0ceb308ac48a6552b992ca3df7ccb9671e47bcedbc78d6b8d0"
     },
     {
       "id": "laintas/canvas",
