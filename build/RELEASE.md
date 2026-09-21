@@ -126,32 +126,47 @@ Confirm the release finished and is not a draft:
 gh release view v1.23.4
 ```
 
-## 3. Deploy the download page (the release is already published)
+## 3. Sync the release to cli.laintas.com and deploy the page
 
-**The release is complete once section 2's workflow finishes.** Nothing below
-is required to ship a version, and nothing consumes it: `/v`, the download
-page and both install scripts all read the GitHub release directly. See
-section 4 for why there is only one channel.
+**The release is NOT complete once section 2's workflow finishes.**
+cli.laintas.com is the primary download channel: the repository may go
+private one day, and every installed CLI's `/v update` must keep working when
+it does. The GitHub release is the build origin and a public mirror; the
+site is what users actually update from.
 
-What still needs deploying is the *page*, whose nginx document root is:
+Two things must land on the server after every release:
+
+1. **The release assets**, under `dist/releases/latest/` and
+   `dist/releases/v<version>/` (the flat layout `LAINTAS_DOWNLOAD_BASE`
+   reads).
+2. **The page itself**, whose nginx document root is:
 
 ```text
 /root/laintas_cli/laintas_cli_download/dist
 ```
 
-`npm run build` from section 1 produces it. It serves the site, `install.sh`
-and `install.ps1` — not release binaries.
+`npm run build` from section 1 produces the page. It serves the site,
+`install.sh` and `install.ps1`; `dist/releases` serves the binaries.
 
-### The optional cli.laintas.com mirror
+### Syncing the release assets
 
-`scripts/build_release_assets.py` still exists and still works. It needs `gh`
-logged in, reads the version from `version.py`, and copies the GitHub release
-into `dist/releases/latest/` and `dist/releases/v<version>/`.
+`scripts/build_release_assets.py` copies the GitHub release into
+`dist/releases/latest/` and `dist/releases/v<version>/`. It needs `gh`
+logged in and reads the version from `version.py`.
 
-Nothing reads those directories today. Run it only to stage a deliberate test
-mirror for `LAINTAS_DOWNLOAD_BASE` (section 4), and if you do, move
-`dist/releases` aside around any later `npm run build` — Vite empties `dist`
-and will delete it:
+**Migration status (plan A, decided 2026-09-21):** the sync is to become a
+job in `.github/workflows/release.yml` that pushes the assets to the server
+right after the GitHub release is published, so the mirror can never starve
+again — that starvation is what drove `/v` to GitHub-only in the first
+place. Until that job exists, run the sync BY HAND as part of EVERY release;
+a release that skips it is incomplete:
+
+```bash
+python3 scripts/build_release_assets.py
+```
+
+Vite empties `dist` on every build, so around any later `npm run build` move
+the assets aside and restore them afterwards:
 
 ```bash
 python3 scripts/build_release_assets.py
@@ -176,27 +191,35 @@ Both manifests must report the version being released, e.g. `1.23.4`.
 
 ## 4. Where `/v` updates from
 
-`updater.py` is configured with:
+**Target state (plan A):** `updater.py` reads cli.laintas.com:
 
 ```python
-DEFAULT_DOWNLOAD_BASE = "https://github.com/lin7c/Laintas_cli"
+DEFAULT_DOWNLOAD_BASE = "https://cli.laintas.com"
 ```
 
-so `/v` reads the same release this workflow publishes:
+so `/v` reads the mirror section 3 feeds:
 
 ```text
-https://github.com/lin7c/Laintas_cli/releases/latest/download/manifest.json
-https://github.com/lin7c/Laintas_cli/releases/latest/download/src_manifest.zip
-https://github.com/lin7c/Laintas_cli/releases/latest/download/SHA256SUMS.txt
-https://github.com/lin7c/Laintas_cli/releases/latest/download/laintas-cli_linux_amd64.tar.gz
-https://github.com/lin7c/Laintas_cli/releases/latest/download/laintas-cli_linux_arm64.tar.gz
+https://cli.laintas.com/releases/latest/manifest.json
+https://cli.laintas.com/releases/latest/src_manifest.zip
+https://cli.laintas.com/releases/latest/SHA256SUMS.txt
+https://cli.laintas.com/releases/latest/laintas-cli_linux_amd64.tar.gz
+https://cli.laintas.com/releases/latest/laintas-cli_linux_arm64.tar.gz
 ```
 
-The site used to self-host these under `cli.laintas.com/releases/<channel>/`,
-written by `scripts/build_release_assets.py` during a manual release. Nothing
-repopulated that directory once releasing moved into CI, so `/v update`, the
-page's download buttons and both install scripts all resolved to 404s against
-a channel that had stopped being fed. One channel now, the one CI writes.
+**Migration status:** `DEFAULT_DOWNLOAD_BASE` still points at
+`https://github.com/lin7c/Laintas_cli` and flips to cli.laintas.com in the
+NEXT release — the same release that ships the CI sync job. Order matters:
+the mirror must be fed before the default moves, or every installed CLI
+404s on its next `/v`. Until that release, `/v` reads the GitHub release this
+workflow publishes.
+
+History: the site used to self-host these under
+`cli.laintas.com/releases/<channel>/`, written by
+`scripts/build_release_assets.py` during a manual release. Nothing
+repopulated that directory once releasing moved into CI, so `/v` was pointed
+at GitHub. That made the repository's public-ness a load-bearing dependency;
+plan A removes it.
 
 A **git checkout is never an update target.** `/v update` on a source install
 compares each file's sha256 against the release manifest, and that comparison
@@ -220,10 +243,10 @@ To pin a version:
 LAINTAS_UPDATE_CHANNEL=v1.23.2 laintas-cli
 ```
 
-which reads (GitHub spells a pinned tag differently from `latest`):
+which reads (after the plan-A release, from the mirror's flat layout):
 
 ```text
-https://github.com/lin7c/Laintas_cli/releases/download/v1.23.2/manifest.json
+https://cli.laintas.com/releases/v1.23.2/manifest.json
 ```
 
 `LAINTAS_DOWNLOAD_BASE` points at a test mirror, read with the flat
@@ -233,9 +256,12 @@ https://github.com/lin7c/Laintas_cli/releases/download/v1.23.2/manifest.json
 
 ```bash
 base=https://github.com/lin7c/Laintas_cli/releases/latest/download
+mirror=https://cli.laintas.com/releases/latest
 curl -fsSL "$base/manifest.json" | python3 -m json.tool
+curl -fsSL "$mirror/manifest.json" | python3 -m json.tool
 curl -fsSIL "$base/laintas-cli_linux_amd64.tar.gz"
-curl -fsSIL "$base/laintas-cli_windows_amd64_setup.exe"
+curl -fsSIL "$mirror/laintas-cli_linux_amd64.tar.gz"
+curl -fsSIL "$mirror/laintas-cli_windows_amd64_setup.exe"
 curl -fsSIL https://cli.laintas.com/install.sh
 curl -fsSIL https://cli.laintas.com/install.ps1
 curl -fsSIL https://helpwo.laintas.com/downloads/latest.json
@@ -243,17 +269,19 @@ curl -fsSIL https://helpwo.laintas.com/downloads/latest.json
 
 Confirm that:
 
-- the version in `latest/manifest.json` is the new one
+- BOTH manifests report the new version — the mirror's is the one `/v` reads
+  after the plan-A release lands
 - amd64, arm64, the source bundle, the Windows installer and the .deb all
-  return `200`
+  return `200` on BOTH channels
 - the download page shows the new version and its cards link at the new tag
 - `src_manifest.zip` matches the file checksums in the manifest
+- the mirror's `SHA256SUMS.txt` verifies (section 3)
 - `downloads/latest.json` still resolves — the Windows build's `/windows
   install` reads it, and it is published by a different repository
 
-`/v` reads the GitHub release, not `cli.laintas.com` — the two `curl` checks
-against that host above cover the install scripts the site serves, and
-nothing else.
+`/v` reads whatever its `DEFAULT_DOWNLOAD_BASE` names — GitHub until the
+plan-A release lands, cli.laintas.com after. The mirror checks above must
+pass either way.
 
 Static file updates need no nginx reload; only a configuration change does:
 
@@ -293,7 +321,7 @@ laintas-cli_windows_amd64_setup.exe
 
 ### The release assets vanish after a build
 
-Only applies to the optional mirror in section 3. The Vite build empties
-`dist`, so move `dist/releases` aside before the build and restore it
-afterwards. A published release is on GitHub and is unaffected by any local
-build.
+The Vite build empties `dist`, so move `dist/releases` aside before the
+build and restore it afterwards (section 3). A published release is on
+GitHub and is unaffected — but once `/v` reads cli.laintas.com (plan A), an
+empty `dist/releases` IS a broken update channel for every installed CLI.
