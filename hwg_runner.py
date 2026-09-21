@@ -20,6 +20,7 @@ from typing import Optional
 
 import agent_contract
 import hwo_runner
+import workflow_common
 import workflow_state
 from hwg_adapter import HwgParseError, as_graph, parse as parse_hwg, validate as validate_hwg
 from hwg_adapter.adapter import fanout_joins, parse_condition, resolve_includes
@@ -133,20 +134,7 @@ def _duration_seconds(value) -> Optional[float]:
     return n / 1000 if unit == "ms" else n * 60 if unit == "m" else n * 3600 if unit == "h" else n
 
 
-def _literal_value(raw: str):
-    s = str(raw or "").strip()
-    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
-        return s[1:-1]
-    if s == "true":
-        return True
-    if s == "false":
-        return False
-    try:
-        if re.match(r"^-?\d+(?:\.\d+)?$", s):
-            return float(s) if "." in s else int(s)
-    except Exception:
-        pass
-    return s
+_literal_value = lambda raw: workflow_common.literal_value(raw, empty_as_none=False)
 
 
 def _resolve_ref(ref: str, graph_inputs: dict, node_outputs: dict, node_output_history: Optional[dict] = None,

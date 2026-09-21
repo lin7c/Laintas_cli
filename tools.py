@@ -7209,6 +7209,72 @@ def scrub_marker_noise(text: str) -> str:
     return "\n".join(out)
 
 
+#: Interactive-input detection, shared by the agent path here and the REPL's
+#: term0 path in laintas_cli. A command whose last non-blank output line is an
+#: explicit prompt and which has been silent this long is waiting on stdin.
+_PROMPT_WAIT_SECONDS = 10.0
+
+# Explicit prompt shapes only. "Line ends with a colon" is NOT one of them:
+# `Running migrations:` (Django), `Building wheels for collected packages:`
+# (pip) and `Traceback (most recent call last):` all end that way and then go
+# quiet while real work happens — reading them as prompts killed a migration
+# half-applied. A colon counts only after a prompt verb, a credential word, or
+# a bracketed default (`Full Name []:`, `Country Name (2 letter code) [AU]:`).
+_PROMPT_QUESTION_RE = re.compile(
+    r"(?:"
+    r"[\[(]\s*y(?:es)?\s*/\s*n(?:o)?\s*[\])]"                  # [Y/n] (yes/no)
+    r"|\byes/no\b"
+    r"|\?\s*$"                                                   # ends with ?
+    r"|^\s*(?:please\s+)?(?:enter|type|input|choose|select|provide|"
+    r"new|retype|re-enter|confirm|verify)\b[^\n]{0,80}:\s*$"
+    r"|(?:password|passphrase|passcode|\bpin\b|otp|token|username|login)"
+    r"[^\n]{0,80}:\s*$"                     # 'for https://…': URLs carry colons
+    r"|\[[^\]\n]{0,40}\]\s*:\s*$"                                # Full Name []:
+    r")",
+    re.IGNORECASE)
+
+_SECRET_PROMPT_RE = re.compile(
+    r"password|passphrase|passcode|\bpin\b|\botp\b|token|secret",
+    re.IGNORECASE)
+
+_PROMPT_ANSI_RE = re.compile(
+    r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*(?:\x07|\x1b\\)")
+
+# Wrapper markers of both shell executors (this module's and laintas_cli's).
+_PROMPT_MARKER_NOISE = ("__LAINTAS_SHELL_BEGIN_", "__LAINTAS_SHELL_END_",
+                        "__CMD_BEGIN_", "__CMD_END_")
+
+
+def question_shaped_tail(text: str) -> str:
+    """The last non-blank line of `text` if it is an interactive prompt.
+
+    Only the LAST non-blank line counts — a question followed by more output
+    means the program moved on. Marker/wrapper noise is never a question.
+    Returns "" when the tail is not prompt-shaped.
+    """
+    if not text:
+        return ""
+    lines = _PROMPT_ANSI_RE.sub("", text).replace("\r\n", "\n").split("\n")
+    for line in reversed(lines):
+        line = line.rstrip()
+        if not line.strip():
+            continue
+        if any(m in line for m in _PROMPT_MARKER_NOISE):
+            return ""   # our own wrapper echo, not a question
+        if _PROMPT_QUESTION_RE.search(line):
+            return line.strip()
+        return ""       # last non-blank line is not a question
+    return ""
+
+
+def is_secret_prompt(prompt: str) -> bool:
+    """True when the prompt asks for a credential; the answer must not echo."""
+    return bool(_SECRET_PROMPT_RE.search(prompt or ""))
+
+
+_question_shaped_tail = question_shaped_tail   # module-internal alias
+
+
 def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
                             abort_event: Any = None,
                             via: str = "deployment_terminal") -> dict:
@@ -7347,6 +7413,29 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
                             "returncode": -1, "via": via}
             except Exception:
                 pass
+            # Interactive-input detection: a question-shaped tail silent for
+            # _PROMPT_WAIT_SECONDS means the command is waiting on stdin, not
+            # hung. The agent cannot answer a PTY prompt: stop the foreground
+            # program and report the question so the agent can rerun with
+            # non-interactive flags or feed stdin data.
+            if time.monotonic() - _last_output >= _PROMPT_WAIT_SECONDS:
+                _q = _question_shaped_tail(new_content)
+                if _q:
+                    _recovered = recover_stuck_shell(session)
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"Command is waiting for interactive input: {_q} "
+                            "(waiting on stdin). Rerun with non-interactive "
+                            "flags (e.g. DEBIAN_FRONTEND=noninteractive, "
+                            "yes | ..., --yes), or feed the answer via stdin."
+                        ),
+                        "result": scrub_marker_noise(new_content).strip(),
+                        "returncode": -1, "via": via,
+                        "waiting_for_input": True, "prompt": _q,
+                        "terminal_recovered": bool(_recovered),
+                        "_shell_stuck": not _recovered,
+                    }
             time.sleep(0.05)
         recovered = recover_stuck_shell(session)
         if recovered:

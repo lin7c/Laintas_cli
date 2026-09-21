@@ -24,6 +24,8 @@ import threading
 import time
 from typing import Any, Iterable
 
+import json_store
+
 try:
     from paths import LAINTAS_HOME
 except Exception:  # paths is unavailable in some minimal test contexts
@@ -267,12 +269,7 @@ def save(cookies: Iterable[dict]) -> int:
     payload = list(keep.values())
     with _LOCK:
         try:
-            COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            tmp = str(COOKIE_FILE) + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh, ensure_ascii=False)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, COOKIE_FILE)
+            json_store.save_json_atomic(COOKIE_FILE, payload, indent=None, mode=0o600)
         except OSError:
             return 0
     return len(payload)

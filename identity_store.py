@@ -36,6 +36,8 @@ import threading
 import time
 from typing import Any
 
+import json_store
+
 try:
     from paths import LAINTAS_HOME
 except Exception:  # minimal/test contexts without the paths module
@@ -176,11 +178,7 @@ def _write(record: dict) -> None:
         except OSError:
             pass
         target = _path(name)
-        tmp = str(target) + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(record, fh, ensure_ascii=False)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, target)
+        json_store.save_json_atomic(target, record, indent=None, mode=0o600)
 
 
 def save(name: str, storage_state: dict, *, domains=None,

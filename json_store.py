@@ -38,7 +38,8 @@ def load_json(path: Union[str, Path], default: Any = None) -> Any:
 
 
 def save_json_atomic(path: Union[str, Path], data: Any, *, indent: int = 2,
-                     ensure_ascii: bool = False, mode: int = None) -> None:
+                     ensure_ascii: bool = False, mode: int = None,
+                     newline: bool = False) -> None:
     """Write *data* as JSON to *path* via temp-file + fsync + atomic rename.
 
     A crash or kill mid-write can never leave a truncated/corrupted target
@@ -55,6 +56,8 @@ def save_json_atomic(path: Union[str, Path], data: Any, *, indent: int = 2,
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=ensure_ascii, indent=indent)
+            if newline:
+                f.write("\n")
             f.flush()
             os.fsync(f.fileno())
         if mode is not None:

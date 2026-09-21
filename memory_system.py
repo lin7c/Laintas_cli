@@ -13,6 +13,7 @@ giving the AI persistent knowledge across sessions.
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 import json
@@ -312,6 +313,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
         tmp.write_text(content, encoding="utf-8")
         os.replace(str(tmp), str(path))
     finally:
+        _forget_parsed(path)
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
@@ -539,6 +541,59 @@ def _visible_in_current_scope(meta: dict) -> bool:
     return False
 
 
+#: Parsed-memory cache. search_memories reads every file twice (once via
+#: list_memories, once via read_memory) and load_all_for_prompt rescans the
+#: whole directory on every prompt build — with the budget in the hundreds of
+#: entries that is real IO on the agent's hot path.
+#:
+#: Two invalidation paths, because a stat key alone is not enough: file
+#: timestamps are tick-coarse and os.replace recycles inodes, so a same-length
+#: rewrite in the same tick could reproduce an older version's
+#: (path, inode, mtime_ns, size) exactly and read back stale. Every write and
+#: delete in this module therefore drops the path's entries (_forget_parsed);
+#: the stat key only has to catch other processes, whose same-tick rewrites
+#: are the one residual window. meta is deep-copied out so callers may mutate
+#: it (nested `metadata` included) without touching the cache.
+_parse_cache: dict[tuple, tuple[dict, str]] = {}
+_parse_cache_lock = _threading.RLock()
+_PARSE_CACHE_MAX = 512
+
+
+def _forget_parsed(path) -> None:
+    """Drop every cached parse of `path` (called on each write/delete)."""
+    target = os.path.abspath(str(path))
+    with _parse_cache_lock:
+        for key in [k for k in _parse_cache if k[0] == target]:
+            del _parse_cache[key]
+
+
+def _parse_memory_file(f) -> Optional[tuple[dict, str]]:
+    """Read+parse one memory file, cached by (path, inode, mtime_ns, size).
+
+    Returns a fresh (meta, body) copy, or None when the file vanished or
+    cannot be read. A miss costs one read+parse; a hit costs zero IO.
+    """
+    try:
+        st = f.stat()
+        key = (os.path.abspath(str(f)), st.st_ino, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+    with _parse_cache_lock:
+        cached = _parse_cache.get(key)
+    if cached is not None:
+        return copy.deepcopy(cached[0]), cached[1]
+    try:
+        content = f.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    parsed = _parse_frontmatter(content)
+    with _parse_cache_lock:
+        if len(_parse_cache) >= _PARSE_CACHE_MAX:
+            _parse_cache.clear()
+        _parse_cache[key] = parsed
+    return copy.deepcopy(parsed[0]), parsed[1]
+
+
 def list_memories(mem_type: str = None, *,
                   include_superseded: bool = False,
                   all_scopes: bool = False) -> list[dict]:
@@ -555,8 +610,10 @@ def list_memories(mem_type: str = None, *,
         if f.name == "MEMORY.md":
             continue
         try:
-            content = f.read_text(encoding="utf-8")
-            meta, body = _parse_frontmatter(content)
+            parsed = _parse_memory_file(f)
+            if parsed is None:
+                continue
+            meta, body = parsed
             entry_type = meta.get("type") or meta.get("metadata", {}).get("type", "unknown")
             if not meta.get("scope") or not meta.get("scope_id"):
                 # Compatibility: bind legacy project/reference facts to the
@@ -620,8 +677,10 @@ def read_memory(name: str) -> Optional[dict]:
             return None
         f = archived
     try:
-        content = f.read_text(encoding="utf-8")
-        meta, body = _parse_frontmatter(content)
+        parsed = _parse_memory_file(f)
+        if parsed is None:
+            return None
+        meta, body = parsed
         entry_type = meta.get("type") or meta.get("metadata", {}).get("type", "unknown")
         if not meta.get("scope") or not meta.get("scope_id"):
             # Resolved for this read only; migrate_legacy_scopes() persists it.
@@ -781,6 +840,7 @@ def delete_memory(name: str) -> tuple[bool, str]:
         return False, f"Memory '{name}' not found"
     try:
         f.unlink()
+        _forget_parsed(f)
         _remove_from_index(name)
         if mem_signals is not None:
             try:
@@ -991,6 +1051,7 @@ def archive_memory(name: str, reason: str = "") -> tuple[bool, str]:
         meta["archived_reason"] = str(reason or "")[:200]
         _atomic_write_text(target_dir / f.name, _format_frontmatter(meta, body))
         f.unlink()
+        _forget_parsed(f)
     except OSError as exc:
         return False, str(exc)
     _remove_from_index(name)

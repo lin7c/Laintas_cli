@@ -37,6 +37,18 @@ def _run_pow_command(argv: list) -> int:
 if __name__ == "__main__" and sys.argv[1:2] == ["pow"]:
     raise SystemExit(_run_pow_command(sys.argv[2:]))
 
+# Same pre-import shortcut for `--version`/`-V`: printing one line should not
+# pay for the interactive stack (prompt_toolkit, rich, agent_loop, ...) that
+# the full import pulls in. Keep the output byte-identical to argparse's
+# `action="version"` so wrappers/scripts cannot tell the difference.
+if __name__ == "__main__" and sys.argv[1:2] in (["--version"], ["-V"]):
+    try:
+        from version import __version__ as _v
+    except Exception:
+        _v = "0.0.0"
+    print(f"laintas-cli {_v}")
+    raise SystemExit(0)
+
 import asyncio
 import copy
 import io
@@ -289,7 +301,32 @@ from terminal_arbiter import Mode as TermMode, TerminalBusy
 # cbreak and have *that* become the baseline everything restores to.
 terminal_arbiter.get_arbiter()
 
-import requests
+class _LazyModule:
+    """Import-on-first-attribute-access stand-in for a module.
+
+    `requests` costs ~170ms of interpreter startup but every real use sits
+    inside functions that run after startup (login, backend calls, usage).
+    Tests also patch attributes on `laintas_cli.requests` directly, so a
+    function-local import per call site would break them; this proxy keeps
+    the module attribute shape while deferring the import. Attribute writes
+    (mock.patch) land on the instance and shadow the real module until
+    deleted, which is exactly the semantics the tests rely on.
+    """
+
+    def __init__(self, name: str):
+        self.__dict__["_lazy_name"] = name
+        self.__dict__["_lazy_mod"] = None
+
+    def __getattr__(self, attr):
+        mod = self.__dict__["_lazy_mod"]
+        if mod is None:
+            import importlib
+            mod = importlib.import_module(self.__dict__["_lazy_name"])
+            self.__dict__["_lazy_mod"] = mod
+        return getattr(mod, attr)
+
+
+requests = _LazyModule("requests")
 from rich.console import Console, Group
 from rich.panel import Panel
 from rich.padding import Padding
@@ -353,7 +390,8 @@ def Table(*args, **kwargs):
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application
 from prompt_toolkit.history import FileHistory
-from prompt_toolkit.completion import Completer, Completion, PathCompleter, WordCompleter
+from prompt_toolkit.completion import (Completer, Completion, PathCompleter,
+                                       ThreadedCompleter, WordCompleter)
 from prompt_toolkit.document import Document
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
@@ -1562,7 +1600,8 @@ SHELL_IDLE_TIMEOUT_SECONDS = 120.0
 
 def _marker_poll_exec(session, command: str, timeout: int = None,
                       strip_ansi_codes: bool = True,
-                      abort_event: Optional[threading.Event] = None) -> dict:
+                      abort_event: Optional[threading.Event] = None,
+                      answer_fn: Optional[Callable[[str], Optional[str]]] = None) -> dict:
     """Serialize a command on a persistent terminal session.
 
     ``timeout`` is an IDLE budget (seconds without new output), not a total
@@ -1570,19 +1609,29 @@ def _marker_poll_exec(session, command: str, timeout: int = None,
 
     ``abort_event`` lets a watcher (the REPL's Esc reader) stop waiting on a
     command that is never going to finish, without waiting out the budget.
+
+    ``answer_fn`` opts in to interactive-input detection: when the command's
+    last line is an explicit prompt (tools.question_shaped_tail) and it has
+    been silent for tools._PROMPT_WAIT_SECONDS, it is called with the prompt
+    line and returns the line to feed stdin (without newline), or None to
+    interrupt and reclaim the shell exactly like Esc. Callers that pass no
+    answer_fn keep the plain idle-timeout behaviour: they have no way to
+    answer, and returning early would leave the prompt holding the shell so
+    the next command (or a `cd` sync) got typed into it as an answer.
     """
     lock = getattr(session, "command_lock", None)
     if lock is None:
         return _marker_poll_exec_unlocked(
-            session, command, timeout, strip_ansi_codes, abort_event)
+            session, command, timeout, strip_ansi_codes, abort_event, answer_fn)
     with lock:
         return _marker_poll_exec_unlocked(
-            session, command, timeout, strip_ansi_codes, abort_event)
+            session, command, timeout, strip_ansi_codes, abort_event, answer_fn)
 
 
 def _marker_poll_exec_unlocked(session, command: str, timeout: int = None,
                                strip_ansi_codes: bool = True,
-                               abort_event: Optional[threading.Event] = None
+                               abort_event: Optional[threading.Event] = None,
+                               answer_fn: Optional[Callable[[str], Optional[str]]] = None
                                ) -> dict:
     """Execute a command through a persistent bash session via marker-poll.
 
@@ -1633,6 +1682,8 @@ def _marker_poll_exec_unlocked(session, command: str, timeout: int = None,
     _last_output_at = time.time()
     _seen_len = 0
     interrupted = False
+    _answers_fed = 0
+    _answered_len = -1   # new_content length when we last fed an answer
 
     while time.time() - _last_output_at < _idle_budget:
         time.sleep(0.08)
@@ -1688,6 +1739,36 @@ def _marker_poll_exec_unlocked(session, command: str, timeout: int = None,
         if abort_event is not None and abort_event.is_set():
             interrupted = True
             break
+        # Interactive-input detection (opt-in via answer_fn): an explicit
+        # prompt silent for _PROMPT_WAIT_SECONDS is waiting on stdin, not
+        # stuck. The answer is fed right here and the same loop keeps waiting
+        # on the same markers.
+        # A prompt we already answered stays the tail until the program
+        # prints again (password prompts do not echo), so ask again only
+        # once the output has moved — otherwise a slow check (sudo verifying)
+        # would get a second, unwanted line fed into it.
+        if (answer_fn is not None
+                and len(new_content) != _answered_len
+                and time.time() - _last_output_at >= tools_mod._PROMPT_WAIT_SECONDS):
+            tail_q = tools_mod.question_shaped_tail(new_content)
+            if tail_q:
+                try:
+                    _answer = answer_fn(tail_q)
+                except Exception:
+                    _answer = None
+                if _answer is None:
+                    # Caller gave up mid-dialog: same recovery as Esc.
+                    interrupted = True
+                    break
+                session.send_keys(_answer + "\n")
+                _answers_fed += 1
+                _answered_len = len(new_content)
+                # The fed line will echo back as bytes; that echo resets the
+                # idle clock on its own, but reset it explicitly so the
+                # program's response gets a full wait budget even when the
+                # PTY has echo off (password prompts).
+                _last_output_at = time.time()
+                continue
 
     stderr_note = ""
     if returncode == -1 and session.is_alive():
@@ -4234,6 +4315,69 @@ _HELPWO_FLAGS = {
 }
 
 
+#: System-detected shell subcommands. No hardcoded tree: the machine's own
+#: bash-completion definitions are the source of truth. The command's
+#: definition is sourced in a THROWAWAY bash subprocess (never term0 — probing
+#: term0 wrote a command into the user's shell on every keystroke, clobbered
+#: $? and $_, and blocked on its command lock), invoked with the official
+#: COMP_* protocol, and COMPREPLY is printed. Commands without a definition
+#: produce nothing, exactly like bash.
+#:
+#: SECURITY: sourcing a completion definition can execute code from the
+#: current directory — git reads .git/config (core.fsmonitor), make expands
+#: $(shell ...) in ./Makefile, etc. bash only does this on an explicit Tab;
+#: so do we. While-typing (no Tab) probing is therefore gated on the cwd being
+#: a trusted workspace; an explicit Tab always probes, matching bash.
+#: (path, mtime_ns) -> (expires_at, COMPREPLY list). Failures cache too, so a
+#: slow definition is not re-run on every keystroke.
+_subcmd_cache: dict[tuple, tuple] = {}
+_SUBCMD_CACHE_TTL = 30.0          # branch lists etc. go stale; keep it short
+_SUBCMD_PROBE_TIMEOUT = 0.8
+
+
+def _probe_shell_subcommands(words: list[str]) -> list[str]:
+    """Ask the system bash-completion definition for `words`' continuations.
+
+    `words` are the fully-typed words (command included, fragment excluded).
+    Returns the raw COMPREPLY entries (caller filters by fragment), or []
+    when the command has no completion definition or the probe fails/exceeds
+    the timeout. Cached per (context, cwd) for a short TTL; runs a throwaway
+    bash subprocess in the current directory, never term0.
+    """
+    if not words:
+        return []
+    cwd = os.getcwd()
+    key = (tuple(words), cwd)
+    now = time.monotonic()
+    hit = _subcmd_cache.get(key)
+    if hit is not None and hit[0] > now:
+        return hit[1]
+    probe_script = Path(__file__).parent / "shell_probe" / "complete_probe.sh"
+    if not probe_script.is_file():
+        return []
+    entries: list = []
+    try:
+        # Empty fragment: the definition returns the full candidate set for
+        # this context (one process per context, cached), and the caller
+        # filters by the typed fragment. `bash --norc --noprofile` keeps the
+        # user's own rc/profile out; the probe script sources only the system
+        # bash_completion. No shell=True: argv is passed as a list.
+        proc = subprocess.run(
+            ["bash", "--norc", "--noprofile", str(probe_script), *words, ""],
+            cwd=cwd, capture_output=True, text=True,
+            timeout=_SUBCMD_PROBE_TIMEOUT,
+            env={**os.environ, "BASH_COMPLETION_USER_FILE": os.devnull})
+        out = (proc.stdout or "").strip()
+        entries = [w.strip() for w in out.split("\n") if w.strip()] if out else []
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        entries = []
+    _subcmd_cache[key] = (now + _SUBCMD_CACHE_TTL, entries)
+    if len(_subcmd_cache) > 256:
+        for k in [k for k, v in _subcmd_cache.items() if v[0] <= now]:
+            _subcmd_cache.pop(k, None)
+    return entries
+
+
 class MetaCompleter(Completer):
     """Context-aware completer: /-commands, shell commands from PATH, and paths."""
 
@@ -4253,20 +4397,30 @@ class MetaCompleter(Completer):
         now = time.time()
         if now - self._cmd_mtime < 5 and self._cmd_completer is not None:
             return
-        words = set(_builtins_for_platform())
-        for path_dir in os.environ.get("PATH", "").split(os.pathsep):
-            p = Path(path_dir)
-            if not p.is_dir():
-                continue
-            try:
-                for entry in p.iterdir():
-                    if entry.is_file() and os.access(entry, os.X_OK):
-                        words.add(entry.name)
-            except (PermissionError, OSError):
-                continue
+        # One PATH enumerator for /scan and the completion menu:
+        # list_path_commands() already applies the user-facing filters
+        # (drop uppercase/systemd-/underscore noise). Builtins join the set
+        # here — they are not on PATH but are runnable first words.
+        words = set(list_path_commands()) | set(_builtins_for_platform())
         self._cmd_words = sorted(words)
         self._cmd_completer = WordCompleter(self._cmd_words, ignore_case=True, sentence=True)
         self._cmd_mtime = now
+
+    def _fragment_hits_command(self, fragment: str) -> bool:
+        """True if the first-word fragment prefix-matches a known command.
+
+        Cheap guard for while-typing popup: WordCompleter already filters,
+        but calling it on every keystroke of prose costs a scan of the full
+        command set. A lowercase binary-prefix check answers "would the menu
+        have anything to show" without building completions.
+        """
+        frag = fragment.casefold()
+        if not self._cmd_words:
+            self._refresh_commands()
+        for word in self._cmd_words:
+            if word.casefold().startswith(frag):
+                return True
+        return False
 
     @staticmethod
     def _completion(value: str, fragment: str, description: str = "") -> Completion:
@@ -4586,29 +4740,92 @@ class MetaCompleter(Completer):
                     yield self._completion(cmd, text, _desc)
             return
 
-        # For non-/-prefixed input, only show completions on explicit Tab —
-        # avoids a noisy menu popping up on every keystroke while typing
-        # natural-language input.
-        if not complete_event.completion_requested:
-            return
-
-        # First word — complete from PATH + builtins
+        # For non-/-prefixed input, path/file completion stays Tab-only —
+        # a menu on every keystroke of natural-language input is noise.
+        # The FIRST WORD is different: shell commands (ls, git, vim, ...)
+        # pop up while typing just like slash commands do, so the hint menu
+        # covers terminal commands too. Guards keep prose quiet: nothing
+        # before 2 characters, and WordCompleter only yields when the
+        # fragment actually prefix-matches a known command — "please fix
+        # this" matches nothing and stays silent.
         stripped = document.text_before_cursor.lstrip()
         cursor_in_first_word = " " not in stripped
         if cursor_in_first_word:
+            # /config shell_command_completion off = Tab-only for shell
+            # commands (the pre-menu behaviour); slash commands are unaffected.
+            try:
+                _shell_menu_on = bool(get_runtime_config("shell_command_completion"))
+            except Exception:
+                _shell_menu_on = True
+            if (not _shell_menu_on
+                    and not complete_event.completion_requested):
+                return
+            if (not complete_event.completion_requested
+                    and not (len(stripped) >= 2
+                             and self._fragment_hits_command(stripped))):
+                return
             self._refresh_commands()
             yield from self._cmd_completer.get_completions(document, complete_event)
             return
 
-        # After a command — path/file completion.
+        # After a command — system-detected subcommands via bash-completion
+        # (git che<TAB>, docker compose <TAB>): the machine's own official
+        # definition is the only source; no hardcoded tree. No definition →
+        # straight to path completion, exactly like bash itself. Same
+        # /config shell_command_completion switch as first-word commands.
+        text_before = document.text_before_cursor
+        last_space = text_before.rfind(" ")
+        path_text = text_before[last_space + 1:] if last_space != -1 else ""
+        _words = text_before.split()
+        _trailing_space = text_before.endswith(" ")
+        if _words and len(_words) >= 1 and " " in text_before:
+            _context = _words if _trailing_space else _words[:-1]
+            _fragment = "" if _trailing_space else _words[-1]
+            try:
+                _shell_menu_on = bool(get_runtime_config("shell_command_completion"))
+            except Exception:
+                _shell_menu_on = True
+            _tab = complete_event.completion_requested
+            # Probe only when the first word is a real command — never fork a
+            # bash for a chat sentence ("please fix the login bug"). And with
+            # the menu off and no Tab, do not probe at all (the result would
+            # be discarded anyway).
+            _cmd0 = _context[0] if _context else ""
+            _is_cmd = (_cmd0 in _builtins_for_platform()
+                       or shutil.which(_cmd0) is not None)
+            # SECURITY: sourcing a definition can run cwd code (git's
+            # core.fsmonitor, make's $(shell ...)). bash does that only on an
+            # explicit Tab; while-typing auto-probe is limited to a trusted
+            # workspace. An explicit Tab always probes.
+            _may_probe = _is_cmd and (_shell_menu_on or _tab)
+            if _may_probe and not _tab:
+                try:
+                    _may_probe = bool(trust_store.project_status().get("trusted"))
+                except Exception:
+                    _may_probe = False
+            _sub = _probe_shell_subcommands(_context) if _may_probe else []
+            if _sub:
+                _matching = [w for w in _sub
+                             if not _fragment or w.startswith(_fragment)]
+                if _matching:
+                    if _shell_menu_on or complete_event.completion_requested:
+                        for value in _matching:
+                            yield self._completion(
+                                value,
+                                _fragment if not _trailing_space else path_text,
+                                "")
+                        return   # definition hit: don't mix path noise in
+                    if not complete_event.completion_requested:
+                        return   # switch off, no Tab: quiet
+
+        if not complete_event.completion_requested:
+            return
+
         # PathCompleter uses document.text_before_cursor (the full line) as the
         # path prefix, which breaks for sentence input like "vim laint".  Create
         # a sub-document that only contains the last whitespace-delimited word
         # so that PathCompleter sees a bare path fragment.
-        text_before = document.text_before_cursor
-        last_space = text_before.rfind(" ")
-        if last_space != -1:
-            path_text = text_before[last_space + 1:]
+        if path_text:
             sub_doc = Document(path_text, len(path_text))
         else:
             sub_doc = document
@@ -6460,7 +6677,11 @@ def get_prompt_session() -> PromptSession:
         hist_file = paths.HISTORY_FILE
         _prompt_session = PromptSession(
             history=_PrivateCommandHistory(str(hist_file)),
-            completer=MetaCompleter(),
+            # ThreadedCompleter: a subcommand probe forks a bash and can take
+            # up to _SUBCMD_PROBE_TIMEOUT; running the completer off the input
+            # thread keeps typing responsive and lets prompt_toolkit cancel a
+            # stale probe when the next keystroke arrives.
+            completer=ThreadedCompleter(MetaCompleter()),
             auto_suggest=AutoSuggestFromHistory(),
             style=_build_prompt_style(),
             key_bindings=_build_keybindings(),
@@ -6634,14 +6855,109 @@ def extract_first_word(user_input: str) -> str:
     return m.group(1).strip("'\"`;&|")
 
 
+#: Everyday English words that are also shell builtins/commands. A sentence
+#: starting with one of these is far more often a prompt than a command
+#: ("help me fix this", "time flies"), so when the input is longer than a
+#: plausible command invocation we treat it as prose. Two words still allows
+#: the real command forms ("kill %1", "help cd", "find .").
+_AMBIGUOUS_COMMAND_WORDS = {
+    "help", "time", "kill", "find", "wait", "history", "exit", "man",
+    "sleep", "clear", "sort", "head", "tail", "which",
+    "who", "whoami", "file", "type", "source", "read", "test", "true",
+    "false", "jobs", "dirs", "hash", "let", "set", "unset",
+}
+
+
 def is_system_command(user_input: str) -> bool:
     """True if the first word is a shell builtin or resolvable on PATH."""
     first = extract_first_word(user_input)
     if not first:
         return False
+    if first in _AMBIGUOUS_COMMAND_WORDS and _is_prose_input(user_input):
+        return False
     if first in _builtins_for_platform():
         return True
     return shutil.which(first) is not None
+
+
+#: Characters that only ever appear in a shell line, never in a sentence typed
+#: at the agent: pipes, redirects, chaining, expansion, globs, job specs.
+_SHELL_SYNTAX_CHARS = set("|<>;&$`()=*~%{}\\")
+
+
+def _is_prose_input(user_input: str) -> bool:
+    """A sentence typed at the agent that merely opens with a command word.
+
+    Word count alone cannot tell "help me fix this bug" from "kill -9 1234
+    5678" or "history | grep ssh" — that rule sent everyday commands to the
+    model as prompts. Any shell-shaped token makes it a command: a flag,
+    shell syntax, a path or filename, a number (pid, seconds, count), or —
+    for the lookup commands — arguments that are all commands themselves
+    ("which python3 node npm"). Only a plain run of words is prose.
+    """
+    words = user_input.split()
+    if len(words) <= 2:
+        return False
+    args = words[1:]
+    for w in args:
+        if w.startswith("-") or any(c in _SHELL_SYNTAX_CHARS for c in w):
+            return False
+        if "/" in w or "." in w.strip(".,!?;:") or w.isdigit():
+            return False
+        if os.path.exists(w):
+            return False
+    if words[0] in ("which", "type", "man", "help", "whatis", "hash") and all(
+            w in _builtins_for_platform() or shutil.which(w) for w in args):
+        return False
+    return True
+
+
+_TTY_WRAPPERS = {"sudo", "env", "nohup", "nice", "stdbuf", "command",
+                 "time", "timeout"}
+_ONE_SHOT_INTERPRETER_FLAGS = {"-c", "-e", "--eval", "-p", "--print",
+                               "-V", "--version", "-h", "--help"}
+
+
+def _needs_tty_passthrough(user_input: str) -> bool:
+    """Should this direct command get full PTY passthrough (not term0)?
+
+    The whitelist is matched against the real program, not a wrapper word:
+    "sudo vim" used to be judged by "sudo" and routed to term0's
+    non-interactive marker-poll, where vim garbled and hung until the idle
+    timeout killed it. Leading VAR=value assignments ("env A=1 B=2 vim",
+    "TERM=xterm vim") and a timeout's duration are skipped the same way.
+
+    One-shot evaluations of a whitelisted interpreter do NOT passthrough:
+    "python -c 'print(1)'" on the tty returns stdout="", so the user saw the
+    output but the model never did. Only eval/print/version flags qualify —
+    a script ("python manage.py createsuperuser", anything with input()) may
+    need the keyboard, and marker-poll cannot forward keystrokes to it.
+    """
+    words = user_input.split()
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if "=" in w and not w.startswith("-") and w.split("=", 1)[0].isidentifier():
+            i += 1                      # VAR=value (bare or after env)
+            continue
+        if w in _TTY_WRAPPERS and i + 1 < len(words):
+            nxt = words[i + 1]
+            if w == "timeout" and (nxt[:1].isdigit() or nxt[:1] == "."):
+                i += 2
+                continue
+            i += 1
+            continue
+        break
+    prog = words[i] if i < len(words) else ""
+    if prog not in get_interactive_commands():
+        return False
+    if prog in ("python", "python3", "ipython", "node", "ruby", "irb"):
+        for arg in words[i + 1:]:
+            if not arg.startswith("-"):
+                break                   # the script: stays interactive
+            if arg.split("=", 1)[0] in _ONE_SHOT_INTERPRETER_FLAGS:
+                return False
+    return True
 
 
 def list_path_commands() -> list:
@@ -25548,6 +25864,15 @@ def _bg_reader_line_mode(target_queue: queue.Queue,
             _queue_supplementary(target_queue, line)
 
 
+#: Set while a term0 command is waiting for the user's answer (see the REPL's
+#: _shell_answer): None = normal supplementary typing, "plain" = the next line
+#: is an answer, "secret" = an answer to a credential prompt. Answers go to the
+#: waiting command verbatim — never through _queue_supplementary, whose
+#: "Queued instruction: …" echo printed a typed password back in clear text —
+#: and a secret answer is not echoed while it is typed either.
+_bg_answer_mode: Optional[str] = None
+
+
 def _bg_reader_cbreak_mode(target_queue: queue.Queue,
                            interrupt_event: Optional[threading.Event] = None,
                            stop_event: Optional[threading.Event] = None,
@@ -25568,6 +25893,8 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
     buf: list[str] = []
 
     def _buf_cells():
+        if _bg_answer_mode == "secret":
+            return 0        # nothing of a secret answer was drawn
         return sum(2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1
                    for c in buf)
 
@@ -25654,6 +25981,19 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
                 continue
 
             if key.name == "enter":
+                if _bg_answer_mode is not None:
+                    # An answer to a waiting command: delivered as typed (an
+                    # empty line accepts the prompt's default), left on
+                    # screen only if it was drawn, and never re-printed.
+                    line = ''.join(buf)
+                    buf.clear()
+                    sys.stdout.write('\n')
+                    sys.stdout.flush()
+                    try:
+                        target_queue.put_nowait(line)
+                    except queue.Full:
+                        pass
+                    continue
                 if buf:
                     line = ''.join(buf)
                     sys.stdout.write('\n')
@@ -25665,14 +26005,16 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
             if key.name == "backspace":
                 if buf:
                     removed = buf.pop()
-                    cells = 2 if unicodedata.east_asian_width(removed) in ('W', 'F') else 1
-                    sys.stdout.write('\b \b' * cells)
-                    sys.stdout.flush()
+                    if _bg_answer_mode != "secret":
+                        cells = 2 if unicodedata.east_asian_width(removed) in ('W', 'F') else 1
+                        sys.stdout.write('\b \b' * cells)
+                        sys.stdout.flush()
                 continue
 
             if key.is_text:
-                sys.stdout.write(key.text)
-                sys.stdout.flush()
+                if _bg_answer_mode != "secret":
+                    sys.stdout.write(key.text)
+                    sys.stdout.flush()
                 buf.extend(key.text)
     except TerminalBusy:
         # The hold succeeded and was then revoked mid-read. Nothing to
@@ -28308,7 +28650,18 @@ def main():
         # Check for meta commands. Dialogue input from the /agents view is a
         # conversation message, never a terminal command — even when it
         # starts with "/" — so it skips meta dispatch entirely.
-        if user_input.startswith("/") and not _is_dialogue:
+        # lstrip(): "/help" typed with a stray leading space used to miss this
+        # gate and fall through to the model as a prompt, while every parser
+        # downstream strips. The absolute-path exception keeps "/usr/bin/vim"
+        # a shell command rather than "Unknown command: /usr/bin/vim".
+        _gate_stripped = user_input.lstrip()
+        _first_word = extract_first_word(_gate_stripped)
+        _is_abs_path_cmd = (
+            _first_word.startswith("/")
+            and os.path.isfile(_first_word)
+            and os.access(_first_word, os.X_OK))
+        if (_gate_stripped.startswith("/") and not _is_dialogue
+                and not _is_abs_path_cmd):
             if (_is_injected_line
                     and _is_password_command(user_input)):
                 console.print("[yellow]/password can only be opened from the "
@@ -28582,7 +28935,11 @@ def main():
                             "returncode": _proc.returncode, "success": _proc.returncode == 0,
                         }
                     except _sub.TimeoutExpired:
-                        _cap_out = "Command timed out after 60s."
+                        _cap_out = ("Command timed out after 60s. It may be "
+                                    "waiting for interactive input, which "
+                                    "cannot be answered from a remote "
+                                    "terminal; run it locally or with "
+                                    "non-interactive flags.")
                         result = {"stdout": "", "stderr": "", "returncode": -1, "success": False}
                 agent_registry._push_events([{"type": "system", "kind": "output", "content": _cap_out[:4000]}])
             else:
@@ -28593,9 +28950,10 @@ def main():
                 # ssh, ...) get full PTY passthrough so they keep native terminal
                 # control (raw keystrokes, resize, full-screen redraw).
                 _first = extract_first_word(user_input)
+                _interactive_hit = _needs_tty_passthrough(user_input)
                 _term0_info = get_terminal("term0")
                 _use_term0 = (
-                    _first not in get_interactive_commands()
+                    not _interactive_hit
                     and _term0_info is not None
                     and _term0_info.session is not None
                     and _term0_info.session.is_alive()
@@ -28611,9 +28969,14 @@ def main():
                     # as an event, never a signal.
                     _shell_abort = threading.Event()
                     _shell_reader = False
+                    # Lines the reader collects beyond Esc land here; when
+                    # the command asks a question (adduser's "New password:",
+                    # apt's "[Y/n]") the poll loop calls answer_fn with the
+                    # prompt and we drain this queue for the user's reply.
+                    _answer_q = queue.Queue()
                     try:
                         _start_bg_input_reader(
-                            queue.Queue(), _shell_abort,
+                            _answer_q, _shell_abort,
                             interrupt_hint=(
                                 "\n[dim]Esc received - stopping the command "
                                 "and reclaiming the terminal.[/dim]"))
@@ -28628,11 +28991,66 @@ def main():
                         # No reader is a worse terminal, not a broken one:
                         # the command still runs and still times out.
                         pass
+
+                    def _shell_answer(prompt: str) -> Optional[str]:
+                        """Feed one user-typed line to the waiting command.
+
+                        Called from inside the poll loop when the command is
+                        waiting on stdin. The bg reader is switched to answer
+                        mode for the duration: the line goes straight to the
+                        command, and for a credential prompt nothing is
+                        echoed — a typed password must not land in the
+                        scrollback (or a mirrored view of it).
+                        Returns None when the user has nothing to say — the
+                        loop then interrupts and recovers, same as Esc.
+                        """
+                        global _bg_answer_mode
+                        _secret = tools_mod.is_secret_prompt(prompt)
+                        # Anything typed before the question was supplementary
+                        # chatter, not this answer.
+                        while True:
+                            try:
+                                _answer_q.get_nowait()
+                            except queue.Empty:
+                                break
+                        # escape(): the prompt line comes from command output
+                        # and may contain rich markup like "[red]" — printing
+                        # it raw would inject styles into the terminal.
+                        console.print(
+                            f"\n[bold cyan]{escape(prompt)}[/bold cyan] "
+                            + ("[dim](input hidden; press Enter when done, "
+                               "Esc stops the command)[/dim]" if _secret else
+                               "[dim](type an answer and press Enter; "
+                               "Esc stops the command)[/dim]"))
+                        _bg_answer_mode = "secret" if _secret else "plain"
+                        try:
+                            while True:
+                                try:
+                                    return _answer_q.get(timeout=0.5)
+                                except queue.Empty:
+                                    if _shell_abort.is_set():
+                                        return None
+                                    try:
+                                        if not _term0_info.session.is_alive():
+                                            return None
+                                    except Exception:
+                                        return None
+                        except Exception:
+                            return None
+                        finally:
+                            _bg_answer_mode = None
+
                     try:
+                        # No reader → an always-None answer_fn: the detection
+                        # then interrupts and recovers like Esc instead of
+                        # returning with the shell still held by the waiting
+                        # program (the next command would type into it).
                         result = _marker_poll_exec(
                             _term0_info.session, user_input,
                             strip_ansi_codes=False,
-                            abort_event=_shell_abort)
+                            abort_event=_shell_abort,
+                            answer_fn=(_shell_answer if _shell_reader
+                                       else (lambda _p: None)))
                     finally:
                         if _shell_reader:
                             _stop_bg_input_reader()

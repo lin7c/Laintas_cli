@@ -75,6 +75,7 @@
     "usage_tracker",
     "workflow_state",
     "hwg_runner",
+    "workflow_common",
     "hwg_view",
     "workflow_viz",
     "worktree_manager",
@@ -145,7 +146,8 @@
   },
   "data_dirs": [
     "default_skills",
-    "docs"
+    "docs",
+    "shell_probe"
   ],
   "extra_files": [
     "LICENSE",

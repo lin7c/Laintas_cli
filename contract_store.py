@@ -55,6 +55,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+import json_store
 import paths
 
 CONTRACT_DIR = ".laintas/contract"
@@ -122,10 +123,7 @@ def _read_json(path: Path, fallback: dict) -> dict:
 
 
 def _write_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(str(tmp), str(path))
+    json_store.save_json_atomic(path, data, indent=2, newline=True)
 
 
 def load(cwd: Optional[str] = None) -> tuple[dict, dict]:

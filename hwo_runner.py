@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 import agent_contract
+import workflow_common
 
 
 # ── Data model (mirrors hwo.ts types) ────────────────────────────────────
@@ -127,24 +128,7 @@ def _format_io_summary(io: Optional[dict]) -> str:
     return f" [in({names('in')}), out({names('out')})]"
 
 
-def _literal_value(raw: Optional[str]):
-    if raw is None:
-        return None
-    s = str(raw).strip()
-    if not s:
-        return None
-    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
-        return s[1:-1]
-    if s == "true":
-        return True
-    if s == "false":
-        return False
-    try:
-        if re.match(r"^-?\d+(?:\.\d+)?$", s):
-            return float(s) if "." in s else int(s)
-    except Exception:
-        pass
-    return s
+_literal_value = workflow_common.literal_value
 
 
 def _resolve_input_ref(ref: str, workflow_inputs: dict, output_scope: dict, self_scope: dict):

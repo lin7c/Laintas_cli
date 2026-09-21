@@ -118,6 +118,7 @@ _DEFAULT_CONFIG = {
     # quiet (a long link step, a slow remote fetch); lower it to fail fast.
     "shell_idle_timeout": 120.0,  # seconds of silence before a command is presumed stuck
     "paste_summary": True,        # collapse large pastes into a [Pasted #N ~L lines] placeholder in the prompt (expanded on submit)
+    "shell_command_completion": True,  # pop up PATH/builtin shell commands (ls, git, ...) in the hint menu while typing the first word
     "paste_summary_min_lines": 3, # paste line-count threshold that triggers the placeholder
     "paste_summary_min_chars": 150, # paste char-count threshold that triggers the placeholder
     # rprompt slot visibility. Comma-separated slot ids (agent, mode, model,
@@ -945,6 +946,7 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "terminal_tail_lines": "Terminal snapshot line count (viewport height)",
     "terminal_buffer_lines": "Scrollable history depth per terminal (lines)",
     "shell_idle_timeout": "Seconds of silence before a terminal command is presumed stuck (idle budget, not a runtime cap)",
+    "shell_command_completion": "Show shell commands (PATH + builtins) in the completion menu while typing the first word; off = Tab-only",
     "disable_remote_terminal": "Opt this runtime environment out of Helpwo's interactive terminal (P2P shell)",
     "allow_remote_exec_without_approval": "Let Helpwo's AI run commands in this environment without local approval (P2P exec)",
     "remote_max_workers": "Maximum concurrently running remote tasks",
@@ -2629,16 +2631,6 @@ def load_resume_state(cwd: str, session_id: str = None) -> Optional[dict]:
         return states[0]
     except Exception:
         return None
-
-
-def clear_resume_state(cwd: str) -> None:
-    """Delete this cwd's resume blob (after a successful /resume consumes it)."""
-    try:
-        _resume_latest_path(cwd).unlink(missing_ok=True)
-        for path in paths.SESSIONS_DIR.glob(_resume_checkpoint_pattern(cwd)):
-            path.unlink(missing_ok=True)
-    except Exception:
-        pass
 
 
 def delete_resume_state(cwd: str, blob: dict) -> None:

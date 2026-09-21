@@ -40,6 +40,21 @@ import paths
 _SEQ_BY_PATH: dict[str, int] = {}
 _LOCK = threading.RLock()
 
+#: Event types that recovery actually reads (last_incomplete_task matches on
+#: prompt_admitted / turn_ended). Only these need to survive a hard crash:
+#: fsync costs milliseconds per event and every tool_call/tool_result used to
+#: pay it. Everything else still gets flush() — visible to any reader, lost
+#: only on OS crash mid-turn, and rebuildable from session files anyway.
+#: LAINTAS_EVENT_FSYNC=1 forces the old fsync-everything behaviour.
+_FSYNC_EVENT_TYPES = frozenset({"prompt_admitted", "turn_ended"})
+
+
+def _fsync_needed(event_type: str) -> bool:
+    if os.environ.get("LAINTAS_EVENT_FSYNC", "").strip() not in ("", "0"):
+        return True
+    return event_type in _FSYNC_EVENT_TYPES
+
+
 def _log_path() -> Path:
     return Path(paths.project_dir()) / "events.jsonl"
 
@@ -175,10 +190,11 @@ def append(event_type: str, **fields) -> int:
             with open(p, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
                 f.flush()
-                try:
-                    os.fsync(f.fileno())
-                except OSError:
-                    pass
+                if _fsync_needed(event_type):
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError:
+                        pass
             paths.ensure_private_file(p)
         return entry["seq"]
     except Exception:
@@ -188,45 +204,79 @@ def append(event_type: str, **fields) -> int:
 def last_incomplete_task() -> Optional[dict]:
     """Return the most recent prompt_admitted event without a turn_ended.
 
-    Reads the log backwards. If the last non-tool_result event is a
-    prompt_admitted or ai_response (i.e., no turn_ended followed it),
-    returns that prompt_admitted event. Returns None if the last task
-    completed cleanly or the log is empty/unreadable.
+    Reads the log BACKWARDS in expanding tail windows (same pattern as
+    _last_seq_in): scanning from the end, the first prompt_admitted whose
+    run_id has no turn_ended after it is the most recent pending admission —
+    which is exactly the crash-recovery case, answered from the first window
+    without touching the rest of a multi-MB log. Only when nothing is pending
+    does the scan walk back through the whole file. A legacy no-run_id
+    admission counts only if it is the last legacy one and no legacy
+    turn_ended followed it. One deliberate difference from the old forward
+    read: when both a legacy and a run_id admission are pending, the one
+    later in the file wins (the old code always preferred the legacy one).
+
+    Returns None if the last task completed cleanly or the log is
+    empty/unreadable.
     """
     try:
         p = _log_path()
         if not p.exists():
             return None
-        lines = p.read_text(encoding="utf-8").splitlines()
-        pending: dict[str, dict] = {}
-        legacy_pending = None
-        order: dict[str, int] = {}
-        for index, line in enumerate(lines):
-            try:
-                evt = json.loads(line)
-            except (json.JSONDecodeError, TypeError):
+        size = p.stat().st_size
+    except OSError:
+        return None
+    closed_runs: set[str] = set()
+    legacy_closed = False
+    legacy_done = False
+    consumed_end = size
+    try:
+        for window in (*_SEQ_TAIL_WINDOWS, size):
+            start = size - window
+            if start < 0:
+                start = 0
+            if start >= consumed_end:
                 continue
-            if evt.get("type") == "prompt_admitted":
-                run_id = str(evt.get("run_id") or "")
-                if run_id:
-                    pending[run_id] = evt
-                    order[run_id] = index
-                else:
-                    legacy_pending = evt
-            elif evt.get("type") == "turn_ended":
-                run_id = str(evt.get("run_id") or "")
-                if run_id:
-                    pending.pop(run_id, None)
-                    order.pop(run_id, None)
-                else:
-                    legacy_pending = None
-        candidates = [
-            (order.get(run_id, -1), evt)
-            for run_id, evt in pending.items()
-        ]
-        if legacy_pending is not None:
-            candidates.append((len(lines), legacy_pending))
-        return max(candidates, key=lambda item: item[0])[1] if candidates else None
+            with open(p, "rb") as fh:
+                fh.seek(start)
+                if start > 0:
+                    fh.readline()   # drop the partial line the seek landed in
+                new_end = fh.tell()
+                if new_end >= consumed_end:
+                    # The window started inside the last unread line (one
+                    # event longer than the window — a prompt with a pasted
+                    # file). Nothing whole to read yet; leave consumed_end
+                    # alone so the next, larger window reads that line in
+                    # full instead of a truncated prefix that fails to parse.
+                    continue
+                data = fh.read(consumed_end - new_end)
+            consumed_end = new_end
+            if not data:
+                continue
+            for line in reversed(data.decode("utf-8", "replace").splitlines()):
+                try:
+                    evt = json.loads(line)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+                etype = evt.get("type")
+                if etype == "turn_ended":
+                    rid = str(evt.get("run_id") or "")
+                    if rid:
+                        closed_runs.add(rid)
+                    else:
+                        legacy_closed = True
+                elif etype == "prompt_admitted":
+                    rid = str(evt.get("run_id") or "")
+                    if rid:
+                        if rid not in closed_runs:
+                            return evt
+                    elif not legacy_done:
+                        if not legacy_closed:
+                            return evt
+                        # The last legacy admission was closed by a legacy
+                        # turn_ended; older legacy admissions were already
+                        # superseded by it in the forward-read semantics.
+                        legacy_done = True
+        return None
     except Exception:
         return None
 
