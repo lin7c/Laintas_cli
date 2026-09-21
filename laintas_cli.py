@@ -4391,12 +4391,56 @@ class MetaCompleter(Completer):
         self._cmd_completer: WordCompleter | None = None
         self._cmd_words: list[str] = []
         self._cmd_mtime: float = 0.0
+        self._refresh_lock = threading.Lock()
+        self._trust_cache: tuple = ("", 0.0, False)   # (cwd, expires, trusted)
 
     def _refresh_commands(self):
-        """Refresh the cached command list if PATH has changed."""
-        now = time.time()
-        if now - self._cmd_mtime < 5 and self._cmd_completer is not None:
+        """Refresh the cached command list if PATH has changed.
+
+        Runs on ThreadedCompleter worker threads: a keystroke cancels the
+        previous completion only at its next yield, and the scan happens
+        before any yield, so several stale threads used to scan PATH at once.
+        Single-flight: one thread scans; the others keep the current list, or
+        wait for the first one when there is no list yet.
+
+        On the Windows product the PATH ends with /mnt/<drive> directories
+        whose readdir goes over DrvFs; the menu list is display candidates,
+        not routing, so the interval is widened there.
+        """
+        _ttl = 300.0 if is_windows_host() else 5.0
+        if time.time() - self._cmd_mtime < _ttl and self._cmd_completer is not None:
             return
+        if not self._refresh_lock.acquire(blocking=self._cmd_completer is None):
+            return                      # another thread is scanning; stale is fine
+        try:
+            now = time.time()
+            if now - self._cmd_mtime < _ttl and self._cmd_completer is not None:
+                return                  # refreshed while we waited
+            self._scan_commands(now)
+        finally:
+            self._refresh_lock.release()
+
+    def _project_trusted(self) -> bool:
+        """trust_store.project_status() cached per cwd for a few seconds.
+
+        The while-typing probe gate asked it on every keystroke: resolve the
+        cwd, read the trust file and sha256 the project's executable
+        customizations — on /mnt/<drive> (the Windows product's usual cwd)
+        that is DrvFs I/O per key.
+        """
+        cwd = os.getcwd()
+        now = time.monotonic()
+        c_cwd, c_exp, c_val = self._trust_cache
+        if c_cwd == cwd and c_exp > now:
+            return c_val
+        try:
+            val = bool(trust_store.project_status().get("trusted"))
+        except Exception:
+            val = False
+        self._trust_cache = (cwd, now + 5.0, val)
+        return val
+
+    def _scan_commands(self, now: float):
         # One PATH enumerator for /scan and the completion menu:
         # list_path_commands() already applies the user-facing filters
         # (drop uppercase/systemd-/underscore noise). Builtins join the set
@@ -4792,17 +4836,18 @@ class MetaCompleter(Completer):
             # be discarded anyway).
             _cmd0 = _context[0] if _context else ""
             _is_cmd = (_cmd0 in _builtins_for_platform()
-                       or shutil.which(_cmd0) is not None)
+                       or _cached_which(_cmd0) is not None)
             # SECURITY: sourcing a definition can run cwd code (git's
             # core.fsmonitor, make's $(shell ...)). bash does that only on an
             # explicit Tab; while-typing auto-probe is limited to a trusted
             # workspace. An explicit Tab always probes.
             _may_probe = _is_cmd and (_shell_menu_on or _tab)
             if _may_probe and not _tab:
-                try:
-                    _may_probe = bool(trust_store.project_status().get("trusted"))
-                except Exception:
-                    _may_probe = False
+                # Windows product: no while-typing probe. Each new word forks
+                # a bash that sources bash_completion inside the WSL VM, and
+                # those forks kept running behind the user's own commands.
+                # An explicit Tab still probes.
+                _may_probe = (not is_windows_host()) and self._project_trusted()
             _sub = _probe_shell_subcommands(_context) if _may_probe else []
             if _sub:
                 _matching = [w for w in _sub
@@ -6830,6 +6875,56 @@ def _pt_prompt_once(cwd: str) -> str:
 # snapshot — newly-installed binaries are picked up immediately.
 
 import re
+
+# ── Routing lookup cache ────────────────────────────────────────────────
+# shutil.which() and os.path.exists() are the hot path of every input line
+# (routing decision + prose detection + completion menu). On the Windows
+# product the WSL distribution's PATH ends with the Windows directories
+# under /mnt/<drive>, where DrvFs directory scans are an order of magnitude
+# slower than native Linux: a miss (a word that is not a Linux command)
+# walked every Windows PATH dir on every keystroke/line. A short TTL cache
+# keeps "newly-installed binaries are picked up" behaviour (seconds, not
+# session lifetime) while making repeated lookups free.
+_LOOKUP_CACHE_TTL = 10.0
+_lookup_cache: dict = {}
+_lookup_cache_lock = threading.Lock()
+
+
+def _cached_which(word: str):
+    """TTL-cached shutil.which(); None result cached too (misses dominate)."""
+    if not word:
+        return None
+    now = time.monotonic()
+    with _lookup_cache_lock:
+        hit = _lookup_cache.get(word)
+        if hit is not None and hit[0] > now:
+            return hit[1]
+    result = shutil.which(word)
+    with _lookup_cache_lock:
+        _lookup_cache[word] = (now + _LOOKUP_CACHE_TTL, result)
+        if len(_lookup_cache) > 4096:
+            for k in [k for k, v in _lookup_cache.items() if v[0] <= now]:
+                _lookup_cache.pop(k, None)
+    return result
+
+
+def _cached_exists(word: str) -> bool:
+    """TTL-cached os.path.exists(); cwd-relative misses change with cwd, so
+    the key includes the cwd for relative-looking words."""
+    if not word:
+        return False
+    key = word if os.path.isabs(word) else f"{os.getcwd()}{os.sep}{word}"
+    now = time.monotonic()
+    with _lookup_cache_lock:
+        hit = _lookup_cache.get(key)
+        if hit is not None and hit[0] > now:
+            return hit[1]
+    result = os.path.exists(word)
+    with _lookup_cache_lock:
+        _lookup_cache[key] = (now + _LOOKUP_CACHE_TTL, result)
+    return result
+
+
 # bash/sh/zsh builtins that aren't on PATH but should still route as commands.
 _POSIX_SHELL_BUILTINS = {
     "alias", "bg", "break", "builtin", "case", "cd", "command", "compgen",
@@ -6877,7 +6972,7 @@ def is_system_command(user_input: str) -> bool:
         return False
     if first in _builtins_for_platform():
         return True
-    return shutil.which(first) is not None
+    return _cached_which(first) is not None
 
 
 #: Characters that only ever appear in a shell line, never in a sentence typed
@@ -6904,10 +6999,10 @@ def _is_prose_input(user_input: str) -> bool:
             return False
         if "/" in w or "." in w.strip(".,!?;:") or w.isdigit():
             return False
-        if os.path.exists(w):
+        if _cached_exists(w):
             return False
     if words[0] in ("which", "type", "man", "help", "whatis", "hash") and all(
-            w in _builtins_for_platform() or shutil.which(w) for w in args):
+            w in _builtins_for_platform() or _cached_which(w) for w in args):
         return False
     return True
 
@@ -6960,32 +7055,44 @@ def _needs_tty_passthrough(user_input: str) -> bool:
     return True
 
 
-def list_path_commands() -> list:
-    """Enumerate user-facing commands currently on PATH (for /scan display)."""
-    commands = set()
-    path_dirs = os.environ.get("PATH", "").split(os.pathsep)
+def _is_user_facing_command_name(c: str) -> bool:
+    """The /scan and completion-menu name filter (noise, not routing)."""
+    if len(c) < 2 or c[0].isupper():
+        return False
+    if "." in c or ":" in c or c.startswith("_"):
+        return False
+    if c.startswith("systemd-") or c.startswith("dbus-") or c.startswith("ksvgtop"):
+        return False
+    return True
 
-    for path_dir in path_dirs:
-        p = Path(path_dir)
-        if not p.is_dir():
+
+def list_path_commands() -> list:
+    """Enumerate user-facing commands currently on PATH (for /scan display).
+
+    Names are filtered BEFORE anything is stat'ed. On the Windows product the
+    PATH ends with /mnt/<drive>/... directories where every entry is
+    `foo.exe`/`foo.dll` — all dropped by the "." rule — and a per-entry
+    is_file()+access() over DrvFs cost seconds per scan for nothing. scandir
+    also answers is_file() from d_type without an extra stat where it can.
+    """
+    commands = set()
+    for path_dir in os.environ.get("PATH", "").split(os.pathsep):
+        if not path_dir:
             continue
         try:
-            for entry in p.iterdir():
-                if entry.is_file() and os.access(entry, os.X_OK):
-                    commands.add(entry.name)
-        except (PermissionError, OSError):
-            pass
-
-    result = []
-    for c in sorted(commands):
-        if len(c) < 2 or c[0].isupper():
+            with os.scandir(path_dir) as it:
+                for entry in it:
+                    name = entry.name
+                    if name in commands or not _is_user_facing_command_name(name):
+                        continue
+                    try:
+                        if entry.is_file() and os.access(entry.path, os.X_OK):
+                            commands.add(name)
+                    except OSError:
+                        continue
+        except (PermissionError, NotADirectoryError, FileNotFoundError, OSError):
             continue
-        if "." in c or ":" in c or c.startswith("_"):
-            continue
-        if c.startswith("systemd-") or c.startswith("dbus-") or c.startswith("ksvgtop"):
-            continue
-        result.append(c)
-    return result
+    return sorted(commands)
 
 
 # ── Shell Detection ──────────────────────────────────────────────────────
