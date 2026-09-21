@@ -304,6 +304,7 @@ the AI agent can reason about cause: `captcha`, `rate_limited`, `network`,
 | `.laintas/workgraph.db` | Project directory | Transactional objective, plan revisions, steps, workflow, approvals, and events |
 | `.laintas/contract/` | Project directory | The API contract two agents agreed on — **committed**, not ignored |
 | `.laintas/handoff/` | Project directory | Handoff envelopes: what one worker left the next — **committed**, not ignored |
+| `~/.laintas/training/local.sqlite3` | Home directory | `/training local` capture: model inputs/outputs kept on this machine, never uploaded (chmod 700 dir) |
 
 
 Two of those are deliberately **not** ignored. `.laintas/` is this CLI's local

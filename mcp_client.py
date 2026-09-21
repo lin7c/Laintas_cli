@@ -291,11 +291,15 @@ class MCPManager:
         except Exception as e:
             srv.status = "error"
             srv.last_error = f"{type(e).__name__}: {e}"
-            # Best-effort cleanup
+            # K3: best-effort cleanup — the stack is attached to srv up
+            # front (see _connect_async), so closing it now actually
+            # terminates the stdio child process instead of no-op'ing.
             try:
                 self._submit(self._disconnect_async(srv), timeout=3.0)
             except Exception:
                 pass
+            srv._session = None
+            srv._exit_stack = None
             return False, srv.last_error
 
         # Register each tool in the global registry.
@@ -322,6 +326,12 @@ class MCPManager:
             cwd=srv.config.get("cwd") or None,
         )
         stack = AsyncExitStack()
+        # K3 (bughunt): attach the stack to the server BEFORE the awaits.
+        # _exit_stack used to be assigned only on success, so a connect
+        # timeout left it unset — the best-effort cleanup then closed
+        # nothing, the stdio child process leaked, and the abandoned
+        # coroutine could still flip status back to "up" when it finished.
+        srv._exit_stack = stack
         read, write = await stack.enter_async_context(stdio_client(params))
         session = await stack.enter_async_context(ClientSession(read, write))
         await asyncio.wait_for(session.initialize(), timeout=CONNECT_TIMEOUT)
@@ -329,7 +339,10 @@ class MCPManager:
         srv._exit_stack = stack
         srv._session = session
         srv.tools = list(result.tools) if hasattr(result, "tools") else []
-        srv.status = "up"
+        # K3: a caller-side timeout has already marked this server "error";
+        # a late completion must not resurrect it as "up".
+        if srv.status == "connecting":
+            srv.status = "up"
         srv.last_error = None
 
     def disconnect(self, name: str, timeout: float = 5.0) -> tuple[bool, str]:

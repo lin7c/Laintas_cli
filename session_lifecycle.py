@@ -64,14 +64,46 @@ def guard(cwd):
                     fcntl.flock(lock, fcntl.LOCK_UN)
 
 
+# path -> ((ino, mtime_ns, size), ids). Session listing probes is_deleted
+# once per session file; re-reading and re-parsing the registry each time
+# multiplied the reads of every resume probe. mark_deleted lands a new inode
+# via os.replace, so a stale hit is not possible.
+_deleted_cache: dict = {}
+
+
 def deleted_ids(cwd):
     path = paths.SESSIONS_DIR / f"{_key(cwd)}_deleted.json"
-    if not path.exists():
+    try:
+        st = path.stat()
+    except OSError:                       # absent (the common case) or unreadable
+        return set()
+    sig = (st.st_ino, st.st_mtime_ns, st.st_size)
+    cached = _deleted_cache.get(str(path))
+    if cached is not None and cached[0] == sig:
+        return set(cached[1])
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
         return set()
     try:
-        return set(json.loads(path.read_text(encoding="utf-8")))
-    except FileNotFoundError:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        # A torn write (crash mid-save, power loss) must not brick every
+        # future session save: quarantine the corrupt file so it can be
+        # inspected, then treat deletion memory as empty.
+        try:
+            path.rename(path.with_name(
+                f"{path.name}.corrupt-{uuid.uuid4().hex[:8]}"))
+        except OSError:
+            pass
         return set()
+    if isinstance(payload, list):
+        ids = frozenset(i for i in payload if isinstance(i, str))
+    else:
+        # A dict payload is not a format we ever wrote; keys are not identities.
+        ids = frozenset()
+    _deleted_cache[str(path)] = (sig, ids)
+    return set(ids)
 
 
 def is_deleted(cwd, blob):
@@ -83,7 +115,15 @@ def mark_deleted(cwd, ids):
     dest = paths.SESSIONS_DIR / f"{_key(cwd)}_deleted.json"
     tmp = dest.with_name(f".{dest.name}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp.write_text(json.dumps(sorted(deleted_ids(cwd) | set(ids))), encoding="utf-8")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(sorted(deleted_ids(cwd) | set(ids))))
+            # D7 (bughunt): fsync before replace. The session files are
+            # unlinked right after this returns; if the deletion registry
+            # is still in the page cache when power dies, the unlinks are
+            # durable but the record of them is not — deleted sessions
+            # resurrect on the next boot. Cost: one fsync per close.
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, dest)
     finally:
         tmp.unlink(missing_ok=True)

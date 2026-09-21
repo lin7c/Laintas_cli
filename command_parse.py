@@ -43,13 +43,42 @@ _WRAPPER_STRING_FLAGS = {"-c", "--command"}
 # was written for the Linux side of that boundary. Treating them as wrappers is
 # what makes the payload visible to those rules instead of the launcher name.
 #
-# PowerShell accepts any unambiguous prefix of a parameter name, so `-Com`,
-# `-Comma` and `-Command` are the same flag; the check below is by prefix for
-# that reason, not for convenience.
+# PowerShell accepts abbreviations of a parameter name, so `-Com`, `-Comma`
+# and `-Command` are the same flag; the check below is by prefix for that
+# reason, not for convenience (see _PS_PARAMS for how the prefix is bounded).
 _WINDOWS_WRAPPERS = {"powershell.exe", "powershell", "pwsh.exe", "pwsh",
                      "cmd.exe", "cmd", "wsl.exe", "wsl"}
-_PS_COMMAND_FLAG_PREFIXES = ("-command", "-c")
-_PS_ENCODED_FLAG_PREFIXES = ("-encodedcommand", "-enc", "-ec", "-e")
+# (full parameter name, shortest prefix PowerShell accepts for it). This is
+# how pwsh's own CommandLineParameterParser resolves a switch: the token must
+# be a prefix of the full name AND at least as long as its minimal form. That
+# is what keeps `-ExecutionPolicy` (min `-ex`) out of `-EncodedCommand`
+# (min `-e`) while still resolving `-Encod` and `-Comm` — an exact-token match
+# let every abbreviation walk past the payload analysis with no risk flag.
+_PS_PARAMS = (
+    ("-command", "-c"), ("-commandwithargs", "-commandw"),
+    ("-configurationname", "-config"), ("-configurationfile", "-configurationf"),
+    ("-custompipename", "-cus"),
+    ("-encodedcommand", "-e"), ("-encodedarguments", "-encodeda"),
+    ("-executionpolicy", "-ex"), ("-file", "-f"), ("-help", "-h"),
+    ("-inputformat", "-in"), ("-interactive", "-i"), ("-login", "-l"),
+    ("-mta", "-mta"), ("-noexit", "-noe"), ("-nologo", "-nol"),
+    ("-noninteractive", "-noni"), ("-noprofile", "-nop"),
+    ("-outputformat", "-o"), ("-psconsolefile", "-psc"),
+    ("-settingsfile", "-settings"), ("-sta", "-sta"), ("-version", "-v"),
+    ("-windowstyle", "-w"), ("-workingdirectory", "-wd"),
+)
+_PS_ALIASES = {"-ec": "-encodedcommand", "-enc": "-encodedcommand",
+               "-cwa": "-commandwithargs", "-wd": "-workingdirectory"}
+_PS_ENCODED_PARAMS = {"-encodedcommand"}
+_PS_COMMAND_PARAMS = {"-command", "-commandwithargs"}
+
+
+def _ps_param_names(token: str) -> set:
+    """Every powershell.exe/pwsh parameter `token` could abbreviate."""
+    if token in _PS_ALIASES:
+        return {_PS_ALIASES[token]}
+    return {full for full, shortest in _PS_PARAMS
+            if full.startswith(token) and len(token) >= len(shortest)}
 _CMD_STRING_FLAGS = {"/c", "/k"}
 
 # Commands that consume a shell script on stdin. `echo "rm -rf /" | sh` is the
@@ -424,20 +453,34 @@ def _windows_payload(program: str, rest: list) -> tuple:
             if lowered == "--" and following:
                 return " ".join(words[idx + 1:]), risks
             continue
-        if any(lowered.startswith(flag) for flag in _PS_ENCODED_FLAG_PREFIXES) \
-                and following:
+        # E4 (bughunt): `startswith("-e")` swallowed -ExecutionPolicy and
+        # -ErrorAction, `startswith("-c")` swallowed -ComputerName. Resolve
+        # the flag the way PowerShell does (see _PS_PARAMS) instead: prefix
+        # of the full name, no shorter than its minimal form. An ambiguous
+        # abbreviation that could be the payload flag is treated as it —
+        # looking at a payload that was not one costs nothing, missing one
+        # that was is the hole. `-flag:value` is PowerShell's inline form.
+        flag_token = lowered.split(":", 1)[0]
+        names = _ps_param_names(flag_token) if flag_token.startswith("-") else set()
+        # Base64 is case-sensitive: take the inline value from the original
+        # token, never from the lowercased one.
+        inline_value = following
+        if ":" in word:
+            inline_val = word.split(":", 1)[1]
+            if inline_val:
+                inline_value = inline_val
+        if names & _PS_ENCODED_PARAMS and inline_value:
             try:
-                raw = base64.b64decode(following, validate=True)
+                raw = base64.b64decode(inline_value, validate=True)
                 decoded = raw.decode("utf-16-le").strip()
             except Exception:
                 decoded = ""
             if decoded:
                 return decoded, {RISK_WRAPPER}
             return "", {RISK_WRAPPER, RISK_UNRESOLVED, RISK_OPAQUE_PAYLOAD}
-        if any(lowered.startswith(flag) for flag in _PS_COMMAND_FLAG_PREFIXES) \
-                and following:
+        if names & _PS_COMMAND_PARAMS and following:
             return " ".join(words[idx + 1:]), risks
-        if lowered.startswith("-file"):
+        if "-file" in names:
             # The script is on disk; its contents are not knowable here. This
             # is not a substitution and must not be reported as one: the agent
             # that is told "the command name is produced at runtime" about

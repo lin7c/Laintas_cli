@@ -1398,6 +1398,7 @@ import backend_profiles          # backend trust domains + credential isolation
 import trust_store               # workspace trust for executable customization
 import winbridge                 # facts about the Windows side of WSL (no-op elsewhere)
 import usage_tracker             # local AI token/cost accounting (/usage)
+import training_local            # /training local: on-machine interaction capture
 import agent_ui_events           # observable events for full-screen Agents Mode
 import mode_manager              # declarative user-selectable agent modes
 import auto_pilot                # heuristic task classification + hint injection
@@ -2804,18 +2805,35 @@ class InteractiveSession:
             self._returncode = 0
             self._eof_reached = True
 
-    def _reap_child(self) -> None:
-        """Blocking wait for child process."""
+    def _reap_child(self, wait: bool = False) -> None:
+        """Reap the child without blocking the output lock.
+
+        K1 (bughunt): this runs inside _read_output_unlocked while the caller
+        holds output_lock. A blocking waitpid(pid, 0) here hangs every thread
+        that wants that lock when the child closed its stdio but stays alive
+        (daemonized/detached processes). Poll WNOHANG instead; close() passes
+        wait=True with a bounded retry after SIGKILL, where the child is
+        expected to exit promptly.
+        """
         if self._returncode != -1 or self.pid < 0 or self.master_fd < 0:
             return
-        try:
-            wpid, status = os.waitpid(self.pid, 0)
-            if os.WIFEXITED(status):
-                self._returncode = os.WEXITSTATUS(status)
-            elif os.WIFSIGNALED(status):
-                self._returncode = 128 + os.WTERMSIG(status)
-        except (OSError, ChildProcessError):
-            pass
+        deadline = time.monotonic() + 5.0 if wait else 0.0
+        while True:
+            try:
+                wpid, status = os.waitpid(self.pid, os.WNOHANG)
+                if wpid == 0:  # still running
+                    if not wait or time.monotonic() >= deadline:
+                        return
+                    time.sleep(0.05)
+                    continue
+                if os.WIFEXITED(status):
+                    self._returncode = os.WEXITSTATUS(status)
+                elif os.WIFSIGNALED(status):
+                    self._returncode = 128 + os.WTERMSIG(status)
+                return
+            except (OSError, ChildProcessError):
+                self._returncode = 0
+                return
 
     def _drain_remaining(self) -> None:
         """Read any leftover data from master fd after child exits."""
@@ -3012,7 +3030,7 @@ class InteractiveSession:
         self._closed = True
 
         if self.master_fd >= 0:
-            self._reap_child()
+            self._reap_child(wait=True)
             self._drain_remaining()
             os.close(self.master_fd)
             self.master_fd = -1
@@ -3364,13 +3382,25 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "fills require a trusted credential broker and fail closed when "
             "none is deployed.")),
     CommandSpec(
-        "/training", "Manage optional training-data sharing", "Account & Session",
-        "/training [status|on|off]",
-        subcommands=("status", "on", "off"),
+        "/training", "Manage training-data sharing (cloud) and capture (local)",
+        "Account & Session",
+        "/training [status|on|off|local [status|on|off|purge|export <file>]]",
+        subcommands=("status", "on", "off", "local"),
+        completion_descriptions=(
+            ("status", "Show cloud sharing state"),
+            ("on", "Let the Gateway retain what it serves"),
+            ("off", "Stop Gateway collection"),
+            ("local", "Keep a copy on this machine instead/as well"),
+        ),
         help_text=(
-            "Sharing is off by default. 'on' explicitly allows Laintas to retain "
-            "gateway-observed CLI model inputs and outputs. 'off' stops future "
-            "collection; previously collected training data is retained.")),
+            "Two independent switches. Cloud sharing is off by default: 'on' "
+            "explicitly allows Laintas to retain gateway-observed CLI model "
+            "inputs and outputs, 'off' stops future collection (already "
+            "collected data is retained). '/training local on' writes the same "
+            "interactions to ~/.laintas/training/ on this machine and uploads "
+            "nothing; it works with any backend and needs no login. Neither "
+            "switch reads the other — local capture does not enable or "
+            "suppress cloud collection.")),
     CommandSpec(
         "/usage", "Show AI usage — local token stats + Laintas backend usage",
         "Account & Session", "/usage [7d|30d|90d] [local] | buy <calls|storage>",
@@ -3966,6 +3996,12 @@ _ARG_COMPLETIONS: dict[str, tuple] = {
             [("reset", "Clear this terminal's override")]
             if get_terminal(prior[0]) is not None else [])),
     ),
+    "/training": ((("local",), _static_candidates(
+        ("status", "Samples captured on this machine"),
+        ("on", "Start keeping a local copy"),
+        ("off", "Stop keeping a local copy"),
+        ("purge", "Delete every local sample"),
+        ("export", "Write the local store to a .jsonl file"))),),
     "/term": ((("rename",), _terminal_candidates()),),
     "/terminate": (((), _terminal_candidates()),),
     "/app": ((("start", "stop", "trust", "revoke"), _cached_provider("apps", lambda: [
@@ -9190,7 +9226,62 @@ def _format_billing_refusal(code: str, body: dict, lang: str = "EN") -> str:
     line = f"{headline}: {detail}" if detail else headline
     return f"{line} — {remedy}" if remedy else line
 
-def call_backend_stream(
+_LOCAL_TRAINING_TTL = 5.0
+_local_training_cache: tuple = (0.0, False)
+
+
+def local_training_enabled() -> bool:
+    """Is `/training local` on? Cached, because this runs per model call.
+
+    Deliberately independent of the account-scoped `/training on|off` state,
+    which lives on the Gateway: a user who shares nothing with us may still
+    want a corpus of their own, and a user who shares everything may not want
+    a second copy on a laptop. Neither switch reads the other.
+    """
+    global _local_training_cache
+    now = time.monotonic()
+    checked_at, value = _local_training_cache
+    if now - checked_at < _LOCAL_TRAINING_TTL:
+        return value
+    try:
+        value = bool(load_config().get("training_local", False))
+    except Exception:
+        value = False
+    _local_training_cache = (now, value)
+    return value
+
+
+def _invalidate_local_training_cache() -> None:
+    global _local_training_cache
+    _local_training_cache = (0.0, False)
+
+
+def call_backend_stream(*args, **kwargs) -> dict:
+    """`_call_backend_stream_impl` plus the optional on-machine capture.
+
+    A wrapper rather than an `if` at each `return`: the implementation has a
+    dozen exits (billing refusal, truncation, native tool calls, prose) and a
+    capture bolted onto each one is a capture that will be forgotten at the
+    thirteenth. Nothing here may raise — a failed capture must cost the turn
+    nothing, so the whole block is guarded and the result is returned either
+    way.
+    """
+    if not local_training_enabled():
+        return _call_backend_stream_impl(*args, **kwargs)
+    sink: dict = {}
+    result = _call_backend_stream_impl(*args, _local_sink=sink, **kwargs)
+    try:
+        cwd = kwargs.get("current_path")
+        if cwd is None and len(args) > 3:
+            cwd = args[3]
+        training_local.record(sink, result if isinstance(result, dict) else {},
+                              cwd=str(cwd or ""), device=_device_name())
+    except Exception:
+        pass
+    return result
+
+
+def _call_backend_stream_impl(
     session: dict,
     message: str,
     system_prompt: str,
@@ -9210,6 +9301,7 @@ def call_backend_stream(
     context_capture: Optional[dict] = None,
     max_tokens_override: Optional[int] = None,
     prompt_budget: Optional[dict] = None,
+    _local_sink: Optional[dict] = None,
 ) -> dict:
     """Call Helpwo backend /api/chat/stream, same as Helpwo frontend.
     Returns parsed {reply, command, memory, done, _billing} dict.
@@ -9320,6 +9412,13 @@ def call_backend_stream(
                 payload["tool_choice"] = "auto"
         except Exception:
             tool_name_map = {}
+
+    # `/training local` keeps a copy of this exact request on this machine.
+    # Stashed by reference and serialised off the hot path; taken HERE because
+    # the payload is complete (model, provider and tools all decided) and the
+    # function returns from a dozen later places.
+    if _local_sink is not None:
+        _local_sink["payload"] = payload
 
     if context_capture is not None:
         # Opt in to an authenticated gateway receipt containing the exact
@@ -9786,6 +9885,12 @@ def call_backend_stream(
         # it looked intermittent.
         if _effective_model and _is_foreground_turn(task_kind):
             _update_status_cache(model=_effective_model)
+
+        # Every successful return below passes through here, so one assignment
+        # covers the native, tagged and prose paths alike.
+        if _local_sink is not None:
+            _local_sink["model"] = _effective_model
+            _local_sink["billing"] = billing_info
 
         raw_text = accumulated.strip()
         # Content is always prose now (tool calls come natively); surface it.
@@ -13090,10 +13195,14 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/messages", "read"): _arg_rule(2, "/messages read <n|key>"),
     ("/messages", "dismiss"): _arg_rule(2, "/messages dismiss <n|key>"),
     ("/fork",): _arg_rule(1, "/fork [name]"),
-    ("/training",): _arg_rule(1, "/training [status|on|off]"),
+    ("/training",): _arg_rule(3, "/training [status|on|off|local ...]"),
     ("/training", "status"): _arg_rule(1, "/training status"),
     ("/training", "on"): _arg_rule(1, "/training on"),
     ("/training", "off"): _arg_rule(1, "/training off"),
+    # `local` is the one leaf that takes an argument of its own (a path), so
+    # its rule is deliberately looser than its siblings'.
+    ("/training", "local"): _arg_rule(
+        3, "/training local [status|on|off|purge|export <file>]"),
     # --port/--host/--dist are key+value pairs, so the ceiling has to cover
     # them together, not just the two it was written for.
     ("/helpwo",): _arg_rule(
@@ -14420,12 +14529,116 @@ def _training_control_request(session: dict, method: str,
     return body
 
 
+def _fmt_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}GB"
+
+
+def _cmd_training_local(args: list) -> None:
+    """`/training local` — capture the same interactions on THIS machine.
+
+    Separate from the account switch above in every respect: it needs no
+    login, works against any backend including a self-hosted one, and neither
+    switch changes the other. Turning cloud sharing off does not turn this on,
+    and turning this on does not stop the Gateway recording what it serves.
+    """
+    sub = args[0].strip().lower() if args else "status"
+    if sub not in ("status", "on", "off", "purge", "export"):
+        raise SlashCommandUsageError(
+            "Usage: /training local [status|on|off|purge|export <file>]")
+
+    if sub in ("on", "off"):
+        config = load_config()
+        config["training_local"] = (sub == "on")
+        save_config(config)
+        _invalidate_local_training_cache()
+        if sub == "on":
+            console.print(
+                "[green]Local training capture is on.[/green]\n"
+                f"[dim]Model inputs and outputs from this CLI are written to "
+                f"{escape(training_local.db_path())} and are never uploaded by "
+                f"laintas_cli. This is independent of /training on|off, which "
+                f"controls what the Gateway retains.[/dim]")
+        else:
+            console.print(
+                "[green]Local training capture is off.[/green]\n"
+                "[dim]Samples already on disk are kept — /training local purge "
+                "deletes them.[/dim]")
+        return
+
+    if sub == "purge":
+        rows = training_local.stats().get("rows", 0)
+        if not rows:
+            console.print("[dim]No local training samples to delete.[/dim]")
+            return
+        try:
+            answer = input(
+                f"Delete all {rows} local training samples? [y/N] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer.lower() not in ("y", "yes"):
+            console.print("[yellow]Kept.[/yellow]")
+            return
+        console.print(f"[green]Deleted {training_local.purge()} samples.[/green]")
+        return
+
+    if sub == "export":
+        target = " ".join(args[1:]).strip()
+        if not target:
+            raise SlashCommandUsageError(
+                "Usage: /training local export <file.jsonl>")
+        training_local.flush()
+        written = training_local.export_jsonl(os.path.expanduser(target))
+        if written:
+            console.print(
+                f"[green]Wrote {written} samples to {escape(target)}.[/green]")
+        else:
+            console.print(
+                "[yellow]Nothing exported — the local store is empty or the "
+                "path is not writable.[/yellow]")
+        return
+
+    training_local.flush()
+    info = training_local.stats()
+    on = local_training_enabled()
+    console.print(
+        f"[{'green' if on else 'yellow'}]Local training capture: "
+        f"{'on' if on else 'off'}[/{'green' if on else 'yellow'}]")
+    console.print(f"[dim]Store: {escape(info['path'])}[/dim]")
+    if not info["rows"]:
+        console.print("[dim]No samples captured yet.[/dim]")
+        return
+    rows, trajs = info["rows"], info["trajectories"]
+    console.print(
+        f"[dim]{rows} sample{'' if rows == 1 else 's'} {symbols.BULLET} "
+        f"{trajs} {'trajectory' if trajs == 1 else 'trajectories'} "
+        f"{symbols.BULLET} {_fmt_bytes(info['bytes'])}[/dim]")
+    if info.get("oldest"):
+        span = (f"{datetime.fromtimestamp(info['oldest']):%Y-%m-%d} → "
+                f"{datetime.fromtimestamp(info['newest']):%Y-%m-%d}")
+        console.print(f"[dim]Span: {span}[/dim]")
+    for kind, count in info["by_kind"][:12]:
+        console.print(f"[dim]  {kind:<20}{count}[/dim]")
+    if info.get("dropped"):
+        console.print(
+            f"[yellow]{info['dropped']} samples dropped (write queue full)."
+            "[/yellow]")
+    if info.get("error"):
+        console.print(f"[yellow]Last capture error: {escape(info['error'])}[/yellow]")
+
+
 def _cmd_training(parts: list, session: dict) -> None:
     """Manage explicit, account-scoped training-data consent."""
     action = parts[1].strip().lower() if len(parts) > 1 else "status"
+    if action == "local":
+        _cmd_training_local(parts[2:])
+        return
     if action not in ("status", "on", "off"):
         raise SlashCommandUsageError(
-            "Usage: /training [status|on|off]")
+            "Usage: /training [status|on|off|local ...]")
 
     with _safe_status("[dim]Checking training-data sharing…[/dim]"):
         state = _training_control_request(session, "GET")
@@ -14443,6 +14656,10 @@ def _cmd_training(parts: list, session: dict) -> None:
             f"{'available' if available else 'unavailable'}[/dim]")
         if scope:
             console.print(f"[dim]Scope: {escape(scope)}[/dim]")
+        console.print(
+            "[dim]Local capture (separate switch): "
+            f"{'on' if local_training_enabled() else 'off'} "
+            f"{symbols.BULLET} /training local[/dim]")
         return
 
     if action == "on" and not available:
@@ -23429,7 +23646,9 @@ def _workflow_result(kind: str, result: dict) -> None:
     heading.append(f"{symbol} ", style=style)
     heading.append(f"{kind} {status}", style="bold white")
     console.print(heading)
-    message = str(result.get("msg") or "").strip()
+    # Prefer the structured pretty render when the compile path attached one
+    # (docs/hwo-hwg-diagnostics-design.md P0); runs and legacy results keep msg.
+    message = str(result.get("pretty") or result.get("msg") or "").strip()
     if message:
         console.print(Text(message, style="white"))
 

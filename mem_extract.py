@@ -127,7 +127,7 @@ _EVIDENCE_MAX_PATHS = 3
 _EVIDENCE_MAX_BYTES = 4_000_000
 
 
-def _proposal_evidence(item: dict) -> list:
+def _proposal_evidence(item: dict, base_cwd: str = None) -> list:
     """Resolve a proposal's cited source paths into evidence dicts.
 
     Delegates the fingerprint to ``mem_evidence.evidence_for`` — the drift
@@ -153,7 +153,11 @@ def _proposal_evidence(item: dict) -> list:
         try:
             path = Path(text)
             if not path.is_absolute():
-                path = Path.cwd() / path
+                # L3 (bughunt): resolve against the session's project cwd, not
+                # the runner process's. Extraction runs on a background thread
+                # whose Path.cwd() can be anywhere; staleness detection must
+                # watch the file the claim was actually read from.
+                path = Path(base_cwd or Path.cwd()) / path
             resolved = path.resolve()
             if not resolved.is_file():
                 continue
@@ -167,7 +171,7 @@ def _proposal_evidence(item: dict) -> list:
     return out
 
 
-def parse_proposals(reply: str) -> list:
+def parse_proposals(reply: str, base_cwd: str = None) -> list:
     """Robustly parse the LLM reply into a list of validated proposal dicts.
     Tolerates code fences and surrounding prose; returns [] on anything odd."""
     if not reply or not isinstance(reply, str):
@@ -212,7 +216,7 @@ def parse_proposals(reply: str) -> list:
             "type": mtype, "name": name,
             "description": desc or body[:60], "body": body,
             "importance": importance,
-            "evidence": _proposal_evidence(item),
+            "evidence": _proposal_evidence(item, base_cwd),
         })
     return out
 
@@ -423,7 +427,12 @@ def extract_and_store(conversation_text: str,
         reply = _call_llm(llm_fn, build_messages(conversation_text), SYSTEM_PROMPT)
     except Exception:
         return []
-    proposals = parse_proposals(reply)
+    # L3: the session knows the project cwd the conversation ran in; hand it
+    # down so relative evidence paths resolve against the project, not the
+    # runner's current directory.
+    session_cwd = ((session or {}).get("cwd") if isinstance(session, dict)
+                    else None) or None
+    proposals = parse_proposals(reply, base_cwd=session_cwd)
     if not proposals:
         return []
     proposals = proposals[:_MAX_WRITE]

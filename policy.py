@@ -223,6 +223,11 @@ _DEFAULT_CONFIG = {
         r"\beval\s*\(", r"\bFunction\s*\(",
         r"\blocalStorage\b", r"\bsessionStorage\b",
         r"document\.cookie", r"\bnavigator\.clipboard\b",
+        # S6 (bughunt): two more exfiltration vectors the list missed.
+        # sendBeacon is fire-and-forget (works during unload, no response
+        # needed); WebSocket is a persistent channel both fetch and XHR
+        # patterns never see.
+        r"\bsendBeacon\s*\(", r"\bnew\s+WebSocket\b", r"\bWebSocket\s*\(",
     ],
 }
 
@@ -868,7 +873,16 @@ def is_unsafe_shared_temp_cleanup(command: str) -> bool:
     shared root. A depth guard makes owned-child sweeps safe, so preserve those.
     """
     stripped = _unwrap_parent(command)
-    shared_root = r"(?:/tmp/?|/var/tmp/?|\$\{?TMPDIR\}?)(?=\s|$)"
+    # S2 (bughunt): `/tmp/.`, `/tmp/./` and `/tmp//` are the same starting
+    # point as `/tmp` to find(1), but the old lookahead only accepted an
+    # optional single trailing slash — every one of them walked past the
+    # shared-root sweep check. `[\./]*` covers the dot-and-slash spellings
+    # that normalise to the root itself; a real subdirectory (`/tmp/x`)
+    # still does not match. Plain `*`, not possessive `*+`: that syntax is
+    # Python 3.11+ and setup.py still supports 3.10, where it raised on
+    # every evaluate(). The class is one char plus an optional dot, so
+    # there is no backtracking to prevent.
+    shared_root = r"(?:/tmp|/var/tmp|\$\{?TMPDIR\}?)(?:[\\/][.]?)*(?=\s|$)"
     find_from_root = re.search(
         rf"(?:^|[;&|()]|\$\()\s*find\s+{shared_root}", stripped)
     if not find_from_root:
@@ -1142,12 +1156,21 @@ def evaluate(command: str, cwd: str = None,
 
     approval_rules = _get_compiled_rules("needs_approval", cfg)
     for rule in approval_rules:
-        if rule.search(stripped):
-            reason = f"Matched approval rule: {rule.pattern}"
-            _write_audit(_audit_entry(command, "needs_approval", reason, cwd, req_id, agent_id))
-            if effective_mode == "enforce":
-                return PolicyDecision("needs_approval", rule.pattern, reason)
-            # In audit mode, approval rules are advisory (allow with warning)
+        # S1 (bughunt): match every variant, not just the string as typed.
+        # A rule written with a literal single space (`rm -rf\s`) was walked
+        # past by `rm  -rf` (double space). The deny loop above already
+        # matches per-variant; approval rules get the same treatment. The
+        # original string is always variants[0], so existing matches keep
+        # firing — this can only add, never remove, an approval.
+        for variant in variants:
+            if rule.search(variant):
+                reason = f"Matched approval rule: {rule.pattern}"
+                if variant != stripped:
+                    reason += f" (resolved from obfuscated form as: {variant})"
+                _write_audit(_audit_entry(command, "needs_approval", reason, cwd, req_id, agent_id))
+                if effective_mode == "enforce":
+                    return PolicyDecision("needs_approval", rule.pattern, reason)
+                # In audit mode, approval rules are advisory (allow with warning)
 
     # ── Path boundary check for write operations ────────────────────────
     # Dynamically add CWD to allowed roots (user working in a directory implies intent to write there)
@@ -1662,14 +1685,50 @@ def set_mode(mode: str) -> tuple[bool, str]:
     """Set the policy mode and persist to disk.
 
     Returns (ok, message). mode must be one of: audit, enforce, disabled.
+
+    S5 (bughunt): two rules here.
+      1. The file written back is the RAW LOCAL config. _load_config()
+         returns the org-merged view; persisting that froze the
+         organisation's rules into the user's local file, so an org
+         policy update later looked unchanged (and the local file
+         betrayed where it came from).
+      2. A request that weakens the effective mode below what the org
+         policy enforces is refused — org policy is a floor, not a
+         suggestion the local file can vote away.
     """
     mode = (mode or "").strip().lower()
     valid = {"audit", "enforce", "disabled"}
     if mode not in valid:
         return False, f"Invalid mode '{mode}'. Valid: {', '.join(sorted(valid))}"
-    cfg = _load_config(force=True)
+    strength = {"disabled": 0, "audit": 1, "enforce": 2}
+    cfg = _load_config(force=True)          # effective (org-merged) view
     old = cfg.get("mode", "audit")
-    cfg["mode"] = mode
+    # Raw local config, exactly what the file holds. When it cannot be read,
+    # start from the shipped defaults (as _load_config does) — never from the
+    # merged view, which would freeze org rules into the local file.
+    local = None
+    try:
+        if CONFIG_PATH.exists():
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                local = raw
+    except (OSError, json.JSONDecodeError):
+        local = None
+    if local is None:
+        local = dict(_DEFAULT_CONFIG)
+        local["allowedRoots"] = _default_allowed_roots()
+    # Org floor: apply org policy over the proposed mode; if it lifts the
+    # mode stricter than requested, the request is a weakening attempt.
+    probe = dict(local)
+    probe["mode"] = mode
+    effective = _apply_org_policy(dict(probe)).get("mode", mode)
+    if strength.get(effective, 0) > strength.get(mode, 0):
+        return False, (f"Cannot set mode '{mode}': organisation policy "
+                       f"enforces '{effective}'. Org policy is a floor, "
+                       f"not a default.")
+    local["mode"] = mode
+    cfg = local
     tmp = CONFIG_PATH.with_suffix(".tmp")
     try:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1685,10 +1744,15 @@ def set_mode(mode: str) -> tuple[bool, str]:
             pass
         return False, f"Failed to write config: {e}"
     # Update cache so subsequent evaluate() calls see the new mode immediately.
-    global _config, _config_mtime
-    _config = cfg
-    try:
-        _config_mtime = CONFIG_PATH.stat().st_mtime
-    except OSError:
-        pass
+    # The cache holds the EFFECTIVE config: the file is local-only, but every
+    # evaluate() must still see the org rules. Caching the raw local dict here
+    # (with a matching mtime) silently dropped org policy until the next edit.
+    global _config, _config_mtime, _config_org_version
+    with _config_lock:
+        _config = _apply_org_policy(dict(cfg))
+        _config_org_version = _current_org_version()
+        try:
+            _config_mtime = CONFIG_PATH.stat().st_mtime
+        except OSError:
+            pass
     return True, f"Policy mode: {old} → {mode}"

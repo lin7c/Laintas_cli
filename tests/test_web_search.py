@@ -611,12 +611,13 @@ class RenderWorkerTests(unittest.TestCase):
 
         def ensure():
             # Mirror the real _ensure_session, which records the session on the
-            # worker so _close_session can find it.
+            # worker so _release can match it.
             self.worker._session = self.session
             return self.session
 
         self.worker._ensure_session = ensure
-        self.addCleanup(self.worker._close_session)
+        # Closing happens on the worker's own thread (K5); shutdown asks it to.
+        self.addCleanup(self.worker.shutdown)
 
     def test_job_runs_and_returns_its_value(self):
         out = self.worker.submit(lambda session: "done", timeout=5)
@@ -675,6 +676,27 @@ class RenderWorkerTests(unittest.TestCase):
         while __import__("time").time() < deadline and not self.session.closed:
             __import__("time").sleep(0.05)
         self.assertTrue(self.session.closed)
+
+    def test_shutdown_closes_the_browser_before_returning(self):
+        self.worker.submit(lambda _session: None, timeout=5)
+        self.worker.shutdown()
+        # Closed on the worker thread, but shutdown waited for it: an exiting
+        # interpreter must not kill the daemon mid-close and leak the browser.
+        self.assertTrue(self.session.closed)
+
+    def test_retired_generation_thread_exits(self):
+        import threading
+        self.worker.IDLE_TIMEOUT = 0.2
+        release = threading.Event()
+        self.addCleanup(release.set)
+        self.worker.submit(lambda _s: release.wait(30), timeout=0.3)
+        old = self.worker._thread
+        out = self.worker.submit(lambda _s: "fresh", timeout=5)
+        self.assertEqual(out.get("value"), "fresh")
+        release.set()
+        old.join(5)
+        self.assertFalse(old.is_alive(),
+                         "abandoned generation kept polling its dead queue")
 
 
 class EscalationTests(unittest.TestCase):

@@ -339,26 +339,47 @@ class TerminalSession:
         return self._interactive
 
     def read_key(self, timeout: Optional[float] = None) -> Optional[Key]:
-        """Return the next keypress, or None on timeout/EOF/non-tty."""
+        """Return the next keypress, or None on timeout/EOF/non-tty.
+
+        K2: once EOF has been seen, an empty inbox returns the eof key
+        immediately (sticky) instead of blocking forever.
+        """
         if self._holder is None or self._holder.raw_bytes:
             return None
+        try:
+            return self._holder.inbox.get_nowait()
+        except queue.Empty:
+            pass
+        if self._arbiter._eof.is_set():
+            return Key("eof")
         try:
             return self._holder.inbox.get(
                 timeout=timeout if timeout is not None else None)
         except queue.Empty:
+            if self._arbiter._eof.is_set():
+                return Key("eof")
             return None
 
     def read_bytes(self, timeout: Optional[float] = None) -> Optional[bytes]:
         """Return the next chunk of unparsed input (raw_bytes holders only).
 
-        Returns b"" on EOF, None on timeout.
+        Returns b"" on EOF, None on timeout. Sticky EOF: once the stream has
+        died, an empty inbox returns b"" instead of blocking forever.
         """
         if self._holder is None or not self._holder.raw_bytes:
             return None
         try:
+            return self._holder.inbox.get_nowait()
+        except queue.Empty:
+            pass
+        if self._arbiter._eof.is_set():
+            return b""
+        try:
             return self._holder.inbox.get(
                 timeout=timeout if timeout is not None else None)
         except queue.Empty:
+            if self._arbiter._eof.is_set():
+                return b""
             return None
 
     def read_line(self, timeout: Optional[float] = None) -> Optional[str]:
@@ -436,6 +457,13 @@ class TerminalArbiter:
 
         self._reader_thread: Optional[threading.Thread] = None
         self._reader_wanted = threading.Event()
+        # K2 (bughunt): EOF is sticky. The reader loop used to dispatch one
+        # eof key to whoever held the terminal and then stop reading; every
+        # LATER read_key(timeout=None) from that holder blocked forever with
+        # an empty inbox and no reader behind it — the key loop could never
+        # notice the stream had died. Once EOF is seen it is remembered and
+        # read_key/read_bytes keep returning it instead of parking.
+        self._eof = threading.Event()
         self._shutdown = threading.Event()
 
         # Clear modes an earlier run may have left in this terminal. A process
@@ -594,12 +622,15 @@ class TerminalArbiter:
             except (BlockingIOError, InterruptedError):
                 continue
             except OSError:
+                # The fd died (closed under us): same contract as EOF.
+                self._eof.set()
                 self._reader_wanted.clear()
                 continue
 
             raw = self._raw_bytes_holder()
 
             if not data:                       # EOF
+                self._eof.set()                # K2: sticky, see read_key
                 self._dispatch([b""] if raw else [Key("eof")])
                 self._reader_wanted.clear()
                 continue

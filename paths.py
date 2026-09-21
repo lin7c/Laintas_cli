@@ -155,6 +155,12 @@ INSTANCES_DIR = LAINTAS_HOME / "instances"   # cross-instance peer registry (070
 WRITES_DIR    = LAINTAS_HOME / "writes"      # cross-instance write log (0700)
 SESSION_LOCKS_DIR = LAINTAS_HOME / "session_locks"  # per-session ownership leases (0700)
 
+# Local training capture (`/training local`). Home-scoped, not per-cwd: a
+# fine-tuning corpus that fragmented per project — and vanished with
+# `rm -rf` on one — would be useless, and /reload wipes <cwd>/.laintas/.
+TRAINING_DIR      = LAINTAS_HOME / "training"      # 0700
+TRAINING_LOCAL_DB = TRAINING_DIR / "local.sqlite3"
+
 # Prompt self-optimization: feedback log + candidate drafts + applied-patch state.
 # Lives under ~/.laintas/ (NOT per-cwd) so it survives /reload (which only wipes
 # the 4 files in _ALL_CWD_FILES under <cwd>/.laintas/).

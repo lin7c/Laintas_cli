@@ -2201,17 +2201,63 @@ class _RenderWorker:
         self._thread: threading.Thread | None = None
         self._session = None
         self._lock = threading.Lock()
+        # K5 (bughunt): per-generation poison flag. A wedged render used to
+        # brick the worker forever (every later submit queued behind the
+        # stuck job and timed out) and shutdown() closed the Playwright
+        # session from the CALLER's thread, which crashes — Playwright is
+        # thread-affine. Each worker generation owns its queue + poison
+        # event; a timed-out caller poisons that generation, the wedged
+        # thread closes the session on ITSELF when it unwinds, and the next
+        # submit builds a fresh generation so renders recover.
+        self._poison_event = threading.Event()
+        self._poisoned = False
 
     # -- worker thread ------------------------------------------------
 
-    def _loop(self) -> None:
+    def _release(self, session) -> None:
+        """Close a session from the worker thread that owns it (K5).
+
+        Never call session.close() from another thread: Playwright's sync
+        API is thread-affine and the old cross-thread shutdown crashed.
+        self._session is only cleared when it still IS this session, so a
+        retired generation cannot drop the next one's live reference.
+        """
+        if session is None:
+            return
+        with self._lock:
+            if self._session is session:
+                self._session = None
+        unregistered = False
+        try:
+            import browser_session as _bs
+            with _bs._browser_lock:
+                names = [n for n, s in _bs._browser_sessions.items() if s is session]
+            for name in names:
+                # unregister_browser_session closes the session itself.
+                unregistered = _bs.unregister_browser_session(name) or unregistered
+        except Exception:
+            pass
+        if not unregistered:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    def _loop(self, jobs: "_queue.Queue", poison: threading.Event) -> None:
+        session = None
         while True:
             try:
-                job = self._jobs.get(timeout=self.IDLE_TIMEOUT)
+                job = jobs.get(timeout=self.IDLE_TIMEOUT)
             except _queue.Empty:
-                self._close_session()
+                self._release(session)
+                session = None
                 with self._lock:
-                    if self._jobs.empty():
+                    if poison.is_set() or self._thread is not threading.current_thread():
+                        # A retired generation: submit() already built a new
+                        # queue and thread, so nothing will ever arrive here
+                        # again. Exit instead of polling a dead queue forever.
+                        return
+                    if jobs.empty():
                         self._thread = None
                         return
                 continue
@@ -2224,9 +2270,12 @@ class _RenderWorker:
             finally:
                 # The session outlives the job on purpose: it holds the cookies
                 # from a challenge the user solved, and it is the browser they
-                # are looking at in the live view. Only the idle timeout and an
-                # explicit shutdown close it.
+                # are looking at in the live view. Only the idle timeout, a
+                # poison (K5), and an explicit shutdown close it.
                 done.set()
+                if poison.is_set():
+                    self._release(session)
+                    return
 
     def _ensure_session(self):
         if self._session is not None and self._session.is_alive():
@@ -2256,26 +2305,6 @@ class _RenderWorker:
         self._session = session
         return session
 
-    def _close_session(self) -> None:
-        session, self._session = self._session, None
-        if session is None:
-            return
-        unregistered = False
-        try:
-            import browser_session as _bs
-            with _bs._browser_lock:
-                names = [n for n, s in _bs._browser_sessions.items() if s is session]
-            for name in names:
-                # unregister_browser_session closes the session itself.
-                unregistered = _bs.unregister_browser_session(name) or unregistered
-        except Exception:
-            pass
-        if not unregistered:
-            try:
-                session.close()
-            except Exception:
-                pass
-
     # -- caller side --------------------------------------------------
 
     def submit(self, fn, timeout: float) -> dict:
@@ -2289,12 +2318,31 @@ class _RenderWorker:
         # worker's exit path re-checks the queue under this same lock, so a job
         # enqueued here is always either picked up or served by a new thread.
         with self._lock:
-            self._jobs.put((fn, box, done))
+            if self._poisoned:
+                # K5: the previous generation is wedged inside a job whose
+                # caller already gave up. Abandon it — the stuck thread closes
+                # its own session if its call ever unwinds — and build a fresh
+                # queue/event/thread so renders recover instead of timing out
+                # forever behind the stuck one.
+                self._jobs = _queue.Queue()
+                self._poison_event = threading.Event()
+                self._session = None
+                self._thread = None
+                self._poisoned = False
+            jobs = self._jobs
+            poison = self._poison_event
+            jobs.put((fn, box, done))
             if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(
-                    target=self._loop, name="web-fetch-render", daemon=True)
+                    target=self._loop, args=(jobs, poison),
+                    name="web-fetch-render", daemon=True)
                 self._thread.start()
         if not done.wait(timeout):
+            # K5: poison THIS generation. The wedged thread closes the
+            # session on itself when it unwinds; never from here.
+            poison.set()
+            with self._lock:
+                self._poisoned = True
             return {"ok": False, "error": f"browser render timed out after {timeout:.0f}s"}
         if "error" in box:
             return {"ok": False, "error": box["error"]}
@@ -2310,8 +2358,32 @@ class _RenderWorker:
             return False
 
     def shutdown(self) -> None:
-        self.submit(lambda _session: None, timeout=5)
-        self._close_session()
+        """K5: close the session ON the worker thread, never from here.
+
+        The old shutdown called _close_session() on the caller's thread —
+        Playwright is thread-affine and that crashed. Instead: poison the
+        current generation and enqueue a no-op job; a healthy worker processes
+        it, sees the poison in its finally, closes its session and exits;
+        shutdown waits a bounded time for that. A wedged worker never gets
+        there, which is honest: its session dies with the process (the thread
+        is a daemon).
+        """
+        done = threading.Event()
+        with self._lock:
+            poison = self._poison_event
+            if poison is not None:
+                poison.set()
+            self._poisoned = True
+            thread = self._thread
+            try:
+                self._jobs.put((lambda _session: None, {}, done))
+            except Exception:
+                pass
+        # Wait (bounded) for the healthy worker to run the no-op and close
+        # its browser on its own thread. Returning at once let interpreter
+        # exit kill the daemon thread mid-close and leak the browser process.
+        if thread is not None and thread.is_alive() and done.wait(5):
+            thread.join(5)
 
 
 _RENDER_WORKER = _RenderWorker()

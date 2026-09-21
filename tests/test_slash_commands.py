@@ -75,7 +75,9 @@ class SlashRegistryTests(unittest.TestCase):
         training = next(
             spec for spec in laintas_cli.COMMAND_SPECS
             if spec.name == "/training")
-        self.assertEqual(training.subcommands, ("status", "on", "off"))
+        # `local` is the second, independent switch: it keeps a copy on this
+        # machine and says nothing about what the Gateway retains.
+        self.assertEqual(training.subcommands, ("status", "on", "off", "local"))
         detail = next(
             spec for spec in laintas_cli.COMMAND_SPECS
             if spec.name == "/detail")

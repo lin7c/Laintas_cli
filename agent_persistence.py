@@ -193,6 +193,17 @@ def apply_persisted_state(agent: "AgentInfo", data: dict) -> None:
                 setattr(agent, key, data[key])
             except AttributeError:
                 pass
+    # L5 (bughunt): depth is persisted (save_agent_state) but was never
+    # restored, so a rehydrated deep agent forgot its nesting level —
+    # can_spawn/depth-limit checks then treated it as a root agent. Restore
+    # it when the file carries a sane value; a fresh registration keeps its
+    # own depth when the file does not.
+    try:
+        saved_depth = int(data.get("depth"))
+        if saved_depth >= 0:
+            agent.depth = saved_depth
+    except (TypeError, ValueError):
+        pass
     deployment = data.get("deployment_terminal") or data.get("stationed_terminal")
     if not data.get("schema_version") and data.get("role") == "deployed":
         # Pre-v2 files conflated membership and deployment. Only a legacy

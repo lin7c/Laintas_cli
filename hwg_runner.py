@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import threading
@@ -25,6 +26,40 @@ from hwg_adapter.adapter import fanout_joins, parse_condition, resolve_includes
 
 
 MAX_GRAPH_STEPS = 200
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with this pid exists.
+
+    E3 crash detection. Windows-safe: os.kill(pid, 0) on Windows actually
+    terminates the target, so probe via OpenProcess/WaitForSingleObject
+    instead. On POSIX, PermissionError means the process exists but belongs
+    to another user — that is "alive" for our purposes.
+    """
+    if pid <= 0:
+        return False
+    try:
+        if os.name == "nt":
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            SYNCHRONIZE = 0x00100000
+            WAIT_TIMEOUT = 0x102
+            handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+            if not handle:
+                return False
+            try:
+                return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+            finally:
+                kernel32.CloseHandle(handle)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+    except Exception:
+        return False
 
 
 def _prepare_node_tasks(run: dict, nodes: list[dict], cwd: str,
@@ -473,6 +508,31 @@ def _cache_key(path: str, node: dict, inputs: dict, workspace: str = "") -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _force_abort_node_agents(agent_ids: list) -> None:
+    """K4 (bughunt): force-abort agents a node spawned after we gave up on it.
+
+    The timeout/cancel path sets node_abort and joins for 2s, then abandons
+    the thread. If the HWO run was stuck somewhere that does not observe the
+    abort (a long tool call), its named agents stayed "running" in the
+    registry forever: the node's retry hit "agent id is already in use"
+    (only *finished* agents are reclaimable) and the old execution kept
+    running in the background. abort_agent cascades to the whole subtree,
+    closes ephemeral PTYs and releases scheduler leases, which both stops
+    the stray work and makes the id reclaimable for the retry.
+    """
+    try:
+        import agent_loop as _al
+    except Exception:
+        return
+    for aid in agent_ids:
+        try:
+            info = _al.get_agent(aid)
+            if info is not None and info.status not in ("done", "error", "aborted"):
+                _al.abort_agent(aid)
+        except Exception:
+            pass
+
+
 def _run_hwo_with_policy(node: dict, deps, session: dict, parent_id: Optional[str], inputs: dict,
                          events_cb=None, abort_event=None) -> dict:
     policy = node.get("policy") or {}
@@ -498,6 +558,24 @@ def _run_hwo_with_policy(node: dict, deps, session: dict, parent_id: Optional[st
         # fires on Esc. The node watches one event, so the two are bridged by
         # a watcher below rather than by asking every callee to take two.
         node_abort = threading.Event()
+        # K4: remember every agent this attempt spawned, so the give-up paths
+        # below can force-abort them instead of leaving "running" orphans.
+        spawned_agents: list = []
+
+        def _tracking_events_cb(rows):
+            try:
+                for row in rows or []:
+                    if row.get("type") == "agent_spawned":
+                        aid = row.get("agentId")
+                        if aid and aid not in spawned_agents:
+                            spawned_agents.append(aid)
+            except Exception:
+                pass
+            if callable(events_cb):
+                try:
+                    events_cb(rows)
+                except Exception:
+                    pass
 
         def target():
             holder.update(hwo_runner.run_hwo_file(
@@ -507,7 +585,7 @@ def _run_hwo_with_policy(node: dict, deps, session: dict, parent_id: Optional[st
                 parent_id=parent_id,
                 inputs=inputs,
                 abort_event=node_abort,
-                events_cb=events_cb,
+                events_cb=_tracking_events_cb,
                 tool_scope=policy.get("tools"),
             ))
 
@@ -526,12 +604,17 @@ def _run_hwo_with_policy(node: dict, deps, session: dict, parent_id: Optional[st
                 break
             t.join(timeout=0.2)
         if _cancelled:
+            node_abort.set()
             t.join(timeout=2.0)
+            if t.is_alive():
+                _force_abort_node_agents(spawned_agents)
             return {"ok": False, "cancelled": True,
                     "msg": f"HWG node #{node['id']}# cancelled by the user."}
         if t.is_alive():
             node_abort.set()
             t.join(timeout=2.0)
+            if t.is_alive():
+                _force_abort_node_agents(spawned_agents)
             last = {"ok": False, "msg": f"HWG node #{node['id']}# timed out after {timeout:g}s."}
             break
         last = holder or {"ok": False, "msg": f"HWG node #{node['id']}# returned no result."}
@@ -578,7 +661,13 @@ def _read_and_validate(path: str) -> tuple[Optional[list], Optional[str]]:
 def compile_hwg_file(path: str) -> dict:
     statements, err = _read_and_validate(path)
     if err:
-        return {"ok": False, "msg": err}
+        result = {"ok": False, "msg": err}
+        try:  # structured diagnostics are additive; never fail the failure path
+            import diagnostics
+            diagnostics.attach_hwg_compile(result, path)
+        except Exception:
+            pass
+        return result
     graph = as_graph(statements)
     lines = [f"HWG compile OK: {path}", f"Nodes: {len(graph['nodes'])}", f"Edges: {len(graph['edges'])}"]
     for node in graph["nodes"]:
@@ -669,6 +758,10 @@ def run_hwg_file(path: str, deps, session: dict, parent_id: Optional[str] = None
         has_incoming = {e["to"] for e in edges}
         starts = [n for n in nodes if n["id"] not in has_incoming]
         current = starts[0] if starts else None
+    # E3: every entry (fresh or resumed) re-records the owning process so a
+    # crashed "running" run is detectable — resume refuses while the owner
+    # lives and recovers from the last checkpoint once it is gone.
+    run["owner"] = {"pid": os.getpid(), "started": time.time()}
     _prepare_node_tasks(
         run, nodes, str(Path.cwd()), owner_agent_id=parent_id)
     run = workflow_state.checkpoint(run, "run_started" if not resume_run else "run_resumed", {"path": path})
@@ -779,6 +872,14 @@ def run_hwg_file(path: str, deps, session: dict, parent_id: Optional[str] = None
 
         if not batch:
             continue
+        # D2: persist the in-flight frontier with the queue before launching
+        # it. A crash between here and frontier_completed used to drop the
+        # popped nodes from the resume state — the run then completed without
+        # ever running them. In-flight nodes re-run from the top on resume,
+        # the same at-least-once semantics as a user-interrupted node.
+        run["ready"] = [c["id"] for c in batch] + ready
+        run = workflow_state.checkpoint(run, "frontier_inflight", {
+            "nodes": [c["id"] for c in batch], "queued": list(ready)})
         if steps + len(batch) > MAX_GRAPH_STEPS:
             run["status"] = "failed"
             workflow_state.checkpoint(
@@ -1011,7 +1112,8 @@ def _route_from(node: dict, outs: list, verdict: str, outputs: dict, run: dict, 
     way, and the scheduler never has to know which kind of edge produced them.
     """
     if any(e.get("fanout") for e in outs):
-        return _open_fanout(node, outs, verdict, outputs, run, join_map)
+        return _open_fanout(node, outs, verdict, outputs, run, join_map,
+                            node_failed)
     nxt = _choose_next(node, outs, verdict, outputs, run, node_failed)
     if isinstance(nxt, dict):
         return nxt
@@ -1031,16 +1133,24 @@ def _note_unhandled_failure(node: dict, run: dict) -> None:
         failures.append(node["id"])
 
 
-def _open_fanout(node: dict, outs: list, verdict: str, outputs: dict, run: dict, join_map: dict):
+def _open_fanout(node: dict, outs: list, verdict: str, outputs: dict, run: dict, join_map: dict,
+                 node_failed: bool = False):
     """Take every matching => branch instead of exactly one.
 
     Records how many branches the join must wait for and returns all of them;
     the scheduler decides the order they actually run in. The join fires once
     the last branch arrives at it.
+
+    A failed node fans out under the same rule as _choose_next: an `on:`
+    condition is the author saying what a failure means there, so branches
+    without one are walking past a failure nobody declared — record it and
+    let the walker end the run failed instead of green-but-empty (L1).
     """
     taken = [e for e in outs if _edge_matches(e, verdict, outputs, _edge_context(run))]
     if not taken:
         return {"error": f"HWG stopped at #{node['id']}#: verdict {verdict!r} matched none of its => branches."}
+    if node_failed and any(not e.get("on") for e in taken):
+        _note_unhandled_failure(node, run)
     join_id = join_map.get(node["id"])
     if not join_id:
         return {"error": f"HWG stopped at #{node['id']}#: its => branches do not converge on a join node."}
@@ -1078,8 +1188,29 @@ def resume_hwg_run(run_id: str, deps, session: dict, parent_id: Optional[str] = 
         return {"ok": False, "msg": f"HWG run not found: {run_id}"}
     if run.get("kind") != "hwg":
         return {"ok": False, "msg": f"Run {run_id} is not an HWG run."}
-    if run.get("status") != "paused":
-        return {"ok": False, "msg": f"HWG run {run_id} is not paused."}
+    run_status = run.get("status")  # not `status`: that name is the module fn
+    if run_status == "running":
+        # E3: the process that owned this run died mid-flight (crash, kill
+        # -9, power loss). Refuse only if the owner is somehow still alive —
+        # otherwise recover from the last checkpoint. The in-flight frontier
+        # was persisted with the queue (frontier_inflight), so it re-runs
+        # from the top rather than silently skipping those nodes.
+        owner = run.get("owner") or {}
+        try:
+            owner_pid = int(owner.get("pid") or 0)
+        except (TypeError, ValueError):
+            owner_pid = 0
+        if owner_pid and _pid_alive(owner_pid):
+            return {"ok": False, "msg": (
+                f"HWG run {run_id} is still running in pid {owner_pid}; "
+                f"wait for it to finish or cancel it before resuming.")}
+        run["status"] = "paused"
+        run = workflow_state.checkpoint(
+            run, "crash_recovery", {"ownerPid": owner_pid})
+    elif run_status != "paused":
+        return {"ok": False, "msg": (
+            f"HWG run {run_id} is {run_status or 'unknown'}, not paused; only a "
+            f"paused, interrupted, or crashed run can be resumed.")}
     if not run.get("pendingInterrupt"):
         # Paused by the user (Esc), not by a manual node asking for a verdict.
         # There is no verdict to apply and no node to route from — the ready

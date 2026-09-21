@@ -34,6 +34,60 @@ COOKIE_FILE = LAINTAS_HOME / "cookies.json"
 
 _LOCK = threading.RLock()
 
+# D6 (bughunt): a cross-process guard for the shared cookie jar. merge() is
+# a read-modify-write of the whole file; two processes (or an unlocked pair
+# of threads) silently dropped each other's cookies. fcntl/msvcrt on a
+# sidecar lock file, the same pattern as workflow_state._store_lock.
+if os.name == "nt":
+    import msvcrt as _msvcrt
+else:
+    import fcntl as _fcntl
+
+
+class _FileLock:
+    def __init__(self, path):
+        self._path = path
+        self._fh = None
+
+    def __enter__(self):
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._fh = open(str(self._path) + ".lock", "a+")
+            if os.name == "nt":
+                if self._fh.tell() == 0:
+                    self._fh.write(" ")
+                    self._fh.flush()
+                self._fh.seek(0)
+                _msvcrt.locking(self._fh.fileno(), _msvcrt.LK_LOCK, 1)
+            else:
+                _fcntl.flock(self._fh.fileno(), _fcntl.LOCK_EX)
+        except Exception:
+            # A lock failure must not break cookie persistence; the thread
+            # lock above still serialises same-process writers.
+            self._close()
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            if self._fh is not None:
+                if os.name == "nt":
+                    self._fh.seek(0)
+                    _msvcrt.locking(self._fh.fileno(), _msvcrt.LK_UNLCK, 1)
+                else:
+                    _fcntl.flock(self._fh.fileno(), _fcntl.LOCK_UN)
+        except Exception:
+            pass
+        self._close()
+        return False
+
+    def _close(self):
+        try:
+            if self._fh is not None:
+                self._fh.close()
+        except Exception:
+            pass
+        self._fh = None
+
 # One cookie == {name, value, domain, path, secure, httpOnly, expires, egress}
 # "expires" is a unix timestamp; 0/absent means a session cookie.
 _KEYS = ("name", "value", "domain", "path", "secure", "httpOnly", "expires", "egress")
@@ -230,21 +284,27 @@ def merge(cookies: Iterable[dict]) -> int:
     Reads every exit's cookies, not just this one's: save() rewrites the whole
     file, so merging while filtered would quietly delete everything earned
     through a proxy the moment one request went out direct.
+
+    D6: the load→modify→save chain runs under both the thread lock and the
+    cross-process file lock — two concurrent mergers used to each rewrite
+    the whole jar from their own stale read, silently dropping the other's
+    cookies.
     """
-    existing = {_key(c): c for c in load(all_egress=True)}
-    changed = 0
-    now = time.time()
-    for item in cookies or []:
-        cookie = _normalize(item if isinstance(item, dict) else {})
-        if not cookie or _is_expired(cookie, now) or not domain_allowed(cookie["domain"]):
-            continue
-        key = _key(cookie)
-        if existing.get(key) != cookie:
-            changed += 1
-        existing[key] = cookie
-    if changed:
-        save(existing.values())
-    return changed
+    with _LOCK, _FileLock(COOKIE_FILE):
+        existing = {_key(c): c for c in load(all_egress=True)}
+        changed = 0
+        now = time.time()
+        for item in cookies or []:
+            cookie = _normalize(item if isinstance(item, dict) else {})
+            if not cookie or _is_expired(cookie, now) or not domain_allowed(cookie["domain"]):
+                continue
+            key = _key(cookie)
+            if existing.get(key) != cookie:
+                changed += 1
+            existing[key] = cookie
+        if changed:
+            save(existing.values())
+        return changed
 
 
 def clear(domain: str = "") -> int:

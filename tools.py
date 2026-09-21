@@ -4609,6 +4609,9 @@ def _bi_hwo(params: dict, ctx: ToolCtx) -> dict:
             abort_event=_ctx_abort_event(ctx),
         )
     out = {"ok": r.get("ok", False), "result": r.get("msg", "")}
+    if r.get("diagnostics"):
+        # Structured compile diagnostics (design P0): additive, machine-readable.
+        out["diagnostics"] = r["diagnostics"]
     if r.get("outputs"):
         out["outputs"] = r.get("outputs")
     return out
@@ -4658,6 +4661,9 @@ def _bi_hwg(params: dict, ctx: ToolCtx) -> dict:
         "ok": bool(result.get("ok", False)),
         "result": result.get("msg", ""),
     }
+    if result.get("diagnostics"):
+        # Structured compile diagnostics (design P0): additive, machine-readable.
+        out["diagnostics"] = result["diagnostics"]
     if result.get("runId"):
         out["run_id"] = result["runId"]
     if result.get("outputs"):

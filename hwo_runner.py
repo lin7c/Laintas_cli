@@ -1419,11 +1419,26 @@ def compile_hwo_file(path: str) -> dict:
     try:
         ast = parse_ast(source)
     except HwoParseError as e:
-        return {"ok": False, "msg": f"hwo: parse error — {e}"}
+        result = {"ok": False, "msg": f"hwo: parse error — {e}"}
+        try:  # structured diagnostics are additive; never fail the failure path
+            import diagnostics
+            diagnostics.attach_hwo_compile(
+                result, path, source, parse_error=e)
+        except Exception:
+            pass
+        return result
 
     errors = validate_ast(ast)
     if errors:
-        return {"ok": False, "msg": "hwo: validation errors:\n" + "\n".join(errors)}
+        result = {"ok": False, "msg": "hwo: validation errors:\n" + "\n".join(errors)}
+        try:
+            import diagnostics
+            diagnostics.attach_hwo_compile(
+                result, path, source,
+                validation_errors=errors, ast=ast)
+        except Exception:
+            pass
+        return result
 
     steps = [_to_node(d) for d in ast if d.get("type") != "workflow"]
 

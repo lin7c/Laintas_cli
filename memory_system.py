@@ -104,21 +104,42 @@ class _UsageLock:
 
     def __enter__(self):
         try:
-            import fcntl
+            import os as _os
             MEMORY_DIR.mkdir(parents=True, exist_ok=True)
             self._fh = open(usage_file().with_suffix(".lock"), "a+")
-            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+            if _os.name == "nt":
+                # D5 (bughunt): `import fcntl` raises on Windows and the old
+                # handler fell through to "proceed unlocked", so the very
+                # platform the lock exists for ran with silent lost updates.
+                # msvcrt.locking on the first byte is the stdlib flock twin
+                # (same pattern as session_lifecycle.guard).
+                import msvcrt
+                self._fh.seek(0)
+                self._fh.write(" ")
+                self._fh.flush()
+                self._fh.seek(0)
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
         except Exception:
-            # No fcntl (or no directory): proceed unlocked rather than lose the
-            # write entirely. Usage is a heuristic, not an accounting ledger.
+            # No lock primitive (or no directory): proceed unlocked rather
+            # than lose the write entirely. Usage is a heuristic, not an
+            # accounting ledger.
             self._close()
         return self
 
     def __exit__(self, *exc):
         try:
             if self._fh is not None:
-                import fcntl
-                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+                import os as _os
+                if _os.name == "nt":
+                    import msvcrt
+                    self._fh.seek(0)
+                    msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
         except Exception:
             pass
         self._close()
@@ -297,6 +318,13 @@ def _atomic_write_text(path: Path, content: str) -> None:
             pass
 
 
+# D4: same-process serializer for the shared MEMORY.md index. fcntl/msvcrt
+# cross-process locking lives in _UsageLock; the index is per-CLI-process
+# here, so a module lock plus atomic replace covers both races and crashes.
+import threading as _threading
+_index_lock = _threading.RLock()
+
+
 def ensure_memory_dir() -> Path:
     """Create the memory directory and index if they don't exist."""
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -410,20 +438,35 @@ def _parse_frontmatter(content: str) -> tuple[dict, str]:
     return meta, body.strip()
 
 
+def _sanitize_frontmatter_value(value) -> str:
+    """One line, no leading key shape (E2, bughunt).
+
+    Frontmatter is line-oriented YAML; a value carrying a newline writes a
+    new key into the header (LLM-generated descriptions reach this), and a
+    value like `type: user` after `description: ` smuggles a second key onto
+    the same line. Collapse whitespace to single spaces and strip the
+    leading `key:` shape so round-trips cannot inject or corrupt fields.
+    """
+    text = str(value if value is not None else "")
+    # Collapse all whitespace (newlines included) to single spaces: the
+    # value can never break out of its line, so no injected key can exist.
+    return " ".join(text.split())
+
+
 def _format_frontmatter(meta: dict, body: str) -> str:
     """Format a memory file with frontmatter."""
     lines = ["---"]
-    lines.append(f"name: {meta.get('name', '')}")
-    lines.append(f"description: {meta.get('description', '')}")
+    lines.append(f"name: {_sanitize_frontmatter_value(meta.get('name', ''))}")
+    lines.append(f"description: {_sanitize_frontmatter_value(meta.get('description', ''))}")
     if 'type' in meta:
         lines.append("metadata:")
         lines.append(f"  type: {meta['type']}")
     if meta.get('product'):
-        lines.append(f"product: {meta['product']}")
+        lines.append(f"product: {_sanitize_frontmatter_value(meta['product'])}")
     if meta.get('scope'):
-        lines.append(f"scope: {meta['scope']}")
+        lines.append(f"scope: {_sanitize_frontmatter_value(meta['scope'])}")
     if meta.get('scope_id'):
-        lines.append(f"scope_id: {meta['scope_id']}")
+        lines.append(f"scope_id: {_sanitize_frontmatter_value(meta['scope_id'])}")
     if meta.get('importance') is not None:
         lines.append(f"importance: {meta['importance']}")
     # When the entry was first written. Not the same question as the file's
@@ -433,7 +476,7 @@ def _format_frontmatter(meta: dict, body: str) -> str:
     if meta.get('archived_at'):
         lines.append(f"archived_at: {meta['archived_at']}")
     if meta.get('archived_reason'):
-        lines.append(f"archived_reason: {str(meta['archived_reason'])[:200]}")
+        lines.append(f"archived_reason: {_sanitize_frontmatter_value(str(meta['archived_reason'])[:200])}")
     # Assertion lifecycle. Written only when non-default so untouched memories
     # keep the exact bytes they had before this existed.
     if meta.get('evidence'):
@@ -444,9 +487,23 @@ def _format_frontmatter(meta: dict, body: str) -> str:
     if meta.get('status') and meta['status'] != STATUS_ACTIVE:
         lines.append(f"status: {meta['status']}")
     if meta.get('stale_reason'):
-        lines.append(f"stale_reason: {str(meta['stale_reason'])[:300]}")
+        lines.append(f"stale_reason: {_sanitize_frontmatter_value(str(meta['stale_reason'])[:300])}")
     if meta.get('superseded_by'):
         lines.append(f"superseded_by: {meta['superseded_by']}")
+    # L4 (bughunt): a rewrite is a round-trip, not a projection. Keys the
+    # whitelist above does not know (written by a newer version, another
+    # product, or a manual edit) used to vanish on every rewrite — silent
+    # data loss for anything this build cannot interpret yet. Re-emit them
+    # verbatim, sanitized like every other header value.
+    _KNOWN_KEYS = {
+        'name', 'description', 'metadata', 'type', 'product', 'scope',
+        'scope_id', 'importance', 'created_at', 'archived_at',
+        'archived_reason', 'evidence', 'status', 'stale_reason',
+        'superseded_by',
+    }
+    for key, value in meta.items():
+        if key not in _KNOWN_KEYS and not key.startswith('_'):
+            lines.append(f"{key}: {_sanitize_frontmatter_value(value)}")
     lines.append("---")
     lines.append("")
     lines.append(body)
@@ -747,31 +804,38 @@ def _update_index(name: str, description: str, mem_type: str,
     if status == STATUS_SUPERSEDED:
         _remove_from_index(name)
         return
-    lines = MEMORY_INDEX.read_text(encoding="utf-8").split('\n')
-    flag = " [stale — evidence changed, unverified]" if status == STATUS_STALE else ""
-    new_entry = f"- [{name}]({name}.md) — {description} [{mem_type}; {scope}]{flag}"
+    # D4 (bughunt): read-modify-write of a shared index with bare write_text
+    # lost concurrent updates (last writer wins, first writer's entry gone)
+    # and a crash mid-write corrupted the whole index. Serialise with the
+    # module lock and land via the atomic tmp+replace path.
+    with _index_lock:
+        lines = MEMORY_INDEX.read_text(encoding="utf-8").split('\n') \
+            if MEMORY_INDEX.exists() else []
+        flag = " [stale — evidence changed, unverified]" if status == STATUS_STALE else ""
+        new_entry = f"- [{name}]({name}.md) — {description} [{mem_type}; {scope}]{flag}"
 
-    # Replace existing entry if present
-    replaced = False
-    for i, line in enumerate(lines):
-        if f"]({name}.md)" in line:
-            lines[i] = new_entry
-            replaced = True
-            break
+        # Replace existing entry if present
+        replaced = False
+        for i, line in enumerate(lines):
+            if f"]({name}.md)" in line:
+                lines[i] = new_entry
+                replaced = True
+                break
 
-    if not replaced:
-        lines.append(new_entry)
+        if not replaced:
+            lines.append(new_entry)
 
-    MEMORY_INDEX.write_text('\n'.join(lines), encoding="utf-8")
+        _atomic_write_text(MEMORY_INDEX, '\n'.join(lines))
 
 
 def _remove_from_index(name: str) -> None:
     """Remove an entry from MEMORY.md."""
     if not MEMORY_INDEX.exists():
         return
-    lines = MEMORY_INDEX.read_text(encoding="utf-8").split('\n')
-    lines = [l for l in lines if f"]({name}.md)" not in l]
-    MEMORY_INDEX.write_text('\n'.join(lines), encoding="utf-8")
+    with _index_lock:
+        lines = MEMORY_INDEX.read_text(encoding="utf-8").split('\n')
+        lines = [l for l in lines if f"]({name}.md)" not in l]
+        _atomic_write_text(MEMORY_INDEX, '\n'.join(lines))
 
 
 def _rewrite_meta(name: str, updates: dict) -> tuple[bool, str]:

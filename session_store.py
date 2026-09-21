@@ -280,21 +280,28 @@ def save_session(session: dict) -> None:
     cwd = session.get("cwd") or os.getcwd()
     paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     _atomic_write_json_if_changed(_session_path(cwd, session_id), session)
-    current = _current_path(cwd)
-    if session.get("closed_at"):
-        try:
-            existing = json.loads(current.read_text(encoding="utf-8")) if current.exists() else {}
-            if existing.get("session_id") == session_id or existing.get("id") == session_id:
-                current.unlink(missing_ok=True)
-            legacy = _legacy_current_path(cwd)
-            if legacy.exists():
-                existing = json.loads(legacy.read_text(encoding="utf-8"))
+    # D1 (bughunt): the current-pointer update is a read-compare-write/unlink
+    # that used to run unguarded. A concurrent close+save could interleave
+    # (close reads current=X, save writes current=Y, close unlinks current)
+    # and lose the new session's pointer — or resurrect a closed one. The
+    # session file write above is safe (unique per-id path); only the shared
+    # pointer needs the lifecycle guard, which is reentrant per-thread.
+    with session_lifecycle.guard(cwd):
+        current = _current_path(cwd)
+        if session.get("closed_at"):
+            try:
+                existing = json.loads(current.read_text(encoding="utf-8")) if current.exists() else {}
                 if existing.get("session_id") == session_id or existing.get("id") == session_id:
-                    legacy.unlink(missing_ok=True)
-        except Exception:
-            pass
-    else:
-        _atomic_write_json_if_changed(current, session)
+                    current.unlink(missing_ok=True)
+                legacy = _legacy_current_path(cwd)
+                if legacy.exists():
+                    existing = json.loads(legacy.read_text(encoding="utf-8"))
+                    if existing.get("session_id") == session_id or existing.get("id") == session_id:
+                        legacy.unlink(missing_ok=True)
+            except Exception:
+                pass
+        else:
+            _atomic_write_json_if_changed(current, session)
 
 
 def close_session(session: dict) -> dict:

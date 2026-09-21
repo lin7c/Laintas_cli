@@ -50,6 +50,12 @@ _PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
     ("JWT", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")),
     ("KEY", re.compile(r"\b(?:KGAT_|sk-|AKIA|ghp_|gho_|github_pat_|xox[baprs]-|AIza)[A-Za-z0-9_\-]{8,}")),
     ("KEY", re.compile(r"(?i)(?<![A-Za-z])(?:bearer|api[_-]?key|access[_-]?token|secret|password|passwd|pwd)\s*[=:]\s*[^\s\"']{4,}")),
+    # S3 (bughunt): the pattern above excludes quotes from the value, so a
+    # JSON string value ("api_key": "sk-...") starts with a quote and never
+    # matched — the secret reached logs unredacted. Match the quoted form
+    # explicitly; the placeholder swallows the quotes with the value, which
+    # keeps the surrounding JSON shape intact (no dangling quote pair).
+    ("KEY", re.compile(r"(?i)(?<![A-Za-z])(?:bearer|api[_-]?key|access[_-]?token|secret|password|passwd|pwd)(?:[_-]?(?:value|val|token))?\s*\"?\s*[=:]\s*(?:\"[^\"\n]{4,}\"|'[^'\n]{4,}')")),
     ("CARD", re.compile(r"\b(?:\d[ -]?){13,16}\b")),
     ("IPV4", re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")),
     ("PHONE", re.compile(r"(?<!\d)(?:\+?\d{1,3}[ -]?)?(?:1[3-9]\d{9}|\d{3}[ -]\d{3,4}[ -]\d{4})(?!\d)")),
@@ -144,7 +150,8 @@ def _record(redacted: str, redacted_spans: list[dict], *, source: str) -> None:
 
 # ── Public scrub API ───────────────────────────────────────────────────────
 def scrub_text(text: str, *, enforce: bool = False, capture: bool = True,
-               source: str = "message") -> tuple[str, list[dict]]:
+               source: str = "message",
+               types: "frozenset | None" = None) -> tuple[str, list[dict]]:
     """Detect (and optionally redact) secrets in one text block.
 
     Returns ``(text_out, spans)``. ``text_out`` is redacted only when
@@ -160,6 +167,8 @@ def scrub_text(text: str, *, enforce: bool = False, capture: bool = True,
             return text, []
 
         spans = scan_text(text)
+        if types is not None:
+            spans = [sp for sp in spans if sp["type"] in types]
         if spans and not already:
             if len(_seen) < _SEEN_CAP:
                 _seen.add(digest)
@@ -175,6 +184,14 @@ def scrub_text(text: str, *, enforce: bool = False, capture: bool = True,
 
 
 _TEXT_KEYS = ("content", "text", "output", "command", "input", "value")
+
+# What an arbitrary structured value (a header, a config field, a tool
+# parameter the whitelist has never heard of) is scanned for: credential
+# shapes only. CARD/IPV4/PHONE/HEX/B64 are shape guesses — on free prose they
+# are acceptable, on a structured value they rewrite real data (a 13-digit
+# epoch-ms timestamp became <CARD>, a target host became <IPV4>) and, under
+# redact_enforce, the model then sees its own past tool call mangled.
+_SECRET_TYPES = frozenset({"PRIVATE_KEY", "JWT", "KEY"})
 
 
 def _scrub_content(value, *, enforce, capture, source):
@@ -204,6 +221,15 @@ def _scrub_content(value, *, enforce, capture, source):
                 # `arguments` may be a serialized JSON string (OpenAI format);
                 # scrubbing it as text still catches embedded secrets.
                 nv, n = _scrub_content(v, enforce=enforce, capture=capture, source=sub)
+            elif isinstance(v, str):
+                # S4 (bughunt): every other string value is still scanned — a
+                # key whitelist cannot keep up with structured tool parameters,
+                # and a Bearer token under input.headers.Authorization sailed
+                # through unredacted — but for credential shapes only (see
+                # _SECRET_TYPES), so ordinary data survives untouched.
+                nv, spans = scrub_text(v, enforce=enforce, capture=capture,
+                                       source=sub, types=_SECRET_TYPES)
+                n = len(spans)
             else:
                 nv, n = v, 0
             new_d[k] = nv

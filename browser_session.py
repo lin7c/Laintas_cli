@@ -430,6 +430,11 @@ class ProxyAuthRelay:
 
     _HEAD_LIMIT = 64 * 1024      # a request head larger than this is not a browser
     _CONNECT_TIMEOUT = 20.0
+    # K7 (bughunt): opaque-relay idle cap. A half-dead peer (crashed without
+    # a TCP RST) used to park the relay threads in recv() forever — three
+    # threads per connection, unbounded. Live long-poll/websocket traffic
+    # pings far more often than this, so only dead connections retire.
+    _IDLE_TIMEOUT = 600.0
 
     def __init__(self, upstream: str, credentials: Optional[str] = None):
         host, _, port = upstream.rpartition(":")
@@ -538,8 +543,13 @@ class ProxyAuthRelay:
                     return
 
             # From here the connection is opaque in both directions.
-            client.settimeout(None)
-            upstream.settimeout(None)
+            # K7 (bughunt): no timeout at all meant a half-dead peer (crashed
+            # without a TCP RST, NAT entry still warm) parked this relay's
+            # threads in recv() forever — three threads per connection,
+            # unbounded. A long idle timeout retires them: normal long-lived
+            # connections (websockets) ping far more often than this.
+            client.settimeout(self._IDLE_TIMEOUT)
+            upstream.settimeout(self._IDLE_TIMEOUT)
             done = threading.Event()
             forward = threading.Thread(target=self._pipe, args=(client, upstream, done), daemon=True)
             forward.start()
@@ -557,6 +567,9 @@ class ProxyAuthRelay:
 
     @staticmethod
     def _pipe(src: socket.socket, dst: socket.socket, done: threading.Event) -> None:
+        # K7: recv() under _IDLE_TIMEOUT raises socket.timeout (an OSError)
+        # when the peer goes silent; that exits this pipe, sets done, and
+        # wakes the opposite direction instead of parking both forever.
         try:
             while not done.is_set():
                 data = src.recv(65536)

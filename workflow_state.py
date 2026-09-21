@@ -9,10 +9,17 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 
 RUNS_FILE = "workflow_runs.json"
@@ -46,6 +53,70 @@ def _runs_path(cwd: Optional[str] = None) -> Path:
 
 def _cache_path(cwd: Optional[str] = None) -> Path:
     return _project_dir(cwd) / CACHE_FILE
+
+
+# D3 (bughunt): every writer does an unlocked read-modify-write of the whole
+# runs/cache file, so concurrent writers (HWG frontier threads, two CLI
+# processes) silently dropped each other's records — 200 concurrent saves
+# left 37 on disk. Serialize the RMW with a per-path thread lock (same
+# process) plus an flock sidecar (across processes), the same pattern as
+# session_lifecycle.guard. Reentrant per-thread: nested save_run calls
+# (checkpoint -> save_run) share the outer hold.
+_thread_locks: dict = {}
+_thread_locks_guard = threading.Lock()
+_local = threading.local()
+
+
+@contextmanager
+def _store_lock(path: Path):
+    key = str(path)
+    with _thread_locks_guard:
+        lock = _thread_locks.setdefault(key, threading.RLock())
+    held = getattr(_local, "held", set())
+    if key in held:
+        yield
+        return
+    lock_path = path.with_name(path.name + ".lock")
+    with lock:
+        # Only ACQUIRING the file lock is allowed to fail softly. The yield
+        # must sit outside that try: an OSError raised by the caller's body
+        # (disk full in _write_json) used to land in the handler, which
+        # yielded a second time and turned it into "generator didn't stop
+        # after throw()".
+        lf = None
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lf = lock_path.open("a")
+            if os.name == "nt":
+                if lf.tell() == 0:
+                    lf.write(" ")
+                    lf.flush()
+                lf.seek(0)
+                msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                fcntl.flock(lf, fcntl.LOCK_EX)
+        except OSError:
+            # A lock-file failure must not break persistence: fall back to
+            # the thread lock alone (previous behaviour, minus same-process
+            # races).
+            if lf is not None:
+                lf.close()
+            lf = None
+        _local.held = held | {key}
+        try:
+            yield
+        finally:
+            _local.held = held
+            if lf is not None:
+                try:
+                    if os.name == "nt":
+                        lf.seek(0)
+                        msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(lf, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                lf.close()
 
 
 def new_run(kind: str, source: str, inputs: Optional[dict] = None, cwd: Optional[str] = None) -> dict:
@@ -86,11 +157,12 @@ def save_run(run: dict, cwd: Optional[str] = None) -> dict:
     run = dict(run)
     run["updatedAt"] = time.time()
     path = _runs_path(cwd)
-    store = _read_json(path, {"runs": {}})
-    runs = dict(store.get("runs") or {})
-    runs[run["runId"]] = run
-    store["runs"] = runs
-    _write_json(path, store)
+    with _store_lock(path):
+        store = _read_json(path, {"runs": {}})
+        runs = dict(store.get("runs") or {})
+        runs[run["runId"]] = run
+        store["runs"] = runs
+        _write_json(path, store)
     return run
 
 
@@ -141,21 +213,23 @@ def cache_get(key: str, cwd: Optional[str] = None) -> Optional[dict]:
 
 def cache_set(key: str, value: dict, ttl_seconds: Optional[float] = None, cwd: Optional[str] = None) -> None:
     path = _cache_path(cwd)
-    store = _read_json(path, {"entries": {}})
-    entries = dict(store.get("entries") or {})
-    entries[key] = {
-        "createdAt": time.time(),
-        "expiresAt": (time.time() + ttl_seconds) if ttl_seconds else None,
-        "value": value,
-    }
-    store["entries"] = entries
-    _write_json(path, store)
+    with _store_lock(path):
+        store = _read_json(path, {"entries": {}})
+        entries = dict(store.get("entries") or {})
+        entries[key] = {
+            "createdAt": time.time(),
+            "expiresAt": (time.time() + ttl_seconds) if ttl_seconds else None,
+            "value": value,
+        }
+        store["entries"] = entries
+        _write_json(path, store)
 
 
 def cache_delete(key: str, cwd: Optional[str] = None) -> None:
     path = _cache_path(cwd)
-    store = _read_json(path, {"entries": {}})
-    entries = dict(store.get("entries") or {})
-    entries.pop(key, None)
-    store["entries"] = entries
-    _write_json(path, store)
+    with _store_lock(path):
+        store = _read_json(path, {"entries": {}})
+        entries = dict(store.get("entries") or {})
+        entries.pop(key, None)
+        store["entries"] = entries
+        _write_json(path, store)

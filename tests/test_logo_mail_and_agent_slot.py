@@ -622,7 +622,7 @@ class SlashUsageEscapingTests(unittest.TestCase):
                 "/training bogus extra", None, {}, None)
         out = "".join(str(call.args[0]) if call.args else ""
                       for call in printed.call_args_list)
-        self.assertIn("[status|on|off]", out)
+        self.assertIn("[status|on|off|local ...]", out)
 
 
 class AgentSlotSwitchTests(unittest.TestCase):

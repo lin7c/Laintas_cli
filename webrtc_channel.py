@@ -768,11 +768,31 @@ class WebrtcManager:
     # ever reaches this channel. shell_exec (the AI tool) must keep using the
     # policy.py-gated exec path — never route AI-driven commands through here.
     async def _open_term(self, channel, msg: dict):
+        # K6 (bughunt): this coroutine is fired with ensure_future, so an
+        # exception here was swallowed and the client never received
+        # term-open-ack OR term-exit — it hung forever waiting on a session
+        # that was never created. Malformed dimensions used to raise
+        # ValueError before anything was sent; parse defensively and wrap
+        # the whole open so any failure reports term-exit instead of silence.
         session_id = str(msg.get("id") or "")
         if not session_id:
             return
-        cols = int(msg.get("cols") or 80)
-        rows = int(msg.get("rows") or 24)
+        try:
+            cols = int(msg.get("cols") or 80)
+            rows = int(msg.get("rows") or 24)
+        except (TypeError, ValueError):
+            cols, rows = 80, 24
+        try:
+            await self._open_term_inner(channel, msg, session_id, cols, rows)
+        except Exception as e:
+            try:
+                channel.send(json.dumps({"t": "term-exit", "id": session_id,
+                                          "error": f"{type(e).__name__}: {e}"}))
+            except Exception:
+                pass
+
+    async def _open_term_inner(self, channel, msg: dict, session_id: str,
+                               cols: int, rows: int):
 
         existing = self._terms.get(session_id)
         if existing is not None:
@@ -1282,7 +1302,17 @@ class WebrtcManager:
                 if not data:
                     break
                 # Let the SCTP buffer drain so a slow viewer doesn't OOM us.
+                # K6 (bughunt): bound the wait. A viewer that disconnected
+                # without closing the data channel never drains, and this
+                # loop used to spin at 50Hz forever holding the bridge alive.
+                # 30s of sustained backpressure means nobody is reading:
+                # end the pump and let _close_vnc clean up.
+                _bp_deadline = None
                 while channel.bufferedAmount > 1_000_000:
+                    if _bp_deadline is None:
+                        _bp_deadline = loop.time() + 30.0
+                    elif loop.time() > _bp_deadline:
+                        return
                     await asyncio.sleep(0.02)
                 channel.send(data)
         except (OSError, asyncio.CancelledError):
