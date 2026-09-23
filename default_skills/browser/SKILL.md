@@ -1,7 +1,7 @@
 ---
 name: browser
 description: Driving the real headless browser on this machine — inspecting a rendered page, filling forms, clicking through a flow, and verifying a site works. Load this before any browser.* call. Not for plain reading of a page, which web.fetch does better.
-version: 1.0.0
+version: 1.0.1
 triggers:
   - browser
   - open the page
@@ -18,6 +18,11 @@ triggers:
 
 `browser.*` drives a real Chrome running on the user's machine (Xvfb + Chrome +
 x11vnc, one stack per session, streamed to the user's live view over WebRTC).
+
+On the Windows build that "machine" is the WSL side: this Chrome is not the
+browser on the user's desktop and has none of their logins. When a Helpwo
+kernel is connected (`win.*` tools present) and the user asks to open or use
+*their* browser, that is the `windows-machine` skill, not this one.
 It is heavier and slower than fetching a page, and every action happens for
 real on the open internet under the user's own IP.
 

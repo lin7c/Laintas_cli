@@ -32,6 +32,8 @@ import threading
 import fcntl
 from typing import Any, Callable, Optional
 
+import child_registry
+
 async def _read_until_idle(proc, idle_seconds: float):
     """Drain a subprocess, bounded by SILENCE rather than by total runtime.
 
@@ -47,10 +49,9 @@ async def _read_until_idle(proc, idle_seconds: float):
                                           timeout=idle_seconds)
         except asyncio.TimeoutError:
             stopped = True
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
+            # The group, not just the `sh` leader: a forked command would
+            # otherwise keep running and holding the pipe.
+            _kill_process_group(proc)
             break
         if not data:
             break                      # EOF: the command finished
@@ -718,10 +719,15 @@ class WebrtcManager:
             channel.send(json.dumps({"t": "exec-res", "id": rid, "ok": False,
                                      "code": -1, "out": f"rejected: {err}"}))
             return
+        proc = None
         try:
+            # Own session: it can then be ended as a group, and it is not in
+            # the CLI's group (killpg on that would take the CLI down too).
             proc = await asyncio.create_subprocess_shell(
                 cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
             )
+            child_registry.register(proc.pid, "p2p-exec")
             out, _idle_stop = await _read_until_idle(proc, REMOTE_EXEC_IDLE_SECONDS)
             if len(out) > 256 * 1024:
                 out = out[:256 * 1024]
@@ -735,6 +741,9 @@ class WebrtcManager:
                                          "code": proc.returncode, "out": out}))
         except Exception as e:
             channel.send(json.dumps({"t": "exec-res", "id": rid, "ok": False, "code": -1, "out": str(e)}))
+        finally:
+            if proc is not None:
+                child_registry.unregister(proc.pid)
 
     # ── Structured filesystem metadata RPC ─────────────────────────────
     # RemoteProvider used to send shell snippets containing pipes, redirects
@@ -846,6 +855,7 @@ class WebrtcManager:
         flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
         fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
+        child_registry.register(pid, "p2p-pty")
         term = {"channel": channel, "master_fd": master_fd, "pid": pid,
                 "buffer": bytearray(), "grace_handle": None}
         self._terms[session_id] = term
@@ -1069,6 +1079,7 @@ class WebrtcManager:
             return
 
         self._ai_exec_procs[req_id] = proc
+        child_registry.register(proc.pid, "p2p-ai-exec")
         total = 0
 
         async def _pump():
@@ -1101,6 +1112,7 @@ class WebrtcManager:
             raise
         finally:
             self._ai_exec_procs.pop(req_id, None)
+            child_registry.unregister(proc.pid)
 
     # ── HTTP tunnel RPC: proxy one request to a loopback port ───────────
     # Lets Helpwo render a dev server running on this host inside its preview

@@ -375,6 +375,19 @@ snapshot. A tree containing an open session cannot be deleted: switch away or
 close its terminal first. Deleted sessions cannot be recreated by stale autosaves.
 Explicit `--execute --session-id` retains its logical-session continuation behavior.
 
+`/agent <name>` switches the foreground conversation; each persistent agent
+has its own `/resume` history. Switching back preserves work completed in the
+background. A working agent can receive updates in `/agents`; switch the
+foreground to it after its task finishes.
+
+`/agents` selects an agent to view or address without changing the foreground
+conversation or terminal ownership. Enter sends an update to a working agent,
+continues the current foreground agent, or starts a **new task** for another
+idle employee. The input hint shows which action applies. To continue another
+agent's existing conversation, leave the panel and use `/agent <name>`; use
+`/resume` there to choose its saved history. `/agents --plain` distinguishes
+the foreground agent and current conversation from older saved records.
+
 `/station` opens the live agent/terminal manager. Press `v` to switch between
 delegation and terminal views, `Enter` for details, `e` to open the existing
 terminal/dialogue view, and `a` to enter a management command. Commands include

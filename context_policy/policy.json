@@ -24,7 +24,7 @@
   "summary_output_tokens": 4096,
   "summary_chunk_tokens": 24000,
   "summary_model": "google/gemma-4-26b-a4b-it",
-  "summary_review_model": "deepseek-v4-flash",
+  "summary_review_model": "priority",
   "file_read_retention": {
     "description": "Shared rules for retaining file-read content so the agent does not re-read files it already has (the re-read amnesia loop). Each product keeps its OWN per-path cache + file I/O; this only standardizes the BEHAVIOR. Modeled on Helpwo's fileViewStates.",
     "enabled": true,

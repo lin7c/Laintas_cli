@@ -58,6 +58,8 @@ import threading
 import time
 from typing import Any, Optional
 
+import child_registry
+
 # Bounds. Deliberately the same order as the P2P path's so a command does not
 # behave differently depending on which transport carried it.
 MAX_EXEC_OUTPUT = 256 * 1024
@@ -287,6 +289,7 @@ def run_exec(body: dict, sse: SseWriter, resolve_cwd, agent_id: Optional[str] = 
             sse.event({"t": "final", "status": "fail", "error": str(e)})
             return
         req.proc = proc
+        child_registry.register(proc.pid, "local-exec")
         _stream_process(proc, req, sse, timeout)
     finally:
         if proc is not None and proc.stdout is not None:
@@ -294,6 +297,8 @@ def run_exec(body: dict, sse: SseWriter, resolve_cwd, agent_id: Optional[str] = 
                 proc.stdout.close()
             except OSError:
                 pass
+        if proc is not None:
+            child_registry.unregister(proc.pid)
         _release_exec(req_id)
 
 
@@ -414,6 +419,9 @@ class LocalTerminal:
 
         self.pid = pid
         self.master_fd = master_fd
+        # A shell that traps SIGHUP outlives the master closing; see
+        # child_registry for why that is not enough on its own.
+        child_registry.register(pid, "local-pty")
         _set_winsize(master_fd, rows, cols)
         self._reader = threading.Thread(
             target=self._pump, daemon=True, name=f"local-pty-{session_id[:8]}")
@@ -495,6 +503,7 @@ class LocalTerminal:
                 break
             time.sleep(0.01)
         self.exit_code = code
+        child_registry.unregister(self.pid)
         self.closed.set()
         with self.lock:
             sock = self.sock

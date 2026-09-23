@@ -170,6 +170,8 @@ _DEFAULT_CONFIG = {
     # is the historical behaviour. These calls are tool-less, structured and
     # high-volume; pointing them at a cheaper long-context model separates the
     # "reasoning" bill from the "context plumbing" bill.
+    # Deliberately pinned, unlike the rest of the defaults that follow the
+    # admin page's priority: compaction wants a cheap long-context model.
     "aux_model": "google/gemma-4-26b-a4b-it",
     # Canonical model id only: the gateway resolves duplicate upstreams using
     # supplier priority/failover. Never pin compaction to OpenRouter here.
@@ -2079,7 +2081,11 @@ def _atomic_write_json(dest, payload: dict) -> None:
 
 
 def _fingerprint_payload(payload: dict) -> str:
-    stable = copy.deepcopy(payload)
+    # No deepcopy: json.dumps never mutates its input, and the only mutation
+    # here is the top-level timestamp pop, which a shallow copy covers. The
+    # old full deepcopy of whole conversations made the /resume picker's
+    # dedup pass several times slower than it needed to be.
+    stable = dict(payload) if isinstance(payload, dict) else payload
     if isinstance(stable, dict):
         stable.pop("timestamp", None)
     raw = json.dumps(
@@ -2236,7 +2242,8 @@ def normalize_fork_lineage(value) -> list:
     return names
 
 
-def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str) -> Optional[dict]:
+def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str,
+                          *, agent_id: str = "primary") -> Optional[dict]:
     all_user_turns = [
         m for m in (chat_history or []) if m.get("role") == "user"
     ]
@@ -2275,10 +2282,18 @@ def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str) 
         "session_id": session_id,
         "kind": kind,
         "cwd": cwd,
+        # Namespacing travels inside the blob too, not just the filename:
+        # header reads (bounded, cheap) answer "whose session is this" without
+        # trusting glob patterns, and delete_resume_state re-derives the right
+        # namespace from the blob itself. Legacy files without it are primary's.
+        "agent_id": _resume_agent_of(agent_id),
         "timestamp": time.time(),
         "title": title,
         "turn_count": len(prompt_turns),
-        "chat_history": history,
+        # chat_history is the whale (whole conversations, tens of MB). It
+        # goes LAST so every small metadata field above — including the
+        # branch parentage below — sits inside a bounded head read
+        # (_read_session_header) without paying for the history itself.
         "older_summary": _summarize_dropped_turns(dropped),
         "durable_rules": durable_rules.list_rules(cwd, active_only=False),
         "tasks": task_manager.export_active_tasks(
@@ -2293,38 +2308,74 @@ def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str) 
         "fork_parent_session_id": parent_session_id,
         "branch_name": branch_name,
         "state": prepare_state_for_repl(state or {}),
+        "chat_history": history,
     }
 
 
-def _resume_latest_path(cwd: str):
-    return paths.SESSIONS_DIR / f"{_session_key(cwd)}_resume.json"
+def _resume_agent_ns(agent_id: str) -> str:
+    """Filename namespace segment for one agent's resume files.
+
+    "primary" (the default everywhere) keeps the legacy filenames so every
+    existing session on disk keeps working with zero migration. Each other
+    persistent agent (scout, foreman, hired employees) gets its own
+    ``__ag_<id>_`` segment, so its autosaves/checkpoints/forks can never
+    collide with — or be offered to — another agent's /resume picker in the
+    same directory. The glob patterns below never match across namespaces:
+    ``{key}_session_*`` requires "session" immediately after the first
+    underscore, while an agent-scoped name has ``__ag_`` there instead.
+    """
+    aid = str(agent_id or "").strip()
+    if not aid or aid == "primary":
+        return ""
+    return f"__ag_{_normalize_session_id(aid)}"
 
 
-def _resume_session_path(cwd: str, session_id: str):
-    return paths.SESSIONS_DIR / f"{_session_key(cwd)}_session_{_normalize_session_id(session_id)}.json"
+def _resume_agent_of(payload_or_agent_id) -> str:
+    """Authoritative agent namespace for a blob (or a raw agent id).
+
+    Legacy files written before per-agent resume carry no ``agent_id``; they
+    are primary's by definition.
+    """
+    if isinstance(payload_or_agent_id, dict):
+        value = str(payload_or_agent_id.get("agent_id") or "").strip()
+    else:
+        value = str(payload_or_agent_id or "").strip()
+    return value or "primary"
 
 
-def _resume_session_pattern(cwd: str) -> str:
-    return f"{_session_key(cwd)}_session_*.json"
+def _resume_latest_path(cwd: str, agent_id: str = "primary"):
+    return paths.SESSIONS_DIR / (
+        f"{_session_key(cwd)}{_resume_agent_ns(agent_id)}_resume.json")
 
 
-def _resume_checkpoint_pattern(cwd: str) -> str:
-    return f"{_session_key(cwd)}_resume_*.json"
+def _resume_session_path(cwd: str, session_id: str, agent_id: str = "primary"):
+    return paths.SESSIONS_DIR / (
+        f"{_session_key(cwd)}{_resume_agent_ns(agent_id)}"
+        f"_session_{_normalize_session_id(session_id)}.json")
 
 
-def _resume_fork_pattern(cwd: str) -> str:
-    return f"{_session_key(cwd)}_fork_*.json"
+def _resume_session_pattern(cwd: str, agent_id: str = "primary") -> str:
+    return f"{_session_key(cwd)}{_resume_agent_ns(agent_id)}_session_*.json"
 
 
-def _resume_fork_path(cwd: str, fork_key: str):
+def _resume_checkpoint_pattern(cwd: str, agent_id: str = "primary") -> str:
+    return f"{_session_key(cwd)}{_resume_agent_ns(agent_id)}_resume_*.json"
+
+
+def _resume_fork_pattern(cwd: str, agent_id: str = "primary") -> str:
+    return f"{_session_key(cwd)}{_resume_agent_ns(agent_id)}_fork_*.json"
+
+
+def _resume_fork_path(cwd: str, fork_key: str, agent_id: str = "primary"):
     safe = re.sub(r"[^A-Za-z0-9_-]", "-", fork_key.strip())[:64]
-    return paths.SESSIONS_DIR / f"{_session_key(cwd)}_fork_{safe}.json"
+    return paths.SESSIONS_DIR / (
+        f"{_session_key(cwd)}{_resume_agent_ns(agent_id)}_fork_{safe}.json")
 
 
-def _prune_resume_checkpoints(cwd: str) -> None:
+def _prune_resume_checkpoints(cwd: str, agent_id: str = "primary") -> None:
     try:
         files = sorted(
-            paths.SESSIONS_DIR.glob(_resume_checkpoint_pattern(cwd)),
+            paths.SESSIONS_DIR.glob(_resume_checkpoint_pattern(cwd, agent_id)),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
@@ -2334,17 +2385,21 @@ def _prune_resume_checkpoints(cwd: str) -> None:
         pass
 
 
-def save_resume_state(state: dict, chat_history: list, cwd: str) -> None:
+def save_resume_state(state: dict, chat_history: list, cwd: str,
+                      *, agent_id: str = "primary") -> None:
     """Persist full-fidelity chat_history + working state for `/resume` (per-cwd).
 
     Unlike save_session_snapshot (a lossy summary feeding the {{lastSession}}
     prompt section), this keeps the actual conversation and bounded working
     state so a later launch in the same directory can continue an unfinished
-    task verbatim. Keyed by cwd so a task in dir A is never restored in dir B.
-    Skips trivial sessions (no user turn). Best-effort; silent on I/O error.
+    task verbatim. Keyed by cwd so a task in dir A is never restored in dir B,
+    and namespaced by agent_id so one agent's conversation is never offered
+    as another's resume point. Skips trivial sessions (no user turn).
+    Best-effort; silent on I/O error.
     """
     try:
-        payload = _build_resume_payload(state, chat_history, cwd, "autosave")
+        payload = _build_resume_payload(
+            state, chat_history, cwd, "autosave", agent_id=agent_id)
         if payload is None:
             return
         paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -2354,30 +2409,36 @@ def save_resume_state(state: dict, chat_history: list, cwd: str) -> None:
         # later trivial turn) must never overwrite it. The per-session file is
         # still discoverable via list_resume_states' glob pattern.
         _atomic_write_json_if_changed(
-            _resume_session_path(cwd, payload["session_id"]), payload)
+            _resume_session_path(cwd, payload["session_id"], agent_id), payload)
     except Exception:
         pass
 
 
-def save_resume_checkpoint(state: dict, chat_history: list, cwd: str) -> Optional[dict]:
+def save_resume_checkpoint(state: dict, chat_history: list, cwd: str,
+                            *, agent_id: str = "primary") -> Optional[dict]:
     with session_lifecycle.guard(cwd):
         if session_lifecycle.is_deleted(cwd, {"state": state}):
             return None
-        return _save_resume_checkpoint_locked(state, chat_history, cwd)
+        return _save_resume_checkpoint_locked(state, chat_history, cwd, agent_id)
 
 
-def _save_resume_checkpoint_locked(state: dict, chat_history: list, cwd: str) -> Optional[dict]:
+def _save_resume_checkpoint_locked(state: dict, chat_history: list, cwd: str,
+                                   agent_id: str = "primary") -> Optional[dict]:
     """Save a selectable resume checkpoint for this cwd, intended for `/q`."""
     try:
-        payload = _build_resume_payload(state, chat_history, cwd, "checkpoint")
+        payload = _build_resume_payload(
+            state, chat_history, cwd, "checkpoint", agent_id=agent_id)
         if payload is None:
             return None
         paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-        dest = paths.SESSIONS_DIR / f"{_session_key(cwd)}_resume_{payload['id']}.json"
+        dest = paths.SESSIONS_DIR / (
+            f"{_session_key(cwd)}{_resume_agent_ns(agent_id)}"
+            f"_resume_{payload['id']}.json")
         _atomic_write_json(dest, payload)
-        _atomic_write_json(_resume_session_path(cwd, payload["session_id"]), payload)
-        _atomic_write_json(_resume_latest_path(cwd), payload)
-        _prune_resume_checkpoints(cwd)
+        _atomic_write_json(
+            _resume_session_path(cwd, payload["session_id"], agent_id), payload)
+        _atomic_write_json(_resume_latest_path(cwd, agent_id), payload)
+        _prune_resume_checkpoints(cwd, agent_id)
         return payload
     except Exception:
         return None
@@ -2387,21 +2448,30 @@ def save_fork_state(state: dict, chat_history: list, cwd: str,
                     fork_name: str, fork_lineage: list = None,
                     fork_parent_session_id: str = "",
                     child_session_id: str = "", *,
-                    source_snapshot: Optional[dict] = None) -> Optional[dict]:
+                    source_snapshot: Optional[dict] = None,
+                    agent_id: str = "primary") -> Optional[dict]:
+    # A fork inherits its source snapshot's namespace unless the caller names
+    # one explicitly; branching a primary session from scout's picker must not
+    # file the child under scout.
+    effective_agent = (
+        agent_id if agent_id != "primary"
+        else _resume_agent_of(source_snapshot or {}))
     with session_lifecycle.guard(cwd):
         parent = fork_parent_session_id or (source_snapshot or {}).get("session_id") or state.get("_session_id")
         if session_lifecycle.is_deleted(cwd, {"session_id": parent}):
             return None
         return _save_fork_state_locked(
             state, chat_history, cwd, fork_name, fork_lineage,
-            fork_parent_session_id, child_session_id, source_snapshot=source_snapshot)
+            fork_parent_session_id, child_session_id,
+            source_snapshot=source_snapshot, agent_id=effective_agent)
 
 
 def _save_fork_state_locked(state: dict, chat_history: list, cwd: str,
                             fork_name: str, fork_lineage: list = None,
                             fork_parent_session_id: str = "",
                             child_session_id: str = "", *,
-                            source_snapshot: Optional[dict] = None) -> Optional[dict]:
+                            source_snapshot: Optional[dict] = None,
+                            agent_id: str = "primary") -> Optional[dict]:
     """Save a named fork snapshot of the current session context.
 
     Like ``save_resume_checkpoint`` but tagged with stable parent/child session
@@ -2413,11 +2483,12 @@ def _save_fork_state_locked(state: dict, chat_history: list, cwd: str,
         # Historical forks must retain the selected snapshot's summary and
         # tasks, not reconstruct them from the source session's current tip.
         payload = (copy.deepcopy(source_snapshot) if source_snapshot is not None
-                   else _build_resume_payload(state, chat_history, cwd, "fork"))
+                   else _build_resume_payload(
+                       state, chat_history, cwd, "fork", agent_id=agent_id))
         if payload is None:
             return None
         payload.update(id=uuid.uuid4().hex[:12], kind="fork", cwd=cwd,
-                       timestamp=time.time())
+                       timestamp=time.time(), agent_id=_resume_agent_of(agent_id))
         parent_session_id = _normalize_session_id(
             fork_parent_session_id or payload.get("session_id"))
         # A fork is a child conversation, not another filename for its parent.
@@ -2455,8 +2526,10 @@ def _save_fork_state_locked(state: dict, chat_history: list, cwd: str,
         paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
         # Key by immutable branch identity. Name-keyed files collide when two
         # different parents both have a child called e.g. "experiment".
-        _atomic_write_json(_resume_fork_path(cwd, child_session_id), payload)
-        _atomic_write_json(_resume_session_path(cwd, payload["session_id"]), payload)
+        _atomic_write_json(
+            _resume_fork_path(cwd, child_session_id, agent_id), payload)
+        _atomic_write_json(
+            _resume_session_path(cwd, payload["session_id"], agent_id), payload)
         return payload
     except Exception:
         return None
@@ -2467,17 +2540,282 @@ _RESUME_MAX_AGE = 7 * 86400
 #: Grace on the mtime pre-filter, so a file whose clock skewed slightly is
 #: still opened and judged by its own recorded timestamp.
 _RESUME_MTIME_GRACE = 3600
+#: How long a recycled (`.expired`) session file is kept for recovery before
+#: it is deleted. Without this the recycler only renamed the disk use it was
+#: written to reclaim, and the sessions directory grew for ever.
+_RECYCLED_MAX_AGE = 7 * 86400
+
+#: Session files are whole conversations — tens of MB per cwd on a working
+#: machine. Deletion and retention only need each file's leading metadata
+#: (session_id, parentage, kind, cwd, timestamp), which every writer emits
+#: before the huge chat_history value, so a bounded head read answers for
+#: the file without parsing it.
+_RESUME_HEADER_BYTES = 65536
+
+#: path -> ((mtime_ns, size), snapshot fingerprint). The /resume picker
+#: recomputes per-file dedup fingerprints on every interaction; a blob's
+#: fingerprint only changes when an autosave rewrites the file, which
+#: always lands a new mtime.
+_RESUME_SNAPSHOT_FPS: dict = {}
+
+#: path -> ((mtime_ns, size), walk-metadata dict). The delete scan re-reads
+#: every session file for a cwd on each picker delete; the files only change
+#: when an autosave rewrites them, which lands a new mtime, so a per-file
+#: cache keyed on that signature makes the second delete in a picker session
+#: stat-only instead of re-parsing tens of MB.
+_SESSION_WALK_CACHE: dict = {}
 
 
-def list_resume_states(cwd: str) -> list:
-    """Return selectable resume states for this cwd, newest first."""
+def _resume_snapshot_fingerprint(item: dict) -> str:
+    """Stable (path, mtime)-keyed fingerprint of a blob's dedup fields.
+
+    Same inputs as before — session_id/title/turn_count/chat_history/tasks/
+    state/fork_lineage — but computed once per file revision instead of on
+    every picker interaction. A blob's fingerprint changes only when an
+    autosave rewrites the file, and a rewrite always lands a new mtime.
+    """
+    path = item.get("_path")
+    try:
+        sig = (path and (os.stat(path).st_mtime_ns, os.stat(path).st_size))
+    except OSError:
+        sig = None
+    cached = _RESUME_SNAPSHOT_FPS.get(path) if sig else None
+    if cached and cached[0] == sig:
+        return cached[1]
+    stable = {
+        "session_id": item.get("session_id"),
+        "title": item.get("title"),
+        "turn_count": item.get("turn_count"),
+        "chat_history": item.get("chat_history") or [],
+        "tasks": item.get("tasks") or [],
+        "state": item.get("state") or {},
+        "fork_lineage": item.get("fork_lineage") or [],
+    }
+    fp = _fingerprint_payload(stable)
+    if sig and path:
+        _RESUME_SNAPSHOT_FPS[path] = (sig, fp)
+    return fp
+
+
+def _recycle_expired_session_file(path) -> None:
+    """Move a past-retention session file out of the globbed namespace.
+
+    Readers discard these by timestamp anyway; keeping them in place made
+    every future scan pay to stat, and (before the mtime short-circuit) to
+    parse them. Renamed files stay on disk for inspection/recovery and are
+    never matched by the `_resume_*`/`_live_*`/`_current*` globs again.
+    """
+    sidecar = path.with_name(path.name + ".expired")
+    try:
+        if sidecar.exists():
+            sidecar.unlink()
+        path.rename(sidecar)
+        # rename() keeps the old mtime, which is already past the retention
+        # horizon — without this the sidecar would be purgeable the moment it
+        # is created, and the recovery window it exists for would be zero.
+        os.utime(sidecar, None)
+        _LAST_RESUME_WRITE_FINGERPRINTS.pop(str(path), None)
+        _RESUME_SNAPSHOT_FPS.pop(str(path), None)
+        _SESSION_WALK_CACHE.pop(str(path), None)
+    except OSError:
+        pass
+
+
+def _literal_ends(text: str, end: int) -> bool:
+    """Whether a bare JSON literal really ends at ``end``.
+
+    Guards `true`/`false`/`null` against a prefix match inside a longer token.
+    The offset differs per literal, and a value may be followed by a comma,
+    the closing brace, whitespace, or the head boundary.
+    """
+    return text[end:end + 1] in ("", ",", "}", " ", "\t", "\r", "\n")
+
+
+def _purge_recycled_session_files(cwd: str) -> None:
+    """Delete this cwd's recycled sidecars once they are past recovery age.
+
+    Recycling renames a whole conversation out of the globbed namespace; the
+    sidecar is there so a mistaken expiry stays reversible, not for ever. Run
+    wherever recycling runs, so the reclaim happens on the same schedule.
+    """
+    key = _session_key(cwd)
+    now = time.time()
+    try:
+        candidates = list(paths.SESSIONS_DIR.glob(f"{key}*.json.expired"))
+    except OSError:
+        return
+    for path in candidates:
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            if now - path.stat().st_mtime > _RECYCLED_MAX_AGE:
+                path.unlink()
+        except OSError:
+            continue
+
+
+def _read_session_header(path) -> Optional[dict]:
+    """Parse a session JSON's leading scalar fields without reading the file.
+
+    Every writer emits the small metadata (session_id, parentage, kind, cwd,
+    timestamp, ...) before the huge ``chat_history`` value, and none of the
+    pre-``chat_history`` values is a container, so a bounded head read plus
+    a depth-1 scalar scan answers for the file. The scan is a real
+    tokenizer, not a regex: earlier string values (e.g. ``last_user_input``)
+    may embed text that merely looks like these keys, and a regex would
+    trust it.
+
+    Returns the metadata dict, or None when the head cannot prove it holds
+    every field the session walk reads (callers fall back to a full read,
+    so a truncated or exotic layout never silently loses fields).
+    """
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            head = fh.read(_RESUME_HEADER_BYTES)
+    except OSError:
+        return None
+    text = head.decode("utf-8", errors="ignore").lstrip()
+    if not text.startswith("{"):
+        return None
+    data = {}
+    i = 1                      # past the opening brace
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in " \t\r\n,":
+            i += 1
+            continue
+        if ch == "}":          # whole object fit in the head
+            break
+        if ch != '"':
+            return None        # not a key: layout we do not understand
+        # Read the key string.
+        j = i + 1
+        while j < n:
+            if text[j] == "\\":
+                j += 2
+                continue
+            if text[j] == '"':
+                break
+            j += 1
+        if j >= n:
+            break              # key truncated at the head boundary
+        try:
+            key = json.loads(text[i:j + 1])
+        except ValueError:
+            return None
+        i = j + 1
+        while i < n and text[i] in " \t\r\n":
+            i += 1
+        if i >= n or text[i] != ":":
+            return None
+        i += 1
+        while i < n and text[i] in " \t\r\n":
+            i += 1
+        if i >= n:
+            break
+        ch = text[i]
+        if ch == '"':
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    break
+                j += 1
+            if j >= n:
+                break          # value truncated: metadata may continue past head
+            try:
+                data[key] = json.loads(text[i:j + 1])
+            except ValueError:
+                return None
+            i = j + 1
+        elif (text.startswith("true", i) and _literal_ends(text, i + 4)) or (
+                text.startswith("false", i) and _literal_ends(text, i + 5)):
+            data[key] = text[i] == "t"
+            i += 4 if data[key] else 5
+        elif text.startswith("null", i) and _literal_ends(text, i + 4):
+            data[key] = None
+            i += 4
+        elif ch.isdigit() or ch == "-":
+            j = i + 1
+            while j < n and text[j] not in ",} \t\r\n":
+                j += 1
+            try:
+                data[key] = json.loads(text[i:j])
+            except ValueError:
+                return None
+            i = j
+        elif ch in "[{":
+            # Record a container value that fits whole in the head:
+            # fork_lineage IS a container, and the legacy-fork parent walk
+            # reads it. Balance-scan to depth 0 first.
+            depth = 0
+            in_str = False
+            k = i
+            while k < n:
+                c = text[k]
+                if in_str:
+                    if c == "\\":
+                        k += 2
+                        continue
+                    if c == '"':
+                        in_str = False
+                elif c == '"':
+                    in_str = True
+                elif c in "[{":
+                    depth += 1
+                elif c in "]}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            if k >= n:
+                break          # container truncated: metadata may continue past head
+            try:
+                data[key] = json.loads(text[i:k + 1])
+            except ValueError:
+                return None
+            i = k + 1
+        else:
+            return None        # true/false/null before chat_history: none of
+            # the consumers read them, but an unknown layout must not yield
+            # a half-trusted dict.
+    if size > _RESUME_HEADER_BYTES:
+        # Truncated head: the delete walk reads kind/id/session_id/cwd/
+        # timestamp plus the parentage fields (parent_session_id,
+        # fork_lineage, and for live copies state._fork_parent_session_id).
+        # Files written before the chat_history-last reorder keep some of
+        # those past the head, so a truncated head that lacks any of them
+        # must fall back to a full read — a missing parent once silently
+        # pruned a locked child out of the subtree.
+        required = {"kind", "id", "session_id", "cwd", "timestamp",
+                    "parent_session_id", "fork_lineage"}
+        if data.get("kind") == "live":
+            # Live copies carry branch parentage only inside `state`; they
+            # never have the snapshot-level parent keys. A head that
+            # reached `state` holds their complete walk view; one that
+            # stopped short of it must fall back to a full read.
+            required = {"kind", "id", "session_id", "cwd", "timestamp", "state"}
+        if not required.issubset(data):
+            return None
+    return data
+
+
+def list_resume_states(cwd: str, *, agent_id: str = "primary") -> list:
+    """Return selectable resume states for this cwd (and agent), newest first."""
     states = []
     seen_ids = set()
     try:
-        files = list(paths.SESSIONS_DIR.glob(_resume_checkpoint_pattern(cwd)))
-        files.extend(paths.SESSIONS_DIR.glob(_resume_session_pattern(cwd)))
-        files.extend(paths.SESSIONS_DIR.glob(_resume_fork_pattern(cwd)))
-        latest = _resume_latest_path(cwd)
+        files = list(paths.SESSIONS_DIR.glob(
+            _resume_checkpoint_pattern(cwd, agent_id)))
+        files.extend(paths.SESSIONS_DIR.glob(
+            _resume_session_pattern(cwd, agent_id)))
+        files.extend(paths.SESSIONS_DIR.glob(
+            _resume_fork_pattern(cwd, agent_id)))
+        latest = _resume_latest_path(cwd, agent_id)
         if latest.exists():
             files.append(latest)
         now = time.time()
@@ -2495,6 +2833,12 @@ def list_resume_states(cwd: str) -> list:
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 if data.get("cwd") != cwd or session_lifecycle.is_deleted(cwd, data):
+                    continue
+                # The blob's own agent_id is authoritative over the glob that
+                # found it: a hand-copied or renamed file must not leak into
+                # another agent's picker just because it landed in the right
+                # directory with the right prefix.
+                if _resume_agent_of(data) != _resume_agent_of(agent_id):
                     continue
                 if time.time() - data.get("timestamp", 0) > _RESUME_MAX_AGE:
                     continue
@@ -2514,31 +2858,37 @@ def list_resume_states(cwd: str) -> list:
     # Collapse exact same-session snapshots while preserving genuinely newer
     # autosaves whose conversation or working state changed after a checkpoint.
     unique = []
-    by_snapshot = {}
     # session_id is part of the fingerprinted payload, so two blobs from
     # different sessions can never collapse into each other. A session that
     # contributed exactly one file therefore has nothing to collide with, and
-    # fingerprinting it is pure cost — a deepcopy plus a JSON dump of a whole
-    # conversation, per file, on every startup.
+    # fingerprinting it is pure cost — a JSON dump of a whole conversation,
+    # per file, on every picker interaction.
     _per_session = collections.Counter(
         str(item.get("session_id") or "") for item in states)
+    # (session_id, cheap tuple) -> [indices into `unique`]. The cheap tuple
+    # discriminates most same-session pairs without any serialization; only
+    # cheap-equal candidates pay for the real (cached) fingerprint.
+    _cheap_buckets: dict = {}
     for item in states:
         if _per_session[str(item.get("session_id") or "")] < 2:
             unique.append(item)
             continue
-        stable = {
-            "session_id": item.get("session_id"),
-            "title": item.get("title"),
-            "turn_count": item.get("turn_count"),
-            "chat_history": item.get("chat_history") or [],
-            "tasks": item.get("tasks") or [],
-            "state": item.get("state") or {},
-            "fork_lineage": item.get("fork_lineage") or [],
-        }
-        snapshot_key = _fingerprint_payload(stable)
-        previous_index = by_snapshot.get(snapshot_key)
+        cheap = (str(item.get("title") or ""), item.get("turn_count"),
+                 len(item.get("chat_history") or []),
+                 len(item.get("tasks") or []))
+        bucket = _cheap_buckets.setdefault(
+            (str(item.get("session_id") or ""), cheap), [])
+        snapshot_key = None
+        previous_index = None
+        for idx in bucket:
+            if snapshot_key is None:
+                snapshot_key = _resume_snapshot_fingerprint(item)
+            if (_resume_snapshot_fingerprint(unique[idx])
+                    == snapshot_key):
+                previous_index = idx
+                break
         if previous_index is None:
-            by_snapshot[snapshot_key] = len(unique)
+            bucket.append(len(unique))
             unique.append(item)
         elif (item.get("kind") == "checkpoint"
               and unique[previous_index].get("kind") != "checkpoint"):
@@ -2553,7 +2903,7 @@ def list_resume_states(cwd: str) -> list:
 _RESUME_SUMMARY_PROBE = 6
 
 
-def latest_resume_summary(cwd: str) -> Optional[dict]:
+def latest_resume_summary(cwd: str, *, agent_id: str = "primary") -> Optional[dict]:
     """Cheap {turn_count, timestamp} for the newest resume blob, or None.
 
     Bounded on purpose. ``list_resume_states`` parses every live blob for the
@@ -2566,10 +2916,13 @@ def latest_resume_summary(cwd: str) -> Optional[dict]:
     advisory names a slightly older session. /resume itself is unaffected.
     """
     try:
-        files = list(paths.SESSIONS_DIR.glob(_resume_checkpoint_pattern(cwd)))
-        files.extend(paths.SESSIONS_DIR.glob(_resume_session_pattern(cwd)))
-        files.extend(paths.SESSIONS_DIR.glob(_resume_fork_pattern(cwd)))
-        latest = _resume_latest_path(cwd)
+        files = list(paths.SESSIONS_DIR.glob(
+            _resume_checkpoint_pattern(cwd, agent_id)))
+        files.extend(paths.SESSIONS_DIR.glob(
+            _resume_session_pattern(cwd, agent_id)))
+        files.extend(paths.SESSIONS_DIR.glob(
+            _resume_fork_pattern(cwd, agent_id)))
+        latest = _resume_latest_path(cwd, agent_id)
         if latest.exists():
             files.append(latest)
         now = time.time()
@@ -2591,6 +2944,8 @@ def latest_resume_summary(cwd: str) -> Optional[dict]:
                 continue
             if (data.get("cwd") != cwd or not data.get("chat_history")
                     or session_lifecycle.is_deleted(cwd, data)):
+                continue
+            if _resume_agent_of(data) != _resume_agent_of(agent_id):
                 continue
             if now - data.get("timestamp", 0) > _RESUME_MAX_AGE:
                 continue
@@ -2614,18 +2969,20 @@ def latest_resume_summary(cwd: str) -> Optional[dict]:
         return None
 
 
-def load_resume_state(cwd: str, session_id: str = None) -> Optional[dict]:
+def load_resume_state(cwd: str, session_id: str = None,
+                      *, agent_id: str = "primary") -> Optional[dict]:
     """Load a full-fidelity resume blob by logical id, or the latest for cwd."""
     try:
         if session_id:
-            path = _resume_session_path(cwd, session_id)
+            path = _resume_session_path(cwd, session_id, agent_id)
             if path.exists():
                 data = json.loads(path.read_text(encoding="utf-8"))
                 if (data.get("cwd") == cwd and not session_lifecycle.is_deleted(cwd, data)
-                        and time.time() - data.get("timestamp", 0) <= 7 * 86400):
+                        and time.time() - data.get("timestamp", 0) <= 7 * 86400
+                        and _resume_agent_of(data) == _resume_agent_of(agent_id)):
                     return data
             return None
-        states = list_resume_states(cwd)
+        states = list_resume_states(cwd, agent_id=agent_id)
         if not states:
             return None
         return states[0]
@@ -2638,26 +2995,73 @@ def delete_resume_state(cwd: str, blob: dict) -> None:
 
     Read all retained and expired records: the picker is a filtered view, not
     an authoritative inventory. Refuse the entire operation if any affected
-    session is open, including this process's own session.
+    session is open, including this process's own session. The namespace is
+    derived from the blob's own agent_id, so deleting scout's session can
+    never walk into primary's files even in the same directory.
     """
     if blob.get("cwd") and blob["cwd"] != cwd:
         raise ValueError("Saved session belongs to a different directory")
+    agent_id = _resume_agent_of(blob)
     with session_lifecycle.guard(cwd):
+        _purge_recycled_session_files(cwd)
         key = _session_key(cwd)
         files = set()
-        for pattern in (_resume_checkpoint_pattern(cwd), _resume_session_pattern(cwd),
-                        _resume_fork_pattern(cwd), f"{key}_live_*.json",
-                        f"{key}_current*.json"):
+        # Recycling is only safe where every reader already discards the file
+        # by its own timestamp. The live copies and the current pointer have
+        # readers that do not: session_store._recover_latest_live applies no
+        # age cutoff, and load_current_session reads a missing pointer as "the
+        # prior session was intentionally closed" — renaming one silently
+        # destroys another terminal's restorable session.
+        recyclable = set()
+        for pattern in (_resume_checkpoint_pattern(cwd, agent_id),
+                        _resume_session_pattern(cwd, agent_id),
+                        _resume_fork_pattern(cwd, agent_id)):
+            found = set(paths.SESSIONS_DIR.glob(pattern))
+            files.update(found)
+            recyclable.update(found)
+        for pattern in (f"{key}_live_*.json", f"{key}_current*.json",
+                       f"{key}__ag_*_live_*.json", f"{key}__ag_*_current*.json"):
             files.update(paths.SESSIONS_DIR.glob(pattern))
-        files.update([_resume_latest_path(cwd), paths.SESSIONS_DIR / f"{key}.json"])
+        files.update([_resume_latest_path(cwd, agent_id),
+                      paths.SESSIONS_DIR / f"{key}.json"])
         records = []
+        now = time.time()
         for path in files:
             if path.is_symlink() or not path.is_file():
                 continue
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
+                # A record past the retention horizon can never rejoin the
+                # tree: every reader discards it by its own timestamp. It
+                # used to be read and parsed anyway (whole conversations,
+                # hundreds of MB on a long-lived cwd) before being skipped.
+                # Recycle it instead; the sidecar keeps a mistaken expiry
+                # reversible and no glob picks the new name up again.
+                if (path in recyclable
+                        and now - path.stat().st_mtime
+                        > _RESUME_MAX_AGE + _RESUME_MTIME_GRACE):
+                    _recycle_expired_session_file(path)
+                    continue
+            except OSError:
                 continue
+            # Only leading metadata feeds the parent/child walk below; a
+            # bounded head read answers for the file without parsing its
+            # chat history.
+            try:
+                st = path.stat()
+                sig = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                continue
+            cached = _SESSION_WALK_CACHE.get(str(path))
+            if cached is not None and cached[0] == sig:
+                data = cached[1]
+            else:
+                data = _read_session_header(path)
+                if data is None:
+                    try:
+                        data = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        continue
+                _SESSION_WALK_CACHE[str(path)] = (sig, data)
             if isinstance(data, dict) and data.get("cwd") == cwd:
                 records.append((path, data))
         sid = session_lifecycle.identity(blob)
@@ -2710,6 +3114,8 @@ def delete_resume_state(cwd: str, blob: dict) -> None:
         for path, _ in targets:
             path.unlink(missing_ok=True)
             _LAST_RESUME_WRITE_FINGERPRINTS.pop(str(path), None)
+            _RESUME_SNAPSHOT_FPS.pop(str(path), None)
+            _SESSION_WALK_CACHE.pop(str(path), None)
 
 
 def load_session_snapshot(cwd: str) -> Optional[dict]:
@@ -3779,7 +4185,17 @@ def get_current_agent() -> Optional[AgentInfo]:
     with _registry_lock:
         if _current_agent_id:
             return _agent_registry.get(_current_agent_id)
-        return None
+
+
+def get_current_agent_id() -> str:
+    """The id of the agent the UI is currently talking to, or "primary".
+
+    The resume/session layer namespaces by this value; defaulting to
+    "primary" keeps every pre-agent call site and legacy file unchanged.
+    """
+    with _registry_lock:
+        current = _current_agent_id
+    return str(current or "primary")
 
 
 # ── Which agent is THIS thread running? ────────────────────────────────────
@@ -5231,11 +5647,26 @@ def _skill_catalog_parts(query: str, base_catalog: str, session) -> tuple[str, s
             metadata = skills_mod.get_all_metadata()
             loaded = set(skills_mod.loaded_skill_names())
             ranked = skill_router.rank_local(str(query or ""), k=limit)
-            names = [name for name, score, _ in ranked if score > 0]
+            def _gated(meta) -> bool:
+                return bool(getattr(meta, "requires_tool", ""))
+
+            names = [name for name, score, _ in ranked if score > 0
+                     and not (name in metadata and _gated(metadata[name])
+                              and not skills_mod.skill_is_available(metadata[name]))]
+            # A skill gated on a tool (`requires_tool`) documents a capability
+            # that is present right now only because the user switched it on —
+            # a connected Windows kernel. Lexical ranking cannot be trusted to
+            # surface it: its text is English, and a request in another
+            # language shares no token with it. Pin it while its tools exist;
+            # it drops out with them.
+            pinned = sorted(
+                name for name, meta in metadata.items()
+                if _gated(meta) and skills_mod.skill_is_available(meta))
             # Relevant available skills get priority. Loaded skills already
             # contribute their full bodies below, so their metadata only fills
             # otherwise-unused catalog slots.
-            names = list(dict.fromkeys([*names, *sorted(loaded)]))[:limit]
+            names = list(dict.fromkeys([*pinned, *names, *sorted(loaded)]))[
+                :limit + len(pinned)]
             if not names:
                 return pointer, ""
             lines = [
@@ -5740,7 +6171,7 @@ def aux_source_chars(task: str) -> int:
 
 def _summary_models() -> tuple:
     return (aux_model_override()[0],
-            str(ctxpol.load().get("summary_review_model") or "deepseek-v4-flash"))
+            str(ctxpol.load().get("summary_review_model") or "priority"))
 
 
 def _summary_output_limit() -> int:
@@ -5889,7 +6320,7 @@ def _llm_review_summary(deps, session, current_path: str, source_text: str,
                     "\n</source-transcript>\n\n<candidate-summary>\n" +
                     candidate.strip() + "\n</candidate-summary>")
         review_model = str(ctxpol.load().get("summary_review_model")
-                           or "deepseek-v4-flash").strip()
+                           or "priority").strip()
         effort = str(get_runtime_config("compact_review_effort") or "none").strip().lower()
         extra = {} if effort == "auto" else {"effort_override": effort}
         if interrupt_event is not None:
@@ -6524,7 +6955,7 @@ def _coordinate_compaction(messages, deps, session, lang, state, *,
     frozen_deps = copy.copy(deps)
     backend = deps.call_backend
     aux_model, aux_provider = aux_model_override()
-    review_model = str(ctxpol.load().get("summary_review_model") or "deepseek-v4-flash")
+    review_model = str(ctxpol.load().get("summary_review_model") or "priority")
     review_effort = str(get_runtime_config("compact_review_effort") or "none")
 
     def frozen_backend(**kwargs):
@@ -7862,7 +8293,7 @@ STATE_KEYS_TURN_ONLY = frozenset({
     "_thread_mode", "_visible_reads", "_read_visible_refusals", "_workflow_phase",
     # Run-scoped identity and bookkeeping. All turn-only by current behaviour:
     # none of them appears in the copy below, so none of them crosses.
-    "_assignment_task", "_evolution_lab_branch", "_max_write_lines",
+    "_assignment_id", "_assignment_task", "_evolution_lab_branch", "_max_write_lines",
     "_overflow_retry", "_parent_agent_id", "_prompt_lab_branch",
     "_prompt_lab_root", "_run_id", "_satisfied_rule_ids", "_require_worktree",
     "_silent_fail_count",
@@ -11437,6 +11868,15 @@ def run_agent_loop(
             _hosted_app_section = ""
         if _hosted_app_section:
             system_prompt = system_prompt.rstrip() + "\n\n" + _hosted_app_section
+        # A connected Windows kernel. Empty unless the win.* tools are
+        # registered, so it can never describe a surface that is not there.
+        try:
+            import windows_tools as _windows_tools
+            _machine_section = _windows_tools.render_prompt_section()
+        except Exception:
+            _machine_section = ""
+        if _machine_section:
+            system_prompt = system_prompt.rstrip() + "\n\n" + _machine_section
         if _prompt_lab_section and not _prompt_lab_has_slot:
             system_prompt = system_prompt.rstrip() + "\n\n" + _prompt_lab_section
         if not _durable_rules_has_slot:

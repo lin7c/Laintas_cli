@@ -77,6 +77,50 @@ class AgentsModeTests(unittest.TestCase):
         start.assert_called_once()
         self.assertEqual(start.call_args.args[0:2], (second.id, "inspect auth"))
 
+    def test_foreground_employee_continues_via_repl_without_new_assignment(self):
+        scout = self._agent("scout")
+        agent_loop.set_current_agent_id(scout.id)
+        scout.chat_history = [{"role": "user", "content": "existing task"}]
+        submit = mock.Mock(return_value=(True, "Sent"))
+        controller = agents_mode.AgentsModeController(
+            "term0", mock.Mock(), {}, repl_submit_cb=submit)
+        controller.select(scout.id)
+        with mock.patch.object(agent_loop, "start_agent_assignment") as start:
+            controller.dispatch("continue that work")
+        submit.assert_called_once_with("continue that work")
+        start.assert_not_called()
+        self.assertEqual(scout.chat_history[0]["content"], "existing task")
+        self.assertEqual(controller._input_action(scout), "continue")
+
+    def test_panel_selection_keeps_foreground_and_shows_new_task_semantics(self):
+        primary = self._agent("primary", role="primary")
+        scout = self._agent("scout")
+        agent_loop.set_current_agent_id(primary.id)
+        controller = agents_mode.AgentsModeController(
+            "term0", mock.Mock(), {}, repl_submit_cb=mock.Mock())
+        controller.select(scout.id)
+        self.assertEqual(agent_loop.get_current_agent_id(), primary.id)
+        hints = "".join(text for _style, text in controller.hint_fragments())
+        self.assertIn("new task", hints)
+        inspector = "".join(text for _style, text in controller.inspector_fragments())
+        self.assertIn("/agent scout", inspector)
+        self.assertIn("/resume", inspector)
+        scout.status = "running"
+        self.assertEqual(controller._input_action(scout), "send update")
+
+    def test_addressing_primary_cannot_inject_into_foreground_scout(self):
+        primary = self._agent("primary", role="primary")
+        scout = self._agent("scout")
+        agent_loop.set_current_agent_id(scout.id)
+        submit = mock.Mock()
+        controller = agents_mode.AgentsModeController(
+            "term0", mock.Mock(), {}, repl_submit_cb=submit)
+        controller.select(scout.id)
+        controller.dispatch("@primary continue your task")
+        submit.assert_not_called()
+        self.assertIn("/agent primary", controller.notice)
+        self.assertEqual(agent_loop.get_current_agent_id(), scout.id)
+
     def test_unsent_drafts_are_isolated_per_selected_agent(self):
         first = self._agent("first")
         second = self._agent("second")

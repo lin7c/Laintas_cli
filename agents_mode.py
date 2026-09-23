@@ -273,6 +273,8 @@ class AgentsModeController:
         return rows
 
     def select(self, agent_id: str) -> bool:
+        # Selection is a view/routing choice, never a foreground session
+        # handoff. `/agent` owns that transition on the REPL thread.
         previous_id = self.selected_id
         if not agent_loop.set_dialog_agent_for_terminal(
                 self.terminal_name, agent_id):
@@ -906,6 +908,8 @@ class AgentsModeController:
         head = [("class:header", f"  {name}")]
         if role and role != "primary":
             head.append(("class:muted", f"  {role}"))
+        if agent_id == agent_loop.get_current_agent_id():
+            head.append(("class:badge", "  foreground"))
         offset = self.focus_scroll[agent_id]
         if offset:
             head.append(("class:badge", f"  {symbols.ARROW_U}{offset}"))
@@ -1003,7 +1007,8 @@ class AgentsModeController:
             keys = [("Alt+" + symbols.ARROW_U + symbols.ARROW_D, "pick"),
                     ("Tab", "close"), ("Esc", "exit")]
         else:
-            keys = [("Enter", "send"),
+            agent = agent_loop.get_agent(self.selected_id)
+            keys = [("Enter", self._input_action(agent)),
                     ("@name", "one-shot"),
                     ("Alt+" + symbols.ARROW_U + symbols.ARROW_D, "agent"),
                     ("Alt+" + symbols.ARROW_L + symbols.ARROW_R, "terminal"),
@@ -1099,6 +1104,21 @@ class AgentsModeController:
             ("class:inspector.value", f"  tools      {tools}\n"),
             ("class:inspector.value", f"  approvals  {approvals}\n"),
         ]
+        turns = sum(isinstance(message, dict)
+                    and message.get("role") == "user"
+                    and message.get("input_kind") not in {"shell", "interactive", "slash"}
+                    for message in (agent.chat_history or []))
+        rows.extend([
+            ("class:inspector.label", "\n  CONVERSATION\n"),
+            ("class:inspector.value", f"  {turns} turn(s) in memory\n"),
+            ("class:inspector.value", f"  Enter: {self._input_action(agent)}\n"),
+        ])
+        if agent.role != "subagent":
+            rows.extend([
+                ("class:muted", "  Continue in the CLI:\n"),
+                ("class:key", f"  /agent {agent.id}\n"),
+                ("class:muted", "  Then /resume for history\n"),
+            ])
         if latest is not None:
             rows.extend([
                 ("class:inspector.label", "\n  LATEST\n"),
@@ -1106,6 +1126,20 @@ class AgentsModeController:
                     latest.summary, 25) + "\n"),
             ])
         return FormattedText(rows)
+
+    def _input_action(self, agent) -> str:
+        if agent is None:
+            return "select an agent"
+        if agent.status in WORKING:
+            return "send update"
+        if (callable(self.repl_submit_cb)
+                and agent.id == agent_loop.get_current_agent_id()):
+            return "continue"
+        if agent.role in {"pool", "deployed"}:
+            return "new task"
+        if agent.role == "primary" and not callable(self.repl_submit_cb):
+            return "continue"
+        return "unavailable"
 
     def header_fragments(self):
         """Identity on the left, a census of the roster on the right.
@@ -1201,12 +1235,17 @@ class AgentsModeController:
                 self.notice = self.execution_block_reason
                 self.invalidate()
                 return
-            if agent.role == "primary":
+            if (callable(self.repl_submit_cb)
+                    and agent.id == agent_loop.get_current_agent_id()):
+                # The foreground can be scout/foreman too. Starting a new
+                # assignment here would reset its history behind the REPL.
+                ok, detail = self.repl_submit_cb(text)
+                self.notice = detail or "Sent"
+            elif agent.role == "primary":
                 if callable(self.repl_submit_cb):
-                    # The outer REPL loop runs this as a dialogue message for
-                    # the Agent; this view only displays the mirrored result.
-                    ok, detail = self.repl_submit_cb(text)
-                    self.notice = detail or "Sent"
+                    self.notice = (
+                        f"Exit Agents Mode and use /agent {agent.id} to continue "
+                        "this conversation")
                 elif not callable(self.primary_submit_cb):
                     self.notice = "Primary runtime is unavailable"
                 else:
@@ -1221,7 +1260,8 @@ class AgentsModeController:
                 ok, detail, _assignment = agent_loop.start_agent_assignment(
                     agent.id, text, self._deps_for(agent.id), self.session,
                     events_cb=self.external_events_cb)
-                self.notice = (f"Started {agent.name or agent.id}" if ok else detail)
+                self.notice = (f"Started new task for {agent.name or agent.id}"
+                               if ok else detail)
         else:
             self.notice = f"Agent state '{agent.status}' cannot accept input"
         self.invalidate()
@@ -1418,9 +1458,13 @@ class AgentsModeController:
 
     def resolve_agent(self, reference: str) -> str:
         folded = reference.casefold()
-        matches = [a.id for a in self.agents()
-                   if a.id.casefold() == folded
-                   or str(a.name or "").casefold() == folded]
+        # Search every live Agent scoped to this terminal, not just the rail:
+        # the deployed primary is hidden from the rail but still addressable.
+        matches = [a.id for a in agent_loop.get_all_agents()
+                   if agent_loop.agent_scope_terminal(a) == self.terminal_name
+                   and not a.lifecycle_terminated
+                   and (a.id.casefold() == folded
+                   or str(a.name or "").casefold() == folded)]
         return matches[0] if len(matches) == 1 else ""
 
     def scroll(self, delta: int) -> None:

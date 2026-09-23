@@ -126,7 +126,14 @@ _DEFAULT_CONFIG = {
         # `-Command` / `/c` payload, so these match the launcher AND anything
         # hidden behind it.
         r"(?i)(?:^|[;&|]\s*|\n\s*)(?:\S*[/\\])?(?:powershell|pwsh)(?:\.exe)?\s",
-        r"(?i)(?:^|[;&|]\s*|\n\s*)(?:\S*[/\\])?cmd(?:\.exe)?\s+/[ck]\b",
+        # Any cmd at all, not just `cmd /c`: it takes its run switch in forms
+        # a pattern cannot enumerate (`//c` from msys, `/s /c`, `/q/c`,
+        # `/cX`, a quoted "/c X") and runs whatever arrives on stdin.
+        r"(?i)(?:^|[;&|]\s*|\n\s*)(?:\S*[/\\])?cmd(?:\.exe)?(?=\s|$|[;&|<>)])",
+        # Windows' other ways of running a command or script by proxy.
+        r"(?i)(?:^|[;&|]\s*|\n\s*)(?:\S*[/\\])?(?:forfiles|conhost|wscript|cscript"
+        r"|pcalua|msbuild|installutil|cmstp|regasm|regsvcs|odbcconf|msxsl"
+        r"|scriptrunner)(?:\.exe)?(?=\s|$|[;&|<>)])",
         r"(?i)(?:^|[;&|]\s*|\n\s*)(?:\S*[/\\])?wsl(?:\.exe)?\s",
         r"(?i)\breg(?:\.exe)?\s+(?:add|delete|import|load|unload)\b",
         r"(?i)\breg(?:istry)?::",

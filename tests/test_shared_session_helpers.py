@@ -57,7 +57,9 @@ class PersistSessionStateTests(unittest.TestCase):
             live = laintas_cli._persist_session_state(
                 {"k": 1}, [], "/work", {"id": "live"}, tasks=[])
         snapshot.assert_called_once_with({"k": 1}, [], "/work")
-        resume.assert_called_once_with({"k": 1}, [], "/work")
+        resume.assert_called_once_with(
+            {"k": 1}, [], "/work",
+            agent_id=laintas_cli.get_current_agent_id())
         sync.assert_called_once_with(
             {"id": "live"}, {"k": 1}, [], cwd="/work", tasks=[])
         self.assertEqual(live, {"id": "synced"})

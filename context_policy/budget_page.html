@@ -1,0 +1,1126 @@
+<!doctype html>
+<html lang="__LANG__">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<!--
+  Context budget page — shared by Helpwo and laintas_cli.
+  Source of truth: Helpwo/src/context/budget-tuner.html. laintas_cli keeps a
+  byte-identical copy (context_policy/budget_page.html); edit here, copy there.
+  Helpwo writes it to the hidden workspace file .budget.html and shows it in
+  its preview, where "Apply" hands the settings back to Helpwo; the CLI writes
+  a file for any browser and downloads a .config for `/config import`.
+-->
+<style>
+:root{
+  --bg:#f3f4f6;--panel:#ffffff;--panel2:#f7f8fa;--ink:#15171c;--dim:#606774;--faint:#99a0ac;--line:#e3e6eb;--line2:#d3d8df;
+  --accent:#3b6ef5;--accent-soft:#e9effe;--ok:#1f9d63;--cut:#e0464b;--cut-soft:#fdecec;--warn:#c9761a;--warn-soft:#fdf2e3;
+  --shadow:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.06);
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  color-scheme:light;
+}
+@media (prefers-color-scheme: dark){:root:not([data-helpwo-theme="light"]){
+  --bg:#0e1014;--panel:#161920;--panel2:#1b1f27;--ink:#e8eaef;--dim:#9aa2b0;--faint:#687080;--line:#262b34;--line2:#333946;
+  --accent:#7196ff;--accent-soft:#1b2542;--cut-soft:#3a1c1f;--warn-soft:#382813;--shadow:none;color-scheme:dark;
+}}
+:root[data-helpwo-theme="dark"]{
+  --bg:#0e1014;--panel:#161920;--panel2:#1b1f27;--ink:#e8eaef;--dim:#9aa2b0;--faint:#687080;--line:#262b34;--line2:#333946;
+  --accent:#7196ff;--accent-soft:#1b2542;--cut-soft:#3a1c1f;--warn-soft:#382813;--shadow:none;color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font:13.5px/1.5 system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+body{display:flex;flex-direction:column;overflow:hidden}
+button,input,select{font:inherit;color:inherit}
+button{cursor:pointer}
+/* ── header ───────────────────────────────────────────────────────── */
+header.top{flex:none;display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
+.brand{flex:1;min-width:200px}
+.brand h1{font-size:15.5px;margin:0}
+.brand .meta{font-size:12px;color:var(--dim)}
+.stats{display:flex;gap:6px;flex-wrap:wrap}
+.stat{display:flex;flex-direction:column;padding:3px 10px;border-radius:9px;background:var(--panel2);border:1px solid var(--line);min-width:96px}
+.stat .k{font-size:11px;color:var(--dim)} .stat .v{font-size:15px;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
+.stat.bad .v{color:var(--cut)} .stat.good .v{color:var(--ok)}
+.stat .d{font-size:11px;font-weight:600;margin-left:5px}
+.up{color:var(--ok)} .down{color:var(--cut)}
+.actions{display:flex;gap:8px}
+.btn{border:1px solid var(--line2);background:var(--panel);border-radius:8px;padding:6px 12px;font-size:13px;white-space:nowrap}
+.btn:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover:not(:disabled){color:#fff;filter:brightness(1.08)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+/* ── three panes ──────────────────────────────────────────────────── */
+.app{flex:1;min-height:0;display:grid;grid-template-columns:250px minmax(0,1fr) 360px;position:relative}
+.app.notree{grid-template-columns:0 minmax(0,1fr) 360px}
+.pane{min-height:0;overflow:auto}
+nav.tree{background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column}
+.app.notree nav.tree{visibility:hidden;border:0}
+.treehead{display:flex;align-items:center;gap:6px;padding:10px 12px 6px;font-weight:650;font-size:13px;position:sticky;top:0;background:var(--panel);z-index:1}
+.treehead .sp{flex:1}
+.treehead label{font-weight:400;font-size:11.5px;color:var(--dim);display:flex;gap:4px;align-items:center;cursor:pointer}
+.trow{display:flex;align-items:center;gap:6px;height:27px;padding:0 10px 0 calc(8px + var(--ind) * 14px);cursor:pointer;font-size:12.5px;border-left:2px solid transparent;white-space:nowrap;user-select:none}
+.trow:hover{background:var(--panel2)}
+.trow.sel{background:var(--accent-soft);border-left-color:var(--accent)}
+.trow.viewing .tname{font-weight:700}
+.trow.absent{color:var(--faint)}
+.caret{width:14px;flex:none;text-align:center;color:var(--dim);font-size:10px;border:0;background:none;padding:0;height:20px}
+.caret.none{visibility:hidden}
+.tsw{width:9px;height:9px;border-radius:2px;flex:none}
+.tname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.tpct{color:var(--ink);font-variant-numeric:tabular-nums;font-size:11.5px;min-width:38px;text-align:right}
+.ttok{color:var(--faint);font-variant-numeric:tabular-nums;font-size:11px;min-width:40px;text-align:right}
+.tdot{width:6px;height:6px;border-radius:50%;flex:none}
+.tdot.cut{background:var(--cut)} .tdot.contains{background:var(--warn)}
+section.stage{display:flex;flex-direction:column;min-width:0;min-height:0}
+.toolbar{flex:none;display:flex;align-items:center;gap:6px;padding:10px 16px 8px;flex-wrap:wrap}
+.tb{border:1px solid var(--line2);background:var(--panel);border-radius:7px;height:28px;min-width:30px;padding:0 8px;display:inline-flex;align-items:center;justify-content:center;gap:4px;font-size:12.5px}
+.tb:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+.tb:disabled{opacity:.4;cursor:default}
+.tb.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.crumbs{display:flex;align-items:center;flex-wrap:wrap;gap:2px;margin-left:4px;font-size:13px;min-width:0}
+.crumbs button{border:0;background:none;padding:2px 5px;border-radius:5px;color:var(--accent)}
+.crumbs button:hover{background:var(--accent-soft)}
+.crumbs .here{font-weight:700;padding:2px 5px}
+.crumbs .sep{color:var(--faint)}
+.toolbar .hint{margin-left:auto;font-size:11.5px;color:var(--faint);white-space:nowrap}
+.viewhead{flex:none;padding:0 16px 8px;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.viewhead .t{font-size:17px;font-weight:700}
+.viewhead .s{font-size:12px;color:var(--dim)}
+.viewhead .s b{color:var(--ink)}
+/* ── the partition canvas: blocks inside blocks ──────────────────── */
+.canvas{position:relative;flex:1;min-height:320px;margin:0 16px;border-radius:12px;background:var(--panel2);border:1px solid var(--line2);overflow:hidden;user-select:none}
+.band{position:absolute;left:0;right:0;overflow:hidden;cursor:pointer}
+.band>.bg{position:absolute;inset:0;background:var(--c);opacity:.10;pointer-events:none}
+.band:hover>.bg{opacity:.17}
+.band.d0{box-shadow:inset 4px 0 0 var(--c)}
+.band.d1,.band.d2{left:12px;right:6px;border-radius:7px;border:1px solid color-mix(in srgb,var(--c) 45%,transparent)}
+.band.d1>.bg{opacity:.14} .band.d2>.bg{opacity:.2}
+.band.fixed>.bg{opacity:.07;background-image:repeating-linear-gradient(135deg,transparent 0 6px,color-mix(in srgb,var(--faint) 30%,transparent) 6px 12px)}
+.band.free{cursor:default}
+.band.free>.bg{opacity:0}
+.band.free.d0{box-shadow:none;background:repeating-linear-gradient(135deg,transparent 0 8px,color-mix(in srgb,var(--line2) 55%,transparent) 8px 9px)}
+.band.sel{z-index:2}
+.band.sel::after{content:"";position:absolute;inset:0;border:2px solid var(--c);border-radius:inherit;pointer-events:none}
+.hd{position:relative;display:flex;align-items:center;gap:8px;height:28px;padding:0 12px 0 14px;font-size:13px;white-space:nowrap}
+.d1>.hd,.d2>.hd{height:21px;padding:0 8px;font-size:11.5px;gap:6px}
+.hd .sw{width:9px;height:9px;border-radius:2px;background:var(--c);flex:none}
+.hd .nm{font-weight:650;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.d2>.hd .nm{font-weight:550}
+.hd .tok{font-size:11.5px;color:var(--dim);font-variant-numeric:tabular-nums}
+.hd .pct{margin-left:auto;font-weight:750;font-variant-numeric:tabular-nums;font-size:14.5px}
+.d1>.hd .pct,.d2>.hd .pct{font-size:11.5px;font-weight:650}
+.meter{position:relative;width:54px;height:6px;border-radius:3px;background:color-mix(in srgb,var(--c) 22%,transparent);overflow:hidden;flex:none}
+.meter i{position:absolute;left:0;top:0;bottom:0;background:var(--c)}
+.meter.over{background:color-mix(in srgb,var(--cut) 25%,transparent)} .meter.over i{background:var(--cut)}
+.d2 .meter,.d2 .tok{display:none}
+.pill{font-size:10.5px;font-weight:700;padding:0 7px;border-radius:999px;line-height:17px;white-space:nowrap}
+.pill.cut{background:var(--cut);color:#fff} .pill.contains{background:var(--warn-soft);color:var(--warn)}
+.pill.fixed{background:var(--panel);color:var(--dim);border:1px solid var(--line2)} .pill.absent{background:var(--panel2);color:var(--faint)}
+.pill.pin{background:var(--accent-soft);color:var(--accent)}
+.d2 .pill{display:none}
+.enter{border:1px solid var(--line2);background:var(--panel);border-radius:6px;font-size:11.5px;line-height:18px;padding:0 7px;color:var(--accent)}
+.enter:hover{background:var(--accent-soft)}
+.band.tiny>.hd{height:100%;min-height:0}
+.band.tiny>.hd .tok,.band.tiny>.hd .meter,.band.tiny>.hd .pill,.band.tiny>.hd .enter{display:none}
+.band.micro>.hd{visibility:hidden}
+.inner{position:absolute;left:0;right:0;bottom:6px}
+.divider{position:absolute;left:0;right:0;height:0;z-index:5}
+.divider::before{content:"";position:absolute;left:0;right:0;top:-1px;border-top:2px solid color-mix(in srgb,var(--ink) 50%,transparent)}
+.divider.fixedline::before{border-top:1px dashed var(--line2)}
+.divider .grip{position:absolute;left:50%;top:-9px;transform:translateX(-50%);width:52px;height:18px;border-radius:9px;background:var(--panel);border:1px solid var(--line2);box-shadow:var(--shadow);cursor:row-resize;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px}
+.divider .grip i{width:18px;height:2px;border-radius:1px;background:var(--dim);display:block}
+.divider .grip:hover,.divider.drag .grip{border-color:var(--accent);background:var(--accent-soft)}
+.divider .hit{position:absolute;left:0;right:0;top:-6px;height:12px;cursor:row-resize}
+.dragtip{position:absolute;right:14px;z-index:8;background:var(--ink);color:var(--bg);font-size:12px;padding:3px 9px;border-radius:7px;pointer-events:none;font-variant-numeric:tabular-nums;transform:translateY(-50%);white-space:nowrap}
+.legend{flex:none;display:flex;gap:14px;flex-wrap:wrap;padding:8px 16px 12px;font-size:11.5px;color:var(--dim)}
+.legend i{display:inline-block;width:16px;height:7px;border-radius:2px;margin-right:5px;vertical-align:1px}
+/* ── inspector ────────────────────────────────────────────────────── */
+aside.side{background:var(--panel);border-left:1px solid var(--line);display:flex;flex-direction:column}
+.sec{padding:12px 14px;border-bottom:1px solid var(--line)}
+.sec:last-child{border-bottom:0}
+.sec h2,.sec summary{font-size:13px;margin:0;font-weight:650;display:flex;align-items:center;gap:8px}
+.sec summary{cursor:pointer;list-style:none}
+.sec summary::-webkit-details-marker{display:none}
+.sec summary::before{content:"▸";color:var(--faint);font-size:11px}
+details[open]>summary::before{content:"▾"}
+.sec summary .sp,.sec h2 .sp{flex:1}
+.ihead{display:flex;align-items:center;gap:8px;font-size:15px;font-weight:700}
+.ihead .sw{width:11px;height:11px;border-radius:3px;flex:none}
+.ipath{font:11.5px var(--mono);color:var(--faint);margin-top:2px;word-break:break-all}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:12.5px;margin:10px 0 4px}
+.kv .k{color:var(--dim)} .kv .v{font-variant-numeric:tabular-nums}
+.share{margin-top:10px;padding:10px;border-radius:9px;background:var(--panel2);border:1px solid var(--line)}
+.share .lbl{font-size:12px;color:var(--dim);margin-bottom:6px}
+.share .ctl{display:flex;align-items:center;gap:8px}
+.share input[type=range]{flex:1;accent-color:var(--c,var(--accent));min-width:0}
+.num{width:66px;text-align:right;border:1px solid var(--line2);border-radius:7px;background:var(--panel);padding:2px 6px;font-variant-numeric:tabular-nums}
+.num:focus{outline:2px solid var(--accent-soft);border-color:var(--accent)}
+.lock{border:1px solid var(--line2);background:var(--panel);border-radius:7px;height:26px;padding:0 7px;font-size:12px;color:var(--dim);white-space:nowrap}
+.lock.on{border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}
+.note{font-size:12px;color:var(--dim);margin-top:8px}
+.note.warn{color:var(--warn)}
+.note.warn:empty{display:none}
+.adv{display:grid;grid-template-columns:auto 1fr;gap:8px 12px;align-items:center;font-size:12.5px;margin-top:8px}
+.adv input[type=number],.adv select{border:1px solid var(--line2);border-radius:7px;background:var(--panel2);padding:3px 7px;width:100%}
+.adv input[type=range]{width:100%;accent-color:var(--accent)}
+.adv .full{grid-column:1 / -1}
+.kids{margin-top:8px;display:flex;flex-direction:column;gap:2px}
+.kid{display:flex;align-items:center;gap:8px;font-size:12.5px;padding:3px 6px;border-radius:6px;cursor:pointer}
+.kid:hover{background:var(--panel2)}
+.kid .tpct{margin-left:auto}
+.tabs{display:flex;gap:4px;margin:8px 0 6px}
+.tab{border:1px solid var(--line2);background:var(--panel2);border-radius:7px;padding:2px 10px;font-size:12px}
+.tab.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.textmap{white-space:pre-wrap;word-break:break-word;background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:10px;max-height:min(52vh,520px);overflow:auto;font:12px/1.55 var(--mono);margin:6px 0 0}
+.textmap .k{background:color-mix(in srgb,var(--c) 24%,transparent);border-radius:2px}
+.textmap .t{background:color-mix(in srgb,var(--c) 9%,transparent)}
+.textmap .x{color:var(--faint);opacity:.7}
+.tlegend{display:flex;gap:12px;font-size:11.5px;color:var(--dim);flex-wrap:wrap}
+.tlegend i{display:inline-block;width:12px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+.chg{display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px dashed var(--line);font-size:12px}
+.chg:last-child{border-bottom:0}
+.chg .what{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
+.chg .from{color:var(--faint);text-decoration:line-through;font-variant-numeric:tabular-nums}
+.chg .to{color:var(--accent);font-weight:650;font-variant-numeric:tabular-nums}
+.link{border:0;background:none;color:var(--accent);font-size:12px;padding:0}
+.err{color:var(--cut);font-size:12px;margin-top:6px}
+.err:empty{display:none}
+.hint{font-size:12px;color:var(--dim)}
+.toolgrid{display:grid;grid-template-columns:1fr auto auto;gap:3px 12px;font-size:12px;margin-top:8px}
+.toolgrid .drop{color:var(--cut);text-decoration:line-through}
+.thbar{position:relative;height:18px;border-radius:6px;background:var(--panel2);border:1px solid var(--line2);margin:12px 0 30px}
+.thbar .used{position:absolute;left:0;top:0;bottom:0;border-radius:6px;background:color-mix(in srgb,var(--ok) 45%,transparent)}
+.thbar .mk{position:absolute;top:-4px;bottom:-4px;width:2px;background:var(--ink)}
+.thbar .mk span{position:absolute;top:24px;left:-40px;width:80px;text-align:center;font-size:10.5px;color:var(--dim)}
+.toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:8px 14px;border-radius:9px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:50;max-width:80vw}
+.toast.show{opacity:.96}
+.empty{padding:14px 0;color:var(--dim);font-size:12.5px}
+/* narrower: the tree becomes a drawer over the canvas */
+@media (max-width:1100px){
+  .app,.app.notree{grid-template-columns:minmax(0,1fr) 330px}
+  nav.tree{position:absolute;left:0;top:0;bottom:0;width:260px;z-index:30;box-shadow:0 8px 30px rgba(0,0,0,.25)}
+  .app.notree nav.tree{display:none}
+  .toolbar .hint{display:none}
+}
+@media (max-width:760px){
+  body{overflow:auto;height:auto}
+  .app,.app.notree{display:block}
+  .canvas{height:440px;flex:none}
+  aside.side{border-left:0;border-top:1px solid var(--line)}
+  nav.tree{position:fixed}
+}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><h1 id="title"></h1><div class="meta" id="meta"></div></div>
+  <div class="stats" id="stats"></div>
+  <div class="actions"><button class="btn" id="undo-all"></button><button class="btn primary" id="primary"></button></div>
+</header>
+<div class="app" id="app">
+  <nav class="tree pane" id="tree"></nav>
+  <section class="stage">
+    <div class="toolbar" id="toolbar"></div>
+    <div class="viewhead" id="viewhead"></div>
+    <div class="canvas" id="canvas"></div>
+    <div class="legend" id="legend"></div>
+  </section>
+  <aside class="side pane">
+    <div class="sec" id="inspector"></div>
+    <details class="sec" id="changes-wrap" open><summary id="changes-title"></summary><div id="changes"></div></details>
+    <details class="sec" id="advanced"><summary id="adv-title"></summary><div id="adv-body"></div></details>
+  </aside>
+</div>
+<div class="toast" id="toast"></div>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+"use strict";
+const D = JSON.parse(document.getElementById("data").textContent);
+const CLI = D.mode === "cli";
+const $ = (id) => document.getElementById(id);
+
+// ── Words ────────────────────────────────────────────────────────────────
+const ZH = {
+  title: "上下文预算", request: "请求", captured: "采集于", window: "窗口", model: "模型",
+  stats: {cut: "将被压缩", saved: "省略", conv: "对话实际可用"}, blocks: (n) => `${n} 个块`,
+  apply: "应用到 Helpwo", applyNeedsHelpwo: "请在 Helpwo 设置里点「预算」打开此页，再应用", download: "下载 .config",
+  undo: "撤销修改", defaults: "恢复出厂默认",
+  nav: {back: "后退", up: "上一级", enter: "进入", tree: "结构树", hint: "单击选中 · 双击进入 · Backspace 返回上一级"},
+  overview: "概览", root: "上下文窗口", input: "输入预算", output: "输出预留", conv: CLI ? "对话历史" : "对话与工具",
+  untagged: "未标注文本", free: "空闲",
+  viewSum: (b, c) => `预算 <b>${b}</b> · 内容 <b>${c}</b>`, viewWhole: (w) => `整个窗口 <b>${w}</b> · 双击进入`,
+  pill: {cut: "将被压缩", contains: "子块压缩", fixed: "🔒 不压缩", absent: "本次未出现", pin: "已锁定"},
+  moreFields: "更多参数（保底 / 超出时 / 原始权重）", treeTitle: "结构树", showAbsent: "显示未出现的块", treeCols: "占父块 · tokens",
+  quota: "份额", content: "内容", sent: "预计发送", atCapture: "采集时", ofParent: (n) => `占「${n}」的比例`,
+  flexOf: (n) => `在「${n}」可分配部分中的比例`, lock: "锁定", lockTip: "锁定后，调整其它块时这个块的比例保持不变",
+  lockedDrag: "这条分割线旁边有锁定的块，先解锁再拖动",
+  floor: "保底 tokens", shrink: "超出时", share: "原始权重",
+  shrinkNames: {none: "不压缩", truncate: "保留开头", tail: "保留结尾", drop: "整块丢弃", narrow: "按工具裁剪", compact: "对话压缩"},
+  fixedNote: "这个块按实际大小占用，不参与比例分配，也不会被压缩。",
+  untaggedNote: "父块里没有被标签包住的文字，按实际大小占用，始终完整发送。",
+  freeNote: "份额里没有被内容用掉的部分。父块没超出时，子块不受比例约束。",
+  outputEff: (set, eff) => `设定 ${set} · 实际 ${eff}`,
+  reasons: {floor: (m) => `低于保底 ${m} tokens，按保底计（可在下面的更多参数里调低保底）`, cap: (m) => `受模型最大输出 ${m} tokens 限制，再调大不会生效`, window: () => "不能超过整个窗口",
+    pinned: (f, c) => `保底 ${f} tokens 高于模型最大输出 ${c}，输出预留固定为 ${c}；拖动或调小比例会一并降低保底`},
+  pctWord: "比例", capNote: (c) => `已到模型最大输出 ${c} tokens，不能再大；往小调会同时降低保底`,
+  capTip: (c) => `模型最大输出 ${c}`,
+  minNote: (m) => `保底 ${m} tokens 生效，比例再调小也不会变小`,
+  rootNote: "整个上下文窗口：先给模型的回答留出输出预留，剩下的是输入预算。双击或点「进入」查看分区。",
+  inputNote: "输入预算按比例分给各块，剩下的留给对话。改动一个块时，对话部分先让出或补上；对话用完后，其它未锁定的块按比例让出。",
+  convNote: CLI ? "对话拿走输入预算里其它块剩下的部分；达到下面的比例时开始压缩。" : "对话和工具定义拿走输入预算里其它块剩下的部分。",
+  convActual: (x) => `其它块没用满的部分也归对话，所以实际可用约 ${x}`,
+  textTitle: "原文", textLegendKept: "按当前设置会发送", textLegendCut: "会被省略",
+  tabNow: "按当前设置", tabSent: "采集时发送", noText: "这个块没有文字内容。", cutAt: (n) => `省略约 ${n} tokens`,
+  children: "子块",
+  changes: "修改", noChanges: "还没有修改。拖动分割线，或在右侧调整比例。",
+  advanced: "高级设置", hysteresis: "释放阈值", hysteresisDesc: "块被压缩后，要降到份额的这个比例以下才恢复完整，避免每轮来回切换打乱缓存。",
+  scalarNames: {assumed_window: "默认窗口", assumed_summary_window: "默认摘要窗口", chars_per_token: "每 token 字符数"},
+  applied: (n) => `已应用到 Helpwo（${n} 项自定义），下一轮对话生效`, applyFail: "应用失败：",
+  stalePage: "这个页面不是 Helpwo 最近生成的那份（可能被改过或已过期）。请在设置里点「预算」重新打开。",
+  compactOrder: "对话压缩阈值需满足 目标 < 后台 < 前台 ≤ 1。",
+  threadMarks: {compact_target: "压缩目标", compact_background: "后台压缩", compact_foreground: "前台压缩"},
+  threadNow: (u, t) => `当前对话 ${u} / 可用 ${t}`, itemCaps: "单项上限（占对话预算的比例）",
+  toolsKept: (k, n) => `保留 ${k} / ${n} 个工具`, core: "核心",
+  aux: "辅助调用（摘要 / 审阅 / 记忆提取）",
+  legend: ["色条：内容占份额", "红色：超出份额", "斜纹：按实际大小", "块中块：下一级分区"],
+  empty: "还没有采集到请求。先进行一次对话，再打开这个页面，就能看到每个块的实际内容。",
+  names: {system:"系统提示词",platform_safety_policy:"平台安全策略",role:"角色设定",authority:"权限说明",environment:"运行环境",context:"记忆与规则",persistentMemory:"持久记忆",durableRules:"长期规则",globalMemory:"全局记忆",skills:"技能",skillContext:"已加载技能",capabilities:"能力说明",tools:"工具定义",execution:"执行模式",workflowPhase:"工作流阶段",rolePrompt:"角色提示",confidenceGuidance:"置信度指引",orchestration:"编排上下文",verification:"验证要求",completion:"完成标准",safety:"安全规则",durable_user_rules:"用户长期规则",durable_rule_protocol:"规则协议",runtime_ownership:"运行时归属",harness_reminders:"运行提醒",intent_alignment:"意图对齐",laintas_product_protocol:"产品协议",work_orchestration:"任务编排",terminal_output_style:"终端输出风格",hwo_prompt_overlay:"HWO 提示覆盖",live:"本轮状态",task:"当前任务",objective:"目标",progress:"进度",warnings:"警告",session_memory:"会话记忆",relevant_skills:"相关技能",sub_terminals:"子终端",delegated_work:"委派工作",files_seen:"已读文件",active_tasks:"进行中任务",environment_now:"当前环境",now:"当前时间",workflow_phase:"工作流阶段",behavior_diagnostics:"行为诊断",role_identity:"角色身份",thread:"对话历史",recent_tail:"最近消息",tool_result:"单条工具结果",read_page:"读取分页",web_fetch:"网页抓取",grep_line:"搜索单行",pruned_output:"裁剪后的输出",output:"输出预留",aux:"辅助调用",summary:"摘要",critic:"审阅",mem_extract:"记忆提取",margin:"余量",source:"源材料"},
+};
+const EN = {
+  title: "Context budget", request: "request", captured: "captured", window: "window", model: "model",
+  stats: {cut: "compressed", saved: "left out", conv: "conversation, actual"}, blocks: (n) => `${n} block${n === 1 ? "" : "s"}`,
+  apply: "Apply to Helpwo", applyNeedsHelpwo: "Open this page with Budget in Helpwo's settings to apply it", download: "Download .config",
+  undo: "Undo changes", defaults: "Shipped defaults",
+  nav: {back: "Back", up: "Up", enter: "Open", tree: "Tree", hint: "click selects · double-click opens · Backspace goes up"},
+  overview: "Overview", root: "Context window", input: "Input budget", output: "Output reserve", conv: CLI ? "Conversation" : "Conversation & tools",
+  untagged: "Untagged text", free: "free",
+  viewSum: (b, c) => `budget <b>${b}</b> · content <b>${c}</b>`, viewWhole: (w) => `the whole window, <b>${w}</b> · double-click to open`,
+  pill: {cut: "compressed", contains: "child compressed", fixed: "🔒 never cut", absent: "not in this request", pin: "locked"},
+  moreFields: "More (floor / when over / raw weight)", treeTitle: "Structure", showAbsent: "show absent blocks", treeCols: "of parent · tokens",
+  quota: "quota", content: "content", sent: "would send", atCapture: "at capture", ofParent: (n) => `share of “${n}”`,
+  flexOf: (n) => `share of what “${n}” splits`, lock: "Lock", lockTip: "Locked: keeps this share when others are adjusted",
+  lockedDrag: "A block next to this divider is locked; unlock it to drag",
+  floor: "floor (tokens)", shrink: "when over", share: "raw weight",
+  shrinkNames: {none: "never cut", truncate: "keep the start", tail: "keep the end", drop: "drop whole", narrow: "drop tools", compact: "compaction"},
+  fixedNote: "This block takes its real size; it is not split by share and never cut.",
+  untaggedNote: "Text in the parent outside any tag. It takes its real size and is always sent whole.",
+  freeNote: "Room in the quota no content uses. Until the parent is over its budget, children are not held to their shares.",
+  outputEff: (set, eff) => `set ${set} · in effect ${eff}`,
+  reasons: {floor: (m) => `below the ${m}-token floor, so the floor applies`, cap: (m) => `capped at the model's ${m}-token maximum output; larger has no effect`, window: () => "cannot exceed the window",
+    pinned: (f, c) => `the ${f}-token floor is above the model's ${c}-token maximum output, so the reserve stays at ${c}; dragging or lowering the share brings the floor down with it`},
+  pctWord: "share", capNote: (c) => `At the model's maximum output of ${c} tokens; it cannot go higher. Making it smaller lowers the floor with it.`,
+  capTip: (c) => `model max output ${c}`,
+  minNote: (m) => `the ${m}-token floor applies; a smaller share makes no difference`,
+  rootNote: "The whole context window: the output reserve is kept for the model's answer; the rest is the input budget. Double-click or press Open to see the partitions.",
+  inputNote: "The input budget is shared out to the blocks; what is left goes to the conversation. Changing one block takes from, or gives to, the conversation first; once that is used up, the other unlocked blocks give way in proportion.",
+  convNote: CLI ? "The conversation gets what the other blocks leave of the input budget; compaction starts at the fractions below." : "The conversation and tool schemas get what the other blocks leave of the input budget.",
+  convActual: (x) => `Room the other blocks leave unused also goes to the conversation, so about ${x} is actually available`,
+  textTitle: "Original text", textLegendKept: "sent with these settings", textLegendCut: "left out",
+  tabNow: "These settings", tabSent: "Sent at capture", noText: "This block has no text.", cutAt: (n) => `about ${n} tokens left out`,
+  children: "Children",
+  changes: "Changes", noChanges: "No changes yet. Drag a divider, or adjust a share on the right.",
+  advanced: "Advanced", hysteresis: "release band", hysteresisDesc: "Once compressed, a block is released only below this fraction of its quota, so it does not flip every turn (which costs the cache).",
+  scalarNames: {assumed_window: "assumed window", assumed_summary_window: "assumed summary window", chars_per_token: "chars per token"},
+  applied: (n) => `Applied to Helpwo (${n} custom setting${n === 1 ? "" : "s"}); takes effect from the next turn`, applyFail: "Could not apply: ",
+  stalePage: "This page is not the one Helpwo generated last (it was edited, or is out of date). Open it again with Budget in the settings.",
+  compactOrder: "Compaction needs target < background < foreground ≤ 1.",
+  threadMarks: {compact_target: "target", compact_background: "background", compact_foreground: "foreground"},
+  threadNow: (u, t) => `thread now ${u} of ${t}`, itemCaps: "Per-item caps (share of the conversation budget)",
+  toolsKept: (k, n) => `${k} of ${n} tools kept`, core: "core",
+  aux: "Auxiliary calls (summary / critic / memory)",
+  legend: ["bar: content vs quota", "red: over its share", "hatched: real size", "block in block: the next level"],
+  empty: "No request has been captured yet. Run a turn first, then open this page again to see every block's real content.",
+  names: {system: "System prompt", live: "Live state", output: "Output reserve", thread: "Conversation", tools: "Tool schemas", aux: "Auxiliary calls"},
+};
+function pickZh() {
+  const env = window.HelpwoEnv;
+  if (env && env.lang) return env.lang === "CN";
+  if (D.lang === "zh" || D.lang === "en") return D.lang === "zh";
+  return /^zh/i.test(navigator.language || "");
+}
+let L = pickZh() ? ZH : EN;
+
+// ── Settings in force, as edited on this page ──────────────────────────
+const B = D.blocks || {}, cfg = {}, initial = {}, def = {};
+for (const [p, leaves] of Object.entries(D.nodes)) {
+  cfg[p] = {}; initial[p] = {}; def[p] = {};
+  for (const [l, v] of Object.entries(leaves)) { cfg[p][l] = v.value; initial[p][l] = v.value; def[p][l] = v.default; }
+}
+const scal = {}, scalInit = {}, scalDef = {};
+for (const [k, v] of Object.entries(D.scalars || {})) { scal[k] = v.value; scalInit[k] = v.value; scalDef[k] = v.default; }
+const active = new Set(D.activeTrees || ["output", "system", "live"]);
+const TOPS = ["system", "tools", "live"].filter((t) => active.has(t) && cfg[t]);
+const locks = new Set();
+
+const fmt = (n) => { n = Math.max(0, Math.round(n || 0)); return n >= 100000 ? (n / 1000).toFixed(0) + "K" : n >= 10000 ? (n / 1000).toFixed(1) + "K" : n.toLocaleString("en-US"); };
+const pctText = (x) => { const v = (x || 0) * 100; return (Math.abs(v) >= 10 || v === 0 ? v.toFixed(0) : v.toFixed(1)) + "%"; };
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const parentOf = (p) => p.includes(".") ? p.slice(0, p.lastIndexOf(".")) : "";
+const topOf = (p) => p.split(".")[0]; // not `top`: that is window.top
+const share = (p) => (cfg[p] && typeof cfg[p].share === "number") ? cfg[p].share : 0;
+const minOf = (p) => (cfg[p] && typeof cfg[p].min === "number") ? cfg[p].min : 0;
+const shrinkOf = (p) => { let q = p; while (q) { if (cfg[q] && cfg[q].shrink) return cfg[q].shrink; q = parentOf(q); } return "truncate"; };
+const allot = (p, parent) => Math.max(minOf(p), Math.floor(share(p) * Math.max(0, parent)));
+const round4 = (x) => Math.round(x * 10000) / 10000;
+
+// Every block path under the trees this client fits (configured or seen).
+const ALL = new Set();
+for (const p of [...Object.keys(cfg), ...Object.keys(B)]) {
+  const t = topOf(p);
+  if (!(t === "system" || t === "live") || !active.has(t)) continue;
+  let q = p; while (q) { ALL.add(q); q = parentOf(q); }
+}
+const kidsOf = (p) => [...ALL].filter((k) => parentOf(k) === p);
+const blockKids = (p) => Object.keys(B).filter((k) => parentOf(k) === p);
+const isBlock = (id) => ALL.has(id);
+// Where a child's text sits in its parent's: bands and the text map follow it.
+const POS = {};
+for (const k of Object.keys(B)) {
+  const p = parentOf(k), text = p && B[p] ? B[p].original || "" : "";
+  POS[k] = B[k].original && text ? text.indexOf(B[k].original) : -1;
+}
+const posKey = (k) => (POS[k] === undefined || POS[k] < 0 ? 1e12 : POS[k]);
+const byPos = (a, b) => (posKey(a) - posKey(b)) || a.localeCompare(b);
+
+// ── Node identity: the tree the page walks ──────────────────────────────
+// "@" overview (the window as one block) › "" window › output | input ›
+// system | tools | live | thread › configured children …  Pseudo nodes
+// "<p>#rest" (untagged text) and "<p>#free" (unused room) exist only in bands.
+function vparent(id) {
+  if (id === "@") return null;
+  if (id === "") return "@";
+  if (id === "output" || id === "input") return "";
+  if (id === "thread" || TOPS.includes(id)) return "input";
+  if (id.includes("#")) return id.slice(0, id.indexOf("#"));
+  return parentOf(id);
+}
+function nameOf(id) {
+  if (id === "@") return L.overview;
+  if (id === "") return L.root;
+  if (id === "input") return L.input;
+  if (id === "output") return L.output;
+  if (id === "thread") return L.conv;
+  if (id.endsWith("#rest")) return L.untagged;
+  if (id.endsWith("#free")) return L.free;
+  const n = id.split(".").pop();
+  return L.names[n] || n.replace(/_/g, " ").replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, (c) => c.toUpperCase());
+}
+const PALETTE = ["#3b82f6", "#8b5cf6", "#14b8a6", "#f59e0b", "#ec4899", "#22c55e", "#06b6d4", "#6366f1", "#f97316", "#84cc16", "#0ea5e9", "#a855f7", "#10b981", "#eab308", "#f43f5e"];
+const COLOR = {"@": "#6366f1", "": "#6366f1", output: "#64748b", input: "#0ea5e9", system: "#3b82f6", tools: "#8b5cf6", live: "#f59e0b", thread: "#22c55e"};
+{
+  // Stable for the page's life: the order of text in the request, not shares.
+  const parents = new Set([...ALL].map(parentOf).filter(Boolean));
+  for (const p of parents) {
+    const off = [...p].reduce((s, c) => s + c.charCodeAt(0), 0);
+    kidsOf(p).sort(byPos).forEach((k, i) => { COLOR[k] = PALETTE[(i + off) % PALETTE.length]; });
+  }
+}
+const colorOf = (id) => id.includes("#") ? "#94a3b8" : COLOR[id] || "#94a3b8";
+
+// ── Arithmetic: mirrors prompt_budget distribute() / fit() ─────────────
+function distribute(budget, naturals) {
+  const res = {}; let remaining = budget; const flex = [];
+  for (const [n, size] of Object.entries(naturals)) {
+    if (n === "\u0000rest" || shrinkOf(n) === "none") { res[n] = size; remaining -= size; } else flex.push(n);
+  }
+  remaining = Math.max(0, remaining); let open = flex.slice();
+  while (open.length) {
+    const w = {}; let tw = 0; for (const n of open) { w[n] = Math.max(share(n), 1e-9); tw += w[n]; }
+    const target = {}; for (const n of open) target[n] = Math.max(minOf(n), Math.floor(remaining * w[n] / tw));
+    const settled = open.filter((n) => naturals[n] <= target[n]);
+    if (!settled.length) { for (const n of open) res[n] = Math.min(naturals[n], target[n]); break; }
+    for (const n of settled) { res[n] = naturals[n]; remaining = Math.max(0, remaining - naturals[n]); open = open.filter((x) => x !== n); }
+  }
+  return res;
+}
+let R = {}, toolKeep = null, PLAN = {}, T = null;
+function simulate(p, budget, enforce) {
+  const nat = B[p].natural, ks = blockKids(p), over = enforce && nat > budget;
+  R[p] = {natural: nat, allotted: enforce ? budget : nat, over, delivered: nat};
+  if (!over) { for (const k of ks) simulate(k, B[k].natural, false); return nat; }
+  const pool = {}; let sum = 0; for (const k of ks) { pool[k] = B[k].natural; sum += B[k].natural; }
+  pool["\u0000rest"] = Math.max(0, nat - sum);
+  const split = distribute(budget, pool); let del = pool["\u0000rest"];
+  for (const k of ks) { const d = simulate(k, split[k], true); del += Math.min(d, split[k]); }
+  if (!ks.length) { const s = shrinkOf(p); del = s === "none" ? nat : (s === "drop" ? 0 : Math.min(nat, budget)); }
+  R[p].delivered = del; return del;
+}
+function compute() {
+  R = {}; PLAN = {};
+  const win = D.window || 0, requested = Math.floor(share("output") * win), floor = minOf("output");
+  let output = Math.max(floor, requested), reason = requested < floor ? "floor" : "";
+  const ceilings = [D.maxOutput, D.maxTokens].filter((x) => x > 0), cap = ceilings.length ? Math.min(...ceilings) : 0;
+  // A floor above the model's cap pins the reserve at the cap both ways.
+  if (cap && output > cap) { reason = requested < cap ? "pinned" : "cap"; output = cap; }
+  if (output > win) { output = win; reason = "window"; }
+  const input = win - output, parts = {system: 0, tools: 0, live: 0}, quotas = {};
+  for (const tp of TOPS) quotas[tp] = allot(tp, input);
+  for (const tp of ["system", "live"]) if (TOPS.includes(tp) && B[tp]) parts[tp] = simulate(tp, quotas[tp], true);
+  toolKeep = null;
+  if (TOPS.includes("tools") && B.tools) {
+    const tb = B.tools, a = quotas.tools, items = tb.items || [];
+    const over = shrinkOf("tools") !== "none" && tb.natural > a; let kept = items.map((i) => i.name);
+    if (over) {
+      const ord = items.slice().sort((x, y) => (x.core === y.core ? x.name.localeCompare(y.name) : (x.core ? -1 : 1)));
+      let used = ord.filter((i) => i.core).reduce((s, i) => s + i.tokens, 0); kept = [];
+      for (const i of ord) { if (i.core) kept.push(i.name); else if (used + i.tokens <= a) { kept.push(i.name); used += i.tokens; } }
+    }
+    toolKeep = new Set(kept);
+    parts.tools = items.length ? items.filter((i) => toolKeep.has(i.name)).reduce((s, i) => s + i.tokens, 0) : tb.natural;
+    R.tools = {natural: tb.natural, allotted: a, over, delivered: parts.tools};
+  }
+  const rest = Math.max(0, input - parts.system - parts.tools - parts.live);
+  const convQuota = Math.max(0, input - TOPS.reduce((s, tp) => s + quotas[tp], 0));
+  const cutPaths = Object.keys(R).filter((p) => R[p].over && R[p].delivered < R[p].natural
+    && !Object.keys(R).some((q) => q !== p && q.startsWith(p + ".") && R[q].over && R[q].delivered < R[q].natural));
+  const saved = ["system", "tools", "live"].reduce((s, tp) => s + (R[tp] ? R[tp].natural - R[tp].delivered : 0), 0);
+  T = {win, output, outputReason: reason, outputCap: cap, outputFloor: floor, input, rest, convQuota, quotas, cutPaths, saved, parts};
+  return T;
+}
+function stateOf(id) {
+  if (!B[id]) return isBlock(id) ? "absent" : "";
+  if (T.cutPaths.includes(id)) return "cut";
+  if (R[id] && R[id].over) return "contains";
+  if (isBlock(id) && shrinkOf(id) === "none") return "fixed";
+  return "";
+}
+// How a block's budget splits among its children — the quota each child
+// would get once the block is over. Fixed children and untagged text take
+// their real size; the rest splits by weight.
+function planOf(p) {
+  if (PLAN[p]) return PLAN[p];
+  const A = quotaOf(p), present = kidsOf(p).filter((k) => B[k]);
+  let fixed = 0; const flex = [];
+  for (const k of present) { if (shrinkOf(k) === "none") fixed += B[k].natural; else flex.push(k); }
+  const restText = B[p] ? Math.max(0, B[p].natural - present.reduce((s, k) => s + B[k].natural, 0)) : 0;
+  const remaining = Math.max(0, A - fixed - restText);
+  const tw = flex.reduce((s, k) => s + Math.max(share(k), 1e-9), 0) || 1;
+  const targets = {};
+  for (const k of flex) targets[k] = Math.max(minOf(k), Math.floor(remaining * Math.max(share(k), 1e-9) / tw));
+  for (const k of present) if (!(k in targets)) targets[k] = B[k].natural;
+  return (PLAN[p] = {A, fixed, restText, remaining, flex: flex.sort(byPos), fixedKids: present.filter((k) => !flex.includes(k)).sort(byPos),
+    targets, present, absent: kidsOf(p).filter((k) => !B[k]).sort()});
+}
+function quotaOf(id) {
+  if (id === "@" || id === "") return T.win;
+  if (id === "output") return T.output;
+  if (id === "input") return T.input;
+  if (id === "thread") return T.convQuota;
+  if (TOPS.includes(id)) return T.quotas[id];
+  if (id.includes("#")) { const lv = partsOf(vparent(id)), f = lv.parts.find((x) => x.id === id); return f ? f.tokens : 0; }
+  const p = parentOf(id);
+  return p ? (planOf(p).targets[id] ?? 0) : 0;
+}
+function contentOf(id) {
+  if (id === "@" || id === "" || id === "output" || id.endsWith("#free")) return null;
+  if (id === "input") return TOPS.reduce((s, tp) => s + (B[tp] ? B[tp].natural : 0), 0) + (CLI && B.thread ? B.thread.natural : 0);
+  if (id === "thread") return CLI && B.thread ? B.thread.natural : null;
+  if (id.endsWith("#rest")) return planOf(vparent(id)).restText;
+  return B[id] ? B[id].natural : 0;
+}
+const enterable = (id) => id === "@" || id === "" || id === "input" || (isBlock(id) && kidsOf(id).some((k) => B[k]));
+// The bands one level shows. kind: whole | abs (share of the parent) |
+// rest (what the others leave) | flex (weight among siblings) | fixed | free.
+function partsOf(id) {
+  if (id === "@") return {id, total: T.win, mode: "whole", parts: [{id: "", kind: "whole", tokens: T.win}]};
+  if (id === "") return {id, total: T.win, mode: "abs", parts: [{id: "output", kind: "abs", tokens: T.output}, {id: "input", kind: "rest", tokens: T.input}]};
+  if (id === "input") {
+    const parts = TOPS.map((tp) => ({id: tp, kind: "abs", tokens: T.quotas[tp]}));
+    parts.push({id: "thread", kind: "rest", tokens: T.convQuota});
+    return {id, total: T.input, mode: "abs", parts};
+  }
+  const plan = planOf(id), parts = [];
+  for (const k of plan.flex) parts.push({id: k, kind: "flex", tokens: plan.targets[k]});
+  for (const k of plan.fixedKids) parts.push({id: k, kind: "fixed", tokens: B[k].natural});
+  if (plan.restText > 0) parts.push({id: id + "#rest", kind: "fixed", tokens: plan.restText});
+  const used = parts.reduce((s, p) => s + p.tokens, 0);
+  if (plan.A > used) parts.push({id: id + "#free", kind: "free", tokens: plan.A - used});
+  return {id, total: Math.max(plan.A, used), budget: plan.A, mode: "flex", parts, plan};
+}
+function flexPct(level) {
+  const ws = level.plan.flex.map((k) => [k, Math.max(share(k), 0)]), tw = ws.reduce((s, [, w]) => s + w, 0) || 1;
+  return Object.fromEntries(ws.map(([k, w]) => [k, w / tw]));
+}
+// The number shown for a part: what its setting means at this level.
+function pctOf(part, level) {
+  if (part.kind === "flex") return flexPct(level)[part.id];
+  if (part.kind === "whole") return 1;
+  return part.tokens / ((level.budget ?? level.total) || 1);
+}
+function partIn(id) {
+  const vp = vparent(id);
+  if (vp === null) return null;
+  const level = partsOf(vp), part = level.parts.find((p) => p.id === id);
+  return part ? {level, part} : null;
+}
+function editableKind(id) {
+  const hit = partIn(id);
+  return hit && (hit.part.kind === "abs" || hit.part.kind === "flex") ? hit.part.kind : "";
+}
+
+// ── The responsive re-split ────────────────────────────────────────────
+function setFlex(level, target, frac, only) {
+  // `only`: trade with just that neighbour (a divider drag); otherwise every
+  // unlocked sibling gives way, or takes up the slack, in proportion.
+  const cur = flexPct(level), keys = Object.keys(cur);
+  const sum0 = keys.reduce((s, k) => s + Math.max(share(k), 0), 0) || 1;
+  const others = only ? [only] : keys.filter((k) => k !== target && !locks.has(k));
+  const lockedSum = keys.filter((k) => k !== target && !others.includes(k)).reduce((s, k) => s + cur[k], 0);
+  const room = only ? cur[target] + cur[only] : Math.max(0, 1 - lockedSum);
+  frac = Math.min(Math.max(0, frac), others.length ? room : cur[target]);
+  const next = {...cur, [target]: frac}, left = room - frac, oSum = others.reduce((s, k) => s + cur[k], 0);
+  for (const k of others) next[k] = oSum > 0 ? cur[k] / oSum * left : left / others.length;
+  for (const k of keys) cfg[k].share = round4(next[k] * sum0);
+}
+// The output reserve is max(floor, share × window) capped at the model's
+// maximum output. With the shipped floor (20K) above a small model's cap the
+// share moved nothing either way — the divider looked dead. So moving it sets
+// the reserve itself: the share, and the floor brought down with it when it
+// is in the way; the model's cap is a hard stop, said so on the page.
+const atCap = () => T.outputCap > 0 && T.output >= T.outputCap;
+function setOutput(frac) {
+  const W = T.win || 1, cap = T.outputCap || W;
+  frac = Math.max(0, Math.min(frac, cap / W, 1));
+  cfg.output.share = round4(frac);
+  const tokens = Math.floor(frac * W);
+  if (typeof cfg.output.min === "number" && cfg.output.min > tokens) cfg.output.min = Math.floor(tokens / 100) * 100;
+}
+function setAbs(level, target, frac, only) {
+  if (target === "output") return setOutput(frac);
+  const absKeys = level.parts.filter((p) => p.kind === "abs").map((p) => p.id);
+  frac = Math.max(0, Math.min(1, frac));
+  if (only && only !== "rest") {
+    const pair = share(target) + share(only);
+    frac = Math.min(frac, pair);
+    cfg[target].share = round4(frac); cfg[only].share = round4(pair - frac); return;
+  }
+  // The rest (input budget / conversation) absorbs the change first; only
+  // once it is used up do the other unlocked parts give way, in proportion.
+  const sumOthers = absKeys.filter((k) => k !== target).reduce((s, k) => s + share(k), 0);
+  let over = sumOthers + frac - 1;
+  if (over > 0 && !only) {
+    const adj = absKeys.filter((k) => k !== target && !locks.has(k)), aSum = adj.reduce((s, k) => s + share(k), 0);
+    if (aSum < over) { frac -= over - aSum; over = aSum; }
+    for (const k of adj) cfg[k].share = round4(Math.max(0, share(k) - (aSum ? share(k) / aSum * over : 0)));
+  } else if (over > 0) frac -= over;
+  cfg[target].share = round4(frac);
+}
+function applyShare(id, frac) {
+  const hit = partIn(id);
+  if (!hit) return;
+  if (hit.part.kind === "flex") setFlex(hit.level, id, frac);
+  else if (hit.part.kind === "abs") setAbs(hit.level, id, frac);
+}
+
+// ── Navigation ─────────────────────────────────────────────────────────
+// `view` is the node whose children fill the canvas; `selected` is the one
+// the inspector shows. Moving between views keeps a back stack.
+let view = "@", selected = "@", navStack = [], showAbsent = false, tab = "now";
+const expanded = new Set(["", "input"]);
+let treeShown = window.innerWidth > 1100;
+function go(next, sel) {
+  if (next !== view) { navStack.push(view); if (navStack.length > 50) navStack.shift(); view = next; }
+  selected = sel ?? next;
+  for (let q = view; q !== null; q = vparent(q)) expanded.add(q);
+  if (window.innerWidth <= 1100) treeShown = false;
+  renderAll();
+}
+function enter(id) { if (enterable(id)) go(id, id); else if (vparent(id) !== null) go(vparent(id), id); }
+function up() { const p = vparent(view); if (p !== null) go(p, view); }
+function back() { if (!navStack.length) return; view = navStack.pop(); selected = view; renderAll(); }
+// Select without rebuilding the canvas: a rebuilt band would swallow the
+// second click of a double-click.
+function select(id) {
+  selected = id;
+  document.querySelectorAll(".band.sel,.trow.sel").forEach((el) => el.classList.remove("sel"));
+  document.querySelectorAll(".band[data-id],.trow[data-tree]").forEach((el) => {
+    if ((el.dataset.id ?? el.dataset.tree) === id) el.classList.add("sel");
+  });
+  renderToolbar(); renderInspector();
+}
+// Show a node wherever it is: here, or by moving to the view that holds it.
+function reveal(id) {
+  const vp = vparent(id);
+  if (id === view || vp === view) select(id); else go(vp === null ? "@" : vp, id);
+}
+
+// ── Rendering ─────────────────────────────────────────────────────────
+function renderHeader() {
+  document.title = L.title + (D.request ? ` · #${D.request}` : "");
+  $("title").textContent = L.title + (D.request ? ` · ${L.request} #${D.request}` : "");
+  $("meta").textContent = [D.model && `${L.model} ${D.model}`, `${L.window} ${fmt(T.win)}`, D.generated && `${L.captured} ${D.generated}`].filter(Boolean).join(" · ");
+  // Token deltas under 10 are the estimate's rounding, not a change.
+  const d = (now, then, goodUp, least = 10) => { const x = Math.round(now - then); if (Math.abs(x) < least) return ""; const good = goodUp ? x > 0 : x < 0; return `<span class="d ${good ? "up" : "down"}">${x > 0 ? "+" : "−"}${fmt(Math.abs(x))}</span>`; };
+  $("stats").innerHTML = [
+    ["cut", L.blocks(T.cutPaths.length), T.cutPaths.length ? "bad" : "good", d(T.cutPaths.length, BASE.cut, false, 1)],
+    ["saved", fmt(T.saved), T.saved ? "bad" : "", d(T.saved, BASE.saved, false)],
+    ["conv", fmt(T.rest), "", d(T.rest, BASE.rest, true)],
+  ].map(([k, v, c, dd]) => `<div class="stat ${c}"><span class="k">${esc(L.stats[k])}</span><span class="v">${v}${dd}</span></div>`).join("");
+  $("undo-all").textContent = L.undo;
+  $("primary").textContent = CLI ? L.download : L.apply;
+}
+function renderToolbar() {
+  const trail = []; for (let q = view; q !== null; q = vparent(q)) trail.unshift(q);
+  const crumbs = trail.map((q, i) => i === trail.length - 1 ? `<span class="here">${esc(nameOf(q))}</span>`
+    : `<button data-go="${esc(q)}">${esc(nameOf(q))}</button><span class="sep">›</span>`).join("");
+  const canEnter = selected !== view && enterable(selected);
+  $("toolbar").innerHTML = `<button class="tb${treeShown ? " on" : ""}" data-act="tree" title="${esc(L.nav.tree)}">☰ ${esc(L.nav.tree)}</button>
+    <button class="tb" data-act="back" title="${esc(L.nav.back)} (Alt+←)" ${navStack.length ? "" : "disabled"}>←</button>
+    <button class="tb" data-act="up" title="${esc(L.nav.up)} (Backspace)" ${vparent(view) === null ? "disabled" : ""}>↑</button>
+    <div class="crumbs">${crumbs}</div>
+    <button class="tb" data-act="enter" ${canEnter ? "" : "disabled"}>${esc(L.nav.enter)} ›</button>
+    <span class="hint">${esc(L.nav.hint)}</span>`;
+  const content = view === "@" || view === "" ? T.output + TOPS.reduce((s, tp) => s + (B[tp] ? B[tp].natural : 0), 0) : contentOf(view);
+  const st = stateOf(view);
+  $("viewhead").innerHTML = `<span class="t">${esc(nameOf(view))}</span>
+    <span class="s">${view === "@" ? L.viewWhole(fmt(T.win)) : L.viewSum(fmt(quotaOf(view)), fmt(content))}</span>
+    ${st && st !== "fixed" ? `<span class="pill ${st}">${esc(L.pill[st])}</span>` : ""}`;
+  $("app").classList.toggle("notree", !treeShown);
+}
+function layout(parts, H, minH) {
+  const total = parts.reduce((s, p) => s + Math.max(0, p.tokens), 0) || 1;
+  const raw = parts.map((p) => Math.max(Math.max(0, p.tokens) / total * H, minH));
+  const k = H / (raw.reduce((s, h) => s + h, 0) || 1);
+  let y = 0;
+  return raw.map((h) => { const r = {y, h: h * k}; y += h * k; return r; });
+}
+function bandHTML(part, level, r, depth) {
+  const id = part.id, c = colorOf(id), st = stateOf(id);
+  const small = depth ? 21 : 28;
+  const cls = ["band", "d" + depth, part.kind === "fixed" ? "fixed" : part.kind === "free" ? "free" : "",
+    r.h < small + 2 ? "tiny" : "", r.h < (depth ? 16 : 13) ? "micro" : "", selected === id ? "sel" : ""].join(" ");
+  const cont = contentOf(id), q = part.tokens;
+  const meter = cont === null ? "" : `<span class="meter${q > 0 && cont > q * 1.001 ? " over" : ""}"><i style="width:${q > 0 ? Math.min(100, 100 * cont / q) : (cont ? 100 : 0)}%"></i></span>`;
+  const tok = part.kind === "free" ? "" : `<span class="tok">${cont === null ? "" : fmt(cont) + " / "}${fmt(q)}</span>`;
+  const pill = st && st !== "fixed" ? `<span class="pill ${st}">${esc(L.pill[st])}</span>` : (locks.has(id) ? `<span class="pill pin">${esc(L.pill.pin)}</span>` : "");
+  let html = `<div class="${cls}" style="top:${r.y}px;height:${r.h}px;--c:${c}" data-id="${esc(id)}"><div class="bg"></div>
+    <div class="hd"><span class="sw"></span><span class="nm" title="${esc(nameOf(id))}">${esc(nameOf(id))}</span>${pill}${meter}${tok}
+      ${depth === 0 && enterable(id) ? `<button class="enter" data-enter="${esc(id)}">${esc(L.nav.enter)} ›</button>` : ""}
+      <span class="pct">${part.kind === "free" ? fmt(q) : pctText(pctOf(part, level))}</span></div>`;
+  // Blocks inside blocks: two levels below the one on screen.
+  const innerTop = small + 1, innerH = r.h - innerTop - 6;
+  const sub = depth < 2 && enterable(id) ? partsOf(id) : null;
+  // Only when every child can be told apart; a stack of slivers says nothing.
+  if (sub && innerH >= Math.max(22, sub.parts.length * 7)) {
+    const rects = layout(sub.parts, innerH, depth ? 4 : 6);
+    html += `<div class="inner" style="top:${innerTop}px">` + sub.parts.map((sp, j) => bandHTML(sp, sub, rects[j], depth + 1)).join("") + `</div>`;
+  }
+  return html + `</div>`;
+}
+let LEVEL = null;
+function renderCanvas() {
+  const box = $("canvas"), H = box.clientHeight;
+  const level = LEVEL = partsOf(view);
+  if (!H) return;
+  const rects = layout(level.parts, H, 10);
+  level.parts.forEach((p, i) => { p._y = rects[i].y; });
+  let html = level.parts.map((p, i) => bandHTML(p, level, rects[i], 0)).join("");
+  const adj = (p) => p.kind === "flex" || p.kind === "abs" || (p.kind === "rest" && level.mode === "abs");
+  for (let i = 0; i < level.parts.length - 1; i++) {
+    const a = level.parts[i], b = level.parts[i + 1];
+    const can = !locks.has(a.id) && !locks.has(b.id) && adj(a) && adj(b) && (a.kind !== "rest" || b.kind !== "rest")
+      && (level.mode === "abs" || (a.kind === "flex" && b.kind === "flex"));
+    html += `<div class="divider${can ? "" : " fixedline"}" style="top:${b._y}px" data-i="${i}">${can ? `<div class="hit" data-drag="${i}"></div><div class="grip" data-drag="${i}" style="left:${[50, 30, 70][i % 3]}%"><i></i><i></i></div>` : ""}</div>`;
+  }
+  box.innerHTML = html + `<div class="dragtip" id="dragtip" hidden></div>`;
+  const swatches = ["color-mix(in srgb,#3b82f6 75%,transparent)", "var(--cut)", "repeating-linear-gradient(135deg,transparent 0 3px,#94a3b8 3px 6px)", "#6366f122;border:1px solid #6366f1"];
+  $("legend").innerHTML = L.legend.map((s, i) => `<span><i style="background:${swatches[i]}"></i>${esc(s)}</span>`).join("");
+}
+function treeKids(id) {
+  if (id === "") return ["output", "input"];
+  if (id === "input") return [...TOPS, "thread"];
+  if (!isBlock(id)) return [];
+  const plan = planOf(id);
+  return [...plan.flex, ...plan.fixedKids, ...(showAbsent ? plan.absent : [])];
+}
+// Every row the same two columns: its share of the parent, then its tokens.
+function treePct(id) {
+  if (id === "") return "100%";
+  const hit = partIn(id);
+  return hit ? pctText(pctOf(hit.part, hit.level)) : "—";
+}
+function renderTree() {
+  const rows = [];
+  const walk = (id, ind) => {
+    const kids = treeKids(id), open = expanded.has(id), st = stateOf(id);
+    const absent = isBlock(id) && !B[id];
+    rows.push(`<div class="trow${selected === id ? " sel" : ""}${view === id ? " viewing" : ""}${isBlock(id) && !B[id] ? " absent" : ""}" style="--ind:${ind}" data-tree="${esc(id)}">
+      <button class="caret${kids.length ? "" : " none"}" data-caret="${esc(id)}">${open ? "▾" : "▸"}</button>
+      <span class="tsw" style="background:${colorOf(id)}"></span><span class="tname" title="${esc(id || nameOf(id))}">${esc(nameOf(id))}</span>
+      ${st === "cut" || st === "contains" ? `<span class="tdot ${st}"></span>` : ""}
+      <span class="tpct">${absent ? "—" : treePct(id)}</span><span class="ttok">${absent ? "" : fmt(quotaOf(id))}</span></div>`);
+    if (open) for (const k of kids) walk(k, ind + 1);
+  };
+  walk("", 0);
+  const scroll = $("tree").scrollTop;
+  $("tree").innerHTML = `<div class="treehead">${esc(L.treeTitle)}<span class="sp"></span><span class="hint" style="font-weight:400;font-size:11px">${esc(L.treeCols)}</span></div><div class="treehead" style="top:auto;position:static;padding-top:0"><span class="sp"></span><label><input type="checkbox" data-act="absent" ${showAbsent ? "checked" : ""}>${esc(L.showAbsent)}</label></div>` + rows.join("");
+  $("tree").scrollTop = scroll;
+}
+
+// ── Inspector ─────────────────────────────────────────────────────────
+function shareValue(id) {
+  if (id === "output") return T.output / (T.win || 1); // what is in effect, not the raw share
+  const hit = partIn(id);
+  return hit.part.kind === "flex" ? flexPct(hit.level)[id] : share(id);
+}
+function shareBlock(id) {
+  const kind = editableKind(id);
+  if (!kind) return "";
+  const vp = vparent(id), v = shareValue(id);
+  return `<div class="share" style="--c:${colorOf(id)}"><div class="lbl">${esc(kind === "flex" ? L.flexOf(nameOf(vp)) : L.ofParent(nameOf(vp)))}</div>
+    <div class="ctl"><input type="range" id="ins-range" min="0" max="100" step="0.1" value="${(v * 100).toFixed(1)}">
+    <input class="num" id="ins-num" type="number" min="0" max="100" step="0.5" value="${(v * 100).toFixed(1)}">%
+    <button class="lock${locks.has(id) ? " on" : ""}" data-lock="${esc(id)}" title="${esc(L.lockTip)}">🔒 ${esc(L.lock)}</button></div>
+    <div class="note warn" id="ins-note">${esc(shareNote(id))}</div></div>`;
+}
+function shareNote(id) {
+  if (id === "output") {
+    if (atCap()) return L.capNote(fmt(T.outputCap));
+    if (!T.outputReason) return "";
+    const r = T.outputReason, why = r === "floor" ? L.reasons.floor(fmt(T.outputFloor)) : r === "cap" ? L.reasons.cap(fmt(T.outputCap))
+      : r === "pinned" ? L.reasons.pinned(fmt(T.outputFloor), fmt(T.outputCap)) : L.reasons.window();
+    return `${L.outputEff(pctText(share("output")), pctText(T.output / (T.win || 1)))} — ${why}`;
+  }
+  const m = minOf(id), hit = partIn(id);
+  if (m && hit) {
+    const raw = hit.part.kind === "flex" ? Math.floor(hit.level.plan.remaining * flexPct(hit.level)[id]) : Math.floor(share(id) * quotaOf(vparent(id)));
+    if (raw < m) return L.minNote(fmt(m));
+  }
+  return "";
+}
+function kvHTML(id) {
+  const q = quotaOf(id), c = contentOf(id), r = R[id], b = B[id];
+  const rows = [[L.quota, fmt(q)]];
+  if (c !== null) rows.push([L.content, fmt(c)]);
+  if (r) rows.push([L.sent, fmt(r.delivered) + (b && b.delivered !== r.delivered ? ` <span class="hint">(${esc(L.atCapture)} ${fmt(b.delivered)})</span>` : "")]);
+  if (r && r.natural > r.delivered) rows.push(["", `<span class="hint">${esc(L.cutAt(fmt(r.natural - r.delivered)))}</span>`]);
+  return rows.map(([k, v]) => `<span class="k">${esc(k)}</span><span class="v">${v}</span>`).join("");
+}
+// The original text, coloured by what these settings would send: each
+// block's own colour over the part that goes out, grey where it is cut.
+function textMapHTML(id) {
+  const out = [];
+  const leaf = (p, s) => {
+    const r = R[p], c = colorOf(p), sh = shrinkOf(p);
+    const ratio = r && r.over && r.natural ? Math.min(1, r.delivered / r.natural) : 1;
+    const keep = sh === "none" ? s.length : Math.floor(s.length * ratio);
+    const kept = (t) => t ? `<span class="k" style="--c:${c}">${esc(t)}</span>` : "";
+    const cut = (t) => t ? `<span class="x">${esc(t)}</span>` : "";
+    out.push(sh === "tail" ? cut(s.slice(0, s.length - keep)) + kept(s.slice(s.length - keep)) : kept(s.slice(0, keep)) + cut(s.slice(keep)));
+  };
+  const plain = (p, s) => { if (s) out.push(`<span class="t" style="--c:${colorOf(p)}">${esc(s)}</span>`); };
+  const walk = (p, text) => {
+    const kids = blockKids(p).filter((k) => B[k].original).sort(byPos);
+    let cursor = 0, placed = 0;
+    const start = out.length;
+    for (const k of kids) {
+      const i = text.indexOf(B[k].original, cursor);
+      if (i < 0) continue;
+      plain(p, text.slice(cursor, i));
+      walk(k, B[k].original); cursor = i + B[k].original.length; placed++;
+    }
+    if (!placed) { out.length = start; leaf(p, text); return; }
+    plain(p, text.slice(cursor));
+  };
+  walk(id, B[id].original || "");
+  return out.join("");
+}
+function textSection(id) {
+  const b = B[id];
+  if (!b) return "";
+  if (!b.original && !b.compressed) return `<div class="note">${esc(L.noText)}</div>`;
+  return `<h2 style="margin-top:14px">${esc(L.textTitle)}</h2>
+    <div class="tabs">${[["now", L.tabNow], ["sent", L.tabSent]].map(([k, n]) => `<button class="tab${tab === k ? " on" : ""}" data-tab="${k}">${esc(n)}</button>`).join("")}</div>
+    ${tab === "now" ? `<div class="tlegend"><span><i style="background:color-mix(in srgb,${colorOf(id)} 35%,transparent)"></i>${esc(L.textLegendKept)}</span><span><i style="background:var(--line2)"></i>${esc(L.textLegendCut)}</span></div>` : ""}
+    <pre class="textmap" id="ins-text">${tab === "now" ? textMapHTML(id) : esc(b.compressed || "")}</pre>`;
+}
+function kidsSection(id) {
+  if (!enterable(id) || id === "@") return "";
+  const level = partsOf(id);
+  return `<h2 style="margin-top:14px">${esc(L.children)}</h2><div class="kids">` + level.parts.map((p) => `<div class="kid" data-reveal="${esc(p.id)}"><span class="tsw" style="background:${colorOf(p.id)}"></span>${esc(nameOf(p.id))}<span class="tpct">${p.kind === "free" ? fmt(p.tokens) : pctText(pctOf(p, level))}</span></div>`).join("") + `</div>`;
+}
+function advancedFields(id) {
+  const own = cfg[id] || {};
+  const rows = [
+    "min" in own ? `<span>${esc(L.floor)}</span><input type="number" min="0" step="100" value="${own.min}" data-p="${esc(id)}" data-l="min">` : "",
+    "shrink" in own ? `<span>${esc(L.shrink)}</span><select data-p="${esc(id)}" data-l="shrink">${["none", "truncate", "tail", "drop", "narrow"].map((o) => `<option value="${o}"${o === own.shrink ? " selected" : ""}>${esc(L.shrinkNames[o])}</option>`).join("")}</select>` : "",
+    "share" in own && parentOf(id) ? `<span>${esc(L.share)}</span><input type="number" min="0" max="1" step="0.005" value="${own.share}" data-p="${esc(id)}" data-l="share">` : "",
+  ].join("");
+  return rows ? `<details style="margin-top:10px"><summary class="hint">${esc(L.moreFields)}</summary><div class="adv">${rows}</div></details>` : "";
+}
+const kidsOfCfg = (p) => Object.keys(cfg).filter((k) => parentOf(k) === p && "share" in cfg[k]);
+function threadSection() {
+  if (!CLI) return "";
+  const th = cfg.thread || {}, u = T.rest || 1, used = B.thread ? B.thread.natural : 0;
+  const marks = ["compact_target", "compact_background", "compact_foreground"].filter((k) => typeof th[k] === "number");
+  return `<div class="note">${esc(L.threadNow(fmt(used), fmt(u)))}</div>
+    <div class="thbar"><div class="used" style="width:${Math.min(100, 100 * used / u)}%"></div>${marks.map((k) => `<div class="mk" data-mk="${k}" style="left:${100 * th[k]}%"><span>${esc(L.threadMarks[k])}<br>${pctText(th[k])}</span></div>`).join("")}</div>
+    <div class="adv">${marks.map((k) => `<span data-label="${k}">${esc(L.threadMarks[k])} · ${pctText(th[k])}</span><input type="range" min="0.05" max="1" step="0.01" value="${th[k]}" data-p="thread" data-l="${k}">`).join("")}</div>
+    <h2 style="margin-top:14px">${esc(L.itemCaps)}</h2>
+    <div class="adv">${kidsOfCfg("thread").map((k) => `<span data-label="${k}">${esc(nameOf(k))} · ${pctText(share(k))} ≈ ${fmt(Math.max(minOf(k), share(k) * u))}</span><input type="range" min="0" max="${Math.max(0.3, share(k))}" step="0.0005" value="${share(k)}" data-p="${k}" data-l="share">`).join("")}</div>
+    <div class="err" id="ins-err"></div>`;
+}
+const toolRows = (items) => items.map((i) => `<span class="${toolKeep && !toolKeep.has(i.name) ? "drop" : ""}">${esc(i.name)}</span><span class="hint">${i.core ? esc(L.core) : ""}</span><span style="text-align:right">${fmt(i.tokens)}</span>`).join("");
+function toolsSection() {
+  const items = (B.tools && B.tools.items) || [];
+  if (!items.length) return "";
+  return `<div class="note" id="ins-tools-kept">${esc(L.toolsKept(toolKeep ? toolKeep.size : items.length, items.length))}</div>
+    <div class="toolgrid" id="ins-tools">${toolRows(items)}</div>`;
+}
+function renderInspector() {
+  const id = selected, st = stateOf(id);
+  const note = id === "@" || id === "" ? L.rootNote : id === "input" ? L.inputNote : id === "thread" ? L.convNote
+    : id.endsWith("#rest") ? L.untaggedNote : id.endsWith("#free") ? L.freeNote : isBlock(id) && B[id] && shrinkOf(id) === "none" ? L.fixedNote : "";
+  const scroll = $("ins-text") ? $("ins-text").scrollTop : 0;
+  $("inspector").innerHTML = `<div class="ihead"><span class="sw" style="background:${colorOf(id)}"></span>${esc(nameOf(id))}${st && st !== "fixed" ? ` <span class="pill ${st}">${esc(L.pill[st])}</span>` : ""}</div>
+    ${isBlock(id) ? `<div class="ipath">${esc(id)}</div>` : ""}
+    <div class="kv" id="ins-kv">${kvHTML(id)}</div>
+    ${note ? `<div class="note">${esc(note)}</div>` : ""}
+    ${id === "thread" ? `<div class="note" id="ins-conv">${esc(L.convActual(fmt(T.rest)))}</div>` : ""}
+    ${shareBlock(id)}${advancedFields(id)}
+    ${id === "thread" ? threadSection() : ""}${id === "tools" ? toolsSection() : ""}
+    ${!Object.keys(B).length ? `<div class="empty">${esc(L.empty)}</div>` : ""}
+    ${kidsSection(id)}${textSection(id)}`;
+  if ($("ins-text") && renderInspector.last === id) $("ins-text").scrollTop = scroll;
+  renderInspector.last = id;
+  refreshThreadError();
+}
+// After a value changed: numbers and the text map in place. The control
+// being dragged or typed into is left alone, or the drag would end.
+let textFrame = 0;
+function refreshInspector() {
+  const id = selected, kv = $("ins-kv");
+  if (!kv) return;
+  kv.innerHTML = kvHTML(id);
+  const range = $("ins-range"), num = $("ins-num");
+  if (range && editableKind(id)) {
+    const v = (shareValue(id) * 100).toFixed(1);
+    if (document.activeElement !== range) range.value = v;
+    if (document.activeElement !== num) num.value = v;
+    $("ins-note").textContent = shareNote(id);
+  }
+  const conv = $("ins-conv"); if (conv) conv.textContent = L.convActual(fmt(T.rest));
+  const kept = $("ins-tools-kept");
+  if (kept && B.tools) { const items = B.tools.items || []; kept.textContent = L.toolsKept(toolKeep ? toolKeep.size : items.length, items.length); $("ins-tools").innerHTML = toolRows(items); }
+  document.querySelectorAll(".kid[data-reveal]").forEach((el) => {
+    const hit = partIn(el.dataset.reveal), span = el.querySelector(".tpct");
+    if (hit && span) span.textContent = hit.part.kind === "free" ? fmt(hit.part.tokens) : pctText(pctOf(hit.part, hit.level));
+  });
+  const pre = $("ins-text");
+  if (pre && tab === "now" && B[id]) {
+    cancelAnimationFrame(textFrame);
+    textFrame = requestAnimationFrame(() => { const top = pre.scrollTop; pre.innerHTML = textMapHTML(id); pre.scrollTop = top; });
+  }
+  refreshThreadError();
+}
+function refreshThreadError() { const e = $("ins-err"); if (e) e.textContent = compactError(); }
+
+// ── Changes, export, advanced ─────────────────────────────────────────
+function changes() {
+  const out = [];
+  for (const p of Object.keys(cfg)) for (const l of Object.keys(cfg[p])) if (cfg[p][l] !== initial[p][l]) out.push({p, l, from: initial[p][l], to: cfg[p][l]});
+  for (const k of Object.keys(scal)) if (scal[k] !== scalInit[k]) out.push({p: "", l: k, from: scalInit[k], to: scal[k]});
+  return out;
+}
+function profile() { // Helpwo: every value that differs from the shipped defaults
+  const out = {};
+  for (const p of Object.keys(cfg)) for (const l of Object.keys(cfg[p])) if (cfg[p][l] !== def[p][l]) out[`budget.${p}.${l}`] = cfg[p][l];
+  for (const k of Object.keys(scal)) if (scal[k] !== scalDef[k]) out[`budget.${k}`] = scal[k];
+  return out;
+}
+function configText() { // laintas_cli: one /config line per setting changed on this page
+  const lines = [D.exportHeader || "# laintas-cli settings", `# from the budget page: request #${D.request}, ${D.model || "model"}, window ${D.window || "?"}`];
+  for (const c of changes().sort((a, b) => (a.p + "." + a.l).localeCompare(b.p + "." + b.l))) lines.push(`budget ${c.p ? c.p.replace(/\./g, " ") + " " : ""}${c.l} ${c.to}`);
+  return lines.join("\n") + "\n";
+}
+function compactError() {
+  const th = cfg.thread || {};
+  if (!CLI || ["compact_target", "compact_background", "compact_foreground"].some((k) => typeof th[k] !== "number")) return "";
+  return th.compact_target < th.compact_background && th.compact_background < th.compact_foreground && th.compact_foreground <= 1 ? "" : L.compactOrder;
+}
+const showVal = (l, v) => l === "shrink" ? (L.shrinkNames[v] || v) : l === "min" || /window/.test(l) ? fmt(v) : typeof v === "number" && v <= 1 ? pctText(v) : v;
+const fieldName = (l, p) => l === "share" ? (p && parentOf(p) ? L.share : L.pctWord) : l === "min" ? L.floor : l === "shrink" ? L.shrink : (L.threadMarks[l] || "");
+const canApply = () => !CLI && !!D.applyToken && window.parent !== window;
+function renderChanges() {
+  const list = changes(), err = compactError();
+  $("changes-title").innerHTML = `${esc(L.changes)} <span class="hint">${list.length || ""}</span><span class="sp"></span><button class="link" data-act="defaults">${esc(L.defaults)}</button>`;
+  $("changes").innerHTML = (list.length ? list.map((c, i) => `<div class="chg"><span class="what" data-reveal="${esc(c.p)}">${esc(c.p ? nameOf(c.p) : (c.l === "hysteresis" ? L.hysteresis : (L.scalarNames[c.l] || c.l)))}${fieldName(c.l, c.p) ? " · " + esc(fieldName(c.l, c.p)) : ""}</span><span class="from">${esc(showVal(c.l, c.from))}</span>→<span class="to">${esc(showVal(c.l, c.to))}</span><button class="link" data-undo="${i}">↺</button></div>`).join("")
+    : `<div class="hint" style="margin-top:6px">${esc(L.noChanges)}</div>`) + (err ? `<div class="err">${esc(err)}</div>` : "");
+  const primary = $("primary");
+  primary.disabled = !!err || (CLI ? !list.length : !canApply());
+  primary.title = !CLI && !canApply() ? L.applyNeedsHelpwo : "";
+  $("undo-all").disabled = !list.length;
+}
+function renderAdvanced() {
+  $("adv-title").textContent = L.advanced;
+  const rows = Object.keys(scal).map((k) => k === "hysteresis"
+    ? `<span data-label="s:${k}">${esc(L.hysteresis)} · ${pctText(scal[k])}</span><input type="range" min="0.5" max="1" step="0.01" value="${scal[k]}" data-s="${k}"><span class="hint full">${esc(L.hysteresisDesc)}</span>`
+    : `<span>${esc(L.scalarNames[k] || k)}</span><input type="number" min="0" step="${k === "chars_per_token" ? 0.1 : 1024}" value="${scal[k]}" data-s="${k}">`).join("");
+  const aux = CLI ? Object.keys(cfg).filter((k) => topOf(k) === "aux" && "share" in cfg[k]) : [];
+  $("adv-body").innerHTML = `<div class="adv">${rows}</div>` +
+    (aux.length ? `<h2 style="margin-top:14px;font-size:12.5px">${esc(L.aux)}</h2><div class="adv">${aux.map((k) => `<span data-label="${k}">${esc(k.slice(4).split(".").map((s) => L.names[s] || s).join(" · "))} · ${pctText(share(k))}</span><input type="range" min="0" max="0.5" step="0.001" value="${share(k)}" data-p="${k}" data-l="share">`).join("")}</div>` : "");
+}
+// After a value changed; the inspector refreshes in place.
+function renderLive() { compute(); renderHeader(); renderToolbar(); renderCanvas(); renderTree(); renderChanges(); refreshInspector(); }
+function renderAll() { compute(); renderHeader(); renderToolbar(); renderCanvas(); renderTree(); renderChanges(); renderInspector(); }
+
+// ── Interaction ────────────────────────────────────────────────────────
+function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("show"); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove("show"), 3000); }
+let justDragged = false;
+document.addEventListener("click", (e) => {
+  const t = e.target;
+  if (justDragged) { justDragged = false; return; }
+  if (t.closest("[data-drag]")) return;
+  const act = t.closest("[data-act]");
+  if (act && act.tagName !== "INPUT") {
+    const a = act.dataset.act;
+    if (a === "tree") { treeShown = !treeShown; renderToolbar(); requestAnimationFrame(renderCanvas); }
+    else if (a === "back") back();
+    else if (a === "up") up();
+    else if (a === "enter") enter(selected);
+    else if (a === "defaults") { e.preventDefault(); for (const p in cfg) Object.assign(cfg[p], def[p]); Object.assign(scal, scalDef); renderAll(); renderAdvanced(); }
+    return;
+  }
+  const el = t.closest("[data-go],[data-enter],[data-caret],[data-tree],[data-reveal],[data-lock],[data-tab],[data-undo],#undo-all,#primary");
+  if (el) {
+    if (el.dataset.go !== undefined) return go(el.dataset.go, el.dataset.go);
+    if (el.dataset.enter !== undefined) return enter(el.dataset.enter);
+    if (el.dataset.caret !== undefined) { const id = el.dataset.caret; expanded.has(id) ? expanded.delete(id) : expanded.add(id); return renderTree(); }
+    if (el.dataset.tree !== undefined) return reveal(el.dataset.tree);
+    if (el.dataset.reveal !== undefined) { if (el.dataset.reveal) reveal(el.dataset.reveal); return; }
+    if (el.dataset.lock) { const id = el.dataset.lock; locks.has(id) ? locks.delete(id) : locks.add(id); renderAll(); return; }
+    if (el.dataset.tab) { tab = el.dataset.tab; renderInspector(); return; }
+    if (el.dataset.undo !== undefined) { const c = changes()[+el.dataset.undo]; if (c) { if (c.p) cfg[c.p][c.l] = c.from; else scal[c.l] = c.from; renderAll(); renderAdvanced(); } return; }
+    if (el.id === "undo-all") { for (const p in cfg) Object.assign(cfg[p], initial[p]); Object.assign(scal, scalInit); renderAll(); renderAdvanced(); return; }
+    if (el.id === "primary") return primary();
+  }
+  const band = t.closest(".band");
+  if (band && !t.closest("button,input,select") && !band.dataset.id.endsWith("#free")) select(band.dataset.id);
+});
+document.addEventListener("dblclick", (e) => {
+  if (e.target.closest("button,input,select,[data-drag]")) return;
+  const band = e.target.closest(".band");
+  if (band) { e.preventDefault(); if (!band.dataset.id.endsWith("#free")) enter(band.dataset.id); return; }
+  const row = e.target.closest("[data-tree]");
+  if (row) enter(row.dataset.tree);
+});
+function primary() {
+  if (CLI) {
+    const url = URL.createObjectURL(new Blob([configText()], {type: "text/plain"}));
+    const a = document.createElement("a"); a.href = url; a.download = `budget-${D.request}.config`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 10000);
+  } else if (canApply()) {
+    window.parent.postMessage({type: "helpwo:budget-apply", token: D.applyToken, values: profile()}, D.origin || "*");
+  }
+}
+document.addEventListener("keydown", (e) => {
+  if (e.target.closest && e.target.closest("input,select,textarea")) return;
+  if (e.key === "Backspace" || (e.altKey && e.key === "ArrowUp")) { e.preventDefault(); up(); }
+  else if (e.altKey && e.key === "ArrowLeft") { e.preventDefault(); back(); }
+  else if (e.key === "Enter" && selected !== view) { e.preventDefault(); enter(selected); }
+  else if (e.key === "Escape") { select(view); }
+  else if ((e.key === "ArrowDown" || e.key === "ArrowUp") && LEVEL) {
+    const ids = LEVEL.parts.map((p) => p.id).filter((id) => !id.endsWith("#free"));
+    if (!ids.length) return;
+    e.preventDefault();
+    const i = ids.indexOf(selected), next = i < 0 ? 0 : Math.max(0, Math.min(ids.length - 1, i + (e.key === "ArrowDown" ? 1 : -1)));
+    select(ids[next]);
+  }
+});
+document.addEventListener("change", (e) => {
+  const el = e.target;
+  if (el.dataset.act === "absent") { showAbsent = el.checked; renderTree(); return; }
+  if (el.id === "ins-num") { applyShare(selected, (parseFloat(el.value) || 0) / 100); el.blur(); renderLive(); return; }
+  if (el.id === "ins-range") { renderLive(); return; }
+  if (el.dataset.s && el.type !== "range") { const v = parseFloat(el.value); if (v > 0) { scal[el.dataset.s] = el.dataset.s === "chars_per_token" ? v : Math.round(v); renderAll(); } return; }
+  if (el.dataset.p && el.type !== "range") {
+    const p = el.dataset.p, l = el.dataset.l;
+    cfg[p][l] = l === "shrink" ? el.value : l === "min" ? Math.max(0, parseInt(el.value || "0", 10)) : Math.max(0, parseFloat(el.value || "0"));
+    renderAll();
+  }
+});
+// Sliders update the model and everything around them, but not themselves.
+document.addEventListener("input", (e) => {
+  const el = e.target;
+  if (el.id === "ins-range") { applyShare(selected, parseFloat(el.value) / 100); renderLive(); return; }
+  if (el.type !== "range") return;
+  const v = parseFloat(el.value);
+  if (el.dataset.s) scal[el.dataset.s] = v; else if (el.dataset.p) cfg[el.dataset.p][el.dataset.l] = v; else return;
+  const label = el.previousElementSibling;
+  if (label && label.dataset.label) {
+    const k = label.dataset.label;
+    if (k.startsWith("s:")) label.textContent = `${L.hysteresis} · ${pctText(v)}`;
+    else if (el.dataset.p === "thread") label.textContent = `${L.threadMarks[el.dataset.l]} · ${pctText(v)}`;
+    else if (topOf(k) === "aux") label.textContent = `${k.slice(4).split(".").map((s) => L.names[s] || s).join(" · ")} · ${pctText(v)}`;
+    else label.textContent = `${nameOf(k)} · ${pctText(v)} ≈ ${fmt(Math.max(minOf(k), v * (T.rest || 1)))}`;
+  }
+  if (el.dataset.p === "thread") { const mk = document.querySelector(`.mk[data-mk="${el.dataset.l}"]`); if (mk) { mk.style.left = 100 * v + "%"; mk.querySelector("span").innerHTML = `${esc(L.threadMarks[el.dataset.l])}<br>${pctText(v)}`; } }
+  compute(); renderHeader(); renderChanges(); refreshThreadError();
+});
+// Divider dragging: the two neighbours trade share; nothing else moves.
+let dragging = null;
+document.addEventListener("pointerdown", (e) => {
+  const g = e.target.closest("[data-drag]"); if (!g || !LEVEL) return;
+  const level = LEVEL, i = +g.dataset.drag, a = level.parts[i], b = level.parts[i + 1];
+  if (locks.has(a.id) || locks.has(b.id)) { toast(L.lockedDrag); e.preventDefault(); return; }
+  const snapshot = {}; for (const p of level.parts) if (cfg[p.id]) snapshot[p.id] = share(p.id);
+  const outMin = cfg.output ? cfg.output.min : undefined;
+  dragging = {view, a: a.id, b: b.id, akind: a.kind, bkind: b.kind, y0: e.clientY, H: $("canvas").clientHeight, snapshot, outMin,
+    outBase: T.output / (T.win || 1),
+    pa: level.mode === "flex" ? flexPct(level)[a.id] : share(a.id), i, total: level.total, remaining: level.plan ? level.plan.remaining : 0};
+  e.preventDefault();
+});
+document.addEventListener("pointermove", (e) => {
+  if (!dragging) return;
+  const g = dragging;
+  for (const [p, v] of Object.entries(g.snapshot)) cfg[p].share = v; // re-apply from the start: the move is absolute
+  if (g.outMin !== undefined) cfg.output.min = g.outMin;
+  compute();
+  const level = partsOf(g.view), dTokens = (e.clientY - g.y0) / g.H * (g.total || 1);
+  if (level.mode === "flex") setFlex(level, g.a, g.pa + dTokens / (g.remaining || 1), g.b);
+  else {
+    const d = dTokens / (g.total || 1);
+    if (g.akind === "abs" && g.bkind === "abs") setAbs(level, g.a, share(g.a) + d, g.b);
+    else if (g.a === "output") setOutput(g.outBase + d);
+    else if (g.akind === "abs") setAbs(level, g.a, share(g.a) + d, "rest");
+    else if (g.bkind === "abs") setAbs(level, g.b, share(g.b) - d, "rest");
+  }
+  justDragged = Math.abs(e.clientY - g.y0) > 2;
+  renderLive();
+  const tip = $("dragtip"), lv = LEVEL, na = lv.parts.find((p) => p.id === g.a), nb = lv.parts.find((p) => p.id === g.b);
+  if (tip && na && nb) {
+    tip.hidden = false; tip.style.top = nb._y + "px";
+    const pinned = g.a === "output" && atCap() ? `  · ${L.capTip(fmt(T.outputCap))}` : "";
+    tip.textContent = `${nameOf(na.id)} ${pctText(pctOf(na, lv))}  ·  ${nameOf(nb.id)} ${pctText(pctOf(nb, lv))}${pinned}`;
+  }
+  const div = document.querySelector(`.divider[data-i="${g.i}"]`); if (div) div.classList.add("drag");
+});
+document.addEventListener("pointerup", () => {
+  if (!dragging) return;
+  dragging = null; renderAll();
+  setTimeout(() => { justDragged = false; }, 0);
+});
+window.addEventListener("message", (e) => {
+  const d = e.data;
+  if (window.parent === window || e.source !== window.parent || !d) return;
+  if (d.type === "helpwo:lang-sync") {
+    const next = d.lang === "CN" ? ZH : EN;
+    if (next !== L) { L = next; document.documentElement.lang = L === ZH ? "zh-CN" : "en"; renderAll(); renderAdvanced(); }
+  } else if (d.type === "helpwo:budget-applied") {
+    toast(d.ok ? L.applied(d.count) : d.code === "stale-page" ? L.stalePage : L.applyFail + (d.error || ""));
+    if (d.ok) { for (const p in cfg) Object.assign(initial[p], cfg[p]); Object.assign(scalInit, scal); renderAll(); }
+  }
+});
+let resizeT = 0;
+window.addEventListener("resize", () => { clearTimeout(resizeT); resizeT = setTimeout(() => { if (!dragging) renderCanvas(); }, 60); });
+
+// ── Start: the whole window as one block ────────────────────────────────
+compute();
+const BASE = {cut: T.cutPaths.length, saved: T.saved, rest: T.rest};
+document.documentElement.lang = L === ZH ? "zh-CN" : "en";
+for (const p of T.cutPaths) for (let q = vparent(p); q !== null; q = vparent(q)) expanded.add(q);
+renderAdvanced();
+renderAll();
+</script>
+</body>
+</html>

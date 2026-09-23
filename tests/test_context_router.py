@@ -93,5 +93,25 @@ class DynamicToolRoutingTests(unittest.TestCase):
         self.assertNotIn("agent.station", names)
 
 
+class CompletedTaskSkillTests(unittest.TestCase):
+    """skill.save was never called: routing hid it from any request whose
+    words did not overlap its description (every Chinese request), and the
+    one mode whose prompt mentioned it did not authorize it."""
+
+    def test_skill_save_is_visible_whatever_the_request_says(self):
+        tools = [_tool("fs.read"), _tool("skill.save")]
+        for query in ("修复登录页的构建错误", "rename the helper"):
+            self.assertIn("skill.save",
+                          context_router.select_tool_names(query, tools))
+
+    def test_execution_modes_prompt_for_it_and_study_authorizes_it(self):
+        import mode_manager
+        for name in ("act", "auto"):
+            mode = mode_manager._BUILTINS[name]
+            self.assertIn("skill.save", mode["instructions"])
+            self.assertIsNone(mode["allowed_tools"])
+        self.assertIn("skill.save", mode_manager._BUILTINS["study"]["allowed_tools"])
+        self.assertNotIn("skill.save", mode_manager._BUILTINS["review"]["allowed_tools"])
+
 if __name__ == "__main__":
     unittest.main()

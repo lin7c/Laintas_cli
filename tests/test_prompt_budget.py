@@ -375,7 +375,7 @@ def test_prop_budget_output_writes_a_page_without_the_gateway(tmp_path, monkeypa
     target = tmp_path / "page.html"
     laintas_cli._cmd_prop(f"budget output {target}", {})
     page = target.read_text()
-    assert "system.execution" in page and '"model": "m"' in page
+    assert "system.execution" in page and '"model": "m"' in page and '"mode": "cli"' in page
     assert "gateway" not in page.split('<script id="data"')[1].split("</script>")[0]
 
 

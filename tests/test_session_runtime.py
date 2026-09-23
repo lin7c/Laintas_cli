@@ -642,10 +642,10 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["changed"])
         self.assertTrue(result["summary_created"])
-        self.assertEqual(len(calls), 2)  # Gemma draft + DeepSeek review
+        self.assertEqual(len(calls), 2)  # Gemma draft + priority-model review
         self.assertEqual(calls[0]["model_override"], "google/gemma-4-26b-a4b-it")
         self.assertIsNone(calls[0]["provider_override"])
-        self.assertEqual(calls[1]["model_override"], "deepseek-v4-flash")
+        self.assertEqual(calls[1]["model_override"], "priority")
         self.assertIsNone(calls[1]["provider_override"])
         compacted = state["_thread_messages"]
         # The obsolete first task is summarized instead of permanently pinned;
@@ -1105,7 +1105,7 @@ class AgentTerminationTests(unittest.TestCase):
         result = agent_loop._llm_review_summary(
             deps, {}, "/tmp", "[User]: evidence", draft, None, "EN")
         self.assertEqual(result, draft)
-        self.assertEqual(calls[0]["model_override"], "deepseek-v4-flash")
+        self.assertEqual(calls[0]["model_override"], "priority")
         self.assertIsNone(calls[0]["provider_override"])
 
     def test_compaction_triggers_memory_consolidation(self):

@@ -48,16 +48,35 @@ def _terminal_id(value: object = None) -> str:
     return _safe_id(value or getattr(paths, "TERMINAL_ID", "terminal-default"))
 
 
-def _current_path(cwd: str):
-    return paths.SESSIONS_DIR / f"{_session_key(cwd)}_current_{_terminal_id()}.json"
+def _agent_ns(agent_id: str) -> str:
+    """Filename namespace segment for one agent's live/current session files.
+
+    "primary" keeps the legacy filenames (zero migration); every other
+    persistent agent gets its own ``__ag_<id>_`` segment so its live copies
+    and current pointer can never be recovered as another agent's session.
+    The primary patterns never match agent-scoped names (``_live`` would
+    have to follow the key directly, but ``__ag_`` is there instead).
+    """
+    aid = str(agent_id or "").strip()
+    if not aid or aid == "primary":
+        return ""
+    return f"__ag_{_safe_id(aid)}"
+
+
+def _current_path(cwd: str, agent_id: str = "primary"):
+    return paths.SESSIONS_DIR / (
+        f"{_session_key(cwd)}{_agent_ns(agent_id)}"
+        f"_current_{_terminal_id()}.json")
 
 
 def _legacy_current_path(cwd: str):
     return paths.SESSIONS_DIR / f"{_session_key(cwd)}_current.json"
 
 
-def _session_path(cwd: str, session_id: str):
-    return paths.SESSIONS_DIR / f"{_session_key(cwd)}_live_{_safe_id(session_id)}.json"
+def _session_path(cwd: str, session_id: str, agent_id: str = "primary"):
+    return paths.SESSIONS_DIR / (
+        f"{_session_key(cwd)}{_agent_ns(agent_id)}"
+        f"_live_{_safe_id(session_id)}.json")
 
 
 def _atomic_write_json(dest, payload: dict) -> None:
@@ -122,9 +141,10 @@ def consume_last_error() -> str:
     return message
 
 
-def _recover_latest_live(cwd: str) -> Optional[dict]:
+def _recover_latest_live(cwd: str,
+                          agent_id: str = "primary") -> Optional[dict]:
     """Recover the newest valid unclosed live copy for a working directory."""
-    pattern = f"{_session_key(cwd)}_live_*.json"
+    pattern = f"{_session_key(cwd)}{_agent_ns(agent_id)}_live_*.json"
     try:
         candidates = sorted(
             paths.SESSIONS_DIR.glob(pattern),
@@ -139,7 +159,9 @@ def _recover_latest_live(cwd: str) -> Optional[dict]:
             owner = data.get("terminal_id") or data.get("instance_id")
             if (data.get("cwd") == cwd and not session_lifecycle.is_deleted(cwd, data)
                     and not data.get("closed_at")
-                    and owner == _terminal_id()):
+                    and owner == _terminal_id()
+                    and str(data.get("agent_id") or "primary")
+                    == str(agent_id or "primary")):
                 return data
         except (OSError, json.JSONDecodeError, TypeError):
             continue
@@ -150,7 +172,9 @@ def is_continuable_reason(reason: str) -> bool:
     return str(reason or "") in CONTINUABLE_REASONS
 
 
-def create_session(cwd: str, state: Optional[dict] = None, chat_history: Optional[list] = None) -> dict:
+def create_session(cwd: str, state: Optional[dict] = None,
+                   chat_history: Optional[list] = None,
+                   agent_id: str = "primary") -> dict:
     now = time.time()
     session_id = _safe_id((state or {}).get("_session_id") or uuid.uuid4().hex[:16])
     # The runtime, autosave and lease must name the same session from its
@@ -161,6 +185,10 @@ def create_session(cwd: str, state: Optional[dict] = None, chat_history: Optiona
         "id": session_id,
         "session_id": session_id,
         "kind": "live",
+        # Travels inside the payload: save_session re-derives the file
+        # namespace from it, so sync/close callers never need to pass it.
+        # Legacy files without it are primary's.
+        "agent_id": str(agent_id or "primary"),
         "instance_id": _terminal_id(),
         "terminal_id": _terminal_id(),
         "cwd": cwd,
@@ -176,10 +204,15 @@ def create_session(cwd: str, state: Optional[dict] = None, chat_history: Optiona
         "last_exit_reason": "",
         "pending_continuation": False,
         "turn_count": 0,
-        "chat_history": copy.deepcopy(chat_history or []),
         "state": copy.deepcopy(state or {}),
         "agent_state": copy.deepcopy(state or {}),
         "tasks": [],
+        # Last on purpose, and it must stay last: agent_loop._read_session_header
+        # answers the session walk from a bounded head read, which only works
+        # while every field it needs precedes the whole conversation. A live
+        # copy is the biggest file of the lot and the one that optimization
+        # exists for.
+        "chat_history": copy.deepcopy(chat_history or []),
     }
     if isinstance(session["state"], dict):
         session["state"]["_session_id"] = session_id
@@ -195,24 +228,23 @@ def create_session(cwd: str, state: Optional[dict] = None, chat_history: Optiona
     return session
 
 
-def load_current_session(cwd: str) -> Optional[dict]:
-    path = _current_path(cwd)
+def load_current_session(cwd: str, agent_id: str = "primary") -> Optional[dict]:
+    path = _current_path(cwd, agent_id)
     try:
-        if not path.exists():
+        if not path.exists() and str(agent_id or "primary") == "primary":
             legacy = _legacy_current_path(cwd)
             if legacy.exists():
                 try:
                     os.replace(str(legacy), str(path))
                 except OSError:
                     pass
-            if not path.exists():
-                # A missing current pointer is the durable signal that the prior
-                # session was intentionally closed. Recover live copies only when
-                # the pointer exists but is corrupt; otherwise an older orphan can
-                # resurrect after /q or /new.
-                return None
+        if not path.exists():
+            # This applies to every agent: a missing pointer means the prior
+            # session was intentionally closed, not that recovery is needed.
+            return None
         data = json.loads(path.read_text(encoding="utf-8"))
         if (data.get("cwd") != cwd or data.get("closed_at")
+                or str(data.get("agent_id") or "primary") != str(agent_id or "primary")
                 or session_lifecycle.is_deleted(cwd, data)):
             return None
         data.setdefault("id", data.get("session_id") or uuid.uuid4().hex[:16])
@@ -237,7 +269,7 @@ def load_current_session(cwd: str) -> Optional[dict]:
                 os.replace(str(path), str(corrupt))
         except OSError:
             pass
-        recovered = _recover_latest_live(cwd)
+        recovered = _recover_latest_live(cwd, agent_id)
         if recovered is not None:
             _record_error(
                 f"Current session index was unreadable ({exc}); recovered its live backup.")
@@ -247,13 +279,16 @@ def load_current_session(cwd: str) -> Optional[dict]:
                 return recovered
             # Re-enter the normal validation/default path now that the pointer
             # has been rebuilt.
-            return load_current_session(cwd) or recovered
+            return load_current_session(cwd, agent_id=agent_id) or recovered
         _record_error(f"Current session could not be loaded: {exc}")
         return None
 
 
-def ensure_current_session(cwd: str, state: Optional[dict] = None, chat_history: Optional[list] = None) -> dict:
-    return load_current_session(cwd) or create_session(cwd, state, chat_history)
+def ensure_current_session(cwd: str, state: Optional[dict] = None,
+                           chat_history: Optional[list] = None,
+                           agent_id: str = "primary") -> dict:
+    return (load_current_session(cwd, agent_id)
+            or create_session(cwd, state, chat_history, agent_id))
 
 
 def save_session(session: dict) -> None:
@@ -277,9 +312,18 @@ def save_session(session: dict) -> None:
         state["_session_id"] = session_id
         session["state"] = state
         session["agent_state"] = copy.deepcopy(state)
+    # Keep the conversation last on every rewrite, not just on the files
+    # create_session made: agent_loop._read_session_header can only answer the
+    # session walk from a bounded head read while all of its fields precede
+    # chat_history, and sessions written before that ordering existed are
+    # exactly the long-lived, largest ones.
+    if "chat_history" in session and next(reversed(session)) != "chat_history":
+        session["chat_history"] = session.pop("chat_history")
     cwd = session.get("cwd") or os.getcwd()
+    agent_id = str(session.get("agent_id") or "primary")
     paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    _atomic_write_json_if_changed(_session_path(cwd, session_id), session)
+    _atomic_write_json_if_changed(
+        _session_path(cwd, session_id, agent_id), session)
     # D1 (bughunt): the current-pointer update is a read-compare-write/unlink
     # that used to run unguarded. A concurrent close+save could interleave
     # (close reads current=X, save writes current=Y, close unlinks current)
@@ -287,7 +331,7 @@ def save_session(session: dict) -> None:
     # session file write above is safe (unique per-id path); only the shared
     # pointer needs the lifecycle guard, which is reentrant per-thread.
     with session_lifecycle.guard(cwd):
-        current = _current_path(cwd)
+        current = _current_path(cwd, agent_id)
         if session.get("closed_at"):
             try:
                 existing = json.loads(current.read_text(encoding="utf-8")) if current.exists() else {}

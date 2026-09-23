@@ -384,3 +384,51 @@ def unregister() -> None:
 def registered_names() -> list[str]:
     with _lock:
         return list(_registered)
+
+
+def render_prompt_section() -> str:
+    """The system-prompt block that exists exactly while these tools do.
+
+    Registering the tools alone was not enough to change what the model does:
+    asked to "open the browser", it reached for `browser.*` — a headless Chrome
+    inside WSL that the user cannot see and that has none of their logins —
+    because nothing said a real desktop was now within reach, or how to start
+    a program on it (there is deliberately no `win.launch`).
+    """
+    with _lock:
+        names = set(_registered)
+    if "win.snapshot" not in names:
+        return ""
+    can_act = "win.invoke" in names
+    tier = ("read and write: you may look and act" if can_act else
+            "read only: you may look but not act — to launch, click or type, "
+            "ask the user to restart the kernel with the write tier")
+    return f"""[THIS WINDOWS MACHINE — present only while helpwo-kernel is connected]
+The user is at this Windows computer and switched the kernel on for a task.
+Tier: {tier}.
+
+- "The browser", "open an app", "click that", "on my screen" mean the Windows
+  desktop the user is looking at, not this WSL shell. Prefer the `win.*` tools
+  and the Windows side for them.
+- `browser.*` is a different, invisible headless Chrome inside WSL, with none
+  of the user's logins. Use it only for background page work (scraping,
+  testing a site) or when the user asks for it by name.
+- Starting a program is the shell's job; there is no `win.launch`. Use
+  `explorer.exe`: it hands the request to Windows and returns at once, so it
+  neither blocks the command nor dies with it, and it needs no approval.
+    URL in the user's default browser: explorer.exe "https://example.com"
+    an installed program: explorer.exe "$(wslpath -w "<Start menu .lnk>")"
+      (find them: find "/mnt/c/ProgramData/Microsoft/Windows/Start Menu/Programs"
+       /mnt/c/Users/*/AppData/Roaming/Microsoft/Windows/Start\\ Menu/Programs -maxdepth 3 -iname '*.lnk')
+    a Windows built-in on PATH: explorer.exe notepad.exe
+  explorer.exe exits with status 1 even on success; judge by the window.
+  Do not run a GUI .exe directly: the command waits for it to close, and the
+  program is killed when the command ends. powershell.exe and cmd.exe work
+  but can stop for the user's approval, depending on their policy.
+  Then poll `win.windows` until its window appears — a cold start takes
+  seconds — and work on it by handle.
+- Then read before you act: `win.snapshot` → `win.invoke` / `win.set_value`;
+  screenshot + click only when a snapshot is `opaque`. Load the
+  `windows-machine` skill before the first `win.*` call.
+- Narrow what you read, do not repeat what you saw in passing, never write a
+  secret down, and never sign in, approve or pass 2FA on the user's behalf."""

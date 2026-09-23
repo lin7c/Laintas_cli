@@ -1,9 +1,16 @@
 ---
 name: windows-machine
 description: Driving the Windows machine itself -- reading windows and the screen, clicking real controls -- through a connected Helpwo kernel.
-version: 1.0.0
+version: 1.1.0
 requires_tool: win.snapshot
 triggers:
+  - open the browser
+  - open an app
+  - launch
+  - window
+  - screen
+  - desktop
+  - computer
   - click a button
   - desktop app
   - screenshot the screen
@@ -36,6 +43,65 @@ so in a block headed BEYOND THE WORKSPACE.
 
 So: the user switched this on deliberately, for a task. It is not a general
 licence, and the sections below are how to hold up your end of that.
+
+## Opening a browser or an application
+
+When the kernel is connected, "open the browser", "open Word", "open WeChat"
+mean a window on the desktop the user is looking at. `browser.*` is not that:
+it is a headless Chrome inside WSL, invisible to the user and signed in to
+nothing of theirs. Use it for background page work (scraping, testing a
+site) or when the user names it, not as "the browser".
+
+There is no `win.launch` -- starting programs stays on the guarded shell, on
+purpose. From this WSL shell, use `explorer.exe`: it hands the request to
+Windows and returns at once, and the command guard lets it through.
+
+```bash
+# a URL in the user's default browser (their profile, their logins)
+explorer.exe "https://example.com"
+
+# an installed program: find its Start-menu shortcut, then open it
+find "/mnt/c/ProgramData/Microsoft/Windows/Start Menu/Programs" \
+     /mnt/c/Users/*/AppData/Roaming/Microsoft/Windows/Start\ Menu/Programs \
+     -maxdepth 3 -iname '*chrome*.lnk' 2>/dev/null
+explorer.exe "$(wslpath -w "/mnt/c/ProgramData/Microsoft/Windows/Start Menu/Programs/Google Chrome.lnk")"
+
+# a Windows built-in on PATH
+explorer.exe notepad.exe
+```
+
+- `explorer.exe` exits with status 1 even when it worked. Judge success by
+  the window appearing, not by the exit code.
+- Shortcut names are in the user's language, not the product's English
+  name; list the folders and pick, rather than guessing.
+  Start-menu folders nest (`Programs/<Vendor>/<App>.lnk`); `find` walks
+  them. With no match, drop the `-iname` and read the list.
+- Do **not** run a GUI `.exe` directly (`notepad.exe`, `/mnt/c/.../app.exe`):
+  WSL waits for it to exit, so the command hangs until the idle timeout, and
+  the program is killed when the command ends.
+- `powershell.exe -Command 'Start-Process ...'` and `cmd.exe /c start ...`
+  also work, but the guard can stop each one for the user's approval (always
+  under an enforcing policy or a remote channel). Keep them
+  for what explorer cannot do, e.g. `Get-StartApps` to find a Store app's
+  AppID, then `explorer.exe "shell:AppsFolder\<AppID>"`.
+- Launch with the URL rather than opening a blank browser and typing into it:
+  it is one step instead of four and never races the address bar.
+
+Starting is asynchronous. Poll `win.windows` (every second or so, for up to
+~20 s) until a window from that process appears, then work on it by
+`handle`. A program that was already running may just come to the front
+instead of opening a new window -- look for it by title rather than
+assuming a new one.
+
+**Inside a browser window**, the tree covers the browser's own controls
+(tabs, address bar, buttons) and usually the page too. The page part can be
+sparse on the first snapshot while the browser switches its accessibility
+support on; snapshot once more before concluding it is empty. To go somewhere
+new in an open window, `win.set_value` the address bar control (Chrome and
+Edge label it "Address and search bar") and `win.key` `enter`; only if that
+control is missing, `win.key` `ctrl+l`, `win.type` the URL, `win.key` `enter`.
+Remember whose browser it is: every tab, saved password and signed-in site
+in it belongs to the user, and the rules below apply to all of them.
 
 ## Read the tree before you look at pixels
 

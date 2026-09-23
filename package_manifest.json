@@ -61,6 +61,7 @@
     "updater",
     "version",
     "browser_session",
+    "child_registry",
     "snapshot",
     "webrtc_channel",
     "winbridge",
@@ -134,7 +135,8 @@
     ],
     "context_policy": [
       "policy.json",
-      "budget.json"
+      "budget.json",
+      "budget_page.html"
     ],
     "diagnostics_adapter": [
       "registry.json"

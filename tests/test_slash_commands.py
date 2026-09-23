@@ -852,7 +852,8 @@ class SlashRegistryTests(unittest.TestCase):
                 setattr(laintas_cli.handle_meta_command, name, value)
         compact_mock.assert_called_once()
         sync_mock.assert_called_once()
-        save_mock.assert_called_once_with(state, chat, "/work")
+        save_mock.assert_called_once_with(
+            state, chat, "/work", agent_id=mock.ANY)
         self.assertIn("12.0k → 4.0k tokens", output.getvalue())
 
     def test_raw_parser_preserves_quotes_json_and_spacing(self):
@@ -2532,6 +2533,25 @@ class WebAndIdentityCommandTests(unittest.TestCase):
         self.assertIn("example.com", output)
         self.assertNotIn("SUPER-SECRET-VALUE", output)
         self.assertNotIn("LS-SECRET", output)
+
+    def test_search_takes_a_prose_query_with_an_apostrophe(self):
+        # /search treats any non-subcommand word as a query, but shlex.split
+        # runs before dispatch: "what's" is an unclosed quote to it, so the
+        # most natural use of the feature raised a usage error instead.
+        action, raw, parts = laintas_cli._parse_slash_command(
+            "/search what's the best python http client")
+        self.assertEqual(action, "/search")
+        self.assertEqual(raw, "what's the best python http client")
+        with mock.patch.object(laintas_cli, "_web_try") as web_try:
+            laintas_cli._cmd_web(parts)
+        self.assertEqual(web_try.call_args.args[0][:2], ["/web", "try"])
+        self.assertIn("what's", web_try.call_args.args[0])
+
+    def test_web_still_rejects_unbalanced_quotes(self):
+        # Only the alias turns an unknown word into a query; /web's own
+        # subcommands are not prose.
+        with self.assertRaises(laintas_cli.SlashCommandUsageError):
+            laintas_cli._parse_slash_command("/web cookies clear 'example.com")
 
     def test_usage_strings_survive_rich_markup(self):
         # Square brackets are Rich markup; unescaped, "[clear [domain]]" is

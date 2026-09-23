@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+import child_registry
 import json_store
 import paths
 
@@ -710,6 +711,10 @@ def spawn_app_process(command: str, *, cwd: str, env_extra: dict,
         log.close()  # the child holds its own descriptor
     with _children_lock:
         _children.append(proc)
+    # PDEATHSIG reaches only the `sh -c` leader; the app it runs is a
+    # grandchild and would be orphaned. The registry ends the whole group.
+    if os.name == "posix":
+        child_registry.register(proc.pid, "app")
     return proc
 
 

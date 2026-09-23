@@ -348,6 +348,177 @@ def _reap_stale_temp_dirs(max_age: float = _STALE_TEMP_AGE) -> int:
     return removed
 
 
+# Written into each profile dir at start(): who owns this browser stack. Chrome,
+# Xvfb and x11vnc run in their own sessions (start_new_session), so nothing in
+# the kernel ties their life to the CLI's — they outlive any exit that skips
+# close(): SIGKILL, OOM, a hard os._exit, a test runner timing out. Measured:
+# eleven stacks, 141 processes, ~1.4 GB RSS + ~2 GB swap, alive two days after
+# the CLIs that started them were gone. The age-based reapers above can never
+# collect those, since a live Chrome keeps its profile fresh.
+_OWNER_FILE = ".laintas-owner"
+
+
+def _proc_start_ticks(pid: int) -> Optional[int]:
+    """Start time of `pid` in clock ticks since boot — tells a live owner apart
+    from an unrelated process that later reused its pid."""
+    try:
+        with open(f"/proc/{pid}/stat", "r") as fh:
+            data = fh.read()
+        return int(data[data.rindex(")") + 2:].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _write_owner(profile_dir: str, *, detached: bool = False) -> None:
+    pid = os.getpid()
+    record = ({"detached": True} if detached
+              else {"pid": pid, "start": _proc_start_ticks(pid)})
+    try:
+        with open(os.path.join(profile_dir, _OWNER_FILE), "w") as fh:
+            json.dump(record, fh)
+    except OSError:
+        pass
+
+
+def _procs_using(path: str) -> list[tuple[int, int]]:
+    """(pid, ppid) of every process whose argv mentions `path` — Chrome's main
+    process, zygotes and renderers via --user-data-dir, crashpad via its
+    database dir inside the profile."""
+    needle = path.encode()
+    found = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = fh.read().split(b"\0")
+        except OSError:
+            continue
+        if any(arg == needle or arg.endswith(b"=" + needle)
+               or (b"=" + needle + b"/") in arg for arg in argv):
+            stat = _proc_stat(pid)
+            if stat is not None:
+                found.append((pid, stat[0]))
+    return found
+
+
+def _profile_orphaned(path: str, procs: list[tuple[int, int]]) -> bool:
+    try:
+        with open(os.path.join(path, _OWNER_FILE), "r") as fh:
+            owner = json.load(fh)
+    except (OSError, ValueError):
+        owner = None
+    if isinstance(owner, dict):
+        if owner.get("detached"):
+            return False                  # meant to outlive its creator
+        pid = owner.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            return False
+        start = _proc_start_ticks(pid)
+        return start is None or (owner.get("start") is not None
+                                 and start != owner.get("start"))
+    # Written before the owner file existed. Chrome is the creator's direct
+    # child, so its root process reparented to init means the creator is gone;
+    # the age floor keeps a slow or foreign start well clear of this. No
+    # processes at all is left to the age-based temp reaper.
+    pids = {pid for pid, _ppid in procs}
+    roots = [(pid, ppid) for pid, ppid in procs if ppid not in pids]
+    if not roots or any(ppid != 1 for _pid, ppid in roots):
+        return False
+    return all(_proc_age(pid) >= _ORPHAN_MIN_AGE for pid, _ppid in roots)
+
+
+def _proc_age(pid: int) -> float:
+    """Seconds since `pid` started, or 0 when unknown (never reads as old)."""
+    start = _proc_start_ticks(pid)
+    try:
+        with open("/proc/uptime", "r") as fh:
+            uptime = float(fh.read().split()[0])
+        return uptime - start / os.sysconf("SC_CLK_TCK") if start else 0.0
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def reap_orphaned_browsers() -> int:
+    """Kill browser stacks whose owning process is gone, and delete their
+    profiles. Returns the number of stacks reaped. Best-effort, never raises.
+
+    Only stacks this module created are touched (the hwo-chrome-* profile
+    dirs), and only when their owner is provably dead; one marked detached
+    (remote_browser's, which is meant to outlive the command) is left alone.
+    """
+    if not os.path.isdir("/proc"):
+        return 0
+    reaped = 0
+    try:
+        root = tempfile.gettempdir()
+        for name in os.listdir(root):
+            if not name.startswith("hwo-chrome-"):
+                continue
+            path = _owned_temp_child(root, os.path.join(root, name),
+                                     ("hwo-chrome-",))
+            if path is None or not os.path.isdir(path):
+                continue
+            procs = _procs_using(path)
+            if not _profile_orphaned(path, procs):
+                continue
+            _terminate_pids([pid for pid, _ppid in procs])
+            try:
+                display_n = int(name[len("hwo-chrome-"):].split("-", 1)[0])
+            except ValueError:
+                display_n = None
+            if display_n is not None:
+                _reap_display_of_dead_owner(display_n)
+            shutil.rmtree(path, ignore_errors=True)
+            reaped += 1
+    except Exception:
+        pass
+    return reaped
+
+
+def _terminate_pids(pids: list[int], grace: float = 3.0) -> None:
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.time() + grace
+    while time.time() < deadline and any(_proc_stat(p) for p in pids):
+        time.sleep(0.1)
+    for pid in pids:
+        if _proc_stat(pid) is not None:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def _reap_display_of_dead_owner(display_n: int) -> None:
+    """The Xvfb/x11vnc pair behind a reaped profile — only if that Xvfb has
+    been orphaned too (ppid 1); a live session's display is never touched."""
+    lock = os.path.join(_X_LOCK_DIR, f".X{display_n}-lock")
+    try:
+        with open(lock, "r") as fh:
+            holder = int(fh.read().strip() or 0)
+    except (OSError, ValueError):
+        return
+    stat = _proc_stat(holder) if holder else None
+    if stat is None:
+        _remove_display_files(display_n)
+        return
+    ppid, comm = stat
+    if comm == "Xvfb" and ppid == 1:
+        _kill_display_stack(display_n, holder)
+        _remove_display_files(display_n)
+
+
 def _port_open(host: str, port: int, timeout: float = 0.5) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -1323,7 +1494,9 @@ class BrowserSession:
             raise RuntimeError(err)
 
         # Collect orphans from earlier sessions before adding one of our own —
-        # displays first, so _free_display sees the numbers they release.
+        # whole stacks whose owner died first (that frees their profiles and
+        # displays), then displays, so _free_display sees the numbers released.
+        reap_orphaned_browsers()
         _reap_stale_temp_dirs()
         _reap_stale_displays()
 
@@ -1331,6 +1504,7 @@ class BrowserSession:
         self.cdp_port = _free_tcp_port(9222, 9322)
         self.rfb_port = _free_tcp_port(5900, 6000)
         self.user_data_dir = tempfile.mkdtemp(prefix=f"hwo-chrome-{self.display_n}-")
+        _write_owner(self.user_data_dir)
 
         # The relay exists only to keep credentials out of Chrome's argv, so an
         # upstream that needs no credentials is pointed at directly. Callers
@@ -1398,6 +1572,19 @@ class BrowserSession:
                 # happened when Chrome swallowed the failure into an error
                 # page nobody parsed.
                 self.initial_nav_error = f"{type(e).__name__}: {e}"[:300]
+
+    def detach(self) -> None:
+        """Declare that this stack is meant to outlive the process that started
+        it (remote_browser's `start` exits and `stop` tears it down later), so
+        reap_orphaned_browsers() must not collect it when this process exits."""
+        if self.user_data_dir:
+            _write_owner(self.user_data_dir, detached=True)
+
+    def kill_host_stack(self) -> None:
+        """Hard-exit path: free the processes and files now, skipping the
+        Playwright disconnect that close() waits on."""
+        self._closed.set()
+        self._close_host_stack()
 
     def close(self) -> None:
         if self._closed.is_set():
@@ -1705,6 +1892,40 @@ def close_all_browser_sessions() -> None:
     for sess in sessions:
         try:
             sess.close()
+        except Exception:
+            pass
+
+
+def kill_all_browser_hosts() -> None:
+    """For exits that cannot afford close_all_browser_sessions() — a second
+    Ctrl+C, a watchdog or sub-terminal os._exit. Kills each stack's processes
+    directly; whatever still escapes is collected by reap_orphaned_browsers()
+    the next time any CLI starts.
+
+    Never blocks on the registry lock. register/unregister hold it across
+    session.close(), which joins the Playwright worker for up to
+    _PW_TEARDOWN_CAP + 5s — so waiting here would stall the terminal watchdog
+    and AgentRegistry._die for tens of seconds in exactly the case they exist
+    for: a main thread stuck inside a hung teardown. A snapshot taken without
+    the lock is enough; the registry is only ever a dict of live sessions, and
+    this path never runs before an exit.
+    """
+    acquired = _browser_lock.acquire(blocking=False)
+    try:
+        for _ in range(3):
+            try:
+                sessions = list(_browser_sessions.values())
+                break
+            except RuntimeError:
+                sessions = []       # mutated mid-iteration by the lock holder
+        if acquired:
+            _browser_sessions.clear()
+    finally:
+        if acquired:
+            _browser_lock.release()
+    for sess in sessions:
+        try:
+            sess.kill_host_stack()
         except Exception:
             pass
 

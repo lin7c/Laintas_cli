@@ -74,6 +74,7 @@ import socket
 import tempfile
 import platform
 import webbrowser
+import atexit
 import threading
 import traceback
 import warnings
@@ -1389,7 +1390,7 @@ from agent_loop import (
     set_terminal_model_selection,
     get_pool_agents, get_deployed_agents, get_or_hire_pool_agent,
     start_agent_assignment,
-    switch_to_agent, set_current_agent_id,
+    switch_to_agent, set_current_agent_id, get_current_agent_id,
     rename_agent, station_agent, unstation_agent,
     close_all_agents,
     spawn_subagent, send_to_agent, recv_from_inbox, drain_inbox,
@@ -1424,6 +1425,7 @@ import terminal_preferences  # durable choices isolated to this logical terminal
 import migrate as migrate_mod  # Auto-migration from old layout
 import hwo_ui as hwo_ui_mod  # /hwo orchestration UI
 import browser_session as browser_mod  # headless-browser live-view stack
+import child_registry                  # every child process group we own
 import session_lifecycle
 import session_store             # durable live current-session state
 import event_log                 # prompt admission + interrupted-run recovery
@@ -2758,6 +2760,7 @@ class InteractiveSession:
 
         # ── Parent ──
         os.close(slave_fd)
+        child_registry.register(pid, "pty-shell")
         fl = fcntl.fcntl(master_fd, fcntl.F_GETFL)
         fcntl.fcntl(master_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
 
@@ -3674,14 +3677,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         ("list", "List the .retask checklists in this workspace"),
         ("done", "Say a task is finished so the AI checks it"),
     )),
-    CommandSpec("/mode", "Show, switch, or create agent modes", "Planning & Tasks", "/mode [act [always]|auto|plan [task]|review|study|step|list|create|delete]", subcommands=("act", "always", "auto", "plan", "review", "study", "step", "list", "create", "delete"), completion_descriptions=(
-        ("act", "Normal execution mode (confirmations on)"),
-        ("always", "ACT with writes & commands auto-approved this session (ACT*)"),
-        ("auto", "Autonomous: auto-confirm ordinary actions after 3s, deletes after 60s"),
-        ("plan", "Reviewed, read-only planning for a task"),
-        ("review", "Read-only code and design review"),
-        ("study", "Read-only memory capture"),
-        ("step", "Run one model iteration per Enter"),
+    CommandSpec("/mode", "Show, switch, or create agent modes", "Planning & Tasks", "/mode [list|create|delete|<mode-name>]", subcommands=("list", "create", "delete"), completion_descriptions=(
         ("list", "List available modes"),
         ("create", "Create a custom mode"),
         ("delete", "Delete a custom mode"),
@@ -3718,7 +3714,14 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
                 "Config & Tools",
                 "/web [status|engines [init]|test [engine]|try <query>|cookies [clear [domain]]]",
                 aliases=("/search",),
-                subcommands=("status", "engines", "test", "try", "cookies")),
+                subcommands=("status", "engines", "test", "try", "cookies"),
+                completion_descriptions=(
+                    ("status", "Show engines, proxy and search configuration"),
+                    ("engines", "List configured search engines (init writes a starter file)"),
+                    ("test", "Probe one engine or the whole chain"),
+                    ("try", "Run a real search query to see live results"),
+                    ("cookies", "Inspect saved browser cookies (clear removes them)"),
+                )),
     CommandSpec("/identity", "Manage saved logins the agent may browse as",
                 "Config & Tools",
                 "/identity [list|check <name>|capture <name> [domains]|delete <name>]",
@@ -4106,8 +4109,10 @@ _ARG_COMPLETIONS: dict[str, tuple] = {
         (item["id"], f"{item.get('status')} {symbols.BULLET} {item.get('objective', '')[:60]}")
         for item in workgraph.list_work()])),),
     "/mode": (
-        ((), _cached_provider("modes", _custom_mode_loader)),
-        (("act",), _static_candidates(("always", "Auto-approve writes and commands this session"))),
+        ((), _static_candidates(
+            ("list", "List available modes"),
+            ("create", "Create a custom mode"),
+            ("delete", "Delete a custom mode"))),
         (("delete",), _cached_provider("modes", _custom_mode_loader)),
     ),
     "/backend": ((("use",), _cached_provider("backends", lambda: [
@@ -4296,6 +4301,22 @@ def _role_candidates(_fragment, _prior) -> list[tuple[str, str]]:
     import agent_roles
     return [(role.name, role.description) for role in agent_roles.list_roles()]
 
+
+_MODE_CREATE_FLAGS = {
+    "--tools": ("Comma-separated tool names or fnmatch globs", lambda _f, _p: [
+        (tool.name, tool.description[:80])
+        for tool in tools_mod.get_registry().list()]),
+    "--deny": ("Comma-separated tool names or globs to block", lambda _f, _p: [
+        (tool.name, tool.description[:80])
+        for tool in tools_mod.get_registry().list()]),
+    "--read-only": ("Restrict to the built-in read-only tool set", None),
+    "--auto-approve": ("What to auto-approve while this mode is active",
+                       _static_candidates(
+                           ("none", "Confirm everything (default)"),
+                           ("writes", "Auto-approve file writes"),
+                           ("commands", "Auto-approve shell commands"),
+                           ("all", "Auto-approve writes and commands"))),
+}
 
 _HIRE_FLAGS = {
     "--profile": ("Start from a built-in employee role", _role_candidates),
@@ -4676,6 +4697,19 @@ class MetaCompleter(Completer):
                         if value.casefold().startswith(fragment.casefold()):
                             yield self._completion(value, fragment, meta)
                     return
+                # /mode create <name> [--flags...]: the first word is the mode
+                # name; from the second word on it behaves like a flag command.
+                if head_lower == "/mode" and partial.split()[:1] == ["create"]:
+                    words = partial.split()
+                    trailing_space = not partial or partial.endswith(" ")
+                    name_typed = len(words) > 1 or (len(words) == 1 and trailing_space)
+                    if name_typed:
+                        candidates, fragment = _flag_completions(
+                            words[1:], trailing_space, _MODE_CREATE_FLAGS)
+                        for value, meta in candidates:
+                            if value.casefold().startswith(fragment.casefold()):
+                                yield self._completion(value, fragment, meta)
+                        return
                 if head_lower in ("/agent", "/agents", "/station", "/st"):
                     words = partial.split()
                     trailing_space = tail.endswith(" ")
@@ -7446,6 +7480,34 @@ def _remember_model_capabilities(payload) -> None:
         pass
 
 
+# Model id -> billing tier ("T1"…) from the last catalogue fetch, so /model can
+# label the current model even when it was set by id without opening the picker.
+_MODEL_TIERS: dict[str, str] = {}
+
+
+def _attach_model_tiers(models: list[dict], payload) -> None:
+    """Fill each row's ``tier`` from the gateway's ``modelCapabilities`` map.
+
+    The providers list carries bare model ids, so the tier only exists in the
+    capabilities map; a tier already on the row (older shapes) wins.
+    """
+    capabilities = payload.get("modelCapabilities") if isinstance(payload, dict) else None
+    if isinstance(capabilities, dict):
+        for model_id, spec in capabilities.items():
+            tier = spec.get("tier") if isinstance(spec, dict) else None
+            if tier:
+                _MODEL_TIERS[str(model_id)] = str(tier).strip().upper()
+    for model in models:
+        if not model.get("tier"):
+            model["tier"] = _MODEL_TIERS.get(model.get("id", ""), "")
+
+
+def _model_tier_suffix(model_id: str) -> str:
+    """` (T1)`-style suffix for a known model, empty when the tier is unknown."""
+    tier = _MODEL_TIERS.get(model_id or "", "")
+    return f" [dim]({tier})[/dim]" if tier else ""
+
+
 def fetch_available_models(
     session: dict,
     cancel_event: Optional[threading.Event] = None,
@@ -7507,6 +7569,7 @@ def fetch_available_models(
             continue
         models = [m for m in models if m.get("id")]
         _remember_model_capabilities(data)
+        _attach_model_tiers(models, data)
         return models, endpoint
 
     raise RuntimeError(last_error or "No model endpoint responded")
@@ -7528,7 +7591,7 @@ def show_model_selector(models: list[dict], current: str = "") -> Optional[dict]
     # Prepend the auto-routing virtual entry at the start of the list,
     # using the same 30-char formatting as real models.
     auto_mark = " *" if current in ("auto", "") else "  "
-    labels.append(f"{auto_mark}[cyan]{'auto-routing':30}[/cyan] Auto-routing (embedding-based)")
+    labels.append(f"{auto_mark}[cyan]{'auto-routing':30}[/cyan] {'':3} Auto-routing (embedding-based)")
     if current in ("auto", ""):
         sel_idx = 0
     for i, model in enumerate(models):
@@ -7536,7 +7599,8 @@ def show_model_selector(models: list[dict], current: str = "") -> Optional[dict]
         provider = model.get("supply") or model.get("description") or _model_supply_label(
             str(model.get("provider") or ""))
         mark = " *" if current and model_id == current else "  "
-        labels.append(f"{mark}[cyan]{model_id:30}[/cyan] {provider}")
+        tier = model.get("tier") or ""
+        labels.append(f"{mark}[cyan]{model_id:30}[/cyan] {tier:3} {provider}")
         if current and model_id == current:
             sel_idx = i + 1  # +1 because auto occupies index 0
     chosen = select_dialog(
@@ -7735,10 +7799,15 @@ def _login_via_device(
         console.print(f"[red]Cannot start browser login: {exc}[/red]")
         return None
 
+    user_code = str(payload.get("userCode") or "")
+    if not re.fullmatch(r"[A-Z0-9]{4}-[A-Z0-9]{4}", user_code):
+        user_code = ""
     console.print(
         "[bold]Open this URL in any browser to sign in:[/bold]\n"
         f"[link={login_url}]{login_url}[/link]\n"
-        f"[dim]Waiting for approval (expires in {expires // 60} minutes)…[/dim]"
+        + (f"Confirm the page shows code [bold]{user_code}[/bold] before approving.\n"
+           if user_code else "")
+        + f"[dim]Waiting for approval (expires in {expires // 60} minutes)…[/dim]"
     )
     try:
         _open_external_url(login_url)
@@ -8600,6 +8669,80 @@ def _close_live_session(session: Optional[dict]) -> None:
         _release_live_session_lease()
 
 
+def _handoff_agent_session(old_agent, new_agent, cwd: str,
+                           old_live: Optional[dict]) -> Optional[dict]:
+    """Hand the REPL's live session from one agent to another on /agent.
+
+    The outgoing agent's conversation is synced into its own live file and
+    autosaved under its own resume namespace, so its /resume stays complete
+    after the switch. The incoming agent's live session is loaded from its
+    own namespace. Its in-memory conversation is authoritative: background
+    assignments update the registry without updating the REPL's live copy.
+    Only an uninitialized agent may adopt a conversation from disk.
+    A fresh conversation never carries the session id the agent
+    inherited at spawn time: that id names another agent's lease and fork
+    lineage. The outgoing live copy stays OPEN (not closed): switching back
+    should pick the conversation up where it left off, and an open live copy
+    is exactly what crash recovery restores.
+    """
+    if new_agent is None:
+        return old_live
+    if old_agent is not None and old_agent.id == new_agent.id:
+        return old_live
+    try:
+        # ── Outgoing: persist under the OLD agent's namespace ──────────
+        if old_agent is not None:
+            history = list(getattr(old_agent, "chat_history", []) or [])
+            if any(isinstance(m, dict) and m.get("role") == "user"
+                   for m in history):
+                save_resume_state(old_agent.state, history, cwd,
+                                  agent_id=old_agent.id)
+            if (old_live and str(old_live.get("agent_id") or "primary")
+                    == old_agent.id):
+                try:
+                    session_store.sync_runtime(
+                        old_live, old_agent.state, history, cwd=cwd)
+                except Exception:
+                    pass
+        # ── Incoming: load or create under the NEW agent's namespace ───
+        incoming = session_store.load_current_session(
+            cwd, agent_id=new_agent.id)
+        has_runtime = bool(new_agent.chat_history or
+                           new_agent.state.get("_session_id") or
+                           new_agent.state.get("_assignment_id"))
+        if incoming is not None and not has_runtime:
+            # Adopt the conversation and session id into the agent objects
+            # the REPL is about to rebind to. Identity-shaped state (profile,
+            # tool scopes) stays the registry's own.
+            new_agent.chat_history[:] = list(
+                incoming.get("chat_history") or [])
+            adopted_state = (incoming.get("state")
+                             or incoming.get("agent_state") or {})
+            new_agent.state.update(prepare_state_for_repl(adopted_state))
+            new_agent.state["_session_id"] = incoming["session_id"]
+        elif incoming is not None:
+            new_agent.state["_session_id"] = incoming["session_id"]
+            incoming = session_store.sync_runtime(
+                incoming, new_agent.state, new_agent.chat_history, cwd=cwd)
+        else:
+            fresh_state = dict(new_agent.state or {})
+            fresh_state.pop("_session_id", None)
+            incoming = session_store.create_session(
+                cwd, fresh_state, new_agent.chat_history,
+                agent_id=new_agent.id)
+            new_agent.state["_session_id"] = incoming["session_id"]
+        # _hold_live_session_lease releases the outgoing lease internally
+        # once the incoming one is granted.
+        _hold_live_session_lease(incoming, cwd)
+        return incoming
+    except Exception as exc:
+        add_debug_log(DebugEntry(
+            timestamp=datetime.now().isoformat(timespec="seconds"),
+            reply=f"agent session handoff failed: {exc}",
+            error=True))
+        raise
+
+
 def _acquire_resume_lease(blob: dict) -> Optional[dict]:
     """Try to take ownership of a resumed session before restoring it.
 
@@ -8649,7 +8792,8 @@ def _archive_previous_session(cwd, live):
             return
         history = live.get("chat_history") or []
         if any(isinstance(m, dict) and m.get("role") == "user" for m in history):
-            save_resume_checkpoint(live.get("state") or live.get("agent_state") or {}, history, cwd)
+            save_resume_checkpoint(live.get("state") or live.get("agent_state") or {}, history, cwd,
+                                    agent_id=str(live.get("agent_id") or "primary"))
         session_store.close_session(live)
 
 
@@ -8668,7 +8812,11 @@ def _switch_resume_session(blob, cwd, state, history, live):
             console.print("[dim]This session is already current.[/dim]")
             return None
         # Refresh after the picker: a peer may have saved or deleted the entry.
-        tip = load_resume_state(cwd, sid) if sid else None
+        # The blob being resumed knows its own namespace; a scout session
+        # must reload scout's tip even if the picker was reached from primary.
+        tip = (load_resume_state(cwd, sid,
+                                 agent_id=str(blob.get("agent_id") or "primary"))
+               if sid else None)
         if tip is not None:
             blob = tip
         elif blob.get("_path"):
@@ -8695,7 +8843,9 @@ def _switch_resume_session(blob, cwd, state, history, live):
             _reset_fresh_session_context(cwd)
             restored_history = []
             restored = _restore_resume_blob(blob, restored_history)
-            new_live = session_store.create_session(cwd, restored, restored_history)
+            new_live = session_store.create_session(
+                cwd, restored, restored_history,
+                agent_id=str(blob.get("agent_id") or "primary"))
             if live:
                 session_store.close_session(copy.deepcopy(live))
         except Exception as exc:
@@ -8801,8 +8951,11 @@ def _resume_choices(cwd: str) -> list:
     Returns all states (checkpoints + autosaves) so the user can resume from
     any saved point. Previously this filtered to only checkpoints when present,
     which hid newer autosaves created after a /q checkpoint.
+
+    Namespaced by the agent the REPL is currently talking to: after
+    `/agent scout`, /resume offers scout's sessions, not primary's.
     """
-    return list_resume_states(cwd)
+    return list_resume_states(cwd, agent_id=get_current_agent_id())
 
 
 def _resolve_resume_selector(choices: list, selector: str) -> Optional[dict]:
@@ -10542,6 +10695,7 @@ class TerminalSession:
             return
 
         # Parent: size the PTY, then connect the relay.
+        child_registry.register(self.pid, "helpwo-terminal")
         if self._closed.is_set():
             self._cleanup()
             return
@@ -12116,6 +12270,7 @@ class AgentRegistry:
                     terminal_arbiter.reset_to_pristine()
                 except Exception:
                     pass
+                _kill_owned_processes()
                 os._exit(0)
             threading.Thread(target=_die, daemon=True).start()
             return
@@ -13864,8 +14019,11 @@ def _validate_slash_args(action: str, args: list[str]) -> None:
                 f"Unexpected argument: {invalid[0]}. Usage: {rule.usage}")
 
 
-#: Commands whose handler reads `raw_args` and ends in free text.
-_FREE_TEXT_TAIL_COMMANDS = frozenset({"/img"})
+#: Commands whose handler reads `raw_args` and ends in free text. `/search`
+#: is here rather than `/web`: only the alias turns an unknown subcommand into
+#: a query, and a query is prose — "what's the best http client" is an
+#: unclosed quote to shlex, not a mistake by the user.
+_FREE_TEXT_TAIL_COMMANDS = frozenset({"/img", "/search"})
 
 
 def _parse_slash_command(cmd: str) -> tuple[str, str, list[str]]:
@@ -15827,8 +15985,8 @@ def _cmd_model_aux(args: list, session: dict) -> None:
 
     Shares the terminal picker deliberately: the auxiliary model is chosen from
     the same catalogue as any other, so anything the gateway serves is a valid
-    choice here — Gemma for long-context compaction by default, but
-    deepseek-v4-flash or whatever else is equally selectable.
+    choice here — Gemma for long-context compaction by default (a deliberate
+    pin), but any served model is equally selectable.
     """
     current = str(get_runtime_config("aux_model") or "")
 
@@ -15937,7 +16095,7 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
         _apply(model)
         console.print(
             f"[green]Model for [bold]{target_terminal}[/bold] set to: "
-            f"[bold]{model}[/bold][/green]")
+            f"[bold]{model}[/bold][/green]{_model_tier_suffix(model)}")
     else:
         current = str(terminal.model_override or "")
         current_provider = str(terminal.provider_override or "")
@@ -15968,7 +16126,7 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
                     model_id = selected.get("id", "") if isinstance(selected, dict) else selected
                     provider_id = selected.get("provider", "") if isinstance(selected, dict) else ""
                     _apply(model_id, provider_id)
-                    info = f"[bold]{model_id}[/bold]"
+                    info = f"[bold]{model_id}[/bold]{_model_tier_suffix(model_id)}"
                     if provider_id:
                         info += f" ([dim]{_model_supply_label(provider_id)}[/dim])"
                     console.print(
@@ -15981,6 +16139,7 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
                 table.add_column("#", style="dim")
                 table.add_column("Current", style="green")
                 table.add_column("Model ID", style="cyan")
+                table.add_column("Tier", justify="center")
                 table.add_column("Name")
                 table.add_column("Provider")
                 # Prepend the auto-routing virtual entry at the top of the table.
@@ -15989,6 +16148,7 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
                     "1",
                     auto_marker,
                     "auto-routing",
+                    "",
                     "Auto-routing (embedding-based)",
                     "",
                 )
@@ -15998,14 +16158,16 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
                         str(idx),
                         marker,
                         m["id"],
+                        m.get("tier") or "—",
                         m.get("name", ""),
                         m.get("supply") or _model_supply_label(
                             str(m.get("provider") or "")),
                     )
                 if not models:
-                    table.add_row("", "", "(none)", "", "")
+                    table.add_row("", "", "(none)", "", "", "")
                 console.print(table)
                 console.print(f"Terminal {target_terminal} override: [bold]{current or '(none)'}[/bold]" +
+                              _model_tier_suffix(current) +
                               (f" ([dim]{_model_supply_label(current_provider)}[/dim])"
                                if current_provider else ""))
                 if models and not sys.stdin.isatty():
@@ -16887,8 +17049,8 @@ def _cmd_prop(raw_args: str, session: dict) -> None:
                 console.print(f"[red]Could not write the page: {escape(str(exc))}[/red]")
                 return
             console.print(f"[green]Budget page written:[/green] {escape(str(written.resolve()))}")
-            console.print("[dim]Open it in a browser, drag the shares, download the .config file, "
-                          "then /config import <file>.[/dim]")
+            console.print("[dim]Open it in a browser, drag the dividers or type percentages, "
+                          "download the .config file, then /config import <file>.[/dim]")
             return
         prop_ui.open_budget_browser(rows, newest_index=budget_index)
         return
@@ -20578,6 +20740,28 @@ def _cmd_agent(parts: list, session: dict, interactive_session) -> bool:
                  else agent.id)
         console.print(f"[dim]Already focused on {label}.[/dim]")
         return False
+    # Session handoff: the outgoing agent's conversation is autosaved under
+    # its own resume namespace, and the incoming agent's live session is
+    # loaded from (or created in) its own — so each persistent agent keeps a
+    # separate /resume list, live copies and lease. Temporary subagents have
+    # no session namespace and keep the shared live session untouched.
+    if agent.role != "subagent":
+        with agent.assignment_lock:
+            if (agent.active_assignment is not None or agent.status in {
+                    "queued", "running", "thinking", "waiting"}):
+                console.print(
+                    f"[yellow]{escape(agent.id)} is working. Use /agents to "
+                    "view progress or send an update; switch after it finishes.[/yellow]")
+                return False
+            _old_live = getattr(handle_meta_command, "_current_live_session", None)
+            try:
+                _incoming_live = _handoff_agent_session(
+                    current, agent, os.getcwd(), _old_live)
+            except Exception as exc:
+                console.print(f"[red]Could not switch sessions: {escape(str(exc))}[/red]")
+                return False
+            handle_meta_command._current_live_session = _incoming_live
+
     if not switch_to_agent(agent.id):
         console.print(f"[red]Could not switch to agent '{agent.id}'.[/red]")
         return False
@@ -20627,8 +20811,28 @@ def _cmd_agents_plain(parts: list) -> None:
                 else:
                     buckets["other"].append(a)
 
+            def _agent_session_note(a):
+                """Show current runtime history before older saved history."""
+                if getattr(a, "role", "") == "subagent":
+                    return ""
+                if a.chat_history:
+                    turns = _resume_turn_count({"chat_history": a.chat_history})
+                    return f" [dim]◦ {turns} turn(s) in current conversation[/dim]"
+                try:
+                    summary = latest_resume_summary(
+                        os.getcwd(), agent_id=a.id)
+                    if summary:
+                        return (f" [dim]\u25e6 saved: {summary['turn_count']} turn(s) "
+                                f"{_format_time_ago(summary['timestamp'])}"
+                                f"[/dim]")
+                except Exception:
+                    pass
+                return ""
+
             def _render(a):
                 markers = []
+                if a.id == get_current_agent_id():
+                    markers.append("[bold green]← foreground[/bold green]")
                 if a.id == input_target_id:
                     markers.append("[bold green]← input[/bold green]")
                 row = ui_rows.get(a.id, {})
@@ -20640,38 +20844,39 @@ def _cmd_agents_plain(parts: list) -> None:
                 status_str = f" [dim]({phase})[/dim]" if phase != "idle" else ""
                 inbox_str = f" [dim yellow]inbox={a.inbox.qsize()}[/dim yellow]" if a.inbox.qsize() else ""
                 name_part = f" {a.name}" if a.name and a.name != a.id else ""
-                return marker, status_str, inbox_str, name_part
+                session_str = _agent_session_note(a)
+                return marker, status_str, inbox_str, name_part, session_str
 
             if buckets["primary"]:
                 console.print("[bold]── Primary ──[/bold]")
                 for a in buckets["primary"]:
-                    marker, st_s, inb, np = _render(a)
-                    console.print(f"  [bold]{a.id}[/bold]{np}{st_s}{inb}{marker}")
+                    marker, st_s, inb, np, ses = _render(a)
+                    console.print(f"  [bold]{a.id}[/bold]{np}{st_s}{inb}{ses}{marker}")
             if buckets["pool"]:
                 idle_count = sum(a.status in {"idle", "ready", "error"}
                                  for a in buckets["pool"])
                 console.print(f"[bold]── Pool ({idle_count} available) ──[/bold]")
                 for a in buckets["pool"]:
-                    marker, st_s, inb, np = _render(a)
-                    console.print(f"  [bold]{a.id}[/bold]{np}{st_s}{inb}{marker}")
+                    marker, st_s, inb, np, ses = _render(a)
+                    console.print(f"  [bold]{a.id}[/bold]{np}{st_s}{inb}{ses}{marker}")
             if buckets["deployed"]:
                 console.print(f"[bold]── Deployed ({len(buckets['deployed'])}) ──[/bold]")
                 for a in buckets["deployed"]:
-                    marker, st_s, inb, np = _render(a)
+                    marker, st_s, inb, np, ses = _render(a)
                     home = agent_deployment_terminal(a) or "?"
                     parent_term = getattr(a, "parent_terminal", None) or "?"
-                    console.print(f"  [bold]{a.id}[/bold]{np} → [cyan]{home}[/cyan] [dim](parent={parent_term})[/dim]{st_s}{inb}{marker}")
+                    console.print(f"  [bold]{a.id}[/bold]{np} → [cyan]{home}[/cyan] [dim](parent={parent_term})[/dim]{st_s}{inb}{ses}{marker}")
             if buckets["subagent"]:
                 console.print(f"[bold]── Subagents ({len(buckets['subagent'])}) ──[/bold]")
                 for a in buckets["subagent"]:
-                    marker, st_s, inb, np = _render(a)
+                    marker, st_s, inb, np, ses = _render(a)
                     parent = a.parent_id or "?"
                     console.print(f"  [bold]{a.id}[/bold]{np} [dim](depth={a.depth}, parent={parent})[/dim]{st_s}{inb}{marker}")
             if buckets["other"]:
                 console.print("[bold]── Other ──[/bold]")
                 for a in buckets["other"]:
-                    marker, st_s, inb, np = _render(a)
-                    console.print(f"  [bold]{a.id}[/bold]{np}{st_s}{inb}{marker}")
+                    marker, st_s, inb, np, ses = _render(a)
+                    console.print(f"  [bold]{a.id}[/bold]{np}{st_s}{inb}{ses}{marker}")
     elif len(parts) == 2 and parts[1].lower() == "tree":
         console.print(build_agents_tree())
     elif len(parts) == 2:
@@ -23174,8 +23379,17 @@ def _web_cookies(parts: list) -> None:
                   r"/web cookies clear \[domain].[/dim]")
 
 
+_WEB_SUBCOMMANDS = ("status", "engines", "test", "try", "cookies")
+
+
 def _cmd_web(parts: list) -> None:
     sub = parts[1].lower() if len(parts) > 1 else ""
+    # /search is the alias people reach for first: anything that is not a
+    # known /web subcommand is treated as a plain query and searched
+    # directly, so "/search python asyncio" works without the "try" word.
+    if parts[0] == "/search" and sub and sub not in _WEB_SUBCOMMANDS:
+        _web_try(["/web", "try", *parts[1:]])
+        return
     if sub in ("", "status"):
         _web_status()
     elif sub == "engines":
@@ -23299,7 +23513,8 @@ def _persist_session_state(agent_state: dict, chat_history: list, cwd: str,
     session_store last recorded it (the input unchanged when there is none).
     """
     save_session_snapshot(agent_state, chat_history, cwd)
-    save_resume_state(agent_state, chat_history, cwd)
+    save_resume_state(agent_state, chat_history, cwd,
+                       agent_id=get_current_agent_id())
     if live_session:
         return session_store.sync_runtime(
             live_session, agent_state, chat_history, cwd=cwd, tasks=tasks)
@@ -25580,6 +25795,31 @@ def _stdin_terminal_disconnected() -> bool:
     return False
 
 
+def _kill_owned_processes() -> None:
+    """Hard-exit teardown (second Ctrl+C, watchdog, sub-terminal os._exit):
+    every child process group this CLI started, browser stacks included.
+    Only signals — never waits on Playwright or a stuck main thread."""
+    try:
+        browser_mod.kill_all_browser_hosts()
+    except Exception:
+        pass
+    try:
+        child_registry.kill_all()
+    except Exception:
+        pass
+
+
+def _reap_orphans_of_dead_clis() -> None:
+    """Startup sweep for CLIs that died by SIGKILL/OOM: their process groups
+    (registry ledgers) and their browser stacks (profile owner files)."""
+    for reap in (child_registry.reap_dead_owners,
+                 browser_mod.reap_orphaned_browsers):
+        try:
+            reap()
+        except Exception:
+            pass
+
+
 def _install_terminal_watchdog(shutdown_fn, *, startup_cwd=None,
                                interval: float = 30.0, grace: float = 8.0):
     """Exit when the controlling terminal or launch directory disappears.
@@ -25652,6 +25892,7 @@ def _install_terminal_watchdog(shutdown_fn, *, startup_cwd=None,
             # a stuck main thread is the reason this thread exists at all.
             threading.Thread(target=attempt_clean_shutdown, daemon=True).start()
             time.sleep(grace)
+            _kill_owned_processes()
             os._exit(0)
 
     threading.Thread(target=watch, name="terminal-watchdog", daemon=True).start()
@@ -27277,7 +27518,8 @@ def _run_execute_mode(task: str, session: dict, depth: int, session_id: str = No
     }
     chat_history = []
     if session_id:
-        saved = load_resume_state(os.getcwd(), session_id=session_id)
+        saved = load_resume_state(os.getcwd(), session_id=session_id,
+                                  agent_id=get_current_agent_id())
         if saved:
             agent_state = _restore_resume_blob(saved, chat_history)
         else:
@@ -27302,7 +27544,8 @@ def _run_execute_mode(task: str, session: dict, depth: int, session_id: str = No
         chat_history.append({"role": "assistant", "content": result})
     if session_id:
         save_resume_state(prepare_state_for_repl(response.get("state", agent_state)),
-                          chat_history, os.getcwd())
+                          chat_history, os.getcwd(),
+                          agent_id=get_current_agent_id())
     last_output = response.get("state", {}).get("lastOutput", "")
     if last_output:
         result += "\n" + last_output
@@ -27765,8 +28008,25 @@ def main():
     # /resume; it is never injected into the new session automatically.
     if args.depth == 0:
         _explicit_startup_resume = bool(args.resume or args.continue_session)
+        # Which agent this terminal was last using decides every session
+        # namespace below (previous-live archive, fresh live session, resume
+        # blob). It must be resolved BEFORE those loads, not at the registry
+        # restore further down — otherwise --resume always loads primary's
+        # archive and the later rebind discards it. Only ids that are
+        # guaranteed to be registered in this process are eligible; a
+        # remembered employee that is not re-registered falls back to
+        # primary, matching what restore_current_agent would do later.
+        _startup_agent_id = "primary"
+        try:
+            _remembered = str(terminal_preferences.get("agent", "") or "")
+            if _remembered in ("primary", DEFAULT_SUB_AGENT_NAME,
+                               DECOMPOSER_SUB_AGENT_NAME):
+                _startup_agent_id = _remembered
+        except Exception:
+            pass
+        _startup_resume_switched = False
         _previous_live_session = session_store.load_current_session(
-            _session_start_cwd)
+            _session_start_cwd, _startup_agent_id)
         _session_warning = session_store.consume_last_error()
         if _session_warning:
             startup_mail.post("session-store", "Session store warning",
@@ -27782,7 +28042,8 @@ def main():
                     f"[red]Could not reset persisted session context: {exc}[/red]")
 
         current_live_session = session_store.create_session(
-            _session_start_cwd, agent_state, chat_history)
+            _session_start_cwd, agent_state, chat_history,
+            agent_id=_startup_agent_id)
         _hold_live_session_lease(current_live_session, _session_start_cwd)
         handle_meta_command._current_live_session = current_live_session
 
@@ -27793,7 +28054,8 @@ def main():
         # latest_resume_summary gets in ~0.03s. /resume still uses the full
         # listing, because a picker really does have to collapse duplicates.
         if not _explicit_startup_resume:
-            _summary = latest_resume_summary(_session_start_cwd)
+            _summary = latest_resume_summary(
+                _session_start_cwd, agent_id=_startup_agent_id)
             if _summary:
                 startup_mail.post(
                     "resume",
@@ -27834,7 +28096,9 @@ def main():
             _startup_advisories = _close_stale_admission
 
         # Only the explicit-restore path still needs the blob up front.
-        _resume_blob = (load_resume_state(_session_start_cwd)
+        _resume_blob = (load_resume_state(
+                            _session_start_cwd,
+                            agent_id=_startup_agent_id)
                         if _explicit_startup_resume else None)
         if _resume_blob and _resume_blob.get("chat_history"):
             switched = _switch_resume_session(
@@ -27843,6 +28107,7 @@ def main():
             if switched is not None:
                 agent_state, current_live_session = switched
                 handle_meta_command._current_live_session = current_live_session
+                _startup_resume_switched = True
                 console.print("[green]Resumed saved session.[/green]")
                 _print_resume_transcript({"chat_history": chat_history}, 20)
         elif _explicit_startup_resume:
@@ -28035,8 +28300,19 @@ def main():
                 if _restored and _restored != "primary":
                     _restored_agent = get_agent(_restored)
                     if _restored_agent is not None:
-                        agent_state = _restored_agent.state
-                        chat_history = _restored_agent.chat_history
+                        if (_startup_resume_switched
+                                and _restored == _startup_agent_id):
+                            # The startup --resume already restored this
+                            # agent's conversation into the REPL locals.
+                            # Rebinding to the registry's boot objects would
+                            # discard it, so the registry adopts the live
+                            # objects instead — the same contract the primary
+                            # path uses at startup.
+                            _restored_agent.state = agent_state
+                            _restored_agent.chat_history = chat_history
+                        else:
+                            agent_state = _restored_agent.state
+                            chat_history = _restored_agent.chat_history
                         interactive_session = (
                             _restored_agent.runtime_session
                             or interactive_session)
@@ -28060,7 +28336,8 @@ def main():
                         objective=agent_state.get("objective"),
                         tasks=_active_task_export())
                 save_resume_state(
-                    agent_state, chat_history, _session_start_cwd)
+                    agent_state, chat_history, _session_start_cwd,
+                    agent_id=get_current_agent_id())
             except Exception as exc:
                 add_debug_log(DebugEntry(
                     timestamp=datetime.now().isoformat(timespec="seconds"),
@@ -28217,6 +28494,9 @@ def main():
                 terminal_arbiter.reset_to_pristine()
             except Exception:
                 pass
+            # Chrome/Xvfb run in their own sessions and survive os._exit —
+            # this is the one browser teardown that does not wait on anything.
+            _kill_owned_processes()
             os._exit(1)
         shutdown._in_progress = True
         if _agents_view_is_active():
@@ -28258,6 +28538,7 @@ def main():
                 close_all_agents()
             except Exception:
                 pass
+            _kill_owned_processes()
             os._exit(0)
         console.print("\n[yellow]Shutting down...[/yellow]")
         if args.depth == 0 and not _quit_checkpoint_saved:
@@ -28297,6 +28578,15 @@ def main():
     # delivers SIGHUP — unregister from Helpwo before dying instead of
     # leaving a stale agent until the 60s heartbeat timeout.
     signal.signal(signal.SIGHUP, shutdown)
+
+    # A CLI that died by SIGKILL/OOM ran none of the teardowns above, and its
+    # browser stacks (>1 GB each with renderers) would otherwise idle until
+    # someone next opens a browser. Owner-checked, so live stacks are safe.
+    threading.Thread(target=_reap_orphans_of_dead_clis,
+                     name="orphan-reaper", daemon=True).start()
+    # Graceful exits all end in sys.exit / return; os._exit and SIGKILL skip
+    # atexit, and are covered by _kill_owned_processes and the reaper above.
+    atexit.register(child_registry.kill_all)
 
     # Signals only help when the main thread can run them. Monitor-only is the
     # one mode meant to outlive its terminal, so it opts out; every other mode
@@ -28573,7 +28863,8 @@ def main():
                     if injected_done is not None:
                         injected_done.set()
                     continue
-                _existing = list_resume_states(_session_start_cwd)
+                _existing = list_resume_states(
+                    _session_start_cwd, agent_id=get_current_agent_id())
                 # Any snapshot sitting on that path already owns the branch -
                 # named forks and auto-named branches alike - so the name has
                 # to be unique among siblings, not just among named forks.
@@ -28593,7 +28884,8 @@ def main():
                 _parent_session_id = str(agent_state.get("_session_id") or "")
                 _fork_blob = save_fork_state(
                     agent_state, chat_history, _session_start_cwd,
-                    _fork_name, _new_lineage, _parent_session_id)
+                    _fork_name, _new_lineage, _parent_session_id,
+                    agent_id=get_current_agent_id())
                 if _fork_blob:
                     _n = _resume_turn_count(_fork_blob)
                     _ago = _format_time_ago(_fork_blob.get("timestamp", 0))
@@ -28611,7 +28903,8 @@ def main():
                 # context, like a branching continuation. The current context
                 # is saved as an anonymous fork checkpoint first so it can be
                 # resumed later.
-                save_resume_state(agent_state, chat_history, _session_start_cwd)
+                save_resume_state(agent_state, chat_history, _session_start_cwd,
+                                   agent_id=get_current_agent_id())
                 _close_live_session(current_live_session)
                 # Inherit chat_history (copy) + state; new session_id.
                 _inherited_history = list(chat_history)
@@ -28624,7 +28917,8 @@ def main():
                     agent_state.get("_fork_lineage"))
                 _taken_paths = {
                     tuple(normalize_fork_lineage(item.get("fork_lineage")))
-                    for item in list_resume_states(_session_start_cwd)
+                    for item in list_resume_states(
+                        _session_start_cwd, agent_id=get_current_agent_id())
                 }
                 _branch_n = 1
                 while tuple(_parent_lineage
@@ -28640,7 +28934,8 @@ def main():
                 _parent_session_id = str(agent_state.get("_session_id") or "")
                 _fork_blob = save_fork_state(
                     agent_state, chat_history, _session_start_cwd,
-                    _auto_branch, _branch_lineage, _parent_session_id)
+                    _auto_branch, _branch_lineage, _parent_session_id,
+                    agent_id=get_current_agent_id())
                 if _fork_blob:
                     _inherited_state = dict(_fork_blob.get("state") or {})
                 else:
@@ -28657,7 +28952,8 @@ def main():
                                    if _fork_blob else prepare_state_for_repl(_inherited_state))
                 _ensure_session_id(agent_state)
                 current_live_session = session_store.create_session(
-                    _session_start_cwd, agent_state, chat_history)
+                    _session_start_cwd, agent_state, chat_history,
+                    agent_id=get_current_agent_id())
                 _hold_live_session_lease(current_live_session, _session_start_cwd)
                 handle_meta_command._current_live_session = current_live_session
                 handle_meta_command._last_agent_state = agent_state
@@ -28718,7 +29014,9 @@ def main():
                 "lastReply": "",
                 "lastOutput": "",
             }
-            current_live_session = session_store.create_session(_session_start_cwd, agent_state, chat_history)
+            current_live_session = session_store.create_session(
+                _session_start_cwd, agent_state, chat_history,
+                agent_id=get_current_agent_id())
             _hold_live_session_lease(current_live_session, _session_start_cwd)
             handle_meta_command._current_live_session = current_live_session
             handle_meta_command._last_agent_state = agent_state
@@ -28737,7 +29035,9 @@ def main():
         )
         if _is_top_level_quit:
             save_session_snapshot(agent_state, chat_history, _session_start_cwd)
-            _checkpoint = save_resume_checkpoint(agent_state, chat_history, _session_start_cwd)
+            _checkpoint = save_resume_checkpoint(
+                agent_state, chat_history, _session_start_cwd,
+                agent_id=get_current_agent_id())
             _quit_checkpoint_saved = True
             if current_live_session:
                 session_store.sync_runtime(
@@ -28794,7 +29094,8 @@ def main():
                 chat_history = handle_meta_command._last_chat_history
                 handle_meta_command._agent_switch_performed = False
                 if args.depth == 0:
-                    save_resume_state(agent_state, chat_history, _session_start_cwd)
+                    save_resume_state(agent_state, chat_history, _session_start_cwd,
+                                   agent_id=get_current_agent_id())
             if should_exit:
                 # /q already finalized this logical session as a checkpoint.
                 # Writing a generic autosave here used to create a duplicate
@@ -28931,7 +29232,8 @@ def main():
                     tasks=_active_task_export(),
                 )
                 handle_meta_command._current_live_session = current_live_session
-                save_resume_state(agent_state, chat_history, _session_start_cwd)
+                save_resume_state(agent_state, chat_history, _session_start_cwd,
+                                   agent_id=get_current_agent_id())
             if injected_done is not None:
                 injected_done.set()
             continue
@@ -29003,7 +29305,8 @@ def main():
                     )
                     handle_meta_command._current_live_session = current_live_session
                     save_resume_state(
-                        agent_state, chat_history, _session_start_cwd)
+                        agent_state, chat_history, _session_start_cwd,
+                        agent_id=get_current_agent_id())
                 if injected_done is not None:
                     injected_done.set()
                 continue
@@ -29330,7 +29633,8 @@ def main():
                     tasks=_active_task_export(),
             )
             handle_meta_command._current_live_session = current_live_session
-            save_resume_state(agent_state, chat_history, _session_start_cwd)
+            save_resume_state(agent_state, chat_history, _session_start_cwd,
+                              agent_id=get_current_agent_id())
 
         if injected_done is not None:
             injected_done.set()

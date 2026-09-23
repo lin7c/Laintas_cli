@@ -77,6 +77,20 @@ def _tokens(text: str) -> set:
         "\u63a8\u8350": {"recommend"}, "\u516c\u8ba4": {"recommend", "popular"},
         "\u8bba\u6587": {"paper", "research", "writing"},
         "\u6587\u6863": {"docs", "documentation"},
+        # Operating the user's own computer (the windows-machine skill).
+        "\u6d4f\u89c8\u5668": {"browser"},
+        "\u6253\u5f00": {"open"},
+        "\u8f6f\u4ef6": {"app"},
+        "\u5e94\u7528": {"app"},
+        "\u7a0b\u5e8f": {"app"},
+        "\u7a97\u53e3": {"window"},
+        "\u5c4f\u5e55": {"screen"},
+        "\u622a\u56fe": {"screenshot"},
+        "\u622a\u5c4f": {"screenshot"},
+        "\u5fae\u4fe1": {"wechat"},
+        "\u70b9\u51fb": {"click"},
+        "\u7535\u8111": {"computer"},
+        "\u684c\u9762": {"desktop"},
     }
     for phrase, terms in aliases.items():
         if phrase in value:

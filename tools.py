@@ -38,6 +38,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+import child_registry
 import paths
 import durable_rules
 import git_attribution
@@ -7500,6 +7501,9 @@ class _ProcessGroupOwner:
         self.pgid = process.pid
         self._closed = False
         self._lock = threading.Lock()
+        # Esc and close() end the group while the CLI is alive; the registry
+        # covers the exits that never get to run them.
+        child_registry.register(self.pgid, "shell")
 
     def _signal_group(self, sig: int) -> bool:
         try:
@@ -7559,6 +7563,7 @@ class _ProcessGroupOwner:
                         stream.close()
                 except Exception:
                     pass
+            child_registry.unregister(self.pgid)
 
 
 def _read_shell_pipe(stream) -> bytes:
@@ -9658,13 +9663,13 @@ def register_builtin_tools() -> None:
         Tool(
             name="skill.save",
             description=(
-                "Write down, as a reusable skill, something you learned about "
-                "working in THIS project that you would want on hand next time "
-                "— a pitfall to avoid, a sequence that finally worked, a "
-                "convention this repo enforces. Use it when a lesson is about "
-                "HOW to do something here; use mem.save when it is a FACT "
-                "about the project. Project scope by default, so it never "
-                "shows up in other repos. Documentation only: this writes "
+                "Record, as a reusable skill, how a task in THIS project was "
+                "successfully completed: the goal, the steps in order, the "
+                "commands and files involved, and how the result was verified. "
+                "Call it after the task is done and verified, so the same kind "
+                "of task can be done the same way next time. Use mem.save for "
+                "a FACT about the project. Project scope by default, so it "
+                "never shows up in other repos. Documentation only: this writes "
                 "instructions, never code. Saving under an existing name "
                 "updates it."),
             schema={

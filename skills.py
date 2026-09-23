@@ -64,6 +64,7 @@ ToolRegistry.unregister_source can pull them out on reload.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -320,23 +321,106 @@ def sync_gateway_skills(session: Optional[dict], *, requests_module=None,
     return results
 
 
-def ensure_bundled_skills_installed() -> list[str]:
-    """Copy bundled documentation skills into the user skills dir if missing.
+#: Written into each seeded copy: the digest of the bundled version it was
+#: seeded from. Equal to the copy's own digest means nobody has edited it.
+_BUNDLED_MARKER = ".bundled-digest"
+#: Digests of every bundled version ever shipped, for copies seeded before the
+#: marker existed (generated from git history; see the file's own header).
+_SHIPPED_DIGESTS_FILE = BUNDLED_SKILLS_DIR / ".shipped-digests.json"
 
-    Existing user skills win; this only seeds defaults for fresh installs.
+
+def _skill_dir_digest(path: Path) -> str:
+    """Content identity of a skill directory: every file's relative path and
+    bytes, in order. Excludes the marker and bytecode, which are not content."""
+    h = hashlib.sha256()
+    for file in sorted(p for p in path.rglob("*") if p.is_file()):
+        rel = file.relative_to(path).as_posix()
+        if rel == _BUNDLED_MARKER or "__pycache__" in file.parts:
+            continue
+        h.update(rel.encode("utf-8"))
+        h.update(b"\0")
+        h.update(file.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _shipped_digests() -> dict[str, set[str]]:
+    try:
+        data = json.loads(_SHIPPED_DIGESTS_FILE.read_text(encoding="utf-8"))
+        return {str(k): set(v) for k, v in data.get("skills", {}).items()}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def _write_bundled_marker(dst: Path, digest: str) -> None:
+    try:
+        (dst / _BUNDLED_MARKER).write_text(digest + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def ensure_bundled_skills_installed() -> list[str]:
+    """Seed bundled skills into the user skills dir, and keep untouched copies
+    current. Returns the names seeded or upgraded.
+
+    The user copy shadows the bundled one, which is what lets people customise
+    a skill. But it used to be copied once and never again, so every
+    improvement to a bundled skill reached new installs only — the Windows
+    guidance a connected kernel depends on included. Now a copy is upgraded
+    when, and only when, it is byte-identical to a version we shipped: an
+    edited copy is the user's and is never touched.
     """
     ensure_skills_dir()
     installed: list[str] = []
     if not BUNDLED_SKILLS_DIR.is_dir():
         return installed
+    history: Optional[dict[str, set[str]]] = None
     for src in sorted(BUNDLED_SKILLS_DIR.iterdir()):
         if not src.is_dir():
             continue
         dst = SKILLS_DIR / src.name
-        if dst.exists():
-            continue
         try:
-            shutil.copytree(src, dst)
+            new = _skill_dir_digest(src)
+            if not dst.exists():
+                shutil.copytree(src, dst)
+                _write_bundled_marker(dst, new)
+                installed.append(src.name)
+                continue
+            if not dst.is_dir():
+                continue
+            # Clear an interrupted upgrade's leftovers even when nothing needs
+            # upgrading now: rmtree() below is best-effort (ignore_errors), so
+            # a copy that could not be removed once would otherwise sit there
+            # for good — and the early `continue` on a digest match means this
+            # is the only pass that ever looks.
+            for stale in (dst.with_name(f".{dst.name}.upgrading"),
+                          dst.with_name(f".{dst.name}.old")):
+                if stale.exists():
+                    shutil.rmtree(stale, ignore_errors=True)
+            current = _skill_dir_digest(dst)
+            if current == new:
+                continue
+            try:
+                marker = (dst / _BUNDLED_MARKER).read_text(encoding="utf-8").strip()
+            except OSError:
+                marker = ""
+            if marker:
+                pristine = current == marker
+            else:
+                if history is None:
+                    history = _shipped_digests()
+                pristine = current in history.get(src.name, set())
+            if not pristine:
+                continue                  # customised: the user's, not ours
+            staging = dst.with_name(f".{dst.name}.upgrading")
+            shutil.rmtree(staging, ignore_errors=True)
+            shutil.copytree(src, staging)
+            _write_bundled_marker(staging, new)
+            retired = dst.with_name(f".{dst.name}.old")
+            shutil.rmtree(retired, ignore_errors=True)
+            os.replace(dst, retired)
+            os.replace(staging, dst)
+            shutil.rmtree(retired, ignore_errors=True)
             installed.append(src.name)
         except OSError:
             continue
@@ -534,7 +618,9 @@ def scan_metadata() -> dict[str, SkillMetadata]:
         if not root.is_dir():
             return
         for child in sorted(root.iterdir()):
-            if not child.is_dir():
+            # Dot-dirs are an interrupted upgrade's staging/retired copies;
+            # sorting first, they would otherwise shadow the real one.
+            if not child.is_dir() or child.name.startswith("."):
                 continue
             # Must have either skill.py or SKILL.md
             if (not (child / "skill.py").is_file()
@@ -818,6 +904,12 @@ def list_skill_dirs() -> list[Path]:
         return []
     out = []
     for child in sorted(SKILLS_DIR.iterdir()):
+        # Same guard as scan_metadata's _absorb: dot-dirs are an interrupted
+        # upgrade's staging (`.<name>.upgrading`) or retired (`.<name>.old`)
+        # copies, and rmtree failures leave them behind silently. Listing one
+        # shows the same skill twice.
+        if child.name.startswith("."):
+            continue
         if child.is_dir() and ((child / "skill.py").is_file() or (child / "SKILL.md").is_file()):
             out.append(child)
     return out

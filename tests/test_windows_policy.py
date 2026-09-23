@@ -124,6 +124,55 @@ class WindowsCommandDecisionTests(unittest.TestCase):
             self.assertEqual(self.decide(command).action, "allow", command)
 
 
+class CmdSpellingTests(unittest.TestCase):
+    """cmd.exe takes its run switch in forms one regex cannot enumerate.
+
+    Only `cmd /c` and `cmd /k` used to need approval. The kernel runs AI
+    commands in an msys bash, which rewrites `//c` to `/c` before cmd starts,
+    so `cmd //c <anything>` sailed through its strict guard -- as did a switch
+    after another switch, a glued or quoted switch, and cmd reading stdin.
+    """
+
+    BYPASSES = (
+        "cmd //c calc", "cmd.exe //C calc", "CMD //c calc", "cmd //k calc",
+        "cmd /s /c calc", "cmd /d /c calc", "cmd /q/c calc", "cmd /ccalc",
+        "cmd //ccalc", '"cmd" "/c calc"',
+        "/c/Windows/System32/cmd //c calc", "C:/Windows/System32/cmd.exe //c calc",
+        "echo calc | cmd", "echo calc | cmd.exe", "cmd < run.bat",
+        # Windows' other command-by-proxy launchers.
+        'forfiles //p C:/ //m win.ini //c "calc"', "conhost.exe calc",
+        "wscript //e:jscript x.js", "cscript //nologo x.vbs",
+        "msbuild evil.proj", "pcalua -a calc.exe",
+    )
+
+    def test_every_spelling_needs_approval_even_in_audit_mode(self):
+        # strict=True is how the kernel and remote channels call it.
+        _isolated_policy("audit")
+        for command in self.BYPASSES:
+            with self.subTest(command=command):
+                self.assertEqual(
+                    policy.evaluate(command, "/tmp", strict=True).action,
+                    "needs_approval")
+
+    def test_the_payload_behind_each_spelling_is_what_gets_judged(self):
+        for command, payload in (("cmd //c del /s /q C:/x", "del /s /q C:/x"),
+                                 ("cmd /q/c calc", "calc"),
+                                 ("cmd /cdir C:/", "dir C:/"),
+                                 ('cmd "/c calc x"', "calc x"),
+                                 ("cmd /s /c calc", "calc")):
+            with self.subTest(command=command):
+                self.assertIn(payload, command_parse.analyze(command).commands)
+
+    def test_names_that_merely_contain_cmd_are_not_caught(self):
+        _isolated_policy("audit")
+        for command in ("firewall-cmd --list-all", "cmdkey /?", "ls ./cmd",
+                        "explorer.exe https://example.com", "notepad.exe"):
+            with self.subTest(command=command):
+                self.assertNotIn(
+                    "cmd(?:",
+                    policy.evaluate(command, "/tmp", strict=True).rule or "")
+
+
 class WindowsPathTests(unittest.TestCase):
     def setUp(self):
         _isolated_policy("enforce")

@@ -81,8 +81,26 @@ _STUDY_TOOLS = [
     "skill.list", "skill.reference",
     "task.create", "task.update", "task.list", "task.get",
     "mem.read", "mem.list", "mem.save", "mem.delete",
+    "skill.save",
     "task.complete",
 ]
+
+# Shared by the execution modes (act, and therefore ACT*, and auto): the moment
+# a task is done is the moment its method is known to work.
+_COMPLETED_TASK_SKILLS = (
+    "\n"
+    "SKILLS FROM COMPLETED TASKS. When a task has been completed "
+    "successfully and verified (or the user confirms they are satisfied "
+    "with the result), and it is a kind of task likely to come up again "
+    "here, record how it was done with skill.save before calling "
+    "task.complete: the goal, the steps in order, the exact commands and "
+    "files involved, and how success was verified. Write it as a "
+    "procedure someone can follow, not a story of the session. Give it a "
+    "description that says WHEN to use it. Cite the key files as "
+    "evidence. Save under an existing name to refine a method you "
+    "recorded before. Skip one-off, trivial, or unfinished tasks - only "
+    "a method that actually produced a good result belongs in a skill."
+)
 
 _BUILTINS = {
     "act": {
@@ -103,7 +121,7 @@ _BUILTINS = {
             "the required fresh approval. A policy BLOCKED result forbids the "
             "underlying operation, not merely that command spelling: never retry "
             "it through find, xargs, a language runtime, or another equivalent "
-            "tool."
+            "tool.\n" + _COMPLETED_TASK_SKILLS
         ),
         "allowed_tools": None,
         "denied_tools": None,
@@ -180,13 +198,13 @@ _BUILTINS = {
             "fact. Rewriting only its text leaves it flagged, on purpose - "
             "editing the prose is not re-checking the source.\n"
             "\n"
-            "FACTS vs PROCEDURES. mem.save is for a FACT ('this project's auth "
-            "goes through X'). When what you learned is HOW to work here - a "
-            "pitfall to avoid next time, a sequence that finally worked, a "
-            "convention this repo enforces - use skill.save instead. It is "
-            "project-scoped by default, so it never surfaces in other repos, "
-            "and it is routed to you automatically when relevant instead of "
-            "waiting for you to remember to read it.\n"
+            "FACTS vs METHODS. mem.save is for a FACT ('this project's auth "
+            "goes through X'). When the user walks you through how a task of "
+            "theirs was successfully completed - the steps, the order, the "
+            "commands, how the result was verified - record that method with "
+            "skill.save instead, so the same kind of task can be done the same "
+            "way next time. It is project-scoped by default and is routed "
+            "automatically when a similar task comes up.\n"
             "\n"
             "WHAT NOT TO SAVE:\n"
             "  - Trivially re-derivable facts (file contents, code in the repo). "
@@ -250,7 +268,7 @@ _BUILTINS = {
             "Approval dialogs remain visible so the user can intervene. In AUTO mode, an "
             "unanswered ordinary confirmation is approved after 3 seconds and an unanswered "
             "deletion confirmation is approved after 60 seconds. Continue immediately after "
-            "approval and finish the actual task."
+            "approval and finish the actual task.\n" + _COMPLETED_TASK_SKILLS
         ),
         "allowed_tools": None,
         "denied_tools": None,

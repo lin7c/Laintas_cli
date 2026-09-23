@@ -22,6 +22,10 @@ CORE_TOOLS = frozenset({
     "tool.search", "web.search", "web.fetch",
     "skill.list", "skill.load", "skill.unload",
     "mem.list", "mem.read", "mem.save",
+    # Recording how a finished task was done is a judgement made at the END of
+    # a task, in words that share nothing with the request that started it, so
+    # lexical routing never surfaced it and it was never called.
+    "skill.save",
     "task.complete", "task.create", "task.get", "task.list", "task.update",
     "agent_return", "workflow.phase_complete", "time.now",
     # Delegation is resident, not routed. Whether to hand part of a task to a
@@ -206,6 +210,14 @@ def select_tool_names(query: str, tools: Iterable[object]) -> set[str]:
     tool_list = list(tools)
     available = {str(getattr(tool, "name", "")) for tool in tool_list}
     selected = set(CORE_TOOLS) & available
+    # A connected Windows kernel is resident, not routed. The tools exist only
+    # while the user has deliberately switched a machine tier on, and the
+    # words for wanting them are everyday ones — "open the browser", "open
+    # WeChat", the same in Chinese — that either match nothing or match `browser.`,
+    # the invisible headless Chrome in WSL. That is how a user with the kernel
+    # running got a browser they could not see.
+    if "win.snapshot" in available:
+        selected.update(name for name in available if name.startswith("win."))
     lowered = _normalize_query(query)
 
     for triggers, selectors in (*_GROUPS, *_registered_groups):

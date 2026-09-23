@@ -79,11 +79,32 @@ def _ps_param_names(token: str) -> set:
         return {_PS_ALIASES[token]}
     return {full for full, shortest in _PS_PARAMS
             if full.startswith(token) and len(token) >= len(shortest)}
-_CMD_STRING_FLAGS = {"/c", "/k"}
+def _cmd_switch_payload(words: list) -> str:
+    """What `cmd` will run, however the switch is spelled. "" if none.
+
+    cmd.exe looks for its run switch anywhere in its arguments and does not
+    need it to be a word of its own. Only `/c` as an exact word used to be
+    recognised, so all of these ran unseen (the kernel executes AI commands
+    in an msys bash, which rewrites `//c` to `/c` before cmd starts):
+
+        cmd //c X      msys-escaped switch
+        cmd /s /c X    another switch first     cmd /q/c X   stacked switches
+        cmd /cX        glued to its command     cmd "/c X"   one quoted word
+    """
+    for idx, word in enumerate(words):
+        if not word.startswith("/"):
+            continue
+        normalized = "/" + word.lstrip("/")        # msys `//c` -> `/c`
+        for part in normalized.split("/")[1:]:
+            if part[:1].lower() in ("c", "k", "r"):
+                head = part[1:].strip()
+                tail = words[idx + 1:]
+                return " ".join(x for x in (head, *tail) if x)
+    return ""
 
 # Commands that consume a shell script on stdin. `echo "rm -rf /" | sh` is the
 # canonical form of this trick.
-_STDIN_SHELLS = _SHELL_WRAPPERS | {"eval"}
+_STDIN_SHELLS = _SHELL_WRAPPERS | {"eval", "cmd", "cmd.exe"}
 
 # Programs whose own arguments are another command: `nohup rm -rf /` runs `rm`,
 # not `nohup`. The parser already looks inside interpreters (`sh -c …`); these are
@@ -443,9 +464,7 @@ def _windows_payload(program: str, rest: list) -> tuple:
         lowered = word.lower()
         following = words[idx + 1] if idx + 1 < len(words) else ""
         if name.startswith(("cmd",)):
-            if lowered in _CMD_STRING_FLAGS and following:
-                return " ".join(words[idx + 1:]), risks
-            continue
+            return _cmd_switch_payload(words), risks
         # powershell / pwsh / wsl
         if name.startswith(("wsl",)):
             # `wsl.exe -- <command>` and `wsl.exe <command>` both run a Linux
