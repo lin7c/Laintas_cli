@@ -195,9 +195,24 @@ Use `/memory` for durable facts and `/rule` for recurring constraints. Keep inst
 
 ### 2. Custom modes
 
-Modes combine instructions with a restrictive tool posture. Built-in modes include `act`, `review`, `study`, `auto`, and `mail`; plan mode owns a separate plan lifecycle. Project modes live in `.laintas/modes.json` and can also be created through `/mode create`.
+Modes combine instructions with a restrictive tool posture. Built-in modes include `act`, `review`, `study`, `auto`, and `step`; plan mode owns a separate plan lifecycle. Project modes live in `.laintas/modes.json` and can also be created interactively through `/mode create`.
 
-```json
+Use `/mode` to switch or manage modes:
+- `/mode <name>` switches to any built-in or project mode (e.g. `/mode review`, `/mode act`).
+- `/mode list` lists all available modes.
+- `/mode create <name> [flags]` creates a custom mode with tool and permission boundaries:
+  - `--tools <tools>`: comma-separated tool names or glob patterns allowed by this mode (auto-completed from registered tools).
+  - `--deny <tools>`: comma-separated tool names or globs explicitly blocked (denials take precedence).
+  - `--read-only`: restrict strictly to the built-in read-only tool suite.
+  - `--auto-approve <none|writes|commands|all>`: execution approval policy for this mode (default `none`).
+- `/mode delete <name>` removes a custom mode.
+
+Command-line creation example:
+```bash
+/mode create docs-review --tools "fs.read,fs.grep,fs.glob" --deny "shell.*,fs.write,fs.edit" --auto-approve none
+```
+
+Modes can also be declared directly in `.laintas/modes.json`:
 {
   "version": 1,
   "active": "docs-review",
@@ -380,6 +395,10 @@ has its own `/resume` history. Switching back preserves work completed in the
 background. A working agent can receive updates in `/agents`; switch the
 foreground to it after its task finishes.
 
+> **Agent Isolation vs. Shared Configuration**:
+> - **Isolated per Agent**: Chat conversation history, local state variables, message queues, PTY/execution terminals, base model/provider bindings, and individual tool policies.
+> - **Shared across all Agents**: Working directory filesystem, persistent project memory, tool registry, and runtime configuration (`_runtime_config`). Adjusting iteration limits (e.g. `/config max_loops <n>` or `/max`) lifts or modifies boundaries globally for every agent in the process.
+
 `/agents` selects an agent to view or address without changing the foreground
 conversation or terminal ownership. Enter sends an update to a working agent,
 continues the current foreground agent, or starts a **new task** for another
@@ -542,6 +561,28 @@ all read the GitHub release the CI workflow publishes.
 ## Version History
 
 The history below is curated from the repository tags and changes, following an Added/Changed/Fixed-style release-note structure rather than reproducing raw commit messages. The tagged public history currently represented in this repository begins at v1.3.0.
+
+### [v1.32.3](https://github.com/lin7c/Laintas_cli/releases/tag/v1.32.3) — 2026-09-23
+
+**Added**
+- Added secondary flag completions for `/mode create` (`--tools`, `--deny`, `--read-only`, `--auto-approve`) with live tool registry candidate prompts.
+- Subcommand listing for `/mode` now cleanly surfaces command capabilities (`list`, `create`, `delete`) while maintaining direct mode switching.
+- Introduced `child_registry.py` and persistent child agent lifecycle tracking.
+
+### [v1.32.2](https://github.com/lin7c/Laintas_cli/releases/tag/v1.32.2) — 2026-09-22
+
+**Fixed**
+- Stopped unnecessary per-keystroke DrvFs work that slowed shell execution under Windows WSL environments.
+
+### [v1.32.1](https://github.com/lin7c/Laintas_cli/releases/tag/v1.32.1) — 2026-09-21
+
+**Changed**
+- Release documentation and assets distribution updated to prioritize `cli.laintas.com` as primary channel.
+
+### [v1.32.0](https://github.com/lin7c/Laintas_cli/releases/tag/v1.32.0) — 2026-09-20
+
+**Added**
+- Integrated blindpick v3.2.0: directory follow behavior and `--dir` override for target repository analysis.
 
 ### [v1.31.1](https://github.com/lin7c/Laintas_cli/releases/tag/v1.31.1) — 2026-09-19
 
@@ -843,8 +884,11 @@ The history below is curated from the repository tags and changes, following an 
   send-a-report-on-task-complete hook, and the email approval channel that stood
   in for a terminal prompt when nobody was watching. The gateway side went with
   it — the mailbox, the inbound-mail webhook, the approval links, and the whole
-  `notifications` module. Outbound mail was the only consumer of the Resend
-  integration, so those credentials are now unused.
+    `notifications` module. Outbound mail was the only consumer of the Resend
+    integration, so those credentials are now unused.
+
+<details>
+<summary><strong>Older releases (v1.16.0 — 2026-08-14 and earlier)</strong></summary>
 
 ### [v1.16.0](https://github.com/lin7c/Laintas_cli/releases/tag/v1.16.0) — 2026-08-14
 
@@ -961,6 +1005,8 @@ The history below is curated from the repository tags and changes, following an 
 **Changed**
 
 - Hardened web fetching and browsing-identity isolation.
+
+</details>
 
 <details>
 <summary><strong>v1.9.x releases</strong></summary>
