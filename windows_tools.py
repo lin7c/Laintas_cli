@@ -100,6 +100,14 @@ def _win_screenshot(args: dict, ctx: ToolCtx) -> dict:
         payload["handle"] = int(args["handle"])
     if args.get("rect"):
         payload["rect"] = [int(v) for v in args["rect"]]
+    # Captured at the size image.describe sends as-is, so the pixels its
+    # vision model reads coordinates off are the view's pixels. Larger, and
+    # describe shrinks the file on the way: every coordinate in its answer
+    # would be in a space win.click was never told about.
+    import vision
+    full = bool(args.get("full_resolution"))
+    if not full:
+        payload["maxEdge"] = vision.DESCRIBE_MAX_EDGE
     result = _call("screenshot", payload)
 
     data_url = str(result.pop("dataUrl", ""))
@@ -116,8 +124,22 @@ def _win_screenshot(args: dict, ctx: ToolCtx) -> dict:
     path.write_bytes(raw)
 
     result["path"] = str(path)
-    result["next"] = ("pass this path to image.describe to ask about it, or "
-                      "image.to_text to read the text in it")
+    size = f"{result.get('width')}x{result.get('height')}"
+    if not result.get("view"):
+        # A kernel from before views ignores `view` and would click these
+        # numbers as screen pixels.
+        result["next"] = (
+            "pass this path to image.describe to ask about it; this kernel is "
+            "too old to click by screenshot coordinates (needs 1.3.0+)")
+    elif full:
+        result["next"] = (
+            "full resolution, for image.to_text; do not click from an "
+            "image.describe answer about it, which is read off a shrunk copy")
+    else:
+        result["next"] = (
+            f"ask image.describe about this path — to click something, ask "
+            f"for its pixel coordinates in this {size} image, then call "
+            f"win.click with view {result.get('view')!r} and those x/y")
     return _ok(result)
 
 
@@ -152,6 +174,8 @@ def _win_click(args: dict, ctx: ToolCtx) -> dict:
     elif "x" in args and "y" in args:
         payload["x"] = int(args["x"])
         payload["y"] = int(args["y"])
+        if args.get("view"):
+            payload["view"] = str(args["view"])
     else:
         return _err("click needs either a label from win.snapshot, or x and y")
     return _ok(_call("click", payload))
@@ -176,11 +200,12 @@ def _win_window(args: dict, ctx: ToolCtx) -> dict:
     if action == "close":
         return _ok(_call("window.close", {"handle": handle}))
     if action == "move":
-        return _ok(_call("window.move", {
-            "handle": handle, "x": int(args.get("x") or 0),
-            "y": int(args.get("y") or 0),
-            "width": int(args.get("width") or 0),
-            "height": int(args.get("height") or 0)}))
+        # Only what was given: the kernel keeps the rest where it is.
+        payload = {"handle": handle}
+        for key in ("x", "y", "width", "height"):
+            if args.get(key) is not None:
+                payload[key] = int(args[key])
+        return _ok(_call("window.move", payload))
     return _err("action must be focus, move or close")
 
 
@@ -240,6 +265,10 @@ def _read_tools() -> list[Tool]:
                 "handle": {"type": "integer", "description": "for target=window"},
                 "rect": {"type": "array", "items": {"type": "integer"},
                          "description": "for target=region: [x, y, width, height]"},
+                "full_resolution": {
+                    "type": "boolean",
+                    "description": ("keep full size for image.to_text on small "
+                                    "text; not for finding things to click")},
             }},
             invoke=_win_screenshot,
         ),
@@ -285,12 +314,15 @@ def _write_tools() -> list[Tool]:
         Tool(
             name="win.click",
             description=(
-                "Move the real mouse and click, by element label or by screen "
-                "coordinates. LAST RESORT: this takes the pointer away from "
+                "Move the real mouse and click, by element label, or by x/y "
+                "pixels in a win.screenshot image together with the `view` it "
+                "returned (refused if the window moved since — look again). LAST RESORT: this takes the pointer away from "
                 "whoever is using the machine. Use it only when win.snapshot "
                 "came back opaque, or the element offers no action."),
             schema={"type": "object", "properties": {
                 "label": {"type": "string", "description": "from win.snapshot"},
+                "view": {"type": "string",
+                         "description": "from the win.screenshot x/y were read off"},
                 "x": {"type": "integer"},
                 "y": {"type": "integer"},
                 "button": {"type": "string", "enum": ["left", "right", "middle"]},
