@@ -508,6 +508,7 @@ class PasswordVault:
         self._last_access = 0.0
         self._state_lock = threading.RLock()
         self._timer = None
+        self.cache_warning = False
 
     # ── state ──────────────────────────────────────────────────────────
 
@@ -582,6 +583,20 @@ class PasswordVault:
         }
         _atomic_write(self._meta_path, json.dumps(cache, indent=2).encode("utf-8"))
 
+    def _refresh_cache(self, blob: dict) -> None:
+        """A disposable cache failure must not turn a committed write into failure."""
+        try:
+            self._rebuild_cache(blob)
+        except OSError:
+            self.cache_warning = True
+            # Do not leave an old list pretending to describe the new vault.
+            try:
+                os.unlink(self._meta_path)
+            except OSError:
+                pass
+        else:
+            self.cache_warning = False
+
     # ── lifecycle ──────────────────────────────────────────────────────
 
     @_serialized
@@ -599,7 +614,7 @@ class PasswordVault:
             key = _derive_key(passphrase, salt, kdf["n"], kdf["r"], kdf["p"], kdf["dklen"])
             blob = {"format": VAULT_FORMAT, "entries": {}}
             _atomic_write(self._blob_path, _serialize_vault(kdf, key, blob))
-            self._rebuild_cache(blob)
+            self._refresh_cache(blob)
         self._kdf = kdf
         self._key = key
         self._touch()
@@ -627,7 +642,7 @@ class PasswordVault:
                 # next unlock simply migrates again.
                 _atomic_write(self._blob_path,
                               _serialize_vault(kdf, key, blob))
-            self._rebuild_cache(blob)
+            self._refresh_cache(blob)
         self._kdf = kdf
         self._key = key
         self._touch()
@@ -656,7 +671,7 @@ class PasswordVault:
             self._kdf = new_kdf
             self._key = new_key
             self._touch()
-            self._rebuild_cache(blob)
+            self._refresh_cache(blob)
         self._kdf = new_kdf
         self._key = new_key
         self._touch()
@@ -678,7 +693,7 @@ class PasswordVault:
             blob, _ = self._decrypt_current(kdf, nonce, ciphertext)
             apply(blob)
             _atomic_write(self._blob_path, _serialize_vault(kdf, self._key, blob))
-            self._rebuild_cache(blob)
+            self._refresh_cache(blob)
 
     def add_entry(self, description, origins, username=None, password=None,
                   notes="", *, kind="login", secret=None) -> str:
@@ -789,6 +804,7 @@ class PasswordVault:
 
     # ── reads ───────────────────────────────────────────────────────────
 
+    @_serialized
     def list_entries(self) -> list:
         """Public metadata only: id, description, origins, timestamps.
 
@@ -804,6 +820,15 @@ class PasswordVault:
         with _FileLock(self._lock_path, exclusive=False):
             if not os.path.isfile(self._blob_path):
                 raise VaultNotInitialized("no vault exists yet")
+            if self.is_unlocked():
+                kdf, nonce, ciphertext = _split_vault_file(self._read_raw())
+                blob, _ = self._decrypt_current(kdf, nonce, ciphertext)
+                # Read the source of truth without extending the unlock timer:
+                # automatic UI refreshes are not user activity.
+                return [_public_view(eid, entry)
+                        for eid, entry in blob["entries"].items()]
+            if self.cache_warning:
+                raise VaultError("metadata cache unavailable; unlock to read entries")
             try:
                 with open(self._meta_path, "rb") as fh:
                     raw = fh.read()

@@ -83,49 +83,114 @@ def _atomic_write_json(dest, payload: dict) -> None:
     _atomic_write_json_if_changed(dest, payload, skip_if_unchanged=False)
 
 
+#: Top-level fields that change on every save without changing the session.
+_VOLATILE_KEYS = ("timestamp", "updated_at")
+
+
+class SerializedJson:
+    """A payload serialized once: its fingerprint, and the chunks to write.
+
+    The chunks are what ``json.dumps`` joins internally. Keeping them apart
+    means a 15MB session is never copied into one string again just to put
+    two timestamps in front of it.
+    """
+
+    __slots__ = ("head", "chunks", "fingerprint")
+
+    def __init__(self, head: str, chunks: list, fingerprint: str):
+        self.head = head
+        self.chunks = chunks
+        self.fingerprint = fingerprint
+
+    def write_to(self, fh) -> None:
+        if self.head:
+            fh.write(self.head)
+            first = self.chunks[0][1:]           # drop the body's own "{"
+            if first != "}":
+                fh.write(",")
+            fh.write(first)
+            fh.writelines(self.chunks[1:])
+        else:
+            fh.writelines(self.chunks)
+
+    def text(self) -> str:
+        import io
+        buf = io.StringIO()
+        self.write_to(buf)
+        return buf.getvalue()
+
+
+_ENCODER = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
+
+
+def serialize_session_json(payload: dict,
+                           volatile: tuple = _VOLATILE_KEYS) -> SerializedJson:
+    """Serialize *payload* once, fingerprinting everything but *volatile*.
+
+    The fingerprint lets a rewrite that only moved the clock be skipped. It
+    used to be a second, key-sorted ``json.dumps`` of a deep copy — on a
+    1,000-message session ~0.9s per file, paid for the live copy and again for
+    the current pointer after every turn. Now the serialization that is written
+    is the one that is hashed. The volatile fields are serialized apart and
+    written first, which keeps them ahead of ``chat_history`` for
+    ``agent_loop._read_session_header``.
+    """
+    head = {k: payload[k] for k in volatile if k in payload}
+    rest = {k: v for k, v in payload.items() if k not in head}
+    # iterencode(_one_shot=True) is exactly what json.dumps runs before its
+    # final "".join — the C encoder's chunk list.
+    chunks = list(_ENCODER.iterencode(rest, _one_shot=True))
+    digest = hashlib.sha256()
+    for chunk in chunks:
+        digest.update(chunk.encode("utf-8"))
+    head_text = _ENCODER.encode(head)[:-1] if head else ""
+    return SerializedJson(head_text, chunks, digest.hexdigest())
+
+
 def _fingerprint_payload(payload: dict) -> str:
-    stable = copy.deepcopy(payload)
-    if isinstance(stable, dict):
-        stable.pop("timestamp", None)
-        stable.pop("updated_at", None)
-    raw = json.dumps(
-        stable, ensure_ascii=False, sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return serialize_session_json(payload).fingerprint
 
 
 def _atomic_write_json_if_changed(
-        dest, payload: dict, *, skip_if_unchanged: bool = True) -> bool:
+        dest, payload: dict, *, skip_if_unchanged: bool = True,
+        serialized: Optional[SerializedJson] = None) -> bool:
     cwd = payload.get("cwd") or os.getcwd()
     with session_lifecycle.guard(cwd):
         if session_lifecycle.is_deleted(cwd, payload):
             return False
-        return _write_session_json(dest, payload, skip_if_unchanged=skip_if_unchanged)
+        return _write_session_json(dest, payload, skip_if_unchanged=skip_if_unchanged,
+                                   serialized=serialized)
 
 
-def _write_session_json(dest, payload: dict, *, skip_if_unchanged: bool = True) -> bool:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    cache_key = str(dest)
-    if skip_if_unchanged:
-        fp = _fingerprint_payload(payload)
-        if _LAST_WRITE_FINGERPRINTS.get(cache_key) == fp and dest.exists():
-            return False
+def write_json_atomically(dest, serialized: SerializedJson) -> None:
+    """Write *serialized* to *dest* through a fsynced temp file and a rename."""
     tmp = dest.with_name(f".{dest.name}.{uuid.uuid4().hex}.tmp")
     try:
         with open(tmp, "w", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+            serialized.write_to(f)
             f.flush()
             os.fsync(f.fileno())
         os.replace(str(tmp), str(dest))
-        if skip_if_unchanged:
-            _LAST_WRITE_FINGERPRINTS[cache_key] = fp
-        return True
     finally:
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _write_session_json(dest, payload: dict, *, skip_if_unchanged: bool = True,
+                        serialized: Optional[SerializedJson] = None) -> bool:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cache_key = str(dest)
+    serialized = serialized or serialize_session_json(payload)
+    if skip_if_unchanged:
+        if (_LAST_WRITE_FINGERPRINTS.get(cache_key) == serialized.fingerprint
+                and dest.exists()):
+            return False
+    write_json_atomically(dest, serialized)
+    if skip_if_unchanged:
+        _LAST_WRITE_FINGERPRINTS[cache_key] = serialized.fingerprint
+    return True
 
 
 def _record_error(message: str) -> None:
@@ -322,8 +387,10 @@ def save_session(session: dict) -> None:
     cwd = session.get("cwd") or os.getcwd()
     agent_id = str(session.get("agent_id") or "primary")
     paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    # The live copy and the current pointer hold the same bytes: serialize once.
+    serialized = serialize_session_json(session)
     _atomic_write_json_if_changed(
-        _session_path(cwd, session_id, agent_id), session)
+        _session_path(cwd, session_id, agent_id), session, serialized=serialized)
     # D1 (bughunt): the current-pointer update is a read-compare-write/unlink
     # that used to run unguarded. A concurrent close+save could interleave
     # (close reads current=X, save writes current=Y, close unlinks current)
@@ -345,7 +412,7 @@ def save_session(session: dict) -> None:
             except Exception:
                 pass
         else:
-            _atomic_write_json_if_changed(current, session)
+            _atomic_write_json_if_changed(current, session, serialized=serialized)
 
 
 def close_session(session: dict) -> dict:

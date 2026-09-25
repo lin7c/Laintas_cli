@@ -174,11 +174,14 @@ class RoleScopeTests(unittest.TestCase):
         contract = agent_contract.normalize({
             "outputs": ["report"], "scope": {"paths": ["src"]}})
         for name in ("shell.exec", "terminal.create", "terminal.send",
-                     "terminal.exec"):
+                     "terminal.exec", "session.start", "session.keys"):
+            call = agent_loop._prepare_tool_call({
+                "name": name, "arguments": {"command": "touch ../escape"}}, 0, 0)
             result = agent_loop._authorize_tool_call(
                 name, "touch ../escape", {"_contract": contract},
                 agent_id="child", allowed_tool_names={name},
-                is_shell_flavored=True, fail_ledger={}, fail_ledger_err={},
+                is_shell_flavored=call["is_shell_flavored"],
+                fail_ledger={}, fail_ledger_err={},
                 repeat_block_limit=3)
             self.assertIsNotNone(result, name)
             self.assertIn("scope.paths", result["error"])

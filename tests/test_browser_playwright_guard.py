@@ -382,23 +382,46 @@ class DropAndTeardown(unittest.TestCase):
         must return even when the worker never will."""
         sess = _session()
         started = threading.Event()
+        release = threading.Event()
+        errors = []
 
         def _wedged(_page):
             started.set()
-            time.sleep(30)
+            release.wait()
+
+        def _run():
+            try:
+                sess.run(_wedged, timeout=30)
+            except BaseException as exc:
+                errors.append(exc)
 
         page = mock.Mock()
         with mock.patch.object(type(sess), "_get_page", lambda self: page):
-            threading.Thread(target=lambda: sess.run(_wedged, timeout=30),
-                             daemon=True).start()
-            self.assertTrue(started.wait(10))
-            dropped = []
-            with mock.patch.object(type(sess), "_drop_pw",
-                                   lambda self: dropped.append(True)), \
-                    mock.patch.object(browser_session, "_PW_TEARDOWN_CAP", 0.2):
-                began = time.monotonic()
+            caller = threading.Thread(target=_run, daemon=True)
+            worker = None
+            caller.start()
+            try:
+                self.assertTrue(started.wait(10))
+                worker = sess._worker
+                dropped = []
+                with mock.patch.object(type(sess), "_drop_pw",
+                                       lambda self: dropped.append(True)), \
+                        mock.patch.object(browser_session, "_PW_TEARDOWN_CAP", 0.2):
+                    began = time.monotonic()
+                    sess.close()
+                    elapsed = time.monotonic() - began
+            finally:
+                # Keep the worker wedged through close(), then release and
+                # join both threads before this test's mocks are restored.
+                release.set()
+                worker = worker or sess._worker
                 sess.close()
-                elapsed = time.monotonic() - began
+                caller.join(timeout=5)
+                if worker is not None:
+                    worker.join(timeout=5)
+            self.assertFalse(caller.is_alive())
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
         self.assertLess(elapsed, 20)
         self.assertEqual(dropped, [True])
 

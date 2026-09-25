@@ -63,6 +63,18 @@ class BillingRefusalTests(unittest.TestCase):
         self.assertTrue(result["reply"].startswith("Membership allowance used up"))
         self.assertIn("laintas.com/dashboard", result["reply"])
 
+    def test_pool_refusal_is_final_and_names_alternatives(self):
+        body = {"code": "model_not_in_funding_pool", "fundingSource": "personal",
+                "detail": "Your membership allowance is used up. Calls beyond it are "
+                          "paid from your balance, and x-model is not available on balance billing.",
+                "remedy": "Switch to a model available here, for example: a-model, b-model."}
+        result, calls = _run(_Refusal(402, body))
+        self.assertEqual(calls, 1)
+        self.assertTrue(result["reply"].startswith("Model not available for this payment"))
+        self.assertIn("a-model", result["reply"])
+        # The remedy is a model switch, not a page to visit.
+        self.assertNotIn("laintas.com/dashboard", result["reply"])
+
     def test_busy_billing_is_retried(self):
         busy = {"code": "billing_busy", "title": "Billing is busy",
                 "detail": "Nothing was charged.", "remedy": "Retry in a moment."}

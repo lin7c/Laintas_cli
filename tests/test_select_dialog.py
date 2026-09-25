@@ -69,6 +69,10 @@ class SelectDialogTests(unittest.TestCase):
     def test_q_cancels(self):
         self.assertIsNone(self._run(["Yes", "No"], "q", full_screen=False))
 
+    def test_q_is_search_text_in_searchable_picker(self):
+        self.assertEqual(self._run(["Other", "qq mail"], "qq\r",
+                                   full_screen=False, search=True), "qq mail")
+
     def test_escape_cancels_during_startup_grace_period(self):
         self.assertIsNone(
             self._run(

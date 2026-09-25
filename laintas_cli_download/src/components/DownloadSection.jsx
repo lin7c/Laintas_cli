@@ -1,15 +1,13 @@
-import { useEffect, useState } from 'react';
-import { motion } from 'framer-motion';
+import { useEffect, useRef, useState } from 'react';
 import {
-  ArrowDownToLine, ArrowRight, Check, CheckCircle2, ChevronRight, CircleDot,
-  Code2, Copy, ExternalLink, GitBranch, Monitor, Network, Package, Play,
-  Radar, RotateCcw, ShieldCheck, Layers3, TerminalSquare, Waypoints, Zap,
+  ArrowDownToLine, ArrowRight, ArrowUpRight, Check, Code2, Copy, Layers3,
+  Monitor, Package, ShieldCheck, TerminalSquare, Waypoints,
 } from 'lucide-react';
 import { useLanguage } from '@/contexts/LanguageContext';
 import SiteFooter from './SiteFooter';
 import TerminalReplay from './TerminalReplay';
 
-const RELEASE_FALLBACK = 'v1.32.1';
+const RELEASE_FALLBACK = 'v1.32.4';
 // Release files are served by GitHub Releases, the one place CI publishes to.
 const RELEASE_BASE = 'https://github.com/lin7c/Laintas_cli/releases/latest/download';
 const RELEASE_API = 'https://api.github.com/repos/lin7c/Laintas_cli/releases/latest';
@@ -19,98 +17,257 @@ const INSTALL_COMMANDS = {
 };
 
 const DOWNLOADS = [
-  { id: 'linux', names: { zh: 'Linux 版本', en: 'Linux' }, details: { zh: 'x86_64 / arm64 · 自动识别', en: 'x86_64 / arm64 · auto-detected' }, href: 'https://cli.laintas.com/install.sh', icon: Package },
-  { id: 'windows', names: { zh: 'Windows 版本', en: 'Windows' }, details: { zh: 'x86_64 · 单文件安装器 · 独立 WSL2', en: 'x86_64 · single installer · private WSL 2' }, file: 'laintas-cli_windows_amd64_setup.exe', icon: Monitor },
-  { id: 'source', names: { zh: '源码包', en: 'Source package' }, details: { zh: 'Python 3.10+ · 可审计', en: 'Python 3.10+ · auditable' }, file: 'laintas-cli_source.zip', icon: Code2 },
+  { id: 'linux', names: { zh: 'Linux', en: 'Linux' }, details: { zh: 'x86_64 / arm64 · 安装脚本自动识别架构', en: 'x86_64 / arm64 · installer picks the architecture' }, href: 'https://cli.laintas.com/install.sh', icon: Package },
+  { id: 'windows', names: { zh: 'Windows', en: 'Windows' }, details: { zh: 'x86_64 · 单文件安装器 · 自带独立 WSL 2', en: 'x86_64 · single installer · private WSL 2' }, file: 'laintas-cli_windows_amd64_setup.exe', icon: Monitor },
+  { id: 'source', names: { zh: '源码包', en: 'Source package' }, details: { zh: 'Python 3.10+ · 审计与二次开发', en: 'Python 3.10+ · audit and extend' }, file: 'laintas-cli_source.zip', icon: Code2 },
 ];
+
+// Capability icons, in the order of COPY[lang].caps.
+const CAP_ICONS = [TerminalSquare, Waypoints, ShieldCheck, Layers3];
 
 // Pricing shown on this page mirrors laintas.com/pricing (the authoritative
 // source). Values are kept in sync with the main site's plan cards; the full
 // tier table and allowance comparison live on the pricing page itself.
 const PLANS = [
-  { id: 'free', price: '$0', period: '/ mo', title: { zh: '按量使用', en: 'Pay as you go' }, desc: { zh: '无需订阅。用多少付多少，单价公开透明。', en: 'No subscription. Only pay for what you use.' }, features: { zh: ['多数产品可先试用', '用多少付多少', '模型分档，单价透明'], en: ['Try most products first', 'Only pay for usage', 'Transparent model tiers'] }, badge: null, highlight: false },
+  { id: 'free', price: '$0', period: '/ mo', title: { zh: '按量使用', en: 'Pay as you go' }, desc: { zh: '无需订阅。用多少付多少，单价公开透明。', en: 'No subscription. Only pay for what you use.' }, features: { zh: ['新用户 100 次调用试用', '用多少付多少', '模型分档，单价透明'], en: ['100-call trial for new accounts', 'Only pay for usage', 'Transparent model tiers'] }, badge: null, highlight: false },
   { id: 'pro', price: '$19.9', period: '/ mo', title: { zh: 'Pro', en: 'Pro' }, desc: { zh: '每月 7,000 次调用，全产品共用一个额度池。', en: '7,000 calls a month, one pooled allowance.' }, features: { zh: ['7,000 次调用 / 月', '所有产品共用同一额度', '检索/嵌入/重排各计 1 次', '超出后可继续按量'], en: ['7,000 calls / month', 'One pool across every product', 'Retrieval/embed/rerank count as 1', 'Continue pay-as-you-go after'] }, badge: { zh: '最受欢迎', en: 'Most popular' }, highlight: true },
   { id: 'gen', price: '$49.9', period: '/ mo', title: { zh: 'Gen', en: 'Gen' }, desc: { zh: '每月 15,000 次调用，5 小时突发上限 1,500 次。', en: '15,000 calls a month, 1,500 in a 5-hour burst.' }, features: { zh: ['15,000 次调用 / 月', '突发速率提高', '全产品共用额度', '面向全职 agent 工作流'], en: ['15,000 calls / month', 'Higher burst rate', 'One pooled allowance', 'For full-time agent workflows'] }, badge: { zh: '全产品', en: 'All products' }, highlight: false },
 ];
 
+// The presenter. One photograph per chapter, shot from one fixed camera, so
+// scrolling reads as one person moving rather than a slideshow. Scenes 1–2 are
+// a closer framing than 3–5; the 2→3 handoff is played as a dolly-out (see
+// SCENE_MOTION) so the change of framing reads as the camera pulling back.
+//   focus  transform-origin: roughly where his face is, so zooms stay on him.
+//   enter  extra scale while fading in; exit: scale lost while fading out.
+//   dip    how far the stage darkens at the middle of the fade into this
+//          scene. Two poses cross-dissolved show a double exposure; a short
+//          dip hides it, the way an editor would cut it.
+const SCENES = [
+  { src: 'scene-1', focus: '38% 22%', enter: 0, exit: 0, dip: 0 },
+  { src: 'scene-2', focus: '34% 24%', enter: 0.04, exit: 0.12, dip: 0.3 },
+  { src: 'scene-3', focus: '25% 18%', enter: 0.3, exit: 0, dip: 0.6 },
+  { src: 'scene-4', focus: '24% 18%', enter: 0.03, exit: 0, dip: 0.3 },
+  { src: 'scene-5', focus: '24% 18%', enter: 0.03, exit: 0, dip: 0.3 },
+];
+
+const clamp01 = (value) => Math.min(1, Math.max(0, value));
+
+// The zoom runs over the whole handoff; the dissolve only over its middle.
+const dissolve = (t) => { const x = clamp01((t - 0.35) / 0.3); return x * x * (3 - 2 * x); };
+
+// Titles are [plain, emphasised]: the second half is set in gold italic, the
+// same way laintas.com sets its display lines.
 const COPY = {
   zh: {
-    kicker: '自主 AGENT · 真实终端 · 运维控制面',
-    titleA: 'AI agent，', titleB: '住进你的真实终端。',
-    intro: 'Laintas CLI 把自主 AI agent 直接放进你的 shell。普通命令仍在真实 PTY 中原生运行；自然语言任务进入可观察、可中断、可委派的 agent 循环 —— 检查工作区、调用工具、拆分任务、并行执行，并把每一步留在可追踪的状态里。',
-    introHighlight: '不是聊天窗口。是离文件和终端最近的那个 agent。',
-    install: '安装 Laintas CLI', seeWorkflow: '查看运行流程',
-    proofLine: ['Linux / Windows', 'HWO / HWG 编排', '策略强制'],
-    realEyebrow: 'RECORDED SESSION · v1.29.4', realTitle: '一段真实会话的录像',
-    realNote: '这不是示意图：真实终端里跑的一次 laintas-cli v1.29.4 会话，逐帧录下来原样回放 —— agent 读项目、跑 pytest、定位失败用例的根因，把补丁摆出来等你批准，落盘后再跑一遍测试。等待思考的长段做了跳剪，画面本身一个字没改。',
-    flowKicker: '01 / 请求生命周期', flowTitle: '一条输入，八个真实运行阶段。', flowIntro: '这是 README 与运行时代码定义的请求生命周期，不是抽象营销漏斗。每个阶段都映射到本地模块与状态边界。',
-    flow: [
-      ['分类输入', 'REPL 区分 Slash 指令、PATH 可执行命令与自然语言任务。'],
-      ['本地路由', 'PATH 命令进入真实 PTY；Slash 指令由内置或扩展注册表解析。'],
-      ['组装上下文', '合并模式、项目提示、规则、记忆、计划、角色、工作流阶段和终端状态。'],
-      ['调用后端', '当前 Backend Profile 决定来源、认证边界、计费标签与模型。'],
-      ['分发工具', '结构化调用进入统一注册表：Built-in、Skills、MCP、Extensions 与 Agents。'],
-      ['逐层授权', '模式、工作流、角色、策略、信任、审批与 Hooks 共同决定执行。'],
-      ['执行与观察', '工具在本地运行，结构化结果被记录并回流到下一轮判断。'],
-      ['持久化与呈现', '事件、历史、追踪、用量、任务、计划、记忆与状态写入状态层。'],
+    chapters: ['开场', '为什么', '工作方式', '价格', '下载'],
+    say: [
+      '我每天都在终端里工作，所以我们把 agent 放进了终端。',
+      '先说为什么：它不是又一个聊天窗口。',
+      '一条指令进来，每一步都看得见、拦得住。',
+      '运行时免费，模型用量按你的节奏来。',
+      '就这些。一行命令，装进你的终端。',
     ],
-    opsKicker: '02 / 运维能力', opsTitle: '为生产工作设计的 agent 控制面。', opsIntro: '更接近运维系统，而不是聊天窗口：知道谁在运行、进行到哪一步、拥有什么权限，以及失败后如何继续。',
-    cards: [
-      { title: '终端原生', desc: 'PATH 命令直接进入真实 PTY；交互程序、长任务和命名子终端保持熟悉的 shell 体验。', icon: TerminalSquare, extra: 'terminal' },
-      { title: '流程编排', desc: 'HWO 协调实时多 agent 协作；HWG 把依赖编译为可恢复的持久工作图。', icon: Waypoints, extra: 'graph' },
-      { title: '策略边界', desc: '模式、角色、阶段、全局策略、信任与审批逐层收窄工具权限。', icon: ShieldCheck, extra: 'policy' },
-      { title: '状态可恢复', desc: '计划、事件、追踪、任务、记忆与流程状态跨会话保存，失败不会被伪装成完成。', icon: RotateCcw, extra: null },
-      { title: '可观测', desc: '事件链、资源浏览器、detail trace —— 每一步都留痕、可回放。', icon: Radar, extra: null },
-      { title: '统一工具面', desc: '内置工具、Skills、MCP 与 Extensions 进入同一注册表和授权管道。', icon: Layers3, extra: null },
+    kicker: 'LAINTAS CLI · 终端里的 AI agent',
+    title: ['命令照常敲，', '其余交给 agent。'],
+    lead: 'Laintas CLI 是装进 shell 的自主 agent。ls、git、vim 这类命令照旧直接在真实 PTY 里运行，不经过模型；用一句话描述的任务，交给 agent 去读代码、跑命令、改文件 —— 每一步都摆在你眼前，关键操作等你点头。',
+    install: '安装 Laintas CLI', seeHow: '看它怎么工作',
+    facts: [['免费', '运行时免费使用，可下载源码审计'], ['Linux · Windows', 'x86_64 / arm64，Windows 10 2004+ / 11'], ['一个账号', '与 Helpwo、插件市场共用 Laintas 账号']],
+    realEyebrow: '真实会话录像 · v1.29.4', realTitle: '一段真实会话，逐帧回放',
+    realNote: 'agent 读项目、跑 pytest、找到失败用例的根因，把补丁摆出来等你批准，落盘后再跑一遍测试。只剪掉了等待模型的空白，画面一个字没改。',
+
+    whyKicker: '01 · 为什么是它', whyTitle: ['离你的文件', '最近的那个 agent。'],
+    whyIntro: '聊天窗口里的 AI 只能给建议，复制、粘贴、执行、再把报错转述回去，这些活还是你在干。Laintas CLI 直接站在你的工作目录里。',
+    compareHead: ['', '聊天窗口', 'Laintas CLI'],
+    compare: [
+      ['上下文', '你复制过去的几段代码', '整个工作目录、终端状态和项目记忆'],
+      ['执行', '给你一段命令，你自己去跑', '自己跑，读完整输出，再决定下一步'],
+      ['出错时', '你把报错转述回去', '它看到的就是你眼前那屏报错'],
+      ['长任务', '关掉页面就断了', '计划、事件和会话都落盘，/resume 接着做'],
     ],
-    controlKicker: '03 / 控制面', controlTitle: '并行，但不失控。', controlIntro: '用角色和阶段拆开责任；每次调用先经授权，再执行、记录并回流。Prompt 负责意图，Runtime Policy 才是安全边界。',
-    agents: ['Planner', 'Operator', 'Verifier'], policy: 'POLICY GATE', states: ['scope: project', 'mode: act', 'approval: enforce', 'trace: on'],
-    priceKicker: 'MODEL & USAGE', priceTitle: '先把运行时装进终端，再按需要选择用量。', priceIntro: 'Laintas CLI 本身免费开源。模型推理按量或订阅计费，Pro 与 Gen 覆盖全部产品、共用一个额度池。', pricing: '查看完整定价方案',
-    downloadKicker: '04 / 下载', downloadTitle: '现在，把它交给真实终端。', downloadIntro: '推荐一行命令安装。也可以按架构下载独立二进制，或使用源码包进行审计与二次开发。',
-    quickInstall: '一行安装', linux: 'Linux', windows: 'Windows', copied: '已复制', copy: '复制', download: '下载', requirements: 'Linux 支持 x86_64 / arm64；Windows 支持 x86_64、Windows 10 2004+ / Windows 11，并需要启用 WSL2。', docs: '阅读文档', source: '查看源码', footer: 'Local runtime. Observable work. Controlled execution.',
+    caps: [
+      ['真实终端', '直接命令绕过模型；交互程序、长任务和命名子终端都保持原生 shell 行为。'],
+      ['并行分工', '子 agent 分头干活：HWO 协调实时协作，HWG 把依赖编译成可恢复的工作图。'],
+      ['分层授权', '模式、角色、阶段、全局策略、信任与审批层层收窄权限，由运行时强制执行。'],
+      ['一个工具面', '内置工具、Skills、MCP 服务器和插件市场里的扩展，走同一个注册表和授权管道。'],
+    ],
+
+    howKicker: '02 · 一条指令的旅程', howTitle: ['看一条指令', '怎么走完全程。'],
+    howIntro: '以“修一下失败的测试”为例。下面是运行时真实经过的路径，每一步都对应本地模块和可追溯的状态。',
+    steps: [
+      ['分流', '先判断是命令、斜杠指令还是任务。pytest 这样的命令直接进 PTY，不花一次模型调用。', '$ pytest → PTY'],
+      ['组装上下文', '模式、项目提示、规则、记忆、计划和当前终端状态拼成一次请求，发往你选定的后端。', 'mode: act · scope: project'],
+      ['调用工具', '模型返回结构化调用；内置工具、Skills、MCP、扩展和子 agent 都从同一个注册表出发。', 'read · shell.exec · edit'],
+      ['过闸', '每个动作先过策略闸：该放行的放行，该问你的停下来问，越界的直接拒绝。', 'allow · ask · deny'],
+      ['执行并留痕', '工具在本地运行，结果回流给下一轮；事件、追踪和用量写进状态层，可回放、可恢复。', 'trace: on'],
+    ],
+    gateKicker: '安全边界', gateTitle: ['并行，', '但不失控。'],
+    gateIntro: 'Prompt 只负责表达意图，边界在运行时。模型再会说，也绕不过一条已经拒绝的策略。',
+    gates: [
+      ['放行', 'allow', ['读取项目文件', '运行测试', 'git status / diff']],
+      ['询问', 'ask', ['写入或删除文件', 'git push', '读取 ~/.ssh 等凭据']],
+      ['拒绝', 'deny', ['把凭据发往外部', '策略禁用的工具', '越权的子 agent 调用']],
+    ],
+    gateNote: '具体落在哪一档，取决于当前模式、项目策略与组织策略。',
+
+    priceKicker: '03 · 价格', priceTitle: ['先装上，', '再决定用多少。'],
+    priceIntro: 'Laintas CLI 本身不收费。模型调用按量计费或订阅，Pro 与 Gen 的额度在所有 Laintas 产品间共用。',
+    perMonth: '/ 月', pricing: '查看完整定价与模型分档',
+    ecoTitle: '同一个账号，也通向这些',
+    eco: [
+      ['Helpwo', '网页端 AI 工作台。在 CLI 里 /connect，就能在浏览器里看到这台机器的终端并直接派任务。', 'https://helpwo.laintas.com/'],
+      ['插件市场', '官方与社区扩展。/extensions install 一条命令装进 CLI，社区代码安装前会先过一遍审查。', '/plugins'],
+      ['Laintas 账户', '余额、订阅、用量与订单，所有产品在同一处查看。', 'https://laintas.com/dashboard'],
+    ],
+
+    downloadKicker: '04 · 下载', downloadTitle: ['现在，', '交给你的终端。'],
+    downloadIntro: '推荐一行命令安装；也可以直接下载安装包，或拿源码包审计与二次开发。',
+    platformLabel: '选择安装平台', linux: 'Linux', windows: 'Windows', copied: '已复制', copy: '复制',
+    startSteps: [['运行安装命令', '自动识别架构并完成安装'], ['启动并登录', '输入 laintas-cli，按提示登录 Laintas 账号'], ['说出第一个任务', '比如“看看这个项目怎么跑起来”']],
+    packages: '安装包', download: '下载',
+    requirements: 'Linux 需 64 位 glibc 系统（x86_64 / arm64）；Windows 需 x86_64、Windows 10 2004+ 或 Windows 11，并启用 WSL 2。',
   },
   en: {
-    kicker: 'AUTONOMOUS AGENT · REAL TERMINAL · OPS CONTROL PLANE',
-    titleA: 'An AI agent', titleB: 'that lives in your terminal.',
-    intro: 'Laintas CLI puts an autonomous AI agent directly into your shell. Commands still run natively in a real PTY; natural-language tasks enter an observable, interruptible, delegating agent loop — inspecting the workspace, calling tools, splitting work, and keeping every step in a recoverable state.',
-    introHighlight: 'Not a chat window. The agent closest to your files and terminal.',
-    install: 'Install Laintas CLI', seeWorkflow: 'See the workflow',
-    proofLine: ['Linux / Windows', 'HWO / HWG', 'Policy enforced'],
-    realEyebrow: 'RECORDED SESSION · v1.29.4', realTitle: 'A recording of a real session',
-    realNote: 'Not a mockup: one laintas-cli v1.29.4 session captured off a real terminal and replayed frame for frame — the agent reads the project, runs pytest, tracks the failing case to its root cause, shows you the patch and waits for approval, then re-runs the tests. Long waits are jump-cut; nothing on screen is rewritten.',
-    flowKicker: '01 / REQUEST LIFECYCLE', flowTitle: 'One input. Eight real runtime stages.', flowIntro: 'This is the request lifecycle defined by the README and runtime code, not an abstract funnel. Every stage maps to a local module and state boundary.',
-    flow: [
-      ['Classify input', 'The REPL distinguishes slash commands, PATH executables, and natural-language tasks.'],
-      ['Route locally', 'PATH commands enter a real PTY; slash commands resolve through built-in or extension registries.'],
-      ['Assemble context', 'Combine mode, project prompt, rules, memory, plan, role, workflow phase, and terminal state.'],
-      ['Call backend', 'The active Backend Profile determines origin, credential boundary, billing label, and model.'],
-      ['Dispatch tools', 'Structured calls enter one registry: Built-ins, Skills, MCP, Extensions, and Agents.'],
-      ['Authorize action', 'Mode, Workflow, Role, Policy, Trust, Approval, and Hooks jointly decide execution.'],
-      ['Execute & observe', 'The tool runs locally; its structured result is recorded and returned to the next iteration.'],
-      ['Persist & render', 'Events, History, Trace, Usage, Tasks, Plans, Memory, and Workflow State feed the state layer.'],
+    chapters: ['Intro', 'Why', 'How it works', 'Pricing', 'Download'],
+    say: [
+      'I live in the terminal. So that is where we put the agent.',
+      'First, why: it is not another chat window.',
+      'One request in. Every step visible, every action gated.',
+      'The runtime is free. Model usage goes at your pace.',
+      'That is it. One line, and it is in your terminal.',
     ],
-    opsKicker: '02 / OPERATIONS', opsTitle: 'An agent control plane built for production work.', opsIntro: 'Closer to an operations system than a chat box: know what is running, where it is, what it may do, and how it recovers.',
-    cards: [
-      { title: 'Terminal native', desc: 'PATH commands run in a real PTY; interactive programs, long jobs, and named sub-terminals keep normal shell behavior.', icon: TerminalSquare, extra: 'terminal' },
-      { title: 'Orchestration', desc: 'HWO coordinates live multi-agent work; HWG compiles dependencies into durable, resumable graphs.', icon: Waypoints, extra: 'graph' },
-      { title: 'Policy boundaries', desc: 'Modes, roles, phases, global policy, trust, and approvals progressively narrow tool access.', icon: ShieldCheck, extra: 'policy' },
-      { title: 'Recoverable state', desc: 'Plans, events, traces, tasks, memory, and workflow state survive restarts without marking failed work complete.', icon: RotateCcw, extra: null },
-      { title: 'Observable', desc: 'Event chains, resource browsers, detail trace — every step is recorded and replayable.', icon: Radar, extra: null },
-      { title: 'Unified tool surface', desc: 'Built-ins, Skills, MCP, and Extensions enter one registry and one authorization pipeline.', icon: Layers3, extra: null },
+    kicker: 'LAINTAS CLI · THE AI AGENT IN YOUR TERMINAL',
+    title: ['Your shell, as usual.', 'Plus an agent.'],
+    lead: 'Laintas CLI is an autonomous agent that lives in your shell. Commands like ls, git and vim still run straight in a real PTY, never through the model. Describe a task in a sentence and the agent reads code, runs commands and edits files — every step in front of you, every risky one waiting for your yes.',
+    install: 'Install Laintas CLI', seeHow: 'See how it works',
+    facts: [['Free', 'Free runtime, source you can download and audit'], ['Linux · Windows', 'x86_64 / arm64, Windows 10 2004+ / 11'], ['One account', 'Shared with Helpwo and the plugin market']],
+    realEyebrow: 'RECORDED SESSION · v1.29.4', realTitle: 'A real session, replayed frame for frame',
+    realNote: 'The agent reads the project, runs pytest, traces the failing case to its root cause, shows the patch and waits for approval, then re-runs the suite. Only the model pauses are cut; nothing on screen is rewritten.',
+
+    whyKicker: '01 · WHY IT EXISTS', whyTitle: ['The agent closest', 'to your files.'],
+    whyIntro: 'An AI in a chat window can only advise. Copying, pasting, running, and relaying the error back is still your job. Laintas CLI stands in your working directory instead.',
+    compareHead: ['', 'Chat window', 'Laintas CLI'],
+    compare: [
+      ['Context', 'The snippets you pasted in', 'The whole workspace, terminal state and project memory'],
+      ['Execution', 'Hands you a command to run', 'Runs it, reads the full output, decides the next step'],
+      ['On failure', 'You relay the error back', 'It sees the same screen of errors you do'],
+      ['Long tasks', 'Close the tab and it is gone', 'Plans, events and sessions persist; /resume picks up'],
     ],
-    controlKicker: '03 / CONTROL PLANE', controlTitle: 'Parallel, without losing control.', controlIntro: 'Separate responsibility with roles and phases. Every call is authorized, executed, recorded, and returned. Prompts shape intent; runtime policy defines the boundary.',
-    agents: ['Planner', 'Operator', 'Verifier'], policy: 'POLICY GATE', states: ['scope: project', 'mode: act', 'approval: enforce', 'trace: on'],
-    priceKicker: 'MODEL & USAGE', priceTitle: 'Install the runtime first. Choose usage as you need it.', priceIntro: 'Laintas CLI is free and open source. Model inference is metered or subscribed — Pro and Gen cover every product from one pooled allowance.', pricing: 'View full pricing',
-    downloadKicker: '04 / DOWNLOAD', downloadTitle: 'Now put it in a real terminal.', downloadIntro: 'Use the one-line installer, download a standalone build for your architecture, or audit and extend the source package.',
-    quickInstall: 'One-line install', linux: 'Linux', windows: 'Windows', copied: 'Copied', copy: 'Copy', download: 'Download', requirements: 'Linux supports x86_64 / arm64. Windows supports x86_64 on Windows 10 2004+ or Windows 11 with WSL 2 enabled.', docs: 'Read the docs', source: 'View source', footer: 'Local runtime. Observable work. Controlled execution.',
+    caps: [
+      ['Real terminal', 'Direct commands bypass the model; interactive programs, long jobs and named sub-terminals keep native shell behavior.'],
+      ['Parallel work', 'Sub-agents split the job: HWO coordinates live collaboration, HWG compiles dependencies into resumable graphs.'],
+      ['Layered authorization', 'Modes, roles, phases, global policy, trust and approvals narrow what a tool may do — enforced by the runtime.'],
+      ['One tool surface', 'Built-in tools, Skills, MCP servers and plugin-market extensions share one registry and one authorization pipeline.'],
+    ],
+
+    howKicker: '02 · THE LIFE OF A REQUEST', howTitle: ['Follow one request', 'all the way through.'],
+    howIntro: 'Take “fix the failing test”. This is the path the runtime actually walks; each step maps to a local module and traceable state.',
+    steps: [
+      ['Route', 'First: command, slash command, or task? A command like pytest goes straight to the PTY without spending a model call.', '$ pytest → PTY'],
+      ['Assemble context', 'Mode, project prompt, rules, memory, plan and live terminal state become one request to the backend you chose.', 'mode: act · scope: project'],
+      ['Call tools', 'The model answers with structured calls; built-ins, Skills, MCP, extensions and sub-agents all come from one registry.', 'read · shell.exec · edit'],
+      ['Pass the gate', 'Every action meets the policy gate: allowed ones run, ask-first ones stop for you, out-of-bounds ones are refused.', 'allow · ask · deny'],
+      ['Run and record', 'The tool runs locally and its result feeds the next turn; events, traces and usage land in state you can replay and resume.', 'trace: on'],
+    ],
+    gateKicker: 'SECURITY BOUNDARY', gateTitle: ['Parallel,', 'never out of hand.'],
+    gateIntro: 'Prompts express intent; the boundary lives in the runtime. No amount of model persuasion gets past a policy that already said no.',
+    gates: [
+      ['Allow', 'allow', ['Read project files', 'Run the tests', 'git status / diff']],
+      ['Ask', 'ask', ['Write or delete files', 'git push', 'Read ~/.ssh and other credentials']],
+      ['Deny', 'deny', ['Send credentials off the machine', 'Tools the policy disables', 'Sub-agent calls beyond their role']],
+    ],
+    gateNote: 'Which tier an action lands in depends on the active mode, project policy and organization policy.',
+
+    priceKicker: '03 · PRICING', priceTitle: ['Install first.', 'Decide how much later.'],
+    priceIntro: 'Laintas CLI itself is free. Model calls are pay-as-you-go or subscription, and Pro and Gen allowances are shared across every Laintas product.',
+    perMonth: '/ mo', pricing: 'Full pricing and model tiers',
+    ecoTitle: 'The same account also opens',
+    eco: [
+      ['Helpwo', 'The web AI workspace. Run /connect in the CLI and see this machine’s terminal — and hand it tasks — from your browser.', 'https://helpwo.laintas.com/'],
+      ['Plugin market', 'Official and community extensions, one /extensions install away. Community code is reviewed before it installs.', '/plugins'],
+      ['Laintas account', 'Balance, subscription, usage and orders for every product, in one place.', 'https://laintas.com/dashboard'],
+    ],
+
+    downloadKicker: '04 · DOWNLOAD', downloadTitle: ['Now,', 'hand it to your terminal.'],
+    downloadIntro: 'The one-line installer is recommended. You can also grab a package directly, or audit and extend the source.',
+    platformLabel: 'Select install platform', linux: 'Linux', windows: 'Windows', copied: 'Copied', copy: 'Copy',
+    startSteps: [['Run the installer', 'It detects your architecture and installs laintas-cli'], ['Start and sign in', 'Type laintas-cli and sign in to your Laintas account'], ['Give it a first task', 'Try “figure out how to run this project”']],
+    packages: 'Packages', download: 'Download',
+    requirements: 'Linux needs a 64-bit glibc system (x86_64 / arm64). Windows needs x86_64 on Windows 10 2004+ or Windows 11 with WSL 2 enabled.',
   },
 };
+
+// Scroll → scene. Each chapter after the first owns one handoff: while its top
+// edge travels up through the middle band of the viewport, its scene fades in
+// over the previous one. Styles are written straight to the layers from a rAF
+// so scrolling never re-renders React; only the chapter index is state.
+function useSceneScroll(chapterRefs, layerRefs, dipRef) {
+  const [active, setActive] = useState(0);
+
+  useEffect(() => {
+    const reduced = window.matchMedia('(prefers-reduced-motion: reduce)');
+    let frame = 0;
+
+    const update = () => {
+      frame = 0;
+      const vh = window.innerHeight;
+      // On narrow screens the stage is a strip over the top half, so the
+      // handoff has to finish before a chapter slides under it.
+      const narrow = window.innerWidth <= 960;
+      const start = narrow ? 0.95 : 0.85;
+      const span = narrow ? 0.4 : 0.45;
+      // t[k]: how far scene k has faded in. Scene 0 is the base layer.
+      const t = SCENES.map((_, k) => {
+        if (k === 0) return 1;
+        const node = chapterRefs.current[k];
+        if (!node) return 0;
+        const top = node.getBoundingClientRect().top;
+        return clamp01((vh * start - top) / (vh * span));
+      });
+      const still = reduced.matches;
+      let dip = 0;
+      SCENES.forEach((scene, k) => {
+        const layer = layerRefs.current[k];
+        if (!layer) return;
+        const incoming = t[k];
+        const outgoing = k + 1 < SCENES.length ? t[k + 1] : 0;
+        const scale = still ? 1 : (1 + scene.enter * (1 - incoming)) * (1 - scene.exit * outgoing);
+        const fade = dissolve(incoming);
+        layer.style.opacity = String(fade);
+        layer.style.transform = `scale(${scale.toFixed(4)})`;
+        dip = Math.max(dip, scene.dip * (1 - Math.abs(2 * fade - 1)));
+      });
+      if (dipRef.current) dipRef.current.style.opacity = dip.toFixed(3);
+      let current = 0;
+      t.forEach((value, k) => { if (value >= 0.5) current = k; });
+      setActive((previous) => (previous === current ? previous : current));
+    };
+
+    const schedule = () => { if (!frame) frame = window.requestAnimationFrame(update); };
+    update();
+    window.addEventListener('scroll', schedule, { passive: true });
+    window.addEventListener('resize', schedule);
+    reduced.addEventListener?.('change', schedule);
+    return () => {
+      window.removeEventListener('scroll', schedule);
+      window.removeEventListener('resize', schedule);
+      reduced.removeEventListener?.('change', schedule);
+      if (frame) window.cancelAnimationFrame(frame);
+    };
+  }, [chapterRefs, layerRefs, dipRef]);
+
+  return active;
+}
 
 export default function DownloadSection() {
   const { lang } = useLanguage();
   const c = COPY[lang] || COPY.en;
   const [release, setRelease] = useState(RELEASE_FALLBACK);
   const [installPlatform, setInstallPlatform] = useState('linux');
+  const chapterRefs = useRef([]);
+  const layerRefs = useRef([]);
+  const dipRef = useRef(null);
+  const active = useSceneScroll(chapterRefs, layerRefs, dipRef);
 
   useEffect(() => {
     if (/Windows/i.test(window.navigator.userAgent)) setInstallPlatform('windows');
@@ -120,155 +277,208 @@ export default function DownloadSection() {
       .catch(() => {});
   }, []);
 
-  return (
-    <main className="product-page">
-      <div className="ops-grid" aria-hidden="true" />
-      <div className="hero-glow" aria-hidden="true" />
+  const chapter = (index) => (node) => { chapterRefs.current[index] = node; };
+  const goTo = (index) => chapterRefs.current[index]?.scrollIntoView({ behavior: 'smooth', block: 'start' });
 
-      {/* ── Hero: copy left, live terminal right ─────────────── */}
-      <section className="hero-shell">
-        <div className="hero-grid">
-          <motion.div className="hero-copy" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.55 }}>
-            <p className="section-kicker"><CircleDot size={13} /> {c.kicker}</p>
-            <h1><span>{c.titleA}</span><br />{c.titleB}</h1>
-            <p className="hero-intro">{c.intro}</p>
-            <p className="hero-highlight"><Zap size={15} />{c.introHighlight}</p>
-            <div className="hero-actions">
-              <a className="button button-primary" href="#download"><ArrowDownToLine size={17} />{c.install}</a>
-              <a className="button button-ghost" href="#workflow">{c.seeWorkflow}<ArrowRight size={16} /></a>
+  return (
+    <main className="product-page story-page" lang={lang === 'zh' ? 'zh-CN' : 'en'}>
+      <div className="story">
+        {/* ── The presenter: one sticky stage, five stacked scenes ───── */}
+        <div className="story-stage" aria-hidden="true">
+          {SCENES.map((scene, index) => (
+            <img
+              key={scene.src}
+              ref={(node) => { layerRefs.current[index] = node; }}
+              className="story-scene"
+              src={`/story/${scene.src}.webp`}
+              srcSet={`/story/${scene.src}-960.webp 960w, /story/${scene.src}.webp 1672w`}
+              sizes="100vw"
+              alt=""
+              style={{ transformOrigin: scene.focus, opacity: index === 0 ? 1 : 0 }}
+              fetchPriority={index === 0 ? 'high' : 'auto'}
+              decoding="async"
+              draggable="false"
+            />
+          ))}
+          <div className="story-dip" ref={dipRef} />
+          <div className="story-shade" />
+          <p className="story-say" key={`${lang}-${active}`}>{c.say[active]}</p>
+        </div>
+
+        <nav className="story-progress" aria-label={lang === 'zh' ? '章节' : 'Chapters'}>
+          {c.chapters.map((label, index) => (
+            <button type="button" key={label} className={index === active ? 'active' : ''} aria-current={index === active ? 'step' : undefined} onClick={() => goTo(index)}>
+              <span>0{index + 1}</span><em>{label}</em>
+            </button>
+          ))}
+        </nav>
+
+        <div className="story-chapters">
+          {/* ── Scene 1 · at the laptop: what it is ───────────────────────── */}
+          <section ref={chapter(0)} id="top" className="story-chapter story-hero">
+            <Kicker>{c.kicker}</Kicker>
+            <h1 className="st-display"><Title parts={c.title} /></h1>
+            <p className="st-lead">{c.lead}</p>
+            <div className="st-actions">
+              <a className="st-button st-button-primary" href="#download"><ArrowDownToLine size={16} />{c.install}</a>
+              <a className="st-button" href="#operations">{c.seeHow}<ArrowRight size={15} /></a>
             </div>
-            <div className="hero-proof-line">
-              {c.proofLine.map((label, i) => {
-                const icons = [Monitor, Network, ShieldCheck];
-                const Icon = icons[i];
-                return <span key={label}><Icon size={15} />{label}</span>;
+            <dl className="st-facts">
+              {c.facts.map(([term, detail]) => <div key={term}><dt>{term}</dt><dd>{detail}</dd></div>)}
+            </dl>
+            <figure className="hero-terminal st-replay">
+              <div className="proof-label"><span className="live-dot" />{c.realEyebrow}</div>
+              <TerminalReplay />
+              <figcaption><strong>{c.realTitle}</strong><span>{c.realNote}</span></figcaption>
+            </figure>
+          </section>
+
+          {/* ── Scene 2 · laptop closed, turns to us: why ─────────────────── */}
+          <section ref={chapter(1)} id="operations" className="story-chapter">
+            <ChapterHead kicker={c.whyKicker} title={c.whyTitle} intro={c.whyIntro} />
+            <div className="st-compare" role="table">
+              <div className="st-compare-row st-compare-head" role="row">
+                {c.compareHead.map((label, index) => <span role="columnheader" key={index}>{label}</span>)}
+              </div>
+              {c.compare.map(([label, chat, cli]) => (
+                <div className="st-compare-row" role="row" key={label}>
+                  <span role="rowheader">{label}</span>
+                  <span role="cell" data-label={c.compareHead[1]}>{chat}</span>
+                  <span role="cell" data-label={c.compareHead[2]}><Check size={14} />{cli}</span>
+                </div>
+              ))}
+            </div>
+            <div className="st-caps">
+              {c.caps.map(([title, desc], index) => {
+                const Icon = CAP_ICONS[index];
+                return (
+                  <article key={title}>
+                    <Icon size={18} strokeWidth={1.6} />
+                    <h3>{title}</h3>
+                    <p>{desc}</p>
+                  </article>
+                );
               })}
             </div>
-          </motion.div>
+          </section>
 
-          <motion.div className="hero-terminal" initial={{ opacity: 0, scale: 0.98 }} animate={{ opacity: 1, scale: 1 }} transition={{ duration: 0.65, delay: 0.12 }}>
-            <div className="proof-label"><span className="live-dot" />{c.realEyebrow}</div>
-            <TerminalReplay />
-            <figcaption><div><strong>{c.realTitle}</strong><span>{c.realNote}</span></div></figcaption>
-          </motion.div>
-        </div>
-      </section>
+          {/* ── Scene 3 · stands and explains: how a request runs ─────────── */}
+          <section ref={chapter(2)} id="workflow" className="story-chapter">
+            <ChapterHead kicker={c.howKicker} title={c.howTitle} intro={c.howIntro} />
+            <ol className="st-journey">
+              {c.steps.map(([title, detail, tag], index) => (
+                <li key={title}>
+                  <span className="st-journey-dot">{index + 1}</span>
+                  <div><h3>{title}<code>{tag}</code></h3><p>{detail}</p></div>
+                </li>
+              ))}
+            </ol>
+            <div id="security" className="st-gate-block">
+              <ChapterHead kicker={c.gateKicker} title={c.gateTitle} intro={c.gateIntro} small />
+              <div className="st-gates">
+                {c.gates.map(([label, tone, items]) => (
+                  <div className={`st-gate st-gate-${tone}`} key={tone}>
+                    <p><i />{label}</p>
+                    <ul>{items.map((item) => <li key={item}>{item}</li>)}</ul>
+                  </div>
+                ))}
+              </div>
+              <p className="st-note">{c.gateNote}</p>
+            </div>
+          </section>
 
-      {/* ── 01 / Request lifecycle ───────────────────────────── */}
-      <SectionIntro id="workflow" kicker={c.flowKicker} title={c.flowTitle} intro={c.flowIntro} />
-      <section className="workflow-rail page-shell" aria-label={c.flowTitle}>
-        {c.flow.map(([title, detail], index) => (
-          <article className="workflow-step" key={title}>
-            <div className="step-index">0{index + 1}<span /></div>
-            <h3>{title}</h3><p>{detail}</p>
-          </article>
-        ))}
-      </section>
+          {/* ── Scene 4 · faces us, open hands: pricing ───────────────────── */}
+          <section ref={chapter(3)} id="pricing" className="story-chapter">
+            <ChapterHead kicker={c.priceKicker} title={c.priceTitle} intro={c.priceIntro} />
+            <div className="st-plans">
+              {PLANS.map((plan) => {
+                const badge = plan.badge ? (plan.badge[lang] || plan.badge.en) : null;
+                return (
+                  <a className={`st-plan${plan.highlight ? ' st-plan-highlight' : ''}`} key={plan.id} href={`https://laintas.com/pricing${plan.id === 'free' ? '#allowance-comparison' : ''}`} target="_blank" rel="noreferrer">
+                    <div className="st-plan-price">
+                      <p>{plan.title[lang] || plan.title.en}{badge && <em>{badge}</em>}</p>
+                      <strong>{plan.price}<small>{c.perMonth}</small></strong>
+                    </div>
+                    <div className="st-plan-body">
+                      <p>{plan.desc[lang] || plan.desc.en}</p>
+                      <ul>{(plan.features[lang] || plan.features.en).map((f) => <li key={f}>{f}</li>)}</ul>
+                    </div>
+                    <ArrowUpRight className="st-plan-arrow" size={18} />
+                  </a>
+                );
+              })}
+            </div>
+            <a className="st-link" href="https://laintas.com/pricing" target="_blank" rel="noreferrer">{c.pricing}<ArrowUpRight size={14} /></a>
+            <div className="st-eco">
+              <p className="st-eco-title">{c.ecoTitle}</p>
+              {c.eco.map(([name, desc, href]) => (
+                <a key={name} href={href} {...(href.startsWith('http') ? { target: '_blank', rel: 'noreferrer' } : {})}>
+                  <strong>{name}</strong><span>{desc}</span><ArrowUpRight size={16} />
+                </a>
+              ))}
+            </div>
+          </section>
 
-      {/* ── 02 / Operations ──────────────────────────────────── */}
-      <SectionIntro id="operations" kicker={c.opsKicker} title={c.opsTitle} intro={c.opsIntro} />
-      <section className="ops-bento page-shell">
-        {c.cards.map(({ title, desc, icon: Icon, extra }, index) => (
-          <article className={`ops-card ops-card-${index + 1}`} key={title}>
-            <div className="ops-card-top"><Icon size={20} /><span>0{index + 1}</span></div>
-            <h3>{title}</h3><p>{desc}</p>
-            {extra === 'graph' && <MiniGraph />}
-            {extra === 'policy' && <div className="policy-list"><span>DENY</span><span>REVIEW</span><span>ALLOW</span></div>}
-            {extra === 'terminal' && <div className="terminal-chips"><span>$ shell</span><span>PTY</span><span>sub-term</span></div>}
-          </article>
-        ))}
-      </section>
-
-      {/* ── 03 / Control plane ───────────────────────────────── */}
-      <section id="security" className="control-section page-shell">
-        <div className="control-copy">
-          <p className="section-kicker">{c.controlKicker}</p>
-          <h2>{c.controlTitle}</h2>
-          <p>{c.controlIntro}</p>
-          <div className="state-list">{c.states.map((state) => <code key={state}>{state}</code>)}</div>
+          {/* ── Scene 5 · points to the right: download ───────────────────── */}
+          <section ref={chapter(4)} id="download" className="story-chapter">
+            <ChapterHead kicker={c.downloadKicker} title={c.downloadTitle} intro={c.downloadIntro} />
+            <div className="st-install">
+              <div className="st-install-tabs" role="group" aria-label={c.platformLabel}>
+                {['linux', 'windows'].map((platform) => (
+                  <button type="button" key={platform} className={installPlatform === platform ? 'active' : ''} onClick={() => setInstallPlatform(platform)} aria-pressed={installPlatform === platform}>{c[platform]}</button>
+                ))}
+              </div>
+              <div className="st-install-line">
+                <code><span aria-hidden="true">{installPlatform === 'windows' ? 'PS>' : '$'}</span>{INSTALL_COMMANDS[installPlatform]}</code>
+                <CopyButton value={INSTALL_COMMANDS[installPlatform]} labels={c} />
+              </div>
+            </div>
+            <ol className="st-start">
+              {c.startSteps.map(([title, detail], index) => (
+                <li key={title}><span>0{index + 1}</span><strong>{title}</strong><p>{detail}</p></li>
+              ))}
+            </ol>
+            <p className="st-eco-title">{c.packages}</p>
+            <div className="st-packages">
+              {DOWNLOADS.map(({ id, names, details, file, href, icon: Icon }) => (
+                <a href={href || `${RELEASE_BASE}/${file}`} key={id}>
+                  <Icon size={18} strokeWidth={1.6} />
+                  <span><strong>{names[lang] || names.en}</strong><small>{details[lang] || details.en}</small></span>
+                  <code>{release}</code>
+                  <em>{c.download}<ArrowDownToLine size={15} /></em>
+                </a>
+              ))}
+            </div>
+            <p className="st-note">{c.requirements}</p>
+          </section>
         </div>
-        <div className="control-diagram" aria-label="Agent authorization flow">
-          <div className="agent-stack">{c.agents.map((agent, index) => <div key={agent}><span>0{index + 1}</span>{agent}<i /></div>)}</div>
-          <div className="flow-arrow"><ChevronRight /></div>
-          <div className="policy-gate"><ShieldCheck /><span>{c.policy}</span><small>role · phase · trust · approval</small></div>
-          <div className="flow-arrow"><ChevronRight /></div>
-          <div className="runtime-node"><Play /><span>LOCAL<br />RUNTIME</span><small>execute · observe · persist</small></div>
-        </div>
-      </section>
-
-      {/* ── MODEL & USAGE · Pricing ──────────────────────────── */}
-      <section id="pricing" className="pricing-section page-shell">
-        <div className="pricing-heading">
-          <div>
-            <p className="section-kicker">{c.priceKicker}</p>
-            <h2>{c.priceTitle}</h2>
-            <p>{c.priceIntro}</p>
-          </div>
-          <a className="button button-light" href="https://laintas.com/pricing" target="_blank" rel="noreferrer">{c.pricing}<ExternalLink size={16} /></a>
-        </div>
-        <div className="pricing-grid">
-          {PLANS.map((plan) => {
-            const title = plan.title[lang] || plan.title.en;
-            const desc = plan.desc[lang] || plan.desc.en;
-            const features = plan.features[lang] || plan.features.en;
-            const badge = plan.badge ? (plan.badge[lang] || plan.badge.en) : null;
-            return (
-              <article className={`price-card${plan.highlight ? ' price-card-highlight' : ''}`} key={plan.id}>
-                {badge && <span className="price-badge">{badge}</span>}
-                <p className="price-name">{title}</p>
-                <div className="price-value"><span className="price-amount">{plan.price}</span><span className="price-period">{plan.period}</span></div>
-                <p className="price-desc">{desc}</p>
-                <ul className="price-features">{features.map((f) => <li key={f}><Check size={13} />{f}</li>)}</ul>
-                <a className="button price-cta" href={`https://laintas.com/pricing${plan.id === 'free' ? '#allowance-comparison' : ''}`} target="_blank" rel="noreferrer">{lang === 'zh' ? '了解详情' : 'Learn more'}<ArrowRight size={15} /></a>
-              </article>
-            );
-          })}
-        </div>
-      </section>
-
-      {/* ── 04 / Download ────────────────────────────────────── */}
-      <section id="download" className="download-section page-shell">
-        <div className="download-heading">
-          <div><p className="section-kicker">{c.downloadKicker}</p><h2>{c.downloadTitle}</h2></div>
-          <p>{c.downloadIntro}</p>
-        </div>
-        <div className="install-platforms" aria-label={lang === 'zh' ? '选择安装平台' : 'Select install platform'}>
-          {['linux', 'windows'].map((platform) => (
-            <button type="button" key={platform} className={installPlatform === platform ? 'active' : ''} onClick={() => setInstallPlatform(platform)} aria-pressed={installPlatform === platform}>{c[platform]}</button>
-          ))}
-        </div>
-        <div className="install-block">
-          <div><span>{c.quickInstall} · {c[installPlatform]}</span><code>{INSTALL_COMMANDS[installPlatform]}</code></div>
-          <CopyButton value={INSTALL_COMMANDS[installPlatform]} labels={c} />
-        </div>
-        <div className="download-grid">
-          {DOWNLOADS.map(({ id, names, details, file, href, icon: Icon }) => (
-            <a className="download-card" href={href || `${RELEASE_BASE}/${file}`} key={id}>
-              <div><Icon size={20} /><span>{release}</span></div>
-              <h3>{names[lang] || names.en}</h3>
-              <p>{details[lang] || details.en}</p>
-              <strong>{c.download}<ArrowDownToLine size={16} /></strong>
-            </a>
-          ))}
-        </div>
-        <p className="requirements"><CheckCircle2 size={15} />{c.requirements}</p>
-      </section>
+      </div>
 
       <SiteFooter />
     </main>
   );
 }
 
-function SectionIntro({ id, kicker, title, intro }) {
-  return <section id={id} className="section-intro page-shell"><p className="section-kicker">{kicker}</p><div><h2>{title}</h2><p>{intro}</p></div></section>;
+function Kicker({ children }) {
+  return <p className="st-kicker"><i aria-hidden="true" />{children}</p>;
 }
 
-function MiniGraph() {
-  return <div className="mini-graph" aria-hidden="true"><span><GitBranch size={13} /> plan</span><i /><span><TerminalSquare size={13} /> execute</span><i /><span><CheckCircle2 size={13} /> verify</span></div>;
+function Title({ parts: [plain, emphasised] }) {
+  return <>{plain}<br /><em>{emphasised}</em></>;
+}
+
+function ChapterHead({ kicker, title, intro, small = false }) {
+  return (
+    <header className={`st-head${small ? ' st-head-small' : ''}`}>
+      <Kicker>{kicker}</Kicker>
+      <h2 className="st-display"><Title parts={title} /></h2>
+      <p>{intro}</p>
+    </header>
+  );
 }
 
 function CopyButton({ value, labels }) {
   const [copied, setCopied] = useState(false);
   async function copy() { await navigator.clipboard.writeText(value); setCopied(true); window.setTimeout(() => setCopied(false), 1600); }
-  return <button type="button" className="copy-button" onClick={copy} aria-label={labels.copy}>{copied ? <Check size={17} /> : <Copy size={17} />}{copied ? labels.copied : labels.copy}</button>;
+  return <button type="button" className="st-copy" onClick={copy} aria-label={labels.copy}>{copied ? <Check size={15} /> : <Copy size={15} />}{copied ? labels.copied : labels.copy}</button>;
 }

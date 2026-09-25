@@ -127,7 +127,7 @@ The runtime policy—not the prompt—is the security boundary. Prompt instructi
 | Planning and tasks | `plan_mode.py`, `task_manager.py`, `workgraph.py`, `workflow_state.py` | Versioned plans, dependencies, approvals, durable graph state | `/plan`, `/task`, `/rule`, workflow definitions |
 | Multi-agent execution | `agent_persistence.py`, `agent_roles.py`, `peer_coordination.py`, `worktree_manager.py`, `hwo_runner.py`, `hwo_ui.py`, `hwg_runner.py`, `workflow_engine.py` | Agent lifecycle, leases, roles, worktrees, orchestrated and resumable workflows | Role/workflow commands, skills, extension tools |
 | Plugin systems | `skills.py`, `skill_router.py`, `mcp_client.py`, `extension_runtime.py`, `extension_manager.py`, `evolution_lab.py`, `evolution_runner.py` | Discovery, trust, lifecycle, registration, cleanup, experimental activation | `SKILL.md`, `skill.py`, `mcp.json`, extension packages |
-| Backend boundary | `backend_profiles.py`, `cloud_provider.py` | Origin classification, credential isolation, provider-specific calls | Backend profiles and environment references |
+| Backend boundary | `backend_profiles.py` | Origin classification, credential isolation, backend selection | Backend profiles and environment references |
 | Web and browser | `browser_session.py`, `web_search.py`, `cookie_store.py`, `identity_store.py` | CDP browser control, search/fetch chain, explicit browsing identity | `/web`, `/identity`, proxy and browser config |
 | Remote integrations | `helpwo_server.py`, `shared_storage.py`, `webrtc_channel.py` | Browser-to-local runtime bridge, file sharing, peer transport | Helpwo and account configuration |
 | Distribution | `updater.py`, `release.py`, `enterprise.py`, `enterprise_installer.py`, `migrate.py` | Updates, signed packages, Enterprise add-ons, migrations | Release channel and signed extensions |
@@ -444,6 +444,24 @@ Inside a child CLI, `/back` (or `/q`) returns to its parent without stopping
 the child; `Ctrl+\\` is the force-detach shortcut. The prompt and Agents view
 show the child's name. LIVE OUTPUT reconstructs the current terminal screen
 instead of concatenating redraws, and refreshing preserves preview scrolling.
+
+### Password vault: `/password`
+
+`/password` opens the shared full-screen entry browser. Use `/` to search by
+description, site or entry ID, Enter for public details, `a` to add, `v` to
+reveal locally, `e` to edit and `d` to delete. Actions that need secrets ask
+you to unlock and then continue with the selected entry. `u` unlocks, `l`
+locks, `c` changes the passphrase, and `q` exits and locks the vault.
+
+Secret input is masked and has no saved input history. Multiline secrets
+preserve blank lines: Enter adds a line, **Ctrl+D finishes**, and Esc cancels.
+In the field editor, select only the fields to change, then choose **Save
+changes**; Cancel discards the draft. An empty username or note clears that
+field; secret entries can also clear their optional site list.
+
+Descriptions and sites are public metadata. Secret values appear only in a
+private local full-screen view, bypassing terminal mirroring; Enter or Esc
+closes that view. Protected browser autofill remains unavailable.
 
 ### Hosted applications: `/helpwo` and `/app`
 

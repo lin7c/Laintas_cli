@@ -116,6 +116,7 @@ _DEFAULT_CONFIG = {
     # budget, never a runtime cap: a build that keeps printing keeps its lease
     # for as long as it takes. Raise it for commands that legitimately go
     # quiet (a long link step, a slow remote fetch); lower it to fail fast.
+    "shell_attach": True,  # direct commands run in term0 with the real terminal attached (live output, keyboard, Ctrl+C); False = the old captured marker-poll path
     "shell_idle_timeout": 120.0,  # seconds of silence before a command is presumed stuck
     "paste_summary": True,        # collapse large pastes into a [Pasted #N ~L lines] placeholder in the prompt (expanded on submit)
     "shell_command_completion": True,  # pop up PATH/builtin shell commands (ls, git, ...) in the hint menu while typing the first word
@@ -947,6 +948,7 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "read_block_visible": "Decline a re-read of lines the model can still see in its own transcript",
     "terminal_tail_lines": "Terminal snapshot line count (viewport height)",
     "terminal_buffer_lines": "Scrollable history depth per terminal (lines)",
+    "shell_attach": "Run commands you type in term0 with the real terminal attached: live output, keyboard input, Ctrl+C interrupts the command, Ctrl+] detaches (/fg returns). Off = capture output and print it when the command ends",
     "shell_idle_timeout": "Seconds of silence before a terminal command is presumed stuck (idle budget, not a runtime cap)",
     "shell_command_completion": "Show shell commands (PATH + builtins) in the completion menu while typing the first word; off = Tab-only",
     "disable_remote_terminal": "Opt this runtime environment out of Helpwo's interactive terminal (P2P shell)",
@@ -1385,11 +1387,13 @@ def _persist_warn(context: str, exc: BaseException) -> None:
     agent state could be lost without any indication. Now prints a dim
     yellow warning to the console so the user knows something went wrong.
     """
+    import sys
     try:
-        deps.console.print(
+        # No LoopDeps reaches this module-level helper. The CLI's console is
+        # prompt_toolkit-aware; a bare stderr write lands on top of the input.
+        sys.modules["laintas_cli"].console.print(
             f"[dim yellow](persistence warning: {context}: {type(exc).__name__}: {exc})[/dim yellow]")
     except Exception:
-        import sys
         print(f"(persistence warning: {context}: {type(exc).__name__}: {exc})",
               file=sys.stderr)
 
@@ -2106,18 +2110,20 @@ def _atomic_write_json_if_changed(
 
 
 def _write_session_json(dest, payload: dict, *, skip_if_unchanged: bool = True) -> bool:
+    import session_store
     dest.parent.mkdir(parents=True, exist_ok=True)
     cache_key = str(dest)
+    # One serialization, hashed and written — see serialize_session_json. The
+    # key-sorted _fingerprint_payload stays for the picker's cross-file dedup.
+    serialized = session_store.serialize_session_json(payload, ("timestamp",))
+    fp = serialized.fingerprint
     if skip_if_unchanged:
-        fp = _fingerprint_payload(payload)
         if _LAST_RESUME_WRITE_FINGERPRINTS.get(cache_key) == fp and dest.exists():
             return False
     tmp = dest.with_name(f".{dest.name}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp.write_text(
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
+        with open(tmp, "w", encoding="utf-8") as fh:
+            serialized.write_to(fh)
         os.replace(str(tmp), str(dest))
         if skip_if_unchanged:
             _LAST_RESUME_WRITE_FINGERPRINTS[cache_key] = fp
@@ -2631,27 +2637,33 @@ def _literal_ends(text: str, end: int) -> bool:
     return text[end:end + 1] in ("", ",", "}", " ", "\t", "\r", "\n")
 
 
-def _purge_recycled_session_files(cwd: str) -> None:
-    """Delete this cwd's recycled sidecars once they are past recovery age.
+def _purge_recycled_session_files(cwd: Optional[str]) -> int:
+    """Delete recycled sidecars once they are past recovery age.
 
     Recycling renames a whole conversation out of the globbed namespace; the
-    sidecar is there so a mistaken expiry stays reversible, not for ever. Run
-    wherever recycling runs, so the reclaim happens on the same schedule.
+    sidecar is there so a mistaken expiry stays reversible, not for ever. Runs
+    for one cwd wherever recycling runs, and for every cwd (``cwd=None``) from
+    the startup sweep — recycling only happens in /resume's delete, so the
+    per-cwd call alone left 1,149 sidecars (237MB) on one machine.
+    Returns how many files were removed.
     """
-    key = _session_key(cwd)
+    pattern = f"{_session_key(cwd)}*.json.expired" if cwd else "*.json.expired"
     now = time.time()
+    removed = 0
     try:
-        candidates = list(paths.SESSIONS_DIR.glob(f"{key}*.json.expired"))
+        candidates = list(paths.SESSIONS_DIR.glob(pattern))
     except OSError:
-        return
+        return 0
     for path in candidates:
         try:
             if path.is_symlink() or not path.is_file():
                 continue
             if now - path.stat().st_mtime > _RECYCLED_MAX_AGE:
                 path.unlink()
+                removed += 1
         except OSError:
             continue
+    return removed
 
 
 def _read_session_header(path) -> Optional[dict]:
@@ -9385,6 +9397,13 @@ def _marker_poll_simple(session, command: str, timeout: float = 30) -> str:
     import uuid as _uuid
     import re as _re
 
+    import term_attach
+    if term_attach.is_busy(session):
+        # The user detached from a program still running in term0; typing
+        # would hand this command to it as input. Returned, not raised: the
+        # caller's fallback on an exception would run the command elsewhere.
+        return f"Parent command refused: {term_attach.busy_message(session)}"
+
     marker_id = _uuid.uuid4().hex[:8]
     start_marker = f"__CMD_BEGIN_{marker_id}__"
     end_marker = f"__CMD_END_{marker_id}__"
@@ -9396,6 +9415,21 @@ def _marker_poll_simple(session, command: str, timeout: float = 30) -> str:
         old_len = len(session.full_output)
 
     session.send_keys(wrapped + "\n")
+    # From here on the command is running in term0. Nothing below may raise:
+    # the caller falls back to subprocess.run on an exception, and that would
+    # run the same command a second time.
+    try:
+        return _marker_poll_collect(session, old_len, start_marker,
+                                    end_marker, timeout)
+    except Exception as exc:
+        return f"(command sent to term0, but reading its output failed: {type(exc).__name__}: {exc})"
+
+
+def _marker_poll_collect(session, old_len: int, start_marker: str,
+                         end_marker: str, timeout: float) -> str:
+    """Poll *session* until *end_marker* appears; return the command's output."""
+    import re as _re
+
     poll_start = time.time()
     cmd_output = ""
 
@@ -9419,6 +9453,7 @@ def _marker_poll_simple(session, command: str, timeout: float = 30) -> str:
                 # first and last marker (e.g. when the command itself echoes
                 # a matching line). The (?=[\r\n]|$) lookahead already
                 # excludes shell-echoed command lines (marker followed by ';').
+                valid = [m for m in starts if m.end() < end_match.start()]
                 chosen = valid[0] if valid else starts[0]
                 body_start = chosen.end()
                 while body_start < len(new_content) and new_content[body_start] in '\r\n':
@@ -9441,6 +9476,9 @@ def _sync_cwd_from_session(session) -> None:
     """Sync parent process CWD from a persistent bash session via marker-poll pwd."""
     import uuid as _uuid
     import re as _re
+    import term_attach
+    if term_attach.is_busy(session):
+        return  # `pwd` would be typed into the program the user detached from
 
     marker_id = _uuid.uuid4().hex[:8]
     start_marker = f"__CMD_BEGIN_{marker_id}__"
@@ -9505,15 +9543,19 @@ def _check_policy(command: str, agent_id: str = None,
     or a missing approval channel. The agent loop uses this to terminate the
     task immediately (see ``deny_exits_loop`` runtime config).
     """
+    from rich.text import Text
+
     decision = policy_mod.evaluate(command, cwd or os.getcwd(),
                                    req_id=req_id, agent_id=agent_id)
+    # Reasons include regex rules and user-controlled paths. They are literal
+    # text, never Rich markup (a path class like [/\\] is otherwise a close tag).
     if decision.action == "deny":
-        msg = f"[bold red]BLOCKED:[/bold red] {decision.reason}"
+        msg = Text.assemble(("BLOCKED:", "bold red"), " ", decision.reason)
         if events_cb is not None and deps is not None:
             deps.console.print(msg)
         return False, decision.reason, False, False
     if decision.action == "needs_approval":
-        msg = f"[bold yellow]APPROVAL REQUIRED:[/bold yellow] {decision.reason}"
+        msg = Text.assemble(("APPROVAL REQUIRED:", "bold yellow"), " ", decision.reason)
         if events_cb is not None and deps is not None:
             deps.console.print(msg)
         approve_fn = getattr(deps, "request_command_approval", None) if deps is not None else None
@@ -9652,9 +9694,11 @@ def _policy_command_arg(name: str, arguments: dict) -> str:
     """
     if not isinstance(arguments, dict):
         return ""
-    if name in ("shell.exec", "terminal.exec", "terminal.send"):
-        command = (arguments.get("input") if name == "terminal.send"
-                   else arguments.get("command"))
+    if name in ("shell.exec", "terminal.exec", "terminal.send",
+                "session.start", "session.keys"):
+        command = (arguments.get("keys") if name == "session.keys" else
+                   arguments.get("input") if name == "terminal.send" else
+                   arguments.get("command"))
         if command is None and name == "terminal.send":
             command = arguments.get("command")
         command = command or ""
@@ -10427,7 +10471,8 @@ def _prepare_tool_call(tc: dict, idx: int, loop: int) -> Optional[dict]:
         "call_id": f"call_{loop+1:02d}_{idx+1:02d}",
         "salient": _salient_arg(name, arguments),
         "is_shell_flavored": name in (
-            "shell.exec", "terminal.create", "terminal.send", "terminal.exec"),
+            "shell.exec", "terminal.create", "terminal.send", "terminal.exec",
+            "session.start", "session.keys"),
     }
 
 
@@ -13429,7 +13474,7 @@ def run_agent_loop(
                     if _authorize_tool_call(
                             _jcall["name"], _jcall["salient"], state,
                             agent_id=agent_id,
-                            allowed_tool_names=_allowed_tool_names,
+                            allowed_tool_names=_authorized_tool_names,
                             is_shell_flavored=_jcall["is_shell_flavored"],
                             fail_ledger=_fail_ledger,
                             fail_ledger_err=_fail_ledger_err,
@@ -13541,7 +13586,7 @@ def run_agent_loop(
                 _block = _authorize_tool_call(
                     name, salient, state,
                     agent_id=agent_id,
-                    allowed_tool_names=_allowed_tool_names,
+                    allowed_tool_names=_authorized_tool_names,
                     is_shell_flavored=is_shell_flavored,
                     fail_ledger=_fail_ledger,
                     fail_ledger_err=_fail_ledger_err,

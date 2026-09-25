@@ -126,6 +126,20 @@ class MirrorHub:
         with self._lock:
             self._append_locked(str(agent_id or "primary"), filtered)
 
+    def mirror_only(self, text: str, agent_id: str) -> None:
+        """Record output someone else already put on the screen.
+
+        A command running with the terminal attached writes its bytes to the
+        tty itself; the mirrors still need them, on the same terms as
+        tee_write (only while recording).
+        """
+        filtered = _filter_for_mirror(str(text or ""))
+        if not filtered:
+            return
+        with self._lock:
+            if self._recording > 0:
+                self._append_locked(str(agent_id or "primary"), filtered)
+
     def tee_write(self, text: str, agent_id: str) -> None:
         """Route one console chunk: mirror always, stdout per ownership."""
         text = str(text or "")

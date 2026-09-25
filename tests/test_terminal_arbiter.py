@@ -342,7 +342,13 @@ class ProcessExitTests(unittest.TestCase):
     # not a regression. Skip instead of failing (e.g. on CI runners).
     @unittest.skipUnless(
         os.environ.get("LAINTAS_E2E_SESSION") == "1"
-        or Path.home().joinpath(".laintas/session.json").exists()
+        # The child CLI inherits this process's environment, so an isolated
+        # LAINTAS_HOME hides ~/.laintas entirely: checking the real home would
+        # skip past the login flow guard and then boot into device login.
+        or (
+            not os.environ.get("LAINTAS_HOME")
+            and Path.home().joinpath(".laintas/session.json").exists()
+        )
         or os.path.exists(os.path.join(os.environ.get("LAINTAS_HOME", ""), "session.json")),
         "no saved login session: CLI cannot reach its prompt (CI runner)",
     )

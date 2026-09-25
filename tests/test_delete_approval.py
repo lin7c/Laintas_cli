@@ -1,4 +1,5 @@
 import copy
+import io
 import json
 import os
 import tempfile
@@ -7,6 +8,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+
+from rich.console import Console
 
 import laintas_cli
 import agent_loop
@@ -113,6 +116,80 @@ class DeletePolicyTests(unittest.TestCase):
                     str(Path(tmp) / "ordinary.txt"), tmp).action,
                 "needs_approval",
             )
+
+
+class PolicyMessageRenderingTests(unittest.TestCase):
+    reason = r"Matched rule: (?:^|[/\\])example [red]literal[/red] [/missing]"
+    command = r"echo [/\\]"
+
+    # Styles are applied via Text.assemble, so the captured output carries
+    # ANSI codes. The contract under test is the *literal* reason text.
+    _ANSI = __import__("re").compile(r"\x1b\[[0-9;]*m")
+
+    def plain(self):
+        return self._ANSI.sub("", self.output.getvalue())
+
+    def setUp(self):
+        self.output = io.StringIO()
+        self.console = Console(file=self.output, width=240, highlight=False)
+
+    def test_deny_reason_is_literal_and_still_blocks(self):
+        approve = mock.Mock()
+        deps = SimpleNamespace(console=self.console, request_command_approval=approve)
+        decision = policy.PolicyDecision("deny", "", self.reason)
+        with mock.patch.object(policy, "evaluate", return_value=decision):
+            result = agent_loop._check_policy(
+                self.command, events_cb=mock.Mock(), deps=deps, cwd="/work")
+        self.assertEqual(result, (False, self.reason, False, False))
+        self.assertEqual(self.plain(), f"BLOCKED: {self.reason}\n")
+        approve.assert_not_called()
+
+    def test_approval_reason_is_literal_and_preserves_approval_outcomes(self):
+        for answer in (True, False, None):
+            with self.subTest(answer=answer):
+                self.output.seek(0)
+                self.output.truncate()
+                approve = mock.Mock(return_value=answer) if answer is not None else None
+                deps = SimpleNamespace(console=self.console, request_command_approval=approve)
+                decision = policy.PolicyDecision("needs_approval", "", self.reason)
+                with mock.patch.object(policy, "evaluate", return_value=decision):
+                    result = agent_loop._check_policy(
+                        self.command, events_cb=mock.Mock(), deps=deps, cwd="/work")
+                self.assertEqual(self.plain(), f"APPROVAL REQUIRED: {self.reason}\n")
+                if answer is None:
+                    self.assertEqual(result, (
+                        False, f"{self.reason} (approval required but no approval channel available)",
+                        True, False))
+                else:
+                    approve.assert_called_once_with(self.command, self.reason)
+                    self.assertEqual(result, (
+                        answer, self.reason if answer else f"User denied: {self.reason}",
+                        True, not answer))
+
+    def test_remote_exec_denial_is_literal(self):
+        registry = SimpleNamespace(agent_id="test", _push_final=mock.Mock())
+        decision = policy.PolicyDecision("deny", "", self.reason)
+        with mock.patch.object(policy, "evaluate", return_value=decision), \
+                mock.patch.object(laintas_cli, "console", self.console):
+            laintas_cli.AgentRegistry._handle_exec(
+                registry, "request", {"command": self.command, "cwd": "/work"})
+        registry._push_final.assert_called_once_with(
+            "request", "fail", f"Blocked by policy: {self.reason}")
+        self.assertEqual(self.plain(),
+                         f"BLOCKED remote exec: {self.command} — {self.reason}\n")
+
+    def test_reload_denial_keeps_files_and_prints_literal_reason(self):
+        decision = policy.PolicyDecision("deny", "", self.reason)
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            saved = directory / laintas_cli.paths._ALL_CWD_FILES[0]
+            saved.write_text("keep", encoding="utf-8")
+            with mock.patch.object(laintas_cli.paths, "project_dir", return_value=directory), \
+                    mock.patch.object(policy, "evaluate_file_delete", return_value=decision), \
+                    mock.patch.object(laintas_cli, "console", self.console):
+                laintas_cli.reload_default_files()
+            self.assertEqual(saved.read_text(encoding="utf-8"), "keep")
+        self.assertEqual(self.plain(), f"Blocked by policy: {self.reason}\n")
 
 
 class DirectCommandApprovalTests(unittest.TestCase):

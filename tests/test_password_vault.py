@@ -254,12 +254,33 @@ class TestStorage(VaultDirTest):
         self.vault.create(PASS)
         eid = self.vault.add_entry("A", ["https://example.com"], "u", "p")
         with mock.patch.object(self.vault, "_rebuild_cache", side_effect=OSError):
-            with self.assertRaises(OSError):
-                self.vault.change_passphrase("new-test-pass")
+            self.vault.change_passphrase("new-test-pass")
+        self.assertTrue(self.vault.cache_warning)
         self.assertEqual(self.vault.get_secret(eid)["password"], "p")
         other = pv.PasswordVault(self.vault._dir)
         self.assertFalse(other.unlock(PASS))
         self.assertTrue(other.unlock("new-test-pass"))
+
+    def test_cache_failure_does_not_report_committed_add_as_failure(self):
+        self.vault.create(PASS)
+        with mock.patch.object(self.vault, "_rebuild_cache", side_effect=OSError):
+            eid = self.vault.add_entry("Dummy key", None, kind="secret", secret="dummy")
+        self.assertTrue(self.vault.cache_warning)
+        self.assertEqual([e["id"] for e in self.vault.list_entries()], [eid])
+        self.assertFalse(os.path.exists(self.vault._meta_path))
+        self.vault.lock()
+        with self.assertRaises(pv.VaultError):
+            self.vault.list_entries()
+        self.assertTrue(self.vault.unlock(PASS))
+        self.assertFalse(self.vault.cache_warning)
+        self.vault.lock()
+        self.assertEqual([e["id"] for e in self.vault.list_entries()], [eid])
+
+    def test_listing_does_not_extend_auto_lock_timer(self):
+        self.vault.create(PASS)
+        accessed = self.vault._last_access
+        self.vault.list_entries()
+        self.assertEqual(self.vault._last_access, accessed)
 
     def test_atomic_write_ignores_predictable_symlink(self):
         target = os.path.join(self.dir, "target")
@@ -602,8 +623,8 @@ class TestEntryBoundaries(unittest.TestCase):
         vault.list_entries.return_value = [{"id": "cred_aabbccddeeff", "kind": "login",
                                            "description": "old", "origins": ["https://example.com"]}]
         with mock.patch.object(ui, "_choose_entry", return_value="cred_aabbccddeeff"), \
-                mock.patch.object(ui, "_ask", side_effect=["new description", ""]), \
-                mock.patch.object(ui, "_secret", return_value=None):
+                mock.patch.object(ui, "_select_dialog", side_effect=[("Description", ""), None]), \
+                mock.patch.object(ui, "_ask", return_value="new description"):
             ui._edit_flow(vault)
         vault.update_entry.assert_not_called()
 
@@ -636,14 +657,120 @@ class TestEntryBoundaries(unittest.TestCase):
         self.assertIn("cryptography>=41.0", manifest["core_requires"])
 
 
+class TestVaultWorkflow(VaultDirTest):
+    def setUp(self):
+        super().setUp()
+        self.vault.create(PASS)
+
+    def test_edit_can_clear_username_notes_and_secret_origins(self):
+        import password_vault_ui as ui
+        eid = self.vault.add_entry("Login", ["https://example.com"], "user", "pw", "note")
+        with mock.patch.object(ui, "_select_dialog", side_effect=[
+                ("Username", ""), ("Notes", ""), ("Save changes", "")]), \
+                mock.patch.object(ui, "_secret", return_value=""):
+            ui._edit_flow(self.vault, eid)
+        self.assertEqual(self.vault.get_secret(eid),
+                         {"kind": "login", "username": "", "password": "pw", "notes": ""})
+        eid = self.vault.add_entry("Key", ["https://example.com"], kind="secret", secret="dummy")
+        with mock.patch.object(ui, "_select_dialog", side_effect=[
+                ("Origins", ""), ("Save changes", "")]), \
+                mock.patch.object(ui, "_ask", return_value=""):
+            ui._edit_flow(self.vault, eid)
+        self.assertEqual(self.vault.list_entries()[1]["origins"], [])
+
+    def test_unlock_continues_selected_delete_and_retries_wrong_password(self):
+        import password_vault_ui as ui
+        eid = self.vault.add_entry("Login", ["https://example.com"], "user", "pw")
+        self.vault.lock()
+        with mock.patch.object(ui, "_secret", side_effect=["wrong", PASS]) as secret, \
+                mock.patch.object(ui, "_confirm", return_value=True), \
+                mock.patch.object(ui, "_choose_entry") as choose:
+            ui._delete_flow(self.vault, eid)
+        self.assertEqual(secret.call_count, 2)
+        choose.assert_not_called()
+        self.assertEqual(self.vault.list_entries(), [])
+
+    def test_cancel_unlock_does_not_continue_delete(self):
+        import password_vault_ui as ui
+        eid = self.vault.add_entry("Login", ["https://example.com"], "user", "pw")
+        self.vault.lock()
+        with mock.patch.object(ui, "_secret", return_value=None), \
+                mock.patch.object(ui, "_confirm") as confirm:
+            ui._delete_flow(self.vault, eid)
+        confirm.assert_not_called()
+        self.assertEqual(len(self.vault.list_entries()), 1)
+
+    def test_bad_origin_reprompts_before_collecting_secrets(self):
+        import password_vault_ui as ui
+        with mock.patch.object(ui, "_ask", side_effect=["example.com/path", "https://example.com"]) as ask:
+            def secret(prompt):
+                self.assertEqual(ask.call_count, 2)
+                return "dummy"
+            with mock.patch.object(ui, "_secret", side_effect=secret):
+                ui._add_login_flow(self.vault, "Login")
+        self.assertEqual(self.vault.list_entries()[0]["origins"], ["https://example.com"])
+
+    def test_expiry_during_edit_reauthenticates_before_commit(self):
+        import password_vault_ui as ui
+        eid = self.vault.add_entry("Login", ["https://example.com"], "user", "pw")
+        def new_description():
+            self.vault.lock()
+            return "New name"
+        with mock.patch.object(ui, "_select_dialog", side_effect=[
+                ("Description", ""), ("Save changes", "")]), \
+                mock.patch.object(ui, "_description_input", side_effect=new_description), \
+                mock.patch.object(ui, "_secret", return_value=PASS):
+            ui._edit_flow(self.vault, eid)
+        self.assertEqual(self.vault.list_entries()[0]["description"], "New name")
+
+    def test_fallback_quit_and_eof_exit(self):
+        import password_vault_ui as ui
+        for answer in ("q", None):
+            browser = mock.Mock()
+            browser.run.side_effect = RuntimeError("renderer unavailable")
+            with mock.patch.object(ui, "_make_browser", return_value=browser), \
+                    mock.patch.object(ui, "_ask", return_value=answer) as ask:
+                ui._run_session(self.vault)
+            ask.assert_called_once()
+            self.assertFalse(self.vault.is_unlocked())
+
+    def test_fullscreen_search_accepts_q_and_exposes_only_metadata(self):
+        import password_vault_ui as ui
+        from prompt_toolkit.input import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        eid = self.vault.add_entry("Mail", ["https://qq.example.com"], "dummy-user", "dummy-pw")
+        with create_pipe_input() as pipe:
+            browser = ui._make_browser(self.vault, input=pipe, output=DummyOutput())
+            self.assertTrue(browser.app.full_screen)
+            self.assertIsNone(browser.assistant_handler)
+            browser.reload()
+            self.assertNotIn("dummy-pw", repr(browser.items))
+            self.assertNotIn("dummy-user", repr(browser.items))
+            async def feed():
+                import asyncio
+                await asyncio.sleep(.1)
+                pipe.send_text("/qq\rv")
+                await asyncio.sleep(2)
+                if not browser.app.is_done:
+                    pipe.send_text("\x03")
+            browser.app.pre_run_callables.append(lambda: browser.app.create_background_task(feed()))
+            outcome = browser.run()
+            self.assertEqual(outcome.action, "reveal")
+            self.assertEqual(outcome.item.key, eid)
+            self.assertEqual(browser._list_query, "qq")
+
+
 class TestInteractiveUiPty(unittest.TestCase):
     """Drives the real UI through a PTY and asserts the core promise:
     secrets typed at hidden prompts are never echoed, so they cannot be
     captured by terminal mirrors or chat history."""
 
-    def _spawn_pty(self, home):
+    def _spawn_pty(self, home, driver=None):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        driver = "import password_vault_ui as ui; ui.handle_command([])"
+        driver = driver or (
+            "import password_vault_ui as ui, terminal_arbiter as ta\n"
+            "with ta.hold('test-dispatch', ta.Mode.EXTERNAL):\n"
+            "    ui.handle_command([])\n")
         master, slave = pty.openpty()
         # select_dialog is a prompt_toolkit app: give the PTY a real size
         # (0x0 breaks full-screen layout) — 80x24 like a plain terminal.
@@ -705,6 +832,41 @@ class TestInteractiveUiPty(unittest.TestCase):
 
         return proc, expect, send, key, state
 
+    def test_long_and_multiline_input_roundtrips_without_echo(self):
+        driver = (
+            "import password_vault_ui as ui; "
+            "v=ui._secret('LONG_INPUT: '); assert v == 'X'*6000; "
+            "v=ui._secret_lines('MULTILINE_INPUT: '); "
+            "assert v == 'first\\n\\nlast\\n'; print('ROUNDTRIP_OK')")
+        with tempfile.TemporaryDirectory(prefix="vault-input-") as home:
+            proc, expect, send, key, state = self._spawn_pty(home, driver)
+            expect(rb"LONG_INPUT")
+            send("X" * 6000)
+            expect(rb"MULTILINE_INPUT")
+            key("\x1b[200~first\n\nlast\n\x1b[201~", wait=0.1)
+            key("\x04", wait=0.1)
+            expect(rb"ROUNDTRIP_OK")
+            self.assertEqual(proc.wait(timeout=10), 0)
+            self.assertNotIn(b"XXXX", state["transcript"])
+            self.assertNotIn(b"first", state["transcript"])
+
+    def test_hidden_input_cancel_restores_terminal_and_has_no_history(self):
+        driver = (
+            "import termios, password_vault_ui as ui; "
+            "before=termios.tcgetattr(0); "
+            "assert ui._secret('CANCEL_INPUT: ') is None; "
+            "assert termios.tcgetattr(0) == before; "
+            "v=ui._secret('NEXT_INPUT: '); assert v == ''; print('CANCEL_OK')")
+        with tempfile.TemporaryDirectory(prefix="vault-input-") as home:
+            proc, expect, send, key, state = self._spawn_pty(home, driver)
+            expect(rb"CANCEL_INPUT")
+            key("dummy-cancelled-secret\x03", wait=0.1)
+            expect(rb"NEXT_INPUT")
+            key("\x1b[A\r", wait=0.1)
+            expect(rb"CANCEL_OK")
+            self.assertEqual(proc.wait(timeout=10), 0)
+            self.assertNotIn(b"dummy-cancelled-secret", state["transcript"])
+
     def test_pty_login_flow_never_echoes_secrets(self):
         home = tempfile.mkdtemp(prefix="vault-e2e-")
         try:
@@ -718,13 +880,13 @@ class TestInteractiveUiPty(unittest.TestCase):
                 expect(rb"Repeat passphrase")
                 send("e2e-passphrase-42")
                 expect(rb"Vault created and unlocked")
-                expect(rb"lock & quit")            # main menu rendered
+                expect(rb"ENTRIES")            # main menu rendered
                 key("a")                          # Add entry
                 expect(rb"Description \(visible")
                 send("E2E test site")
                 expect(rb"Entry kind")
                 key("l")                          # login
-                expect(rb"Approved HTTPS origin")
+                expect(rb"HTTPS origin")
                 send("https://e2e.example.com")
                 expect(rb"Username \(hidden\)")
                 send("e2e-user")
@@ -735,8 +897,7 @@ class TestInteractiveUiPty(unittest.TestCase):
                 expect(rb"Notes \(hidden")
                 send("")
                 expect(rb"added cred_[0-9a-f]{12} \(login\)")
-                key("s")                          # Show entries
-                expect(rb"cred_[0-9a-f]{12}  \[login\]  E2E test site")
+                expect(rb"E2E test site")
                 key("l")                          # Lock vault
                 expect(rb"vault locked")
                 key("q")                          # Quit
@@ -785,26 +946,22 @@ class TestInteractiveUiPty(unittest.TestCase):
                 expect(rb"Repeat passphrase")
                 send("e2e-passphrase-42")
                 expect(rb"Vault created and unlocked")
-                expect(rb"lock & quit")
+                expect(rb"ENTRIES")
                 key("a")                          # Add entry
                 expect(rb"Description \(visible")
                 send("Deploy API key")
                 expect(rb"Entry kind")
                 key("s")                          # secret
-                expect(rb"Related HTTPS origin")
+                expect(rb"HTTPS origin")
                 send("")                       # optional: skip
                 expect(rb"Secret value \(hidden, multi-line")
-                # A pasted multiline key arrives all at once. Reopening
-                # getpass for each line used to discard the buffered tail.
-                send(line1 + "\n" + line2 + "\n")
-                expect(rb"\.\.\. \(hidden", count=1)   # 1st continuation
-                expect(rb"\.\.\. \(hidden", count=2)   # 2nd continuation
+                # Bracketed paste preserves line boundaries; Ctrl+D finishes.
+                key("\x1b[200~" + line1 + "\n" + line2 + "\x1b[201~", wait=0.1)
+                key("\x04", wait=0.1)
                 expect(rb"Notes \(hidden")
                 send("")
                 expect(rb"added cred_[0-9a-f]{12} \(secret\)")
-                key("s")                          # Show entries
-                expect(rb"cred_[0-9a-f]{12}  \[secret\]  Deploy API key"
-                       rb"  \[no origin\]")
+                expect(rb"Deploy API key")
                 key("q")                          # Quit
                 expect(rb"Vault closed")
                 proc.wait(timeout=15)
@@ -838,8 +995,8 @@ class TestInteractiveUiPty(unittest.TestCase):
 
     def test_pty_view_shows_secret_on_screen_then_clears(self):
         """End-to-end reveal: the secret appears on the user's screen (the
-        PTY master sees it — that is the point of view), Enter wipes the
-        screen with an ANSI erase, and the session closes cleanly."""
+        PTY master sees it), bypasses a stdout mirror, and Enter leaves the
+        alternate screen before returning to the public browser."""
         home = tempfile.mkdtemp(prefix="vault-e2e3-")
         try:
             vdir = os.path.join(home, ".laintas", "password-vault")
@@ -849,27 +1006,43 @@ class TestInteractiveUiPty(unittest.TestCase):
                            "view-user", "view-pw-77")
             vault.lock()
 
-            proc, expect, send, key, state = self._spawn_pty(home)
+            driver = '''
+import io, sys
+import password_vault_ui as ui
+original = sys.stdout
+captured = io.StringIO()
+class Tee:
+    def write(self, text):
+        captured.write(text)
+        return original.write(text)
+    def __getattr__(self, name):
+        return getattr(original, name)
+sys.stdout = Tee()
+ui.handle_command([])
+sys.stdout = original
+assert 'view-pw-77' not in captured.getvalue()
+assert 'view-user' not in captured.getvalue()
+assert 'e2e-passphrase-42' not in captured.getvalue()
+print('MIRROR_SAFE')
+'''
+            proc, expect, send, key, state = self._spawn_pty(home, driver)
             try:
-                expect(rb"lock & quit")            # main menu (vault exists)
-                key("u")                          # Unlock vault
+                expect(rb"ENTRIES")            # main menu (vault exists)
+                key("v")                          # Reveal unlocks in place
                 expect(rb"Vault passphrase")
                 send("e2e-passphrase-42")
                 expect(rb"vault unlocked")
-                key("v")                          # View entry
-                expect(rb"View which entry\?")
-                key("\r")                         # Enter selects first row
-                expect(rb"Show the secret on this screen")
+                expect(rb"Show the secret on this local screen")
                 key("y")                          # confirm reveal
                 expect(rb"username: view-user")
                 expect(rb"password: view-pw-77")   # on the screen, by design
-                expect(rb"Press Enter to clear")
-                send("")
-                expect(rb"\x1b\[2J")               # ANSI screen erase sent
-                expect(rb"screen cleared")
+                expect(rb"Enter / Esc closes")
+                key("\r")
+                expect(rb"Private view closed")
                 key("q")                          # Quit
                 expect(rb"Vault closed")
-                proc.wait(timeout=15)
+                expect(rb"MIRROR_SAFE")
+                self.assertEqual(proc.wait(timeout=15), 0)
             finally:
                 if proc.poll() is None:
                     proc.kill()

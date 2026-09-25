@@ -12,6 +12,14 @@ Usage:
 
 import sys
 
+# Run as a script (`python laintas_cli.py`, the PyInstaller entry), this file
+# is `__main__`, and the twenty-odd `import laintas_cli` calls elsewhere would
+# execute it a second time as a separate module: its own console, its own
+# status cache, its own sub-terminal registry. Register this module under its
+# real name before any of them can run.
+if __name__ == "__main__":
+    sys.modules.setdefault("laintas_cli", sys.modules["__main__"])
+
 
 def _run_pow_command(argv: list) -> int:
     """`laintas pow ...` -- AI-PoW's command line, served by the ai-pow extension.
@@ -486,6 +494,7 @@ console = Console(
 # Agent's ANSI scrollback so the full-screen view can show the real REPL
 # output. Ownership of stdout switches in _enter/_exit_agents_view.
 import repl_mirror
+import term_attach
 
 
 def _mirror_target_agent_id() -> str:
@@ -1236,7 +1245,7 @@ def select_dialog(
                         return
 
     @kb.add("escape")
-    @kb.add("q")
+    @kb.add("q", filter=Condition(lambda: not search))
     @kb.add("c-c")
     def _(event):
         # Cancellation is never subject to the startup grace period.  A user
@@ -1360,7 +1369,7 @@ def choose_record(records, *, title: str, label: Callable,
         selected_index=max(0, min(selected_index, len(rows) - 1)),
         search=search,
         full_screen=full_screen,
-        hint=(f"Type to filter  {symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ select  Esc/q cancel"
+        hint=(f"Type to filter  {symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ select  Esc cancel"
               if search else f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ select  Esc/q cancel"),
     )
     if chosen is None:
@@ -1645,6 +1654,11 @@ def _marker_poll_exec_unlocked(session, command: str, timeout: int = None,
     """
     if session is None or not session.is_alive():
         return {"stdout": "", "stderr": "session not alive", "returncode": -1, "success": False}
+    if term_attach.is_busy(session):
+        # The user detached from a command that is still running here; typing
+        # into it (or "recovering" it with a signal) would hit their program.
+        return {"stdout": "", "stderr": term_attach.busy_message(session),
+                "returncode": -1, "success": False}
 
     import uuid as _uuid
     import re as _re
@@ -1841,7 +1855,8 @@ def _recover_deleted_cwd() -> str:
     try:
         info = get_terminal("term0")
         session = info.session if info is not None else None
-        if session is not None and session.is_alive():
+        if (session is not None and session.is_alive()
+                and not term_attach.is_busy(session)):
             session.send_keys(f"cd {shlex.quote(cwd)}\n")
             # bash cannot resolve anything from a deleted directory, so a
             # replacement PTY is the only reliable outcome if the cd fails.
@@ -1909,6 +1924,167 @@ def _ensure_term0_alive() -> None:
                 replacement.close()
             except Exception:
                 pass
+
+
+# ── Direct commands with the terminal attached (see term_attach.py) ─────
+
+def _shell_attach_available() -> bool:
+    """Can a typed command run in term0 with the real terminal attached?
+
+    Needs a real terminal on both ends and the screen to be ours: the /agents
+    view owns it while open, and a remote (Helpwo) request has no keyboard.
+    `/config shell_attach off` returns to the marker-poll path.
+    """
+    try:
+        if not get_runtime_config("shell_attach"):
+            return False
+    except Exception:
+        return False
+    try:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return False
+    except (AttributeError, ValueError, OSError):
+        return False
+    try:
+        if _agents_view_is_active():
+            return False
+    except Exception:
+        return False
+    return bool(getattr(terminal_arbiter.get_arbiter(), "interactive", False))
+
+
+def _attach_mirror(text: str) -> None:
+    repl_mirror.hub.mirror_only(text, _mirror_target_agent_id())
+
+
+def _finish_attached(res, command: str) -> dict:
+    """Turn a term_attach result into the REPL's result dict, and act on it."""
+    if res.status == "done":
+        if res.cwd and os.path.isdir(res.cwd):
+            try:
+                os.chdir(res.cwd)
+            except OSError:
+                pass
+    elif res.status == "detached":
+        console.print(
+            f"[dim]{symbols.DOT} Detached — [bold]{escape(command)}[/bold] keeps "
+            "running in term0. /fg returns to it.[/dim]")
+    else:
+        # exit, or an exec'd program ended: the shell is gone. A real terminal
+        # would close; here the next command needs a shell, so start one
+        # where this one last stood.
+        info = get_terminal("term0")
+        old = info.session if info is not None else None
+        if old is not None:
+            try:
+                old._laintas_last_cwd = os.getcwd()
+            except Exception:
+                pass
+        _ensure_term0_alive()
+        console.print(
+            f"[dim]{symbols.DOT} The shell exited; started a new one in "
+            f"{escape(os.getcwd())}.[/dim]")
+    output = term_attach.summary_for_model(res, command)
+    return {
+        "stdout": output,
+        "stderr": "",
+        "returncode": res.returncode,
+        "success": res.status == "done" and res.returncode == 0
+    }
+
+
+def _run_attached_command(command: str) -> Optional[dict]:
+    """Run a typed command in term0 with the terminal attached.
+
+    Returns the REPL result dict, or None when attaching was not possible and
+    nothing was sent — the caller then uses the marker-poll path.
+    """
+    info = get_terminal("term0")
+    session = info.session if info is not None else None
+    if session is None or not session.is_alive():
+        return None
+    if term_attach.is_busy(session):
+        _report_detached_finish()
+        if term_attach.is_busy(session):
+            console.print(f"[yellow]{escape(term_attach.busy_message(session))}[/yellow]")
+            return {"stdout": "", "stderr": "", "returncode": -1,
+                    "success": False}
+    import agent_loop as _al_attach
+    _al_attach.pause_activity_status()
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    try:
+        res = term_attach.run(session, command, hold=terminal_arbiter.hold,
+                              mirror=_attach_mirror)
+    except TerminalBusy:
+        return None      # raised before anything was sent
+    except Exception as exc:
+        # The command may already be running: never fall back to another path
+        # (that would run it twice). Let the next command recover the shell.
+        try:
+            session._laintas_shell_dirty = True
+        except Exception:
+            pass
+        console.print(f"[red]term0: {escape(type(exc).__name__)}: {escape(str(exc))}[/red]")
+        return {"stdout": "", "stderr": str(exc), "returncode": -1,
+                "success": False}
+    if res is None:
+        return None
+    return _finish_attached(res, command)
+
+
+def _report_detached_finish() -> None:
+    """Say so when a command the user detached from has finished (non-blocking)."""
+    info = get_terminal("term0")
+    session = info.session if info is not None else None
+    if session is None:
+        return
+    # Any is_busy() check may already have settled it (an agent turn, a Helpwo
+    # command); the result waits on the session to be reported here.
+    try:
+        finished = term_attach.take_finished(session)
+    except Exception:
+        return
+    if finished is None:
+        return
+    command, res = finished
+    if res.status == "done":
+        if res.cwd and os.path.isdir(res.cwd):
+            try:
+                os.chdir(res.cwd)
+            except OSError:
+                pass
+        console.print(
+            f"[dim]{symbols.DOT} term0: [bold]{escape(command)}[/bold] finished "
+            f"(exit {res.returncode}). /term shows its output.[/dim]")
+    else:
+        console.print(
+            f"[dim]{symbols.DOT} term0: the shell running "
+            f"[bold]{escape(command)}[/bold] exited.[/dim]")
+
+
+def _cmd_fg() -> None:
+    """/fg — return to the command detached with Ctrl+]."""
+    info = get_terminal("term0")
+    session = info.session if info is not None else None
+    if session is None or not term_attach.is_busy(session):
+        console.print("[dim]Nothing is running in the background of term0.[/dim]")
+        return
+    job = term_attach.detached_job(session)
+    import agent_loop as _al_attach
+    _al_attach.pause_activity_status()
+    try:
+        res = term_attach.resume(session, hold=terminal_arbiter.hold,
+                                 mirror=_attach_mirror)
+    except TerminalBusy as exc:
+        console.print(f"[yellow]Cannot take the terminal: {escape(str(exc))}[/yellow]")
+        return
+    if res is None:
+        console.print("[yellow]Could not reattach to term0.[/yellow]")
+        return
+    _finish_attached(res, job.command if job else "")
 
 
 # ── Interactive-terminal whitelist ──────────────────────────────────────
@@ -3415,6 +3591,7 @@ class CommandSpec:
 COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/help", "Show command help", "Basics", "/help [command]"),
     CommandSpec("/cwd", "Show the working directory", "Basics"),
+    CommandSpec("/fg", "Return to the command detached from term0 with Ctrl+]", "Basics"),
     CommandSpec(
         "/messages", "Read the notices behind the L> mark", "Basics",
         "/messages [list|read <n>|seen|dismiss <n>|clear]",
@@ -7625,12 +7802,17 @@ def choose_login_method() -> Optional[str]:
 
 # ── Authentication ──────────────────────────────────────────────────────
 
-def verify_session(session: dict) -> Optional[dict]:
-    """Verify a saved session token with laintas.com. Returns {id, name, email} or None."""
+def check_session(session: dict) -> tuple:
+    """Ask laintas.com whether *session* is signed in.
+
+    Returns ``(status, user)``. ``status`` is ``"ok"`` (``user`` is
+    ``{id, name, email}``), ``"invalid"`` — the server answered and the session
+    is not signed in — or ``"unreachable"``: no network, a timeout, a 5xx, a
+    rate limit or a challenge page. Only ``"invalid"`` says anything about the
+    session; the other failures say something about the connection.
+    """
     cookies = session.get("cookies", {})
     headers = session.get("headers", {})
-    token = session.get("token", "")
-    # Call get-session to get full user info.
     req_args = None
     # Current SSO cookie first, then legacy names for a smooth migration.
     for cookie_name in official_messages.SESSION_COOKIE_NAMES:
@@ -7640,26 +7822,39 @@ def verify_session(session: dict) -> Optional[dict]:
             break
     if not req_args and headers.get("Authorization"):
         req_args = {"headers": headers}
+    if not req_args:
+        return "invalid", None
 
-    if req_args:
-        try:
-            resp = requests.get(f"{LAINTAS_BASE}/api/auth/get-session",
-                                timeout=5, allow_redirects=False, **req_args)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data and isinstance(data, dict):
-                    user = data.get("user") or {}
-                    uid = user.get("id")
-                    if uid:
-                        return {
-                            "id": uid,
-                            "name": user.get("name", ""),
-                            "email": user.get("email", ""),
-                        }
-        except requests.RequestException:
-            pass
+    try:
+        resp = requests.get(f"{LAINTAS_BASE}/api/auth/get-session",
+                            timeout=5, allow_redirects=False, **req_args)
+    except requests.RequestException:
+        return "unreachable", None
+    if resp.status_code == 401:
+        return "invalid", None
+    if resp.status_code != 200:
+        return "unreachable", None
+    try:
+        data = resp.json()
+    except ValueError:
+        # A 200 that is not JSON is a proxy or challenge page, not an answer.
+        return "unreachable", None
+    # Better Auth answers an unknown session with 200 and a JSON null.
+    user = (data.get("user") or {}) if isinstance(data, dict) else {}
+    uid = user.get("id")
+    if not uid:
+        return "invalid", None
+    return "ok", {
+        "id": uid,
+        "name": user.get("name", ""),
+        "email": user.get("email", ""),
+    }
 
-    return None
+
+def verify_session(session: dict) -> Optional[dict]:
+    """Verify a session with laintas.com. Returns {id, name, email} or None."""
+    status, user = check_session(session)
+    return user if status == "ok" else None
 
 
 def resolve_session_from_token(token: str, resp_cookies=None) -> Optional[dict]:
@@ -7777,7 +7972,7 @@ def _login_via_device(
     try:
         started = requests.post(
             f"{ACCOUNTS_BASE}/api/auth/cli-device/start",
-            json={}, timeout=10, allow_redirects=False,
+            json={}, timeout=30, allow_redirects=False,
         )
         if cancel_event is not None and cancel_event.is_set():
             return None
@@ -8056,16 +8251,21 @@ def ensure_auth() -> Optional[dict]:
     session = load_session()
     if session:
         with _safe_status("[dim]Checking sign-in…[/dim]"):
-            user_info = verify_session(session)
-        if user_info:
+            status, user_info = check_session(session)
+        if status == "ok":
             session["userId"] = user_info["id"]
             session["userName"] = user_info.get("name", "")
             session["userEmail"] = user_info.get("email", "")
             return session
-        else:
-            console.print("[yellow]Session expired. Use /login to re-authenticate.[/yellow]")
-            clear_session()
-            return None
+        if status == "unreachable":
+            # Being offline says nothing about the sign-in. Deleting it here
+            # made every start without network a forced re-login.
+            console.print(f"[yellow]Could not reach {LAINTAS_BASE} to check "
+                          "your sign-in; continuing with the saved one.[/yellow]")
+            return session
+        console.print("[yellow]Session expired. Use /login to re-authenticate.[/yellow]")
+        clear_session()
+        return None
 
     # 2. No cached account — perform one browser/device authorization attempt.
     # Repeating a two-minute OAuth wait automatically is confusing and can
@@ -9391,7 +9591,7 @@ def reload_default_files() -> None:
         import policy as _policy
         decision = _policy.evaluate_file_delete(str(proj), os.getcwd())
         if decision.action == "deny":
-            console.print(f"[red]Blocked by policy: {decision.reason}[/red]")
+            console.print(Text(f"Blocked by policy: {decision.reason}", style="red"))
             return
         if decision.action == "needs_approval":
             preview = "DELETE generated project files\n" + "\n".join(
@@ -9765,9 +9965,15 @@ _BILLING_REFUSAL_HEADLINES = {
     "quota_exceeded": "Membership allowance used up",
     "billing_busy": "Billing busy",
     "billing_unavailable": "Billing temporarily unavailable",
+    # The upstream pool that pays for this call (member allowance vs balance)
+    # does not serve the model; the remedy names models that it does.
+    "model_not_in_funding_pool": "Model not available for this payment",
 }
-# Refusals no retry fixes: they need money, a pack, or the allowance to reset.
-_BILLING_FINAL_CODES = frozenset({"insufficient_balance", "quota_exhausted", "quota_exceeded"})
+# Refusals no retry fixes: they need money, a pack, the allowance to reset,
+# or another model.
+_BILLING_FINAL_CODES = frozenset({"insufficient_balance", "quota_exhausted", "quota_exceeded",
+                                  "model_not_in_funding_pool"})
+_BILLING_PAGE_CODES = frozenset({"insufficient_balance", "quota_exhausted", "quota_exceeded"})
 _BALANCE_PAGE_URL = "https://laintas.com/settings"
 _ALLOWANCE_PAGE_URL = "https://laintas.com/dashboard"
 
@@ -9796,7 +10002,7 @@ def _format_billing_refusal(code: str, body: dict, lang: str = "EN") -> str:
     # The page to go to is the part that must survive an older gateway that
     # sends no remedy, or one that words it differently.
     page = (_BALANCE_PAGE_URL if code == "insufficient_balance"
-            else _ALLOWANCE_PAGE_URL if code in _BILLING_FINAL_CODES else "")
+            else _ALLOWANCE_PAGE_URL if code in _BILLING_PAGE_CODES else "")
     if page and page not in remedy:
         remedy = (f"{remedy} " if remedy else "") + f"Check it at {page}."
     line = f"{headline}: {detail}" if detail else headline
@@ -11593,7 +11799,8 @@ class AgentRegistry:
                                     agent_id=self.agent_id)
         if decision.action == "deny":
             self._push_final(req_id, "fail", f"Blocked by policy: {decision.reason}")
-            console.print(f"[red]BLOCKED remote exec: {cmd[:100]} — {decision.reason}[/red]")
+            console.print(Text(
+                f"BLOCKED remote exec: {cmd[:100]} — {decision.reason}", style="red"))
             return
         if (decision.action == "needs_approval"
                 or not get_runtime_config("allow_remote_exec_without_approval")):
@@ -13326,7 +13533,8 @@ def _enter_session_raw(session, display_name: str = "", display_cmd: str = "") -
     """Full interactive takeover of a sub-terminal session.
 
     All keystrokes are forwarded to the session. Type /back or /q in the
-    sub-terminal to detach without closing it. Ctrl+\\ also detaches.
+    sub-terminal to detach without closing it. Ctrl+] also detaches (Ctrl+\\
+    is SIGQUIT and belongs to the program, as in a real terminal).
 
     Session output streams directly to the terminal — exactly like
     using a real terminal.
@@ -13380,7 +13588,7 @@ def _enter_session_raw(session, display_name: str = "", display_cmd: str = "") -
     # Clear screen and show a minimal header (no pending-output replay —
     # stale ANSI absolute-position sequences cause cursor misalignment).
     sys.stdout.write("\033[2J\033[H")
-    sys.stdout.write(f"\033[2m{symbols.DOT} {cmd_display}  │  /back or /q detach  │  Ctrl+\\ force-detach\033[0m\n")
+    sys.stdout.write(f"\033[2m{symbols.DOT} {cmd_display}  │  /back or /q detach  │  Ctrl+] force-detach\033[0m\n")
     sys.stdout.write("─" * 60 + "\n")
     sys.stdout.flush()
 
@@ -13424,8 +13632,16 @@ def _enter_session_raw(session, display_name: str = "", display_cmd: str = "") -
                 if data is not None:
                     if not data:
                         break                     # EOF on stdin
-                    # Ctrl+\ (byte 0x1c) → force detach
-                    if b'\x1c' in data:
+                    # Ctrl+] (byte 0x1d) → force detach, as for a typed
+                    # command (term_attach.DETACH_KEY). Ctrl+\ reaches the
+                    # program: it is SIGQUIT in a real terminal.
+                    cut = data.find(term_attach.DETACH_KEY)
+                    if cut >= 0:
+                        if cut:
+                            try:
+                                os.write(mfd, data[:cut])
+                            except OSError:
+                                pass
                         detached = True
                         break
                     try:
@@ -13733,7 +13949,7 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     **{
         (name,): _arg_rule(0, name)
         for name in (
-            "/cwd", "/scan", "/login", "/max",
+            "/cwd", "/fg", "/scan", "/login", "/max",
             "/tools", "/snapshots", "/continue", "/password",
         )
     },
@@ -17273,11 +17489,14 @@ def _cmd_bash(parts: list, raw_args: str) -> bool:
         if _t0 is None or _t0.session is None or not _t0.session.is_alive():
             console.print("[red]term0 session unavailable.[/red]")
         else:
-            result = _marker_poll_exec(_t0.session, raw_cmd, strip_ansi_codes=False)
-            _sync_cwd_from_term0(_t0.session)
-            stdout = result.get("stdout", "")
-            if stdout:
-                console.print(stdout)
+            result = (_run_attached_command(raw_cmd)
+                      if _shell_attach_available() else None)
+            if result is None:
+                result = _marker_poll_exec(_t0.session, raw_cmd, strip_ansi_codes=False)
+                _sync_cwd_from_term0(_t0.session)
+                stdout = result.get("stdout", "")
+                if stdout:
+                    console.print(stdout)
             returncode = result.get("returncode")
             rc_text = f" {symbols.BULLET} exit {returncode}" if returncode is not None else ""
             console.print(f"[dim]cwd → {os.getcwd()}{rc_text}[/dim]")
@@ -25085,6 +25304,9 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
     elif action == "/cwd":
         _cmd_cwd()
 
+    elif action == "/fg":
+        _cmd_fg()
+
     elif action == "/usage":
         _show_usage_command(parts[1:], session)
 
@@ -27725,6 +27947,25 @@ def main():
     except Exception:
         pass
 
+    # ── Reclaim what dead instances left under ~/.laintas: recycled session
+    # sidecars past their recovery window, registrations and leases of dead
+    # pids, and the empty per-cwd directories they sat in. Nothing else ever
+    # removes these. Off the startup path; the top-level CLI only.
+    if getattr(args, "depth", 0) == 0:
+        def _sweep_state_dirs():
+            try:
+                import peer_coordination
+                peer_coordination.gc_stale_state()
+            except Exception:
+                pass
+            try:
+                import agent_loop as _al_gc
+                _al_gc._purge_recycled_session_files(None)
+            except Exception:
+                pass
+        threading.Thread(target=_sweep_state_dirs, name="state-gc",
+                         daemon=True).start()
+
     # Apply environment overrides
     if args.backend:
         os.environ["LAINTAS_BACKEND"] = args.backend
@@ -27859,7 +28100,10 @@ def main():
             source = (conversation or "extension").split(":", 1)[0]
             # Injected lines are not echoed, so a task would otherwise appear
             # to run with nothing having asked for it.
-            console.print(f"\n[dim]({source})[/dim] [bold]{text}[/bold]",
+            # escape(): injected text is arbitrary (extension tasks, Helpwo
+            # bridge) and may contain Rich-looking sequences like "[/\\]".
+            console.print(f"\n[dim]({escape(source)})[/dim] "
+                          f"[bold]{escape(str(text))}[/bold]",
                           markup=True, highlight=False)
             done = threading.Event()
             _inject_input(str(text), done)
@@ -28690,6 +28934,7 @@ def main():
         _repl_cwd = _recover_deleted_cwd()
         # ── term0 health check ──
         _ensure_term0_alive()
+        _report_detached_finish()
         try:
             item = _get_input(str(_repl_cwd or paths.live_cwd()))
         except KeyboardInterrupt:
@@ -29281,7 +29526,7 @@ def main():
         # All REPL instances (depth 0 and depth > 0) execute system commands
         # directly. Natural language goes to AI.
         if _system_input:
-            console.print(f"\n[dim yellow]$ {user_input}[/dim yellow]")
+            console.print(f"\n[dim yellow]$ {escape(user_input)}[/dim yellow]")
             if agent_registry.agent_id:
                 agent_registry._push_events([{"type": "system", "kind": "command", "content": user_input}])
 
@@ -29353,12 +29598,18 @@ def main():
                         result = {"stdout": "", "stderr": "", "returncode": -1, "success": False}
                 agent_registry._push_events([{"type": "system", "kind": "output", "content": _cap_out[:4000]}])
             else:
-                # Local user: ordinary commands route through term0's persistent
-                # bash (marker-poll + cwd sync) so cd/export/pushd actually persist
-                # across commands — term0's bash state IS what "current directory"
-                # means here. Commands in the interactive whitelist (vim, claude,
-                # ssh, ...) get full PTY passthrough so they keep native terminal
-                # control (raw keystrokes, resize, full-screen redraw).
+                # Local user at a real terminal: the command runs in term0 with
+                # the terminal attached (term_attach) — live output, keyboard,
+                # Ctrl+C, full-screen programs, all in the one shell whose
+                # cd/export/alias persist. Every command, vim and ssh included.
+                #
+                # Without a terminal to attach (the /agents view, a pipe, a
+                # shell term_attach cannot integrate, /config shell_attach off):
+                # ordinary commands go through term0 by marker-poll, and the
+                # interactive whitelist (vim, claude, ssh, ...) gets a PTY of
+                # its own.
+                _attached_result = (_run_attached_command(user_input)
+                                    if _shell_attach_available() else None)
                 _first = extract_first_word(user_input)
                 _interactive_hit = _needs_tty_passthrough(user_input)
                 _term0_info = get_terminal("term0")
@@ -29369,7 +29620,9 @@ def main():
                     and _term0_info.session.is_alive()
                 )
 
-                if _use_term0:
+                if _attached_result is not None:
+                    result = _attached_result
+                elif _use_term0:
                     # Esc reaches a running command. Until this existed the
                     # only key that did anything during a term0 command was
                     # Ctrl+C, and outside an AI run SIGINT is still bound to

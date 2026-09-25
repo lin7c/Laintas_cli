@@ -16,17 +16,17 @@ python laintas_cli.py --execute "task"   # Non-interactive single task
 python laintas_cli.py --backend URL      # Override LAINTAS_BACKEND
 ```
 
-There IS a test suite — 118 files under `tests/`, ~2,600 test functions. Activate the venv first (`source venv/bin/activate`); two modules import `pytest`, which the system python lacks.
+There IS a test suite — ~185 files under `tests/`, ~3,500 test functions. Activate the venv first (`source venv/bin/activate`); two modules import `pytest`, which the system python lacks.
 
 ```bash
-python3 -m unittest discover -s tests          # full suite, ~70s
+python3 -m unittest discover -s tests          # full suite, several minutes
 python3 -m unittest tests.test_git_policy      # targeted, sub-second — use this while iterating
-python3 -m pytest tests/                       # also works, ~85s
+python3 -m pytest tests/                       # also works
 ```
 
 The suite is green on a clean checkout — no expected failures, and CI runs it with no deselect list. Note `-t .` fails — there is no `tests/__init__.py`.
 
-There is no linter config and no Makefile. Beyond tests, iterate by running the CLI directly. After editing files, force-reload the dev session by typing `/reload` inside the REPL (deletes `.laintas/` project files and restarts).
+There is no linter config and no Makefile. CI does gate on one lint rule — undefined names — so run `ruff check --select F821 --exclude venv,build .` before pushing (ruff is in the venv). Beyond tests, iterate by running the CLI directly. After editing files, force-reload the dev session by typing `/reload` inside the REPL (deletes `.laintas/` project files and restarts).
 
 ## Package Builds
 
@@ -70,12 +70,12 @@ A typo in an already published message is fixed on the laintas.com admin page (S
 The project has grown from two core modules to ten, organized in layers:
 
 **Core (original two):**
-- **`laintas_cli.py`** (~26,100 lines) — Entry point, REPL, PTY execution (`InteractiveSession`, `SubTerminalSession`), OAuth/session auth, `AgentRegistry` (remote heartbeat + polling), meta-command dispatch, prompt template generation, debug TUI.
-- **`agent_loop.py`** (~13,200 lines) — Library: `run_agent_loop()`, runtime config, debug ring buffer, terminal registry (named persistent sub-terminals), agent registry (tree hierarchy, spawning, inboxes, abort), context compression, memory formatting, policy integration.
+- **`laintas_cli.py`** (~29,700 lines) — Entry point, REPL, PTY execution (`InteractiveSession`, `SubTerminalSession`), OAuth/session auth, `AgentRegistry` (remote heartbeat + polling), meta-command dispatch, prompt template generation, debug TUI.
+- **`agent_loop.py`** (~14,800 lines) — Library: `run_agent_loop()`, runtime config, debug ring buffer, terminal registry (named persistent sub-terminals), agent registry (tree hierarchy, spawning, inboxes, abort), context compression, memory formatting, policy integration.
 
 **Tools & extensibility layer (Phase 3):**
-- **`tools.py`** (~11,600 lines) — `ToolRegistry` singleton: structured `Tool` dataclass (name, JSONSchema params, invoke callable) + `ToolCtx`. Built-in tools registered at import time. All modules share one registry.
-- **`skills.py`** (~1,285 lines) — Loads user-installed skill directories from `~/.laintas/skills/`. Each skill is a `skill.py` that exposes `get_tools() -> list[Tool]`. Tags tools with `source="skill:<name>"`.
+- **`tools.py`** (~12,100 lines) — `ToolRegistry` singleton: structured `Tool` dataclass (name, JSONSchema params, invoke callable) + `ToolCtx`. Built-in tools registered at import time. All modules share one registry.
+- **`skills.py`** (~1,380 lines) — Loads user-installed skill directories from `~/.laintas/skills/`. Each skill is a `skill.py` that exposes `get_tools() -> list[Tool]`. Tags tools with `source="skill:<name>"`.
 - **`mcp_client.py`** (~435 lines) — Bridges async `mcp` SDK to the sync Tool registry. Runs a dedicated asyncio thread, one child subprocess per configured MCP server, registers tools as `source="mcp:<server>"`. Config lives in `~/.laintas/mcp.json`.
 - **`web_search.py`** (~3,000 lines) - Backs `web.search` and `web.fetch`.
   - **Search**: ordered engine chain (default `tavily -> google -> duckduckgo -> cn-bing -> laintas_search -> laintas_gateway`), fast-fail cooldown, structured error types, `region`/`timelimit` filters.
@@ -105,11 +105,11 @@ The project has grown from two core modules to ten, organized in layers:
 Everything about *which mechanism answers* — accessibility tree, window manager, or pixels — lives in the kernel, not here, so Helpwo's browser agent and this CLI cannot drift apart on it.
 
 **Cross-cutting subsystems:**
-- **`policy.py`** (~370 lines) — Security policy engine: evaluates every command as allow/needs_approval/deny via regex rules. Config in `~/.laintas/policy.json` (mtime-cached, zero-restart updates). Audit log in `~/.laintas/audit.log`. Three modes: audit, enforce, disabled.
-- **`memory_system.py`** (~290 lines) — Cross-session persistent memory: 4 types (user/feedback/project/reference), stored as markdown files with frontmatter in `~/.laintas/memory/`, indexed by `MEMORY.md`.
+- **`policy.py`** (~1,770 lines) — Security policy engine: evaluates every command as allow/needs_approval/deny via regex rules. Config in `~/.laintas/policy.json` (mtime-cached, zero-restart updates). Audit log in `~/.laintas/audit.log`. Three modes: audit, enforce, disabled.
+- **`memory_system.py`** (~1,210 lines) — Cross-session persistent memory: 4 types (user/feedback/project/reference), stored as markdown files with frontmatter in `~/.laintas/memory/`, indexed by `MEMORY.md`.
 - **`hooks.py`** (~270 lines) — Event-driven hook system: pre_command, post_command, pre_tool, post_tool, on_session_start/end, on_error, on_memory_change. Config in `~/.laintas/hooks.json`; Python hooks in `~/.laintas/hooks.py` (mtime-cached).
-- **`plan_mode.py`** (~260 lines) — Structured planning: `/plan enter` → AI explores & designs → writes plan to `~/.laintas/plans/<name>.md` → `/plan approve` → execution.
-- **`task_manager.py`** (~180 lines) — Persistent task tracking in `~/.laintas/tasks.json` with status workflow (pending→in_progress→completed) and dependency links.
+- **`plan_mode.py`** (~690 lines) — Structured planning: `/plan enter` → AI explores & designs → writes plan to `~/.laintas/plans/<name>.md` → `/plan approve` → execution.
+- **`task_manager.py`** (~430 lines) — Persistent task tracking in `~/.laintas/tasks.json` with status workflow (pending→in_progress→completed) and dependency links.
 
 ### Config vs. subsystem commands
 
@@ -133,7 +133,8 @@ separately from `ok` and `fail`. Its probe query is deliberately operator-free:
 ### Input Routing (REPL classifies every line)
 
 1. Starts with `/` → meta command. Built-ins first (`/help`, `/login`, `/term`, `/debug`, `/name`, `/memory`, `/prop`, `/scan`, `/cwd`, `/clear`, `/exit`); unhandled `/` commands fall through to `.laintas/commands.py:handle_extra_command`.
-2. First whitespace token resolves via `shutil.which(...)` or matches a shell/cmd builtin → direct PTY passthrough, no AI. `cd` is special-cased at the REPL to mutate parent CWD (PTY subshell can't).
+2. First whitespace token resolves via `shutil.which(...)` or matches a shell/cmd builtin → run in term0, no AI. At a real terminal the command runs **attached** (`term_attach.py`): the user's tty is wired to term0's pty until the shell itself reports completion, so it behaves like a terminal — live output, keyboard, Ctrl+C for the command (never the CLI), vim/ssh/python in the same shell as every other command, `exec`/`exit` end the shell and a new term0 starts. Completion and the directory come from shell integration (PS0/PROMPT_COMMAND, zsh preexec/precmd) printing nonce- and token-tagged OSC 777 sequences; the command itself is `eval`'d from a private file, never typed. Ctrl+] detaches, `/fg` reattaches, and while a detached command runs nothing else may type into term0 (marker-poll, agent `shell.exec`, stuck-shell recovery all refuse). Without a tty to attach (the /agents view, pipes, `/config shell_attach off`, a shell other than bash ≥4.4/zsh) the old marker-poll path runs, with the interactive whitelist getting a PTY of its own.
+
 3. Otherwise → `run_agent_loop()` (natural language).
 
 Routing uses live `shutil.which()` lookups plus a fixed builtin set (`_POSIX_SHELL_BUILTINS`) — newly-installed binaries are picked up immediately, no snapshot to refresh. `/scan` is a display-only enumerator.
@@ -176,6 +177,8 @@ Two consequences worth knowing before you "fix" something:
 The exception, and it is the only one: `InteractiveSession` configures its *own pty slave's* attrs in the forked child. That is the child's terminal, not ours.
 
 ### Interrupting a run
+
+This is about the agent loop. A command the user typed runs attached (see Input Routing): there Esc belongs to the program and Ctrl+C interrupts the command, as in any terminal.
 
 Esc soft-interrupts; only a double Ctrl+C force-exits. Esc sets the loop's interrupt event directly and never raises a signal, so it cannot kill the CLI.
 

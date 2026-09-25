@@ -508,7 +508,13 @@ class ArenaKeyPathTests(BlindpickTestCase):
         from prompt_toolkit.input import create_pipe_input
         from prompt_toolkit.output import DummyOutput
         for name, value in (("COLUMNS", "100"), ("LINES", "30")):
+            old = os.environ.get(name)
             os.environ[name] = value
+            # Restored like _arena does: a leaked COLUMNS=100 made every later
+            # test that starts the real CLI render a 100-column status bar.
+            self.addCleanup(
+                lambda n=name, o=old: os.environ.__setitem__(n, o)
+                if o is not None else os.environ.pop(n, None))
         ctx = create_pipe_input()
         pipe = ctx.__enter__()
         self.addCleanup(ctx.__exit__, None, None, None)

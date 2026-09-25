@@ -37,6 +37,16 @@ jobs:
           # reading like a normal failure.
           pip install pytest pillow
 
+      # Undefined names only. Every one this found was a real bug that no
+      # test caught, because each sat behind an `except` that turned the
+      # NameError into a fallback: a parent() command run twice, file_push
+      # failing on every call, /canvas unable to start Helpwo. Zero false
+      # positives across the tree, so it can gate.
+      - name: Undefined names (ruff F821)
+        run: |
+          pip install ruff
+          ruff check --select F821 --exclude venv,build .
+
       # No deselect list: the two tests that used to need one now pass, which
       # the informational step that watched for exactly that reported the
       # first time this job got far enough to run anything.

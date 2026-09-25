@@ -110,26 +110,35 @@ class _PeerCoordinator:
     def register(self, cwd: str) -> None:
         """Register this instance (called once at process startup)."""
         self._cwd_hash = _cwd_hash(cwd)
-        try:
-            reg_dir = paths.INSTANCES_DIR / self._cwd_hash
-            reg_dir.mkdir(parents=True, exist_ok=True)
+        self._reg_cwd = cwd
+        payload = {
+            "instance_id": self._instance_id,
+            "pid": os.getpid(),
+            "cwd": cwd,
+            "started_at": time.time(),
+        }
+        reg_dir = paths.INSTANCES_DIR / self._cwd_hash
+        # Two attempts: gc_stale_state in another process may remove an empty,
+        # day-old directory between our mkdir and our write.
+        for attempt in (1, 2):
             try:
-                os.chmod(reg_dir, 0o700)
+                reg_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.chmod(reg_dir, 0o700)
+                except OSError:
+                    pass
+                tmp = reg_dir / f".{self._instance_id}.tmp"
+                dest = reg_dir / f"{self._instance_id}.json"
+                tmp.write_text(json.dumps(payload), encoding="utf-8")
+                os.replace(str(tmp), str(dest))
+                self._reg_file = dest
+                return
+            except FileNotFoundError:
+                if attempt == 2:
+                    self._reg_file = None
             except OSError:
-                pass
-            payload = {
-                "instance_id": self._instance_id,
-                "pid": os.getpid(),
-                "cwd": cwd,
-                "started_at": time.time(),
-            }
-            tmp = reg_dir / f".{self._instance_id}.tmp"
-            dest = reg_dir / f"{self._instance_id}.json"
-            tmp.write_text(json.dumps(payload), encoding="utf-8")
-            os.replace(str(tmp), str(dest))
-            self._reg_file = dest
-        except OSError:
-            self._reg_file = None   # best-effort: coordination silently off
+                self._reg_file = None   # best-effort: coordination silently off
+                return
 
     def attach_actor(self, actor: str) -> None:
         """Declare a second writer inside this process (e.g. an attached Helpwo).
@@ -231,6 +240,12 @@ class _PeerCoordinator:
         self._last_heartbeat = now
         try:
             os.utime(self._reg_file, None)
+        except FileNotFoundError:
+            # gc_stale_state collected it (or someone cleaned the directory):
+            # this instance is alive, so put itself back.
+            cwd = getattr(self, "_reg_cwd", None)
+            if cwd:
+                self.register(cwd)
         except OSError:
             pass
 
@@ -395,6 +410,69 @@ def _gc_writes(log_dir: Path) -> None:
 # is what stays lazy.
 
 
+#: A per-cwd lock/registry directory this long untouched and empty is litter.
+_STATE_DIR_MAX_AGE = 86400
+#: A registration older than this goes even when its pid is alive: pids get
+#: reused, and a live instance heartbeats well inside it (and re-registers if
+#: its file went missing anyway).
+_REGISTRATION_MAX_AGE = 7 * 86400
+
+
+def gc_stale_state(now: Optional[float] = None) -> dict:
+    """Remove what dead instances left in ``instances/`` and ``session_locks/``.
+
+    Nothing reclaimed these: a killed process never runs its atexit
+    unregister, a released lease leaves its per-cwd directory behind, and a
+    test run in a temp directory leaves a directory per temp path. One working
+    machine had 2,527 registry directories and 2,875 empty lock directories.
+
+    Removes only
+      * registration files whose pid is dead (and that are past the heartbeat
+        staleness window), or that are older than a week;
+      * lease files whose owner pid is dead;
+      * directories that are then empty and untouched for a day.
+    Best-effort, never raises. Returns counts for diagnostics.
+    """
+    now = time.time() if now is None else now
+    removed = {"registrations": 0, "leases": 0, "dirs": 0}
+
+    def _age(p: Path) -> float:
+        return now - p.stat().st_mtime
+
+    def _owner_pid(p: Path) -> int:
+        try:
+            return int(json.loads(p.read_text(encoding="utf-8")).get("pid") or 0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            return 0
+
+    for root, suffix, is_stale in (
+            (paths.INSTANCES_DIR, ".json",
+             lambda p: _age(p) > _REGISTRATION_MAX_AGE or (
+                 _age(p) > _HEARTBEAT_STALE_SECS and not _pid_alive(_owner_pid(p)))),
+            (paths.SESSION_LOCKS_DIR, ".lock",
+             lambda p: _age(p) > _HEARTBEAT_STALE_SECS
+             and not _pid_alive(_owner_pid(p)))):
+        try:
+            subdirs = [d for d in root.iterdir() if d.is_dir() and not d.is_symlink()]
+        except OSError:
+            continue
+        for sub in subdirs:
+            try:
+                # Judged by its age before we delete from it (that bumps it).
+                dir_age = _age(sub)
+                for f in sub.iterdir():
+                    if f.name.endswith(suffix) and f.is_file() and is_stale(f):
+                        f.unlink(missing_ok=True)
+                        key = "registrations" if suffix == ".json" else "leases"
+                        removed[key] += 1
+                if dir_age > _STATE_DIR_MAX_AGE:
+                    sub.rmdir()      # fails, harmlessly, unless empty
+                    removed["dirs"] += 1
+            except OSError:
+                continue
+    return removed
+
+
 def _pid_alive(pid: int) -> bool:
     """POSIX liveness probe: True if a process with this pid exists."""
     if not pid or pid <= 0:
@@ -418,6 +496,20 @@ def acquire_session_lease(cwd: str, session_id: str) -> dict:
     *live* instance currently owns the session.  A stale lease (owner pid
     dead) is broken and taken over automatically.
     """
+    try:
+        return _acquire_session_lease(cwd, session_id)
+    except FileNotFoundError:
+        # gc_stale_state removed the (empty, day-old) lock directory between
+        # our mkdir and our write. Once more, from the mkdir.
+        try:
+            return _acquire_session_lease(cwd, session_id)
+        except Exception as exc:
+            return {"ok": False, "owner": None, "error": str(exc)}
+    except Exception as exc:
+        return {"ok": False, "owner": None, "error": str(exc)}
+
+
+def _acquire_session_lease(cwd: str, session_id: str) -> dict:
     try:
         sid = _normalize_session_id(session_id)
         if not sid:
@@ -506,6 +598,8 @@ def acquire_session_lease(cwd: str, session_id: str) -> dict:
                     "error": "lease takeover race"}
         _held_leases.add((_cwd_hash(cwd), sid))
         return {"ok": True, "owner": None, "took_over": owner is not None}
+    except FileNotFoundError:
+        raise   # the caller retries: the lock directory was collected
     except OSError as exc:
         return {"ok": False, "owner": None, "error": str(exc)}
 

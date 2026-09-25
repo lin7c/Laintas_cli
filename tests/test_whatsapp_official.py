@@ -157,7 +157,9 @@ class ChannelTaskExecutionTests(unittest.TestCase):
         # Injected input is not echoed by the main loop, so without this a
         # task appears to run with nothing having asked for it.
         self.assertIn("console.print(", self.body)
-        self.assertIn("{text}", self.body)
+        # escape(): injected text is arbitrary and must not be parsed as Rich
+        # markup ("[/\\]"-style sequences raise MarkupError otherwise).
+        self.assertIn("escape(str(text))", self.body)
 
     def test_a_task_that_never_finishes_reports_instead_of_hanging(self):
         self.assertIn("EXTENSION_TASK_TIMEOUT", self.body)

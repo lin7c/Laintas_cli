@@ -4374,7 +4374,7 @@ def _bi_spawn_parallel(params: dict, ctx: ToolCtx) -> dict:
             if ok and not message:
                 ok = False
                 message = (
-                    f"(agent finished after {_tool_counts.get(cid, 0)} tool "
+                    f"(agent finished after {_members[cid].tool_calls} tool "
                     "call(s) but returned no final answer — its findings were "
                     "not reported; re-run this sub-task yourself or reissue it "
                     "with a narrower goal)")
@@ -5612,6 +5612,7 @@ def _bi_file_push(params: dict, ctx: ToolCtx) -> dict:
     """
     import backend_profiles
     import os as _os
+    import requests
 
     backend_url = _os.environ.get("LAINTAS_BACKEND", "https://laintas.com")
     try:
@@ -7037,8 +7038,14 @@ def recover_stuck_shell(session: Any, probe_timeout: float = 2.0) -> bool:
     Signals the PTY foreground process group, then verifies that the shell
     answers a probe echo. No printable input is injected into the foreground
     program: doing so can mutate files or confirm an unintended action.
+
+    Never for a command the user detached from (term_attach): that program is
+    running on purpose, not stuck.
     """
     import uuid
+    import term_attach
+    if term_attach.is_busy(session):
+        return False
     try:
         _output_total = getattr(session, "output_total", None)
         if isinstance(_output_total, int):
@@ -7294,6 +7301,19 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
         f"echo {end_marker}:$__laintas_rc"
     )
 
+    import term_attach
+    if term_attach.is_busy(session):
+        _detached = term_attach.detached_job(session)
+        # The user detached from a command still running in this shell
+        # (Ctrl+] in term0). Typing into it would hand our command to their
+        # program as input.
+        return {
+            "ok": False,
+            "error": ("The terminal is running a command the user detached "
+                      f"from ({_detached.command if _detached else 'a command'}); it is not free until "
+                      "that finishes or the user stops it."),
+            "result": "", "returncode": -1, "via": via,
+        }
     lock = getattr(session, "command_lock", None)
     entered = False
     _capture = None

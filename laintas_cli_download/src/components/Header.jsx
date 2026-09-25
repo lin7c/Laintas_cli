@@ -8,8 +8,8 @@ import { useAuth } from '../contexts/AuthContext';
 import BrandMark from './BrandMark';
 
 const NAV = {
-  zh: [['流程', '/#workflow'], ['运维能力', '/#operations'], ['安全边界', '/#security'], ['下载', '/#download'], ['插件市场', '/plugins']],
-  en: [['Workflow', '/#workflow'], ['Operations', '/#operations'], ['Security', '/#security'], ['Download', '/#download'], ['Plugin Market', '/plugins']],
+  zh: [['为什么', '/#operations'], ['工作方式', '/#workflow'], ['安全边界', '/#security'], ['下载', '/#download'], ['插件市场', '/plugins']],
+  en: [['Why', '/#operations'], ['How it works', '/#workflow'], ['Security', '/#security'], ['Download', '/#download'], ['Plugin Market', '/plugins']],
 };
 
 export default function Header() {

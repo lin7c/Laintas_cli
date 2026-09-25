@@ -26,8 +26,21 @@ class CanvasToolTests(unittest.TestCase):
         tools.register_builtin_tools()
         # The four canvas tools ship with the extension now, so the test
         # registers exactly what the host would register on load.
+        cls._canvas_tool_names = [t.name for t in canvas_ext._canvas_tools()]
+        cls._previous_canvas_tools = {
+            name: tools.get_registry().get(name) for name in cls._canvas_tool_names}
         for tool in canvas_ext._canvas_tools():
             tools.get_registry().register(tool, overwrite=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        # The registry is process-global: without this, a later test file
+        # that loads the canvas extension through the real runtime hits
+        # "tool name already registered" (register_tool uses overwrite=False).
+        for name in cls._canvas_tool_names:
+            tools.get_registry().unregister(name)
+            if cls._previous_canvas_tools[name] is not None:
+                tools.get_registry().register(cls._previous_canvas_tools[name])
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

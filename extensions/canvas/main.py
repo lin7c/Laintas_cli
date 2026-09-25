@@ -318,6 +318,7 @@ def _canvas_open(path: str, canvas_mod) -> None:
         # Helpwo lives in its own sub-terminal; wait for it, since the whole
         # point of this command is the URL.
         try:
+            import app_host
             runtime = _cli()._launch_app_subterminal(
                 app_host.HELPWO_APP, persistent=True, options={},
                 agent_registry=None, open_url=False, wait=True) or {}

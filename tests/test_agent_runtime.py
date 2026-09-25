@@ -1279,6 +1279,30 @@ class EphemeralSessionTests(unittest.TestCase):
         self.assertIsNone(result["session"])
         self.assertEqual(agent_loop.get_all_terminals(), [])
 
+    def test_hidden_private_session_tools_still_obey_command_policy(self):
+        for name, argument in (("session.start", "command"), ("session.keys", "keys")):
+            with self.subTest(tool=name):
+                deps = _deps({
+                    "reply": "starting", "tool_calls": [{
+                        "name": name, "arguments": {argument: "blocked-command"},
+                    }], "finish_reason": "tool_calls", "done": False, "error": False,
+                })
+                deps.InteractiveSession = _FakeInteractiveSession
+                child = agent_loop.register_agent(name="policy-child", depth=1, role="subagent")
+                with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                        mock.patch.object(agent_persistence, "AGENTS_DIR", Path(tmp) / "agents"), \
+                        mock.patch.object(agent_loop, "_visible_tool_names_for_task", return_value=set()), \
+                        mock.patch.object(agent_loop, "_check_policy",
+                                          return_value=(False, "test deny", False, False)) as policy:
+                    Path(".laintas").mkdir()
+                    result = agent_loop.run_agent_loop(
+                        deps, "use a temporary repl", {}, child.state, child.chat_history,
+                        depth=1, agent_id=child.id, max_loops_override=1)
+                policy.assert_called_once()
+                self.assertEqual(policy.call_args.args[0], "blocked-command")
+                self.assertEqual(_FakeInteractiveSession.instances, [])
+                self.assertIn("test deny", result["state"]["lastOutput"])
+
     def test_foreground_task_changes_emit_current_agent_live_list(self):
         responses = iter([
             {
