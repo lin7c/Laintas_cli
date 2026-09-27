@@ -118,8 +118,8 @@ export const GROUPS = [
           { t: 'code', label: 'bash', code: 'unzip laintas-cli_source.zip\ncd laintas-cli-source\npython3 -m pip install -r requirements.txt\npython3 laintas_cli.py' },
           {
             t: 'p', ...L(
-              'Linux 和 macOS 双架构安装包、Debian 包、Windows 安装程序、源码包以及 SHA-256 校验文件都发布在 [GitHub Releases](https://github.com/lin7c/Laintas_cli/releases)，并同步到 `cli.laintas.com/releases/latest/`；[下载页](/#download) 列出了直链。',
-              'Linux and macOS archives for both architectures, the Debian package, Windows installer, source package and SHA-256 checksums are published on [GitHub Releases](https://github.com/lin7c/Laintas_cli/releases) and mirrored at `cli.laintas.com/releases/latest/`; the [download section](/#download) links to the files.',
+              'Linux 和 macOS 双架构安装包、Debian 包、Windows 安装程序、源码包以及 SHA-256 校验文件都发布在 [GitHub Releases](https://github.com/lin7c/Laintas_cli/releases)，并同步到 `cli.laintas.com/releases/latest/`；[下载页](/#download) 的安装脚本会自动选择 Linux 或 Mac 架构。',
+              'Linux and macOS archives for both architectures, the Debian package, Windows installer, source package and SHA-256 checksums are published on [GitHub Releases](https://github.com/lin7c/Laintas_cli/releases) and mirrored at `cli.laintas.com/releases/latest/`; the [download section](/#download) offers an installer that picks the Linux or Mac architecture automatically.',
             ),
           },
         ],

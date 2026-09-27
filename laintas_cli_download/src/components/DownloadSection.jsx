@@ -19,8 +19,7 @@ const INSTALL_COMMANDS = {
 
 const DOWNLOADS = [
   { id: 'linux', names: { zh: 'Linux', en: 'Linux' }, details: { zh: 'x86_64 / arm64 · 安装脚本自动识别架构', en: 'x86_64 / arm64 · installer picks the architecture' }, href: 'https://cli.laintas.com/install.sh', icon: Package },
-  { id: 'mac-arm64', names: { zh: 'Mac · Apple Silicon', en: 'Mac · Apple Silicon' }, details: { zh: 'arm64 · macOS 原生终端版', en: 'arm64 · native macOS terminal build' }, file: 'laintas-cli_darwin_arm64.tar.gz', icon: Laptop },
-  { id: 'mac-intel', names: { zh: 'Mac · Intel', en: 'Mac · Intel' }, details: { zh: 'x86_64 · macOS 原生终端版', en: 'x86_64 · native macOS terminal build' }, file: 'laintas-cli_darwin_amd64.tar.gz', icon: Laptop },
+  { id: 'mac', names: { zh: 'macOS', en: 'macOS' }, details: { zh: 'Apple Silicon / Intel · 安装脚本自动识别架构', en: 'Apple Silicon / Intel · installer picks the architecture' }, href: 'https://cli.laintas.com/install.sh', icon: Laptop },
   { id: 'windows', names: { zh: 'Windows', en: 'Windows' }, details: { zh: 'x86_64 · 单文件安装器 · 自带独立 WSL 2', en: 'x86_64 · single installer · private WSL 2' }, file: 'laintas-cli_windows_amd64_setup.exe', icon: Monitor },
   { id: 'source', names: { zh: '源码包', en: 'Source package' }, details: { zh: 'Python 3.10+ · 审计与二次开发', en: 'Python 3.10+ · audit and extend' }, file: 'laintas-cli_source.zip', icon: Code2 },
 ];

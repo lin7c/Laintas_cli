@@ -58,8 +58,8 @@ To pin this release, set `LAINTAS_INSTALL_TAG=laintas-cli-beta-v1` for the
 installer or `LAINTAS_UPDATE_CHANNEL=laintas-cli-beta-v1` for `/v update`.
 The installer downloads Mac archives and `SHA256SUMS.txt` from
 `https://cli.laintas.com/releases/latest/` and verifies the archive. The
-download page links both Apple Silicon and Intel archives directly from the
-same mirror. New Mac builds use this mirror for `/v update`; the already
+download page offers a single Mac install link that selects Apple Silicon or
+Intel from the same mirror. New Mac builds use this mirror for `/v update`; the already
 published `laintas-cli-beta v1` binary was built before that updater change
 and still uses GitHub Releases for `/v update`.
 Sync the site mirror with

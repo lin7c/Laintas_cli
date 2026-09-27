@@ -73,6 +73,7 @@ elif [ "$INSTALL_MODE" = "mac" ]; then
         arm64) ARCH="arm64" ;;
         *) echo "Unsupported Mac architecture: $(uname -m)"; exit 1 ;;
     esac
+    echo "  Detected: macOS $ARCH"
     # LAINTAS_INSTALL_TAG optionally pins an exact release. Mac packages and
     # checksums are served from the cli.laintas.com release mirror.
     RELEASE_TAG="${LAINTAS_INSTALL_TAG:-}"

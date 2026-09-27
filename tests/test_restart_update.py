@@ -424,12 +424,12 @@ class UpdateChannelTests(unittest.TestCase):
         self.assertIn(
             "https://cli.laintas.com/releases/latest",
             page)
-        # Linux uses the installer script; direct package cards include both
-        # native Mac architectures and the other downloadable installers.
+        # Linux and Mac use the same architecture-detecting installer. Other
+        # packages remain direct downloads.
+        self.assertIn("id: 'mac'", page)
+        self.assertIn("Apple Silicon / Intel", page)
         for asset in ("laintas-cli_windows_amd64_setup.exe",
-                      "laintas-cli_source.zip",
-                      "laintas-cli_darwin_amd64.tar.gz",
-                      "laintas-cli_darwin_arm64.tar.gz"):
+                      "laintas-cli_source.zip"):
             self.assertIn(asset, page)
 
 
