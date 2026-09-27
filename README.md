@@ -46,9 +46,10 @@ irm https://cli.laintas.com/install.ps1 | iex
 laintas-cli
 ```
 
-The macOS build is a native terminal CLI for Apple Silicon and Intel. It
-does not include Helpwo Kernel or Helpwo machine sharing. Install the current
-release (the script checks the archive's SHA-256):
+The macOS build is a native terminal CLI for Apple Silicon (`arm64`) and Intel
+(`x86_64`). The installer detects the architecture automatically and verifies
+the archive's SHA-256 checksum. It does not include Helpwo Kernel or Helpwo
+machine sharing:
 
 ```bash
 curl -fsSL https://cli.laintas.com/install.sh | bash
@@ -60,7 +61,7 @@ your shell does not already use it. The installer downloads and verifies the
 Mac package from `cli.laintas.com/releases/latest/`. See [the release guide](build/RELEASE.md)
 for the Mac build and verification steps.
 
-Manage the Windows helper from `/windows` (alias `/kernel`). The full-screen
+On Windows, manage the Helpwo helper from `/windows` (alias `/kernel`). The full-screen
 manager shows its status and offers the same operations as these shortcuts:
 
 | Command | Result |
@@ -75,7 +76,7 @@ manager shows its status and offers the same operations as these shortcuts:
 `/windows restart` reuses connected access (otherwise workspace only).
 `/windows install --force` repairs an installation without starting it.
 
-Check the host before installing:
+On Linux, check the host architecture and glibc before installing:
 
 ```bash
 uname -m
@@ -242,6 +243,8 @@ Command-line creation example:
 ```
 
 Modes can also be declared directly in `.laintas/modes.json`:
+
+```json
 {
   "version": 1,
   "active": "docs-review",
@@ -462,7 +465,7 @@ Role selection and routing never broaden the parent's tool permissions.
 | Execution | `/term`, `/spawn`, `/agents`, `/task` | Terminals, delegated agents, and task tracking |
 | Workflows | `/hwo`, `/hwg` | Live orchestration and durable graph execution |
 | Plugins | `/mcp`, `/extensions`, `/evolve`, `/reload`, `/trust` | External tools and executable customization |
-| Connectivity | `/backend`, `/web`, `/identity`, `/helpwo`, `/shared` | Inference, search/fetch, browser identity, sharing a session with Helpwo through the machine's Helpwo kernel, the cloud folder Helpwo mounts |
+| Connectivity | `/backend`, `/web`, `/identity`, `/helpwo`, `/shared` | Inference, search/fetch, browser identity, the cloud folder, and Helpwo sharing where a kernel is available |
 | Applications | `/app` | Run a registered application in its own sub-terminal with its own agent |
 | Administration | `/policy`, `/usage`, `/training`, `/v`, `/org` | Policy, allowance, data preference, updates, Enterprise |
 
@@ -493,6 +496,10 @@ private local full-screen view, bypassing terminal mirroring; Enter or Esc
 closes that view. Protected browser autofill remains unavailable.
 
 ### Hosted applications: `/helpwo` and `/app`
+
+Helpwo machine sharing requires Helpwo Kernel. The macOS build does not include
+that kernel, so the `/helpwo` sharing workflow below is unavailable on Mac.
+The `/app` application bridge is separate from Helpwo machine sharing.
 
 laintas_cli never talks to Helpwo itself. Helpwo reaches a machine through the
 **Helpwo kernel** running on it, and a CLI session reaches Helpwo through that
@@ -601,21 +608,46 @@ The package manifest is intentionally explicit. When adding a runtime module, bu
 
 - Linux amd64 standalone archive
 - Linux arm64 standalone archive
+- macOS Intel (`amd64`) native CLI archive
+- macOS Apple Silicon (`arm64`) native CLI archive
 - Single-file Windows amd64 installer with a private WSL 2 root filesystem
 - Linux amd64 Debian package
-- Linux-compatible source archive
+- Source archive
 - SHA-256 checksums and source-update manifests
 
-The download page offers the one-line Linux installer, which selects the
-architecture-specific ELF asset, alongside a direct link to every artifact the
-release publishes: the single-file Windows installer
-(`laintas-cli_windows_amd64_setup.exe`), both Linux archives, the Debian
-package and the source zip. Those links, the install scripts and `/v update`
-all read the GitHub release the CI workflow publishes.
+The download page offers one-line installers for Linux and macOS; each selects
+the matching CPU architecture. It also links to the Windows installer
+(`laintas-cli_windows_amd64_setup.exe`), both Linux archives, both Mac archives,
+the Debian package and the source zip. The Mac installer downloads the archive
+and checksum file from `cli.laintas.com/releases/latest/`. Linux installation
+and the Windows installer currently download from GitHub Releases. The already
+published `laintas-cli-beta v1` Mac binary also uses GitHub Releases for
+`/v update`; Mac binaries built from current `main` use the site mirror.
+
+The current public release is [laintas-cli-beta v1](https://github.com/lin7c/Laintas_cli/releases/tag/laintas-cli-beta-v1)
+(tag `laintas-cli-beta-v1`). It is an ordinary GitHub Release, marked `latest`;
+its Python package version is `1.32.5b1`. The Mac package is an initial native
+CLI build without Helpwo Kernel. See [the release guide](build/RELEASE.md) for
+build and verification details.
 
 ## Version History
 
 The history below is curated from the repository tags and changes, following an Added/Changed/Fixed-style release-note structure rather than reproducing raw commit messages. The tagged public history currently represented in this repository begins at v1.3.0.
+
+### [laintas-cli-beta v1](https://github.com/lin7c/Laintas_cli/releases/tag/laintas-cli-beta-v1) — 2026-09-27
+
+**Added**
+
+- Native macOS CLI archives for Apple Silicon and Intel, with an installer that
+  detects the architecture and verifies the archive checksum.
+- Mac downloads mirrored on `cli.laintas.com`; no Helpwo Kernel in the Mac build.
+
+### [v1.32.4](https://github.com/lin7c/Laintas_cli/releases/tag/v1.32.4) — 2026-09-25
+
+**Fixed**
+
+- Hardened terminal rendering of injected text and improved per-agent resume,
+  terminal attachment, vault and Windows screenshot interaction behavior.
 
 ### [v1.32.3](https://github.com/lin7c/Laintas_cli/releases/tag/v1.32.3) — 2026-09-23
 
