@@ -100,3 +100,20 @@ class ContractNotifyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SharedRegistryTests(unittest.TestCase):
+    """A session shared through the kernel is where notifications go."""
+
+    def tearDown(self):
+        contract_notify.set_registry(None)
+
+    def test_the_shared_registry_is_found(self):
+        registry = mock.Mock(agent_id="agent-1")
+        contract_notify.set_registry(registry)
+        self.assertIs(contract_notify._registry(), registry)
+
+    def test_a_registry_that_stopped_sharing_is_not_used(self):
+        contract_notify.set_registry(mock.Mock(agent_id=None))
+        with mock.patch("helpwo_server._agent_registry", return_value=None):
+            self.assertIsNone(contract_notify._registry())

@@ -245,6 +245,18 @@ def _prune_backups(keep: int = 3) -> None:
 
 
 def _version_tuple(v: str):
+    match = re.fullmatch(
+        r"v?(\d+)\.(\d+)\.(\d+)(?:[-.]?(a|alpha|b|beta|rc)[.-]?(\d+))?",
+        str(v).strip(), re.IGNORECASE)
+    if match:
+        major, minor, patch = (int(match.group(i)) for i in (1, 2, 3))
+        stage = match.group(4)
+        order = {"a": 0, "alpha": 0, "b": 1, "beta": 1, "rc": 2}
+        return (major, minor, patch,
+                order[stage.lower()] if stage else 3,
+                int(match.group(5)) if stage else 0)
+    # Preserve comparisons for older/custom manifests whose versions were not
+    # strict SemVer, while keeping known prereleases below the final release.
     parts = []
     for chunk in str(v).strip().split("."):
         num = "".join(ch for ch in chunk if ch.isdigit())
@@ -768,9 +780,10 @@ def apply_frozen_update(manifest: dict, channel_dir: str, log) -> Optional[str]:
     elif machine in ("aarch64", "arm64"):
         arch = "arm64"
     else:
-        log(f"[red]Unsupported Linux architecture: {machine or 'unknown'}[/red]")
+        log(f"[red]Unsupported architecture: {machine or 'unknown'}[/red]")
         return None
-    asset = f"laintas-cli_linux_{arch}.tar.gz"
+    platform_tag = "darwin" if sys.platform == "darwin" else "linux"
+    asset = f"laintas-cli_{platform_tag}_{arch}.tar.gz"
     url = _asset_url(channel_dir, asset)
 
     try:

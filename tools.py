@@ -5835,7 +5835,10 @@ def _bi_terminal_read(params: dict, ctx: ToolCtx) -> dict:
         cursors[key] = cursor + max_chars
         resume_cursor = cursor + max_chars
         head_first = True
-    new_output = delta.strip()
+    # Raw PTY bytes: executor markers, colour codes and prompt echoes are
+    # plumbing, not output (term0 carries every command the user typed).
+    new_output = _PROMPT_ANSI_RE.sub(
+        "", scrub_marker_noise(delta.replace("\r\n", "\n"))).strip()
     completed = not alive
     returncode = None
     if completed:

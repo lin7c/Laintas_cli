@@ -4,6 +4,70 @@ How to publish a version to GitHub and sync it to `cli.laintas.com`, so that
 the download page, the install script and the CLI's `/v` update command all
 use the same set of release assets.
 
+## `laintas-cli-beta v1` release (`laintas-cli-beta-v1`)
+
+The Mac build is a native terminal CLI for Intel (`amd64`) and Apple Silicon
+(`arm64`). It does **not** install, start, or depend on Helpwo Kernel. Helpwo
+machine sharing and the Linux Xvfb/x11vnc browser screen are outside this beta.
+The usual terminal, model, file and agent features are the intended test scope.
+
+Builds must run on macOS: `.github/workflows/release.yml` uses `macos-15-intel`
+and `macos-15`, then packages the one-file binaries as:
+
+```text
+laintas-cli_darwin_amd64.tar.gz
+laintas-cli_darwin_arm64.tar.gz
+```
+
+For a local Mac build, use Python 3.12 in a virtual environment:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install . 'pyinstaller>=6.16,<7' pytest
+.venv/bin/python -m pytest -q tests/test_mac_beta.py
+PATH="$PWD/.venv/bin:$PATH" bash build/mac/build_mac_package.sh
+```
+
+The packaging script checks the native architecture and runs the frozen
+binary's `--version` smoke test before making an archive. The archive includes
+`install.sh`, which installs into `~/.local/bin` without sudo. Release CI also
+tests the Mac-specific process and update paths. The resulting binary uses
+PyInstaller's ad-hoc signature; Developer ID signing and notarization are
+required before treating this as the general public Mac installer.
+
+Publish after both Mac jobs pass. `version.py` keeps the PEP 440 package
+version `1.32.5b1` for pip and Debian packaging, while the public release
+name is `laintas-cli-beta v1`. Commit the intended source, tag that commit
+`laintas-cli-beta-v1`, and push the tag. The workflow marks this tag as a
+GitHub prerelease, so the stable `latest` URL remains on the
+previous stable version. Check the release and both architecture archives:
+
+```bash
+gh release view laintas-cli-beta-v1 --json isPrerelease,assets
+curl -fsSIL https://github.com/lin7c/Laintas_cli/releases/download/laintas-cli-beta-v1/laintas-cli_darwin_arm64.tar.gz
+curl -fsSIL https://github.com/lin7c/Laintas_cli/releases/download/laintas-cli-beta-v1/laintas-cli_darwin_amd64.tar.gz
+```
+
+Mac beta testers install the pinned tag, never the stable `latest` channel:
+
+```bash
+curl -fsSL https://cli.laintas.com/install.sh | LAINTAS_INSTALL_TAG=laintas-cli-beta-v1 bash
+```
+
+The installer verifies the archive against the release's `SHA256SUMS.txt`.
+For `/v update` on a beta, set `LAINTAS_UPDATE_CHANNEL=laintas-cli-beta-v1`;
+the default update channel remains stable. If the optional site mirror is
+synced, run `LAINTAS_RELEASE_TAG=laintas-cli-beta-v1 python3 scripts/build_release_assets.py`.
+It writes only to `dist/releases/laintas-cli-beta-v1/` and leaves
+`dist/releases/latest/` untouched.
+
+Run one real smoke test on each Mac architecture before announcing the beta:
+install the archive, launch `laintas-cli --version`, execute a shell command,
+run a model turn, spawn and finish a sub-agent in a disposable Git repository,
+and confirm `/v update` selects the `darwin` archive. Keep the resulting
+transcript with the release notes. CI cannot verify interactive terminal
+behavior by itself.
+
 ## 1. Pre-release checks
 
 From the repository root:
@@ -77,6 +141,11 @@ Releasing a new version means updating:
   answered from the GitHub API, so keep it in step with `version.py`
 - the version shown in the page's compatibility section
 
+For a prerelease, keep the page's stable `RELEASE_FALLBACK` and its
+`/releases/latest/download` links on the last stable release. Use the pinned
+beta URL and install command in the macOS beta section above; GitHub
+prereleases do not advance the stable `latest` pointer.
+
 `RELEASE_BASE` does not move between releases: it is the release channel's
 rolling `latest/download` pointer, and the cards build their filenames from
 the tag the page looked up.
@@ -113,6 +182,8 @@ git push origin v1.23.4
 
 - `laintas-cli_linux_amd64.tar.gz`
 - `laintas-cli_linux_arm64.tar.gz`
+- `laintas-cli_darwin_amd64.tar.gz`
+- `laintas-cli_darwin_arm64.tar.gz`
 - `laintas-cli_windows_amd64_setup.exe`
 - `laintas-cli_source.zip`
 - `laintas-cli_<version>_amd64.deb`
@@ -232,10 +303,10 @@ already match the release. `--overwrite-local` does keep one, under
 `.laintas-update-backup/<version>-<stamp>/` (last three sets), because there
 the replaced file may be the only copy of an edit.
 
-A frozen install downloads the **Linux** archive for its architecture on every
-platform, Windows included: there the CLI runs as that same binary inside its
-private WSL distribution. `laintas-cli.exe` and the distribution are replaced
-by re-running the installer, not by `/v`.
+A frozen install downloads the archive for its host: macOS uses `darwin`,
+Linux uses `linux`, and the Windows product also uses `linux` because its CLI
+runs inside the private WSL distribution. `laintas-cli.exe` and the WSL
+distribution are replaced by re-running the Windows installer, not by `/v`.
 
 To pin a version:
 

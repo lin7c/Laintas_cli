@@ -318,6 +318,10 @@ export default function DownloadSection() {
           <section ref={chapter(0)} id="top" className="story-chapter story-hero">
             <Kicker>{c.kicker}</Kicker>
             <h1 className="st-display"><Title parts={c.title} /></h1>
+            <figure className="hero-terminal st-replay">
+              <TerminalReplay />
+              <figcaption><strong>{c.realTitle}</strong><span>{c.realNote}</span></figcaption>
+            </figure>
             <p className="st-lead">{c.lead}</p>
             <div className="st-actions">
               <a className="st-button st-button-primary" href="#download"><ArrowDownToLine size={16} />{c.install}</a>
@@ -326,11 +330,6 @@ export default function DownloadSection() {
             <dl className="st-facts">
               {c.facts.map(([term, detail]) => <div key={term}><dt>{term}</dt><dd>{detail}</dd></div>)}
             </dl>
-            <figure className="hero-terminal st-replay">
-              <div className="proof-label"><span className="live-dot" />{c.realEyebrow}</div>
-              <TerminalReplay />
-              <figcaption><strong>{c.realTitle}</strong><span>{c.realNote}</span></figcaption>
-            </figure>
           </section>
 
           {/* ── Scene 2 · laptop closed, turns to us: why ─────────────────── */}

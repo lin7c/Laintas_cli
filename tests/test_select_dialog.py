@@ -69,6 +69,41 @@ class SelectDialogTests(unittest.TestCase):
     def test_q_cancels(self):
         self.assertIsNone(self._run(["Yes", "No"], "q", full_screen=False))
 
+    @staticmethod
+    def _click(row):
+        # SGR press + release at 1-based column 5, screen line ``row``+1.
+        return f"\x1b[<0;5;{row + 1}M\x1b[<0;5;{row + 1}m"
+
+    def test_full_screen_click_highlights_then_second_click_chooses(self):
+        # Line 0 is the title; items start on line 1.
+        keys = self._click(3) + self._click(3)
+        self.assertEqual(
+            self._run(["a", "b", "c"], keys, title="Pick"), "c")
+
+    def test_full_screen_single_click_only_moves_the_highlight(self):
+        self.assertEqual(
+            self._run(["a", "b", "c"], self._click(2) + "\r", title="Pick"),
+            "b")
+
+    def test_full_screen_wheel_moves_the_highlight(self):
+        wheel_down = "\x1b[<65;5;2M"
+        self.assertEqual(
+            self._run(["a", "b", "c"], wheel_down * 2 + "\r", title="Pick"),
+            "c")
+
+    def test_click_confirms_with_the_action_protocol(self):
+        # The /resume picker: enter_action + action keys return (action, idx).
+        keys = self._click(2) + self._click(2)
+        self.assertEqual(
+            self._run(["a", "b"], keys, title="Resume",
+                      action_keys={"d": "details"}, enter_action="resume"),
+            ("resume", 1))
+
+    def test_inline_dialog_leaves_the_mouse_to_the_terminal(self):
+        self.assertEqual(
+            self._run(["Yes", "No"], self._click(1) + self._click(1) + "\r",
+                      full_screen=False), "Yes")
+
     def test_q_is_search_text_in_searchable_picker(self):
         self.assertEqual(self._run(["Other", "qq mail"], "qq\r",
                                    full_screen=False, search=True), "qq mail")

@@ -21,10 +21,11 @@ echo "── Laintas CLI Installer ───────────────
 UNAME_S=$(uname -s)
 case "$UNAME_S" in
     Linux) INSTALL_MODE="linux" ;;
+    Darwin) INSTALL_MODE="mac" ;;
     MINGW*|MSYS*|CYGWIN*) INSTALL_MODE="windows" ;;
     *)
         echo "Unsupported OS: $UNAME_S"
-        echo "Supported platforms: Linux and 64-bit Windows with WSL 2"
+        echo "Supported platforms: Linux, macOS and 64-bit Windows with WSL 2"
         exit 1
         ;;
 esac
@@ -66,6 +67,39 @@ if [ "$INSTALL_MODE" = "linux" ]; then
         exit 1
     fi
 
+    printf '\n  Done! Run `laintas-cli` to start.\n\n'
+elif [ "$INSTALL_MODE" = "mac" ]; then
+    case "$(uname -m)" in
+        x86_64) ARCH="amd64" ;;
+        arm64) ARCH="arm64" ;;
+        *) echo "Unsupported Mac architecture: $(uname -m)"; exit 1 ;;
+    esac
+    # Prereleases do not replace GitHub's stable /latest pointer. The beta
+    # install command supplies LAINTAS_INSTALL_TAG explicitly.
+    RELEASE_TAG="${LAINTAS_INSTALL_TAG:-}"
+    if [ -z "$RELEASE_TAG" ]; then
+        echo "macOS is in beta. Set LAINTAS_INSTALL_TAG to the beta release tag."
+        exit 1
+    fi
+    case "$RELEASE_TAG" in
+        *[!a-zA-Z0-9._-]*) echo "Invalid release tag"; exit 1 ;;
+    esac
+    TAG_BASE="https://github.com/lin7c/Laintas_cli/releases/download/$RELEASE_TAG"
+    ASSET="laintas-cli_darwin_${ARCH}.tar.gz"
+    curl --fail --location --show-error --progress-bar \
+        --retry 2 --connect-timeout 15 --max-time 900 \
+        "$TAG_BASE/$ASSET" -o "$TMP_DIR/$ASSET"
+    curl --fail --location --show-error --silent \
+        --retry 2 --connect-timeout 15 --max-time 60 \
+        "$TAG_BASE/SHA256SUMS.txt" -o "$TMP_DIR/SHA256SUMS.txt"
+    expected="$(awk -v asset="$ASSET" '$2 == asset {print $1}' "$TMP_DIR/SHA256SUMS.txt")"
+    actual="$(shasum -a 256 "$TMP_DIR/$ASSET" | awk '{print $1}')"
+    if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
+        echo "Checksum verification failed for $ASSET" >&2
+        exit 1
+    fi
+    tar xzf "$TMP_DIR/$ASSET" -C "$TMP_DIR"
+    bash "$TMP_DIR/install.sh"
     printf '\n  Done! Run `laintas-cli` to start.\n\n'
 else
     echo "  Detected: Windows amd64"

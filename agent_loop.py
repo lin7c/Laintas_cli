@@ -903,6 +903,14 @@ def _live_status_model() -> str:
     """Best-effort read of the current model name for the thinking spinner."""
     try:
         import laintas_cli
+        # A direct `/model route` calls its own model; the laintas
+        # selection is not what answers. This name also keys the remembered
+        # context window, so returning the laintas model here would budget a
+        # provider model against somebody else's window.
+        import model_route
+        direct = model_route.active_model()
+        if direct:
+            return direct
         # Same order the status bar uses. Reading only the cache made the two
         # disagree: the bar showed the real model while the spinner, finding
         # the cache empty, fell back to a placeholder. The cache is filled from
@@ -8254,6 +8262,36 @@ def _history_without_current_turn(chat_history: list, original_input: str) -> li
     return chat_history
 
 
+def _pending_direct_commands(history: list, limit: int = 10) -> list:
+    """Commands the user typed straight into term0 since the agent last spoke.
+
+    They are recorded in chat_history but never enter the message thread, and
+    the <sub_terminals> snapshot skips the agent's own terminal — so without
+    this the agent cannot know the user just ran `pytest` and saw it fail.
+    Only the commands are named; the output stays in term0 for terminal.read.
+    """
+    commands = []
+    returncode = None
+    for message in reversed(history or []):
+        role = message.get("role")
+        if role == "shell":
+            # Recorded after its command, so met first walking backwards.
+            returncode = message.get("returncode")
+            continue
+        if role == "user" and message.get("input_kind") == "interactive":
+            continue
+        if role == "user" and message.get("input_kind") == "shell":
+            command = " ".join(str(message.get("content") or "").split())
+            if command:
+                commands.append({"command": command[:200],
+                                 "returncode": returncode})
+            returncode = None
+            continue
+        break
+    commands.reverse()
+    return commands[-limit:]
+
+
 #: Every `state["_…"]` key the runtime writes, and whether it survives the turn
 #: boundary. `prepare_state_for_repl` builds a FRESH dict from a hand-written
 #: list, so a key added anywhere else is silently dropped at the end of the
@@ -8290,6 +8328,7 @@ STATE_KEYS_CARRIED = frozenset({
 })
 
 STATE_KEYS_TURN_ONLY = frozenset({
+    "_direct_commands", "_direct_commands_readable",
     "_budget_rows", "_gateway_ceded", "_budget_window",
     "_compaction_wait_failed", "_transient_prompt_tokens",
     "_context_live_tokens", "_context_live_messages",
@@ -9244,6 +9283,25 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     env_block = ("\n<environment_now>\n" + "\n".join(_env_bits) + "\n</environment_now>\n"
                  if _env_bits else "")
 
+    user_commands_block = ""
+    _direct = state.get("_direct_commands") or []
+    if _direct:
+        _lines = []
+        for item in _direct:
+            _rc = item.get("returncode")
+            _lines.append(f"  $ {item.get('command')}"
+                          + (f"  (exit {_rc})" if isinstance(_rc, int) and _rc >= 0 else ""))
+        _how = ('Their output is not in this conversation; read it with '
+                'terminal.read name="term0" (a long buffer returns its tail '
+                'plus a resume_cursor for the rest) when the request may '
+                'refer to it.'
+                if state.get("_direct_commands_readable", True) else
+                "Their output is not in this conversation.")
+        user_commands_block = (
+            "\n<user_terminal>\nSince your last turn the user ran these "
+            "commands directly in term0:\n" + "\n".join(_lines)
+            + f"\n{_how}\n</user_terminal>\n")
+
     if thread_mode:
         task_block = f"<task>\n{original_input}\n</task>\n" if first_turn else ""
         return f"""{task_block}{objective_block}{approved_plan_block}
@@ -9258,7 +9316,7 @@ step {loop+1}/{max_loops} — {n_steps} command(s) executed so far
 <sub_terminals>
 {terminals_snapshot or "(none)"}
 </sub_terminals>
-{volatile_block}{env_block}{now_block}"""
+{user_commands_block}{volatile_block}{env_block}{now_block}"""
 
     return f"""<task>
 {original_input}
@@ -9283,7 +9341,7 @@ step {loop+1}/{max_loops} — {n_steps} command(s) executed so far
 <sub_terminals>
 {terminals_snapshot or "(none)"}
 </sub_terminals>
-{volatile_block}{env_block}{now_block}"""
+{user_commands_block}{volatile_block}{env_block}{now_block}"""
 
 
 def _detect_lang(text: str) -> str:
@@ -10438,6 +10496,11 @@ def _visible_tool_names_for_task(
             routed |= {"retask.create", "retask.update", "retask.read"}
     except Exception:
         pass
+    # The user ran commands in term0 since the agent last spoke; the hint in
+    # the live state points at terminal.read, which "fix that error" would
+    # never route to by keyword.
+    if state.get("_direct_commands"):
+        routed |= {"terminal.read", "terminal.scroll"}
     return set(authorized_names) & routed
 
 
@@ -11145,6 +11208,10 @@ def run_agent_loop(
         _final_turn = max_loops > 1 and loop == max_loops - 1
         _loop_id = next_debug_loop()
         history_context = _history_without_current_turn(chat_history, original_input)
+        if "_direct_commands" not in state:
+            # Once per run: later steps append the agent's own turns to the
+            # history, after which the scan would find nothing.
+            state["_direct_commands"] = _pending_direct_commands(history_context)
         skill_context = skills_mod.get_activated_skills_context()
         skill_catalog = (skills_mod.describe_skills_for_prompt()
                          if not get_runtime_config("dynamic_context") else "")
@@ -11156,6 +11223,8 @@ def run_agent_loop(
         )))
         _allowed_tool_names = fit_tool_names(_visible_tool_names_for_task(
             _routing_query, state, _authorized_tool_names), state)
+        state["_direct_commands_readable"] = (
+            _allowed_tool_names is None or "terminal.read" in _allowed_tool_names)
 
         # ── Phase 2: abort check + inbox drain ────────────────────────
         if self_info is not None:

@@ -43,7 +43,7 @@ class ArgumentContractTests(unittest.TestCase):
                 "/extensions create demo --desc 'a demo'",
                 "/extensions pack demo --output demo.lext",
                 "/usage 7d local", "/usage buy calls",
-                "/helpwo --port 8080 --host ::1 --dist ./dist --remote",
+                "/helpwo", "/helpwo stop", "/helpwo --remote",
                 "/shared rm old --yes", "/windows install --force",
                 "/web cookies clear example.com", "/identity capture work a.com,b.com",
                 "/evolve activate cand-1 --force", "/prompt status"):
@@ -154,7 +154,7 @@ class ArgumentCompletionTests(unittest.TestCase):
 
     def test_static_second_level_values(self):
         self.assertEqual(self._complete("/usage buy "), ["calls", "storage"])
-        self.assertEqual(self._complete("/windows start "), ["read", "write"])
+        self.assertEqual(self._complete("/windows start "), ["workspace", "read", "write"])
         self.assertEqual(self._complete("/v enterprise "), ["on", "off", "gateway"])
         self.assertEqual(self._complete("/policy disabled "), ["--yes"])
         self.assertIn("--plain", self._complete("/agents "))

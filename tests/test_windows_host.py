@@ -237,12 +237,24 @@ def test_a_disconnect_releases_a_waiting_call(host):
     assert errors, "a dropped connection must not leave a caller hanging"
 
 
-def test_no_host_is_started_off_wsl(monkeypatch):
-    """A Linux or macOS session must not grow a listener it has no use for."""
+def test_off_wsl_the_host_waits_for_a_linux_kernel(monkeypatch, tmp_path):
+    """The Helpwo kernel is how a session reaches Helpwo on every platform,
+    so a Linux session publishes itself too — in the laintas home, and never
+    the single Windows file."""
     monkeypatch.delenv("LAINTAS_KERNEL_RENDEZVOUS", raising=False)
+    monkeypatch.setenv("LAINTAS_KERNEL_RENDEZVOUS_DIR", str(tmp_path / "rdv"))
     monkeypatch.setattr(winbridge, "in_wsl", lambda: False)
     windows_host.stop_host()
-    assert windows_host.start_host() is None
+    host = windows_host.start_host()
+    try:
+        assert host is not None
+        files = list((tmp_path / "rdv").glob("*.json"))
+        assert len(files) == 1
+        assert oct(files[0].stat().st_mode & 0o777) == "0o600", "the token is a key"
+        assert host._path is None, "no single file off Windows"
+    finally:
+        windows_host.stop_host()
+    assert list((tmp_path / "rdv").glob("*.json")) == [], "stopping removes it"
 
 
 def test_a_kernel_that_dies_before_the_probe_leaves_no_tools(host):
@@ -269,3 +281,76 @@ def test_a_kernel_that_dies_before_the_probe_leaves_no_tools(host):
     time.sleep(0.4)
     assert windows_tools.registered_names() == []
     assert get_registry().get("win.snapshot") is None
+
+
+# -- the link the relay rides on -----------------------------------------
+
+@pytest.fixture
+def dir_host(tmp_path):
+    windows_tools.unregister()
+    h = WindowsHost(directory=tmp_path / "rdv", publish_legacy=False)
+    assert h.start()
+    rendezvous = next((tmp_path / "rdv").glob("*.json"))
+    yield h, rendezvous
+    h.stop()
+    windows_tools.unregister()
+
+
+def test_a_kernel_without_machine_tiers_is_linked_but_not_probed(dir_host):
+    """A Linux kernel (or a Windows one without the switches) connects for
+    the relay; asking it for Windows tools would only be refused."""
+    h, rendezvous = dir_host
+    links = []
+    h.add_link_listener(links.append)
+    kernel = FakeKernel(rendezvous, {})
+    kernel.send({"t": "hello", "token": kernel.info["token"],
+                 "kernel": {"features": ["cli-relay"], "machineRead": False}})
+    kernel._thread.start()
+    assert _wait(lambda: links == [True])
+    assert h.supports("cli-relay")
+    time.sleep(0.2)
+    assert not any(m.get("t") == "win" for m in kernel.seen)
+    kernel.close()
+    assert _wait(lambda: links == [True, False])
+
+
+def test_unprompted_frames_reach_their_handler(dir_host):
+    h, rendezvous = dir_host
+    got = []
+    h.set_handler("cli-inputs", got.append)
+    kernel = FakeKernel(rendezvous, {})
+    kernel.send({"t": "hello", "token": kernel.info["token"],
+                 "kernel": {"features": ["cli-relay"]}})
+    kernel._thread.start()
+    assert _wait(lambda: h.connected)
+    kernel.send({"t": "cli-inputs", "agentId": "a", "inputs": [{"kind": "chat"}]})
+    assert _wait(lambda: got)
+    assert got[0]["inputs"][0]["kind"] == "chat"
+    kernel.close()
+
+
+def test_stale_files_of_dead_sessions_are_collected(tmp_path):
+    directory = tmp_path / "rdv"
+    directory.mkdir()
+    dead = directory / "old.json"
+    dead.write_text(json.dumps({"port": 1, "token": "x" * 32,
+                                "hostname": socket.gethostname(),
+                                "pid": 2 ** 22 + 12345}))
+    elsewhere = directory / "other-machine.json"
+    elsewhere.write_text(json.dumps({"port": 1, "token": "y" * 32,
+                                     "hostname": "not-this-host", "pid": 1}))
+    windows_host._collect_stale(directory)
+    assert not dead.exists()
+    assert elsewhere.exists(), "another machine's session is not ours to judge"
+
+
+def test_stop_leaves_a_single_file_another_session_took_over(tmp_path):
+    single = tmp_path / "single.json"
+    first = WindowsHost(path=single)
+    assert first.start()
+    second = WindowsHost(path=single)
+    assert second.start()
+    first.stop()
+    assert single.exists(), "the newer session still needs it"
+    second.stop()
+    assert not single.exists()

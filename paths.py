@@ -138,6 +138,8 @@ HOOKS_FILE        = LAINTAS_HOME / "hooks.json"
 PYTHON_HOOKS_FILE = LAINTAS_HOME / "hooks.py"
 MCP_FILE          = LAINTAS_HOME / "mcp.json"
 BACKENDS_FILE     = LAINTAS_HOME / "backends.json"
+MODEL_PROVIDERS_FILE = LAINTAS_HOME / "model_providers.json"
+MODEL_KEYS_FILE   = LAINTAS_HOME / "model_keys.json"
 TRUST_FILE        = LAINTAS_HOME / "trust.json"
 TASKS_FILE        = LAINTAS_HOME / "tasks.json"
 MESSAGES_READ_FILE = LAINTAS_HOME / "messages_read.json"
@@ -291,7 +293,7 @@ def ensure_home() -> None:
             pass
     for private_file in (
         MCP_FILE, BACKENDS_FILE, TRUST_FILE, INTERACTIVE_COMMANDS_FILE,
-        MESSAGES_READ_FILE,
+        MESSAGES_READ_FILE, MODEL_PROVIDERS_FILE, MODEL_KEYS_FILE,
     ):
         ensure_private_file(private_file)
 

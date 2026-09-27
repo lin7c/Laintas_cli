@@ -128,9 +128,11 @@ class OwnerIdentityTests(unittest.TestCase):
     """
 
     def test_a_kernel_thread_is_never_a_live_owner(self):
-        # pid 2 is kthreadd on Linux: alive, but it owns nothing.
-        self.assertTrue(worktree_manager._pid_alive(2))
-        self.assertFalse(worktree_manager._owner_alive({"pid": 2}))
+        # Model a live kernel thread without assuming this test process can
+        # see the host PID namespace (where pid 2 is kthreadd).
+        with mock.patch.object(worktree_manager, "_pid_alive", return_value=True), \
+                mock.patch.object(worktree_manager, "_has_cmdline", return_value=False):
+            self.assertFalse(worktree_manager._owner_alive({"pid": 2}))
 
     def test_pid_0_and_1_are_never_owners(self):
         self.assertFalse(worktree_manager._owner_alive({"pid": 1}))

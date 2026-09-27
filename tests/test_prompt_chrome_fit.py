@@ -158,5 +158,40 @@ class RenderCallbackPurityTests(unittest.TestCase):
             laintas_cli._reset_session_approvals()
 
 
+class ReflowResizeTests(unittest.TestCase):
+    """Narrowing a reflowing terminal re-wraps the full-width rprompt row.
+
+    The resize erase has to climb the wrapped head too, or one stale
+    "~   L> 1 | primary | AUTO | glm-5." row is left behind per SIGWINCH.
+    """
+
+    def _frame(self, top: str):
+        from prompt_toolkit.layout.screen import Char, Screen
+        screen = Screen()
+        for x, ch in enumerate(top):
+            screen.data_buffer[0][x] = Char(ch)
+        for x, ch in enumerate("│ › "):
+            screen.data_buffer[1][x] = Char(ch)
+        return screen
+
+    def test_shrinking_counts_the_wrapped_head(self):
+        screen = self._frame("~" + " " * 50 + "L> 1 | primary | AUTO | glm-5.3")
+        extra = laintas_cli._reflowed_extra_rows
+        self.assertEqual(extra(screen, 4, 1, 82), 0)   # still fits
+        self.assertEqual(extra(screen, 4, 1, 81), 1)
+        self.assertEqual(extra(screen, 4, 1, 27), 3)   # 82 cols -> 4 rows
+
+    def test_cursor_row_past_the_new_edge(self):
+        screen = self._frame("~")
+        self.assertEqual(laintas_cli._reflowed_extra_rows(screen, 50, 1, 40), 1)
+
+    def test_resize_handler_is_installed_once(self):
+        from prompt_toolkit.application import Application
+        handler = Application._on_resize
+        self.assertTrue(getattr(handler, "_laintas_reflow", False))
+        laintas_cli._install_reflow_aware_resize()
+        self.assertIs(Application._on_resize, handler)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,5 @@
 import { useLanguage } from '../contexts/LanguageContext';
+import { Link } from 'react-router-dom';
 import BrandMark from './BrandMark';
 
 // One footer for every page. It lived inside DownloadSection, so the plugin
@@ -20,7 +21,7 @@ export default function SiteFooter() {
       <BrandMark compact />
       <p>{c.footer}</p>
       <nav>
-        <a href="https://laintas.com/docs" target="_blank" rel="noreferrer">{c.docs}</a>
+        <Link to="/docs">{c.docs}</Link>
         <a href="https://github.com/lin7c/Laintas_cli" target="_blank" rel="noreferrer">{c.source}</a>
         <a href="https://laintas.com/pricing" target="_blank" rel="noreferrer">{c.pricing}</a>
       </nav>

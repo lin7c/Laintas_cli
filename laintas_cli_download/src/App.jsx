@@ -5,6 +5,7 @@ import { AuthProvider } from './contexts/AuthContext';
 import Header from './components/Header';
 import DownloadSection from './components/DownloadSection';
 import ExtensionsPage from './pages/ExtensionsPage';
+import DocsPage from './pages/DocsPage';
 import LoginPage from './pages/LoginPage';
 import RegisterPage from './pages/RegisterPage';
 import SettingsPage from './pages/SettingsPage';
@@ -31,6 +32,12 @@ function AppContent() {
           <div className="relative min-h-screen">
             <Header />
             <ExtensionsPage />
+          </div>
+        } />
+        <Route path="/docs" element={
+          <div className="relative min-h-screen">
+            <Header />
+            <DocsPage />
           </div>
         } />
         <Route path="/login" element={

@@ -626,13 +626,22 @@ class CommandTests(_Home):
         with _Capture(), \
                 mock.patch.object(laintas_cli, "_launch_app_subterminal") as launch, \
                 mock.patch("helpwo_server.start_server") as start:
-            laintas_cli._cmd_helpwo("--port 9000", ["/helpwo", "--port", "9000"], registry, {})
+            laintas_cli._cmd_helpwo("", ["/helpwo"], registry, {})
         start.assert_not_called()
         launch.assert_called_once()
         args, kwargs = launch.call_args
         self.assertEqual(args[0], "helpwo")
         self.assertTrue(kwargs["persistent"])
-        self.assertEqual(kwargs["options"]["port"], 9000)
+
+    def test_the_local_server_flags_are_refused_with_the_reason(self):
+        registry = mock.Mock(agent_id="host-1", workspace_path=None)
+        with _Capture() as out, \
+                mock.patch.object(laintas_cli, "_launch_app_subterminal") as launch, \
+                mock.patch("helpwo_server.start_server") as start:
+            laintas_cli._cmd_helpwo("--port 9000", ["/helpwo", "--port", "9000"], registry, {})
+        launch.assert_not_called()
+        start.assert_not_called()
+        self.assertIn("kernel", out.text)
 
     def test_helpwo_inside_a_sub_terminal_serves_in_place(self):
         registry = mock.Mock(agent_id=None, workspace_path=None)
@@ -796,13 +805,13 @@ class HelpwoEnvironmentRegistrationTests(unittest.TestCase):
                                   "createdAt": 0, "createdBy": "term0"}
         registry.as_environment = as_environment
         registry.workspace_path = "/srv/project"
-        response = mock.Mock(status_code=200)
-        response.json.return_value = {"agentId": "a1", "agentSecret": "s1"}
+        link = mock.Mock(connected=True)
+        link.supports.return_value = True
+        link.request.return_value = {"ok": True, "agentId": "a1"}
         try:
-            with mock.patch.object(laintas_cli.requests, "post",
-                                   return_value=response) as post:
+            with mock.patch("windows_host.get_host", return_value=link):
                 self.assertTrue(registry.register({"userId": "u1"}, quiet=True))
-            return post.call_args.kwargs["json"]
+            return link.request.call_args.args[0]["payload"]
         finally:
             registry._remote_executor.shutdown(wait=False, cancel_futures=True)
             registry._remote_control_executor.shutdown(wait=False, cancel_futures=True)

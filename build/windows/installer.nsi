@@ -13,6 +13,9 @@ ManifestDPIAware true
 !ifndef APP_VERSION
   !define APP_VERSION "0.0.0"
 !endif
+!ifndef APP_VERSION_NUMERIC
+  !define APP_VERSION_NUMERIC "${APP_VERSION}"
+!endif
 !ifndef PAYLOAD_DIR
   !define PAYLOAD_DIR "payload"
 !endif
@@ -35,7 +38,7 @@ SetCompressor /SOLID lzma
 ShowInstDetails show
 ShowUnInstDetails show
 
-VIProductVersion "${APP_VERSION}.0"
+VIProductVersion "${APP_VERSION_NUMERIC}.0"
 VIAddVersionKey "ProductName" "${APP_NAME}"
 VIAddVersionKey "CompanyName" "${APP_PUBLISHER}"
 VIAddVersionKey "FileDescription" "${APP_NAME} installer"

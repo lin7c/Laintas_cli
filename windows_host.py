@@ -54,8 +54,26 @@ MAX_FRAME = 32 * 1024 * 1024
 CALL_TIMEOUT = 45.0
 
 
+def rendezvous_dir() -> Optional[Path]:
+    """Where each CLI session publishes its own endpoint for the kernel.
+
+    One file per process, so the kernel serves every session on the machine
+    (it watches the directory; see kernel/localbridge.py). On the Windows
+    build the kernel is a Windows program and looks under LOCALAPPDATA; on
+    Linux both run as the same user and share the laintas home.
+    """
+    override = os.environ.get("LAINTAS_KERNEL_RENDEZVOUS_DIR")
+    if override:
+        return Path(override)
+    if winbridge.in_wsl():
+        base = winbridge.localappdata()
+        return base / "Laintas" / "kernel-rendezvous" if base else None
+    import paths
+    return Path(paths.LAINTAS_HOME) / "kernel-rendezvous"
+
+
 def rendezvous_path() -> Optional[Path]:
-    """Where the CLI publishes its endpoint.
+    """The single-file endpoint kernels older than the relay look for.
 
     Under LOCALAPPDATA rather than the workspace: the workspace is a folder
     the user chooses and may delete, and a rendezvous that vanishes with it
@@ -82,8 +100,20 @@ class WindowsHost:
     a question worth answering when somebody has it, not before.
     """
 
-    def __init__(self, path: Optional[Path] = None) -> None:
-        self._path = path if path is not None else rendezvous_path()
+    def __init__(self, path: Optional[Path] = None, *,
+                 directory: Optional[Path] = None,
+                 publish_legacy: bool = True) -> None:
+        # An explicit path means exactly that file (the tests, and the old
+        # override). Otherwise: this session's own file in the directory, and
+        # — for the primary terminal only — the single file older kernels
+        # read, so their Windows tools keep working until they are updated.
+        if path is not None:
+            self._path = path
+            self._dir = directory
+        else:
+            self._path = rendezvous_path() if publish_legacy else None
+            self._dir = directory if directory is not None else rendezvous_dir()
+        self._dir_file: Optional[Path] = None
         self._token = secrets.token_hex(24)
         self._listener: Optional[socket.socket] = None
         self._conn: Optional[socket.socket] = None
@@ -101,8 +131,15 @@ class WindowsHost:
         self._thread: Optional[threading.Thread] = None
         self.info: dict = {}
         self.probe: dict = {}
+        #: Windows tools are ready (the machine tiers were probed).
         self.on_connect: Optional[Callable[["WindowsHost"], None]] = None
         self.on_disconnect: Optional[Callable[[], None]] = None
+        #: Any kernel connected / went away — the relay's concern, and every
+        #: platform's, whether or not the kernel controls Windows.
+        self._link_listeners: list[Callable[[bool], None]] = []
+        #: Frames the kernel sends unprompted, by type: relayed inputs from
+        #: Helpwo, requests for this session's screen.
+        self._handlers: dict[str, Callable[[dict], None]] = {}
 
     # -- lifecycle -------------------------------------------------------
 
@@ -110,9 +147,35 @@ class WindowsHost:
     def connected(self) -> bool:
         return self._conn is not None
 
+    def features(self) -> frozenset:
+        """What the connected kernel says it supports; empty for old ones."""
+        raw = self.info.get("features") if isinstance(self.info, dict) else None
+        return frozenset(str(f) for f in raw) if isinstance(raw, list) else frozenset()
+
+    def supports(self, feature: str) -> bool:
+        return self.connected and feature in self.features()
+
+    def add_link_listener(self, callback: Callable[[bool], None]) -> None:
+        """Call `callback(True)` on every kernel connection, `(False)` on loss.
+
+        Called at once with True if a kernel is already connected, so a
+        listener added late does not miss the connection it cares about.
+        """
+        with self._callback_lock:
+            self._link_listeners.append(callback)
+            already = self._conn is not None and bool(self.info)
+        if already:
+            try:
+                callback(True)
+            except Exception:
+                pass
+
+    def set_handler(self, kind: str, handler: Callable[[dict], None]) -> None:
+        self._handlers[kind] = handler
+
     def start(self) -> bool:
         """Publish a rendezvous and wait for the kernel. Never raises."""
-        if self._path is None:
+        if self._path is None and self._dir is None:
             return False
         try:
             listener = socket.socket()
@@ -123,19 +186,35 @@ class WindowsHost:
             return False
         self._listener = listener
         port = listener.getsockname()[1]
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            # Written whole, then moved into place: the kernel polls this
-            # path, and a half-written file is a connection attempt against
-            # a port that does not exist yet.
-            staging = self._path.with_suffix(".tmp")
-            staging.write_text(json.dumps({
-                "version": 1, "host": "127.0.0.1", "port": port,
-                "token": self._token, "pid": os.getpid(),
-                "created": int(time.time()),
-            }), encoding="utf-8")
-            staging.replace(self._path)
-        except OSError:
+        record = {
+            "version": 2, "host": "127.0.0.1", "port": port,
+            "token": self._token, "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "created": int(time.time()),
+        }
+        published = False
+        if self._dir is not None:
+            try:
+                self._dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.chmod(self._dir, 0o700)
+                except OSError:
+                    pass
+                _collect_stale(self._dir)
+                self._dir_file = self._dir / (
+                    f"{socket.gethostname()}-{os.getpid()}-{self._token[:8]}.json")
+                _publish(self._dir_file, record)
+                published = True
+            except OSError:
+                self._dir_file = None
+        if self._path is not None:
+            try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                _publish(self._path, record)
+                published = True
+            except OSError:
+                pass
+        if not published:
             listener.close()
             self._listener = None
             return False
@@ -152,11 +231,17 @@ class WindowsHost:
                     sock.close()
                 except OSError:
                     pass
-        try:
-            if self._path is not None and self._path.exists():
-                self._path.unlink()
-        except OSError:
-            pass
+        for mine in (self._path, self._dir_file):
+            try:
+                # Only a file that still names us: a newer session may have
+                # taken the single file over, and removing it would cut that
+                # session off from the kernel.
+                if mine is not None and mine.exists():
+                    data = json.loads(mine.read_text(encoding="utf-8"))
+                    if data.get("token") == self._token:
+                        mine.unlink()
+            except (OSError, ValueError):
+                pass
 
     def _accept_loop(self) -> None:
         while not self._stop.is_set() and self._listener is not None:
@@ -195,7 +280,15 @@ class WindowsHost:
                 if message is None:
                     break
                 if isinstance(message, dict):
-                    self._resolve(message)
+                    handler = self._handlers.get(str(message.get("t") or ""))
+                    if handler is not None:
+                        # Off the reader thread: a handler may itself call
+                        # the kernel, and the answer arrives through here.
+                        threading.Thread(target=self._run_handler,
+                                         args=(handler, message),
+                                         name="kernel-frame", daemon=True).start()
+                    else:
+                        self._resolve(message)
         finally:
             # Taken around the whole teardown so a greeting still in flight
             # either announces before this runs, or sees `_conn` cleared and
@@ -218,15 +311,43 @@ class WindowsHost:
                         self.on_disconnect()
                     except Exception:
                         pass
+                if was_connected:
+                    self._notify_link(False)
+
+    @staticmethod
+    def _run_handler(handler: Callable[[dict], None], message: dict) -> None:
+        try:
+            handler(message)
+        except Exception:
+            pass
+
+    def _notify_link(self, up: bool) -> None:
+        for callback in list(self._link_listeners):
+            try:
+                callback(up)
+            except Exception:
+                pass
 
     def _greet(self, conn: socket.socket) -> None:
-        """Probe, then announce — but only if this connection is still ours.
+        """Announce the link, then probe for Windows tools — only while ours.
 
         The probe can fail because the kernel just went away, and the
         disconnect path has already run by the time we find out. Announcing
         anyway re-registers tools for a kernel that is gone, which is how a
         dead connection ends up with a live tool surface.
         """
+        with self._callback_lock:
+            if self._conn is not conn:
+                return
+        self._notify_link(True)
+        info = self.info if isinstance(self.info, dict) else {}
+        if "features" in info and not (info.get("machineRead")
+                                       or info.get("machineWrite")):
+            # A kernel that says what it supports and grants no machine tier
+            # has no Windows tools to offer (every Linux kernel, and a
+            # Windows one started without the switches). Probing would only
+            # be refused.
+            return
         try:
             probe = self.call("probe", timeout=15)
         except Exception:
@@ -274,10 +395,35 @@ class WindowsHost:
             count -= len(chunk)
         return b"".join(chunks)
 
+    def send(self, payload: dict) -> None:
+        """Send one frame, expecting no answer. Raises if no kernel."""
+        self._write(payload)
+
+    def request(self, payload: dict, timeout: float = CALL_TIMEOUT) -> dict:
+        """Send a frame and wait for the frame that carries the same id."""
+        with self._pending_lock:
+            self._counter += 1
+            req_id = f"cli-{self._counter}"
+            event = threading.Event()
+            slot: list = []
+            self._pending[req_id] = (event, slot)
+        try:
+            self._write({**payload, "id": req_id})
+        except KernelUnavailable:
+            with self._pending_lock:
+                self._pending.pop(req_id, None)
+            raise
+        if not event.wait(timeout):
+            with self._pending_lock:
+                self._pending.pop(req_id, None)
+            raise KernelUnavailable(
+                f"the Helpwo kernel did not answer within {int(timeout)}s")
+        return slot[0] if slot else {}
+
     def _write(self, payload: dict) -> None:
         conn = self._conn
         if conn is None:
-            raise KernelUnavailable("no Windows kernel is connected")
+            raise KernelUnavailable("no Helpwo kernel is connected")
         raw = json.dumps(payload).encode("utf-8")
         with self._send_lock:
             try:
@@ -353,7 +499,57 @@ class WindowsHost:
         return False
 
 
-#: Process-wide host. Started by the REPL bootstrap on the Windows build.
+def _publish(target: Path, record: dict) -> None:
+    """Write whole, then move into place, owner-only.
+
+    The kernel polls this path, and a half-written file is a connection
+    attempt against a port that does not exist yet. The token in it is what
+    lets the kernel in, so nobody else on the machine gets to read it.
+    """
+    staging = target.with_suffix(".tmp")
+    staging.write_text(json.dumps(record), encoding="utf-8")
+    try:
+        os.chmod(staging, 0o600)
+    except OSError:
+        pass
+    staging.replace(target)
+
+
+def _collect_stale(directory: Path) -> None:
+    """Remove files left by CLI sessions on this machine that no longer run.
+
+    Only this host's, only by pid: another distribution or machine sharing the
+    folder is not ours to judge. A file the kernel would dial and find nobody
+    behind costs it a retry every half minute, forever.
+    """
+    me = socket.gethostname()
+    try:
+        entries = list(directory.glob("*.json"))
+    except OSError:
+        return
+    for entry in entries[:256]:
+        try:
+            data = json.loads(entry.read_text(encoding="utf-8"))
+            if data.get("hostname") != me:
+                continue
+            pid = int(data.get("pid") or 0)
+        except (OSError, ValueError, TypeError):
+            continue
+        if pid <= 0 or pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            try:
+                entry.unlink()
+            except OSError:
+                pass
+        except OSError:
+            pass   # alive, but not ours to signal
+
+
+#: Process-wide host. Started by the REPL bootstrap on every platform: the
+#: Helpwo kernel is how this session reaches Helpwo, not only Windows.
 _host: Optional[WindowsHost] = None
 _host_lock = threading.Lock()
 
@@ -362,16 +558,17 @@ def get_host() -> Optional[WindowsHost]:
     return _host
 
 
-def start_host() -> Optional[WindowsHost]:
-    """Begin waiting for a Windows kernel. Safe to call on any platform."""
+def start_host(primary: bool = True) -> Optional[WindowsHost]:
+    """Begin waiting for a Helpwo kernel. Safe to call on any platform.
+
+    `primary` is the top-level terminal: only it publishes the single file
+    older kernels read, so two sessions never fight over it.
+    """
     global _host
     with _host_lock:
         if _host is not None:
             return _host
-        if (not winbridge.in_wsl()
-                and not os.environ.get("LAINTAS_KERNEL_RENDEZVOUS")):
-            return None
-        host = WindowsHost()
+        host = WindowsHost(publish_legacy=primary and winbridge.in_wsl())
 
         def connected(h: WindowsHost) -> None:
             import windows_tools
@@ -386,6 +583,8 @@ def start_host() -> Optional[WindowsHost]:
         if not host.start():
             return None
         _host = host
+        import atexit
+        atexit.register(host.stop)
         return host
 
 

@@ -1046,8 +1046,17 @@ def select_dialog(
             sel[0] = vis[0][0]
         return vis
 
+    # Screen line -> what a click there means: ("item", index) or
+    # ("page", ±1). Rebuilt with every render so it matches what is drawn.
+    _line_targets: dict[int, tuple] = {}
+
     def _build_lines():
         lines = []
+        _line_targets.clear()
+
+        def _line_no() -> int:
+            return sum(text.count("\n") for _style, text in lines)
+
         if title:
             lines.append(("bold #e6edf3", f"{title}\n"))
 
@@ -1069,6 +1078,7 @@ def select_dialog(
                 end = min(start + list_h, len(vis))
 
         if start > 0:
+            _line_targets[_line_no()] = ("page", -1)
             lines.append(("class:muted", f"  {symbols.ARROW_U} {start} more\n"))
 
         if not vis:
@@ -1089,9 +1099,11 @@ def select_dialog(
                 row_text = _apply_marquee(
                     row_text, oi, _marquee_last_sel, _marquee_start)
             style = "class:selected" if is_sel else ""
+            _line_targets[_line_no()] = ("item", oi)
             lines.append((style, row_text + "\n"))
 
         if end < len(vis):
+            _line_targets[_line_no()] = ("page", 1)
             lines.append(("class:muted", f"  {symbols.ARROW_D} {len(vis) - end} more\n"))
 
         # ── Footer hint ──
@@ -1169,8 +1181,7 @@ def select_dialog(
             else:
                 chk.add(sel[0])
 
-    @kb.add("enter")
-    def _(event):
+    def _confirm(running_app) -> None:
         if _in_grace():
             return
         vis = _clamp_sel()
@@ -1178,18 +1189,29 @@ def select_dialog(
             if on_action is not None:
                 return
             if act_keys:
-                event.app.exit(result=(None, -1))
+                running_app.exit(result=(None, -1))
             else:
-                event.app.exit(result=None)
+                running_app.exit(result=None)
             return
         if multi:
             checked_items = [items[oi] for oi in sorted(chk)
                              if oi < len(items)]
-            event.app.exit(result=checked_items)
+            running_app.exit(result=checked_items)
         elif enter_action and act_keys:
-            event.app.exit(result=(enter_action, sel[0]))
+            running_app.exit(result=(enter_action, sel[0]))
         else:
-            event.app.exit(result=items[sel[0]])
+            running_app.exit(result=items[sel[0]])
+
+    @kb.add("enter")
+    def _(event):
+        _confirm(event.app)
+
+    def _move(delta: int) -> None:
+        vis = _visible()
+        if not vis:
+            return
+        cur_vi = next((i for i, (oi, _, _) in enumerate(vis) if oi == sel[0]), 0)
+        sel[0] = vis[max(0, min(len(vis) - 1, cur_vi + delta))][0]
 
     # Action keys (e.g. d=details, x=delete in resume picker)
     for _key, _action in list(act_keys.items()):
@@ -1271,7 +1293,39 @@ def select_dialog(
             height=1,
             style="class:search-input",
         ))
-    list_ctrl = FormattedTextControl(lambda: _ptk_fragments(_build_lines()))
+    class _ListControl(FormattedTextControl):
+        """The list, plus the mouse: the wheel moves the highlight, a click
+        highlights a row and a click on the highlighted row chooses it (as
+        Enter does), and the "N more" rows page."""
+
+        def mouse_handler(self, mouse_event):
+            if not full_screen:
+                return NotImplemented
+            kind = mouse_event.event_type
+            if kind == MouseEventType.SCROLL_UP:
+                _move(-1)
+            elif kind == MouseEventType.SCROLL_DOWN:
+                _move(1)
+            elif kind == MouseEventType.MOUSE_UP:
+                target = _line_targets.get(mouse_event.position.y)
+                if target is None:
+                    return None
+                if target[0] == "page":
+                    import shutil
+                    _move(target[1] * max(1, shutil.get_terminal_size().lines - 8))
+                elif target[1] == sel[0]:
+                    if multi:
+                        chk.symmetric_difference_update({sel[0]})
+                    else:
+                        _confirm(get_app())
+                else:
+                    sel[0] = target[1]
+            else:
+                return NotImplemented
+            get_app().invalidate()
+            return None
+
+    list_ctrl = _ListControl(lambda: _ptk_fragments(_build_lines()))
     if full_screen:
         layout_panes.append(Window(content=list_ctrl))
     else:
@@ -1300,6 +1354,9 @@ def select_dialog(
         key_bindings=kb,
         style=style,
         full_screen=full_screen,
+        # Full-screen only: an inline dialog capturing the mouse would take
+        # away the terminal's own text selection of the output above it.
+        mouse_support=full_screen,
         refresh_interval=refresh_interval,
     )
     async def _auto_confirm():
@@ -1378,9 +1435,10 @@ def choose_record(records, *, title: str, label: Callable,
 
 
 try:
-    from version import __version__
+    from version import __version__, RELEASE_NAME
 except Exception:
     __version__ = "0.0.0"
+    RELEASE_NAME = "laintas-cli"
 
 # ── Agent Loop (extracted module) ─────────────────────────────────────
 from agent_loop import (
@@ -1444,6 +1502,7 @@ import extension_runtime         # hot-loaded project extension runtime
 import workgraph                 # unified objective/plan/steps/workflow state
 import hooks as hooks_mod        # trusted Python hooks + argv hooks
 import backend_profiles          # backend trust domains + credential isolation
+import model_route               # /model route: backend-served vs. direct provider key
 import trust_store               # workspace trust for executable customization
 import winbridge                 # facts about the Windows side of WSL (no-op elsewhere)
 import usage_tracker             # local AI token/cost accounting (/usage)
@@ -2640,13 +2699,11 @@ def connect_terminal_to_helpwo(agent_registry: "AgentRegistry", session: dict,
         workspace_changed = workspace is not None and workspace != agent_registry.workspace_path
         if name_same and not workspace_changed:
             if not quiet:
-                shared = agent_registry.workspace_path
                 console.print(Panel(
-                    f"[green]Already connected to Helpwo[/green]\n"
-                    f"{'Terminal' if is_sub else 'Runtime environment'}: [bold]{current}[/bold]\n"
-                    f"Agent ID: {agent_registry.agent_id}\n"
-                    f"Workspace: [bold]{shared or os.getcwd()}[/bold]\n\n"
-                    f"[dim]/name renames; /helpwo stop withdraws this environment.[/dim]",
+                    f"[green]Already shared with Helpwo[/green]\n"
+                    f"{'Terminal' if is_sub else 'Session'}: [bold]{current}[/bold]\n"
+                    f"Agent ID: {agent_registry.agent_id}\n\n"
+                    f"[dim]/name renames; /helpwo stop stops sharing.[/dim]",
                     title="Connected", border_style="green",
                 ))
             return True
@@ -2661,10 +2718,9 @@ def connect_terminal_to_helpwo(agent_registry: "AgentRegistry", session: dict,
     if name and is_sub and meta is not None:
         meta["name"] = name
     reg_name = name or ((meta or {}).get("name") if is_sub else None)
-    ok = agent_registry.register(session, name=reg_name, quiet=True)
+    ok = agent_registry.register(session, name=reg_name, quiet=True,
+                                 explain=not quiet)
     if not ok:
-        if not quiet:
-            console.print("[red]Could not reach the Helpwo backend — not connected.[/red]")
         return False
     agent_registry.start_heartbeat()
     agent_registry.start_message_poll(
@@ -2684,15 +2740,13 @@ def connect_terminal_to_helpwo(agent_registry: "AgentRegistry", session: dict,
                 title="Connected", border_style="green",
             ))
         else:
-            shared = agent_registry.workspace_path or os.getcwd()
             console.print(Panel(
-                f"[green]Runtime environment online in Helpwo[/green]\n"
+                f"[green]Shared with Helpwo through this machine's Helpwo kernel[/green]\n"
                 f"Name: [bold]{agent_registry.agent_name}[/bold]\n"
                 f"Agent ID: {agent_registry.agent_id}\n"
-                f"Workspace: [bold]{shared}[/bold]\n"
-                f"[dim]→ this CLI's terminal + this folder's files are the environment "
-                f"(files ride the direct P2P channel, never the server).[/dim]\n\n"
-                f"[dim]Pick it in Helpwo's terminal page. /helpwo stop to go offline.[/dim]",
+                f"[dim]→ listed in Helpwo's terminals under this machine. The machine's "
+                f"files, terminal and preview come from the kernel.[/dim]\n\n"
+                f"[dim]/helpwo stop stops sharing.[/dim]",
                 title="Connected", border_style="green",
             ))
     return True
@@ -3752,7 +3806,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "Agent/terminal, PageUp/PageDown scrolls, and Esc exits."
         )),
     CommandSpec("/term", "List, create, or rename terminals", "Agents & Terminals", "/term [name|rename <old> <new>]", aliases=("/t",), subcommands=("rename",)),
-    CommandSpec("/helpwo", "Run Helpwo in its own sub-terminal with its own agent (this folder = its workspace; login, data and conversation persist per folder); /helpwo stop closes it", "Agents & Terminals", "/helpwo [--port N] [--host ADDR] [--dist <path>] [--remote] | stop", subcommands=("stop",)),
+    CommandSpec("/helpwo", "Share a session with Helpwo through this machine's Helpwo kernel: its own sub-terminal and agent, listed under this machine in Helpwo; /helpwo stop closes it", "Agents & Terminals", "/helpwo [stop]", subcommands=("stop",)),
     CommandSpec(
         "/app", "Run a registered application in its own sub-terminal with its own agent",
         "Agents & Terminals", "/app [list|start <name>|stop <name>|trust <name>|revoke <name>]",
@@ -3885,7 +3939,17 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     )),
     CommandSpec("/work", "Inspect or resume unified WorkGraph state", "Planning & Tasks", "/work [status|list|resume|history]", subcommands=("status", "list", "resume", "history")),
     CommandSpec("/workflow", "Run a multi-phase workflow", "Planning & Tasks", "/workflow {start|status|advance|approve|end|list}", subcommands=("start", "status", "advance", "approve", "end", "list")),
-    CommandSpec("/model", "List or select a deployed terminal model override", "Config & Tools", "/model [terminal|aux] [id|reset]", subcommands=("aux", "reset", "clear", "default")),
+    CommandSpec("/model", "Select the chat model: backend models or your own provider key", "Config & Tools", "/model [terminal|aux|@agent] [id|reset] | route [<route> [model] [window]|list] | add [provider] [key|$VAR] [model] [name] | remove <route>",
+        subcommands=("aux", "reset", "clear", "default", "route", "add", "remove"),
+        completion_descriptions=(
+            ("aux", "Pick the model for compaction, critic and memory extraction"),
+            ("reset", "Clear this terminal's model override (use gateway auto-routing)"),
+            ("clear", "Clear this terminal's model override (use gateway auto-routing)"),
+            ("default", "Clear this terminal's model override (use gateway auto-routing)"),
+            ("route", "Choose who serves the chat: the backend or your own provider key"),
+            ("add", "Add your own provider key as a direct model route"),
+            ("remove", "Delete a provider route and its stored key"),
+        )),
     CommandSpec("/config", "View or set runtime configuration", "Config & Tools", "/config [<key>|<prefix> [<value>]|import <file>|export <file>|reset]"),
     CommandSpec("/web", "Inspect web search and fetch: engines, proxy, cookies, diagnostics",
                 "Config & Tools",
@@ -3906,24 +3970,18 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/policy", "Show or set security policy", "Config & Tools", "/policy [audit|enforce|disabled [--yes]|reset]", subcommands=("audit", "enforce", "disabled", "reset")),
     CommandSpec("/trust", "Review or change workspace trust", "Config & Tools", "/trust [status|allow|revoke]", subcommands=("status", "allow", "revoke")),
     CommandSpec(
-        "/windows", "Reach the Windows machine this CLI runs inside of",
+        "/windows", "Helpwo Kernel manager: install, update, start and uninstall",
         "Config & Tools",
-        "/windows [status | install [--force] | start [read|write] | stop]",
-        subcommands=("status", "install", "start", "stop"),
+        "/windows [status|check|install [--force]|update [--force]|start [workspace|read|write]|restart [workspace|read|write]|stop|uninstall]",
+        aliases=("/kernel",),
+        subcommands=("status", "check", "install", "update", "start", "restart", "stop", "uninstall", "help"),
         help_text=(
-            "On the Windows build this CLI is a Linux program inside a "
-            "private WSL distribution, so the machine you are sitting at - "
-            "its windows, its applications, its screen - is out of reach "
-            "until a small helper is running on the Windows side. `install` "
-            "downloads it, checks its published checksum and installs it "
-            "without further questions. "
-            "`start` is separate, and the word you give it decides how much "
-            "of your machine the agent may touch: with no word, its own "
-            "workspace folder and nothing else; `read` adds seeing every "
-            "window and the screen; `write` adds driving applications with "
-            "your real keyboard and mouse. It opens its own console window - "
-            "that window is the connection, and closing it is how you cut "
-            "access in a hurry."
+            "Open the full-screen Helpwo Kernel manager on Windows / WSL. "
+            "start installs if needed; choose workspace (default), read or write access. "
+            "update checks the latest release, verifies the download, and restores the "
+            "connected session's existing access. If already current, nothing changes. "
+            "install only installs. uninstall stops the kernel and uses its official "
+            "uninstaller, keeping your workspace files. /kernel is an alias."
         )),
     CommandSpec("/hooks", "Manage executable hooks", "Config & Tools", "/hooks [status|trust|revoke|reload]", subcommands=("status", "trust", "revoke", "reload")),
     CommandSpec("/backend", "Manage backend trust profiles", "Config & Tools", "/backend [status|list|use <name>|config]", subcommands=("status", "list", "use", "config")),
@@ -4034,6 +4092,13 @@ def _cached_candidates(key: str, loader) -> list[tuple[str, str]]:
         rows = []
     _ARG_COMPLETION_CACHE[key] = (now, rows)
     return rows
+
+
+def _model_key_env_candidates() -> list[tuple[str, str]]:
+    """`$VAR` for environment variables that look like API keys (names only)."""
+    return [(f"${name}", "read the key from this environment variable")
+            for name in sorted(os.environ)
+            if re.search(r"(API_?KEY|_KEY)$", name)][:20]
 
 
 def _static_candidates(*pairs: tuple[str, str]):
@@ -4250,7 +4315,21 @@ _ARG_COMPLETIONS: dict[str, tuple] = {
         # bare `/model` opens, so TAB only offers structural targets —
         # terminals, the `aux` axis and `reset`.
         ((), _terminal_candidates(include_primary=True, stationed_only=True)),
-        ((), _static_candidates(("aux", "Pick the compaction/critic/memory model"))),
+        ((), _static_candidates(("aux", "Pick the compaction/critic/memory model"),
+                                ("route", "Who serves the chat: the backend or your key"),
+                                ("add", "Add your own provider key"),
+                                ("remove", "Delete a provider route and its key"))),
+        (("route",), _cached_provider("model_routes", lambda: [
+            (model_route.DEFAULT_ROUTE, "served by the backend (default)"),
+            *[(route.name, f"{route.spec.label} {symbols.BULLET} {route.model}")
+              for route in model_route.list_routes()],
+            ("list", "Routes and which one is active"),
+        ])),
+        (("remove",), _cached_provider("model_routes_rm", lambda: [
+            (route.name, route.base_url) for route in model_route.list_routes()])),
+        # Every position after `add`, with a `<slot>` hint row in each.
+        *((("add", *("*",) * depth), lambda f, p: _model_add_arg_candidates(f, p))
+          for depth in range(6)),
         (("aux",), _static_candidates(("reset", "Use the terminal's own model again"))),
         (("aux",), _terminal_candidates(include_primary=True, stationed_only=True)),
         (("*",), lambda fragment, prior: (
@@ -4292,17 +4371,20 @@ _ARG_COMPLETIONS: dict[str, tuple] = {
             ("delete", "Delete a custom mode"))),
         (("delete",), _cached_provider("modes", _custom_mode_loader)),
     ),
-    "/backend": ((("use",), _cached_provider("backends", lambda: [
-        (profile.name, f"{profile.kind} {symbols.BULLET} {profile.base_url}")
-        for profile in backend_profiles.list_profiles()])),),
+    "/backend": (
+        (("use",), _cached_provider("backends", lambda: [
+            (profile.name, f"{profile.kind} {symbols.BULLET} {profile.base_url}")
+            for profile in backend_profiles.list_profiles()])),
+    ),
     "/policy": ((("disabled",), _YES_FLAG),),
     "/trust": ((("allow",), _YES_FLAG),),
     "/hooks": ((("trust",), _YES_FLAG),),
     "/windows": (
-        (("start",), _static_candidates(
+        ((("start", "restart"),), _static_candidates(
+            ("workspace", "Only the kernel workspace"),
             ("read", "Also see every window and the screen"),
             ("write", "Also drive applications, keyboard and mouse"))),
-        (("install",), _FORCE_FLAG),
+        ((("install", "update"),), _FORCE_FLAG),
     ),
     "/skill": (
         ((("trust", "revoke"),), _cached_provider("skills", _skill_loader())),
@@ -4504,13 +4586,8 @@ _HIRE_FLAGS = {
     "--terminal": ("Deploy straight into a live terminal", _terminal_candidates(alive_only=True)),
 }
 
-_HELPWO_FLAGS = {
-    "--port": ("Local gateway port", _NO_VALUE_HINT),
-    "--host": ("Loopback address to bind", _static_candidates(
-        ("127.0.0.1", "IPv4 loopback"), ("localhost", "loopback name"), ("::1", "IPv6 loopback"))),
-    "--dist": ("A local Helpwo build directory", _path_candidates(dirs_only=True)),
-    "--remote": ("Open the hosted app and share this environment", None),
-}
+#: /helpwo has no flags of its own any more (see _parse_helpwo_flags).
+_HELPWO_FLAGS: dict = {}
 
 
 #: System-detected shell subcommands. No hardcoded tree: the machine's own
@@ -4950,6 +5027,12 @@ class MetaCompleter(Completer):
                                 yield self._completion(
                                     entry.value, fragment, entry.description)
                     for value, meta in _dynamic_arg_candidates(spec.name, prior, fragment):
+                        if value.startswith("<") and value.endswith(">"):
+                            # A hint row: says what this argument is; inserts nothing.
+                            if not fragment:
+                                yield Completion("", start_position=0,
+                                                 display=value, display_meta=meta)
+                            continue
                         if value in seen or not value.casefold().startswith(fragment.casefold()):
                             continue
                         seen.add(value)
@@ -5579,7 +5662,8 @@ def _rprompt_current_value(slot_id: str):
     if slot_id == "mode":
         return _rprompt_current_mode_choice()
     if slot_id == "model":
-        value = str(_status_cache.get("model") or get_selected_model() or "auto")
+        value = str(model_route.active_model() or _status_cache.get("model")
+                    or get_selected_model() or "auto")
         return "auto" if value in ("", "auto", "auto-routing") else value
     if slot_id == "effort":
         return str(get_runtime_config("reasoning_effort") or "none")
@@ -5878,7 +5962,13 @@ def _rprompt_apply_model_choice(value: str) -> tuple[bool, str]:
         # A model-only setter leaves a previously pinned provider behind.
         set_model_selection(model, "")
     _update_status_cache(model=model or "auto")
-    return True, f"Model set to {model or 'auto-routing'}."
+    note = ""
+    # Same rule as /model: a backend model means the backend serves the chat.
+    if (model_route.selected_name() != model_route.DEFAULT_ROUTE
+            and not os.environ.get(model_route.ENV_OVERRIDE)):
+        model_route.select(model_route.DEFAULT_ROUTE)
+        note = f" Model route: back to {model_route.DEFAULT_ROUTE}."
+    return True, f"Model set to {model or 'auto-routing'}.{note}"
 
 
 def _rprompt_commit() -> tuple[bool, str, str]:
@@ -6457,6 +6547,64 @@ def _pessimistic_width(text: str) -> int:
 _RPROMPT_SEPARATOR = " | "
 
 
+# Narrowing the window left one stale copy of the path/rprompt row behind per
+# SIGWINCH.  The rprompt is right-aligned, so that row always reaches the last
+# column; a reflowing terminal (VTE, iTerm2, Windows Terminal, kitty, tmux...)
+# re-wraps it into two rows when the window shrinks.  prompt_toolkit's resize
+# erase only climbs the row count it drew (cursor_up(y)), lands on the wrapped
+# tail and erase_down()s from there, leaving the head - "~   L> 1 | primary |
+# AUTO | glm-5." - in the scrollback.  Before that erase, re-measure the last
+# frame at the new width and climb the extra wrapped rows as well.  Widening
+# never re-wraps a line that fit, so only shrinking is corrected.
+def _reflowed_extra_rows(screen, cursor_x: int, cursor_y: int,
+                         new_columns: int) -> int:
+    """Rows a reflowing terminal added above the cursor when narrowed."""
+    if new_columns <= 0:
+        return 0
+    extra = 0
+    for y in range(cursor_y):
+        row = screen.data_buffer.get(y)
+        if not row:
+            continue
+        right = 0
+        for x, ch in row.items():
+            if ch.char != " ":
+                right = max(right, x + max(1, ch.width))
+        if right > new_columns:
+            extra += (right - 1) // new_columns
+    return extra + max(0, cursor_x) // new_columns
+
+
+def _install_reflow_aware_resize() -> None:
+    original = Application._on_resize
+    if getattr(original, "_laintas_reflow", False):
+        return
+
+    def _on_resize(self) -> None:
+        try:
+            renderer = self.renderer
+            screen = renderer._last_screen
+            old = renderer._last_size
+            if (screen is not None and old is not None
+                    and not renderer.full_screen):
+                new_columns = self.output.get_size().columns
+                if 0 < new_columns < old.columns:
+                    pos = renderer._cursor_pos
+                    extra = _reflowed_extra_rows(screen, pos.x, pos.y,
+                                                 new_columns)
+                    if extra:
+                        renderer._cursor_pos = pos._replace(y=pos.y + extra)
+        except Exception:
+            pass
+        original(self)
+
+    _on_resize._laintas_reflow = True
+    Application._on_resize = _on_resize
+
+
+_install_reflow_aware_resize()
+
+
 def _fit_rprompt(segments: list, budget: int) -> list:
     """Drop trailing rprompt segments until the worst-case width fits *budget*.
 
@@ -6518,7 +6666,8 @@ def _sync_status_context() -> None:
             model = str(agent.base_model)
             model_source = "agent"
         else:
-            model = get_selected_model() or _status_cache.get("model", "")
+            model = (model_route.active_model() or get_selected_model()
+                     or _status_cache.get("model", ""))
             model_source = "default"
         _update_status_cache(
             agent=str(agent.name or agent.id),
@@ -6874,6 +7023,23 @@ def _is_password_command(text: str) -> bool:
     return bool(words) and words[0].lower() == "/password"
 
 
+def _carries_model_key(text: str) -> bool:
+    """`/model add <provider> <key> …` — a provider key typed inline.
+
+    A `$VAR` reference is not a secret; any other word in the key slot is.
+    """
+    words = (text or "").split()
+    if len(words) < 4 or words[0].lower() != "/model" or words[1].lower() != "add":
+        return False
+    key_slot = 4 if words[2].lower() == "custom" else 3
+    return len(words) > key_slot and not words[key_slot].startswith("$")
+
+
+def _is_private_command(text: str) -> bool:
+    """Lines that must never be written to the history file or debug record."""
+    return _is_password_command(text) or _carries_model_key(text)
+
+
 class _PrivateCommandHistory(FileHistory):
     """Reject vault command text before prompt_toolkit persists it.
 
@@ -6882,12 +7048,12 @@ class _PrivateCommandHistory(FileHistory):
     """
 
     def append_string(self, string: str) -> None:
-        if not _is_password_command(string):
+        if not _is_private_command(string):
             super().append_string(string)
 
     def load_history_strings(self):
         for string in super().load_history_strings():
-            if not _is_password_command(string):
+            if not _is_private_command(string):
                 yield string
 
 
@@ -7754,15 +7920,25 @@ def fetch_available_models(
 
 
 
-def show_model_selector(models: list[dict], current: str = "") -> Optional[dict]:
+def show_model_selector(models: list[dict], current: str = "", *,
+                        routes: Optional[list] = None,
+                        active_route: str = "") -> Optional[dict]:
     """Interactive model selector. Returns the complete model row or None.
 
     Prepends an ``auto`` virtual entry at the start of the list. When the user
     selects it, returns ``{"id": "auto", "provider": ""}`` so the caller
     can set the terminal to auto-routing mode.
+
+    *routes* (model_route.DirectRoute) are listed after the backend's models;
+    picking one returns ``{"route": name}``. While one of them is
+    *active_route*, it — not a backend model — carries the current mark.
     """
-    if not models:
+    routes = list(routes or [])
+    if not models and not routes:
         return None
+    on_route = bool(active_route) and active_route != model_route.DEFAULT_ROUTE
+    if on_route:
+        current = "\0"          # no backend row is current
     labels = []
     sel_idx = 0
     # Prepend the auto-routing virtual entry at the start of the list,
@@ -7780,19 +7956,32 @@ def show_model_selector(models: list[dict], current: str = "") -> Optional[dict]
         labels.append(f"{mark}[cyan]{model_id:30}[/cyan] {tier:3} {provider}")
         if current and model_id == current:
             sel_idx = i + 1  # +1 because auto occupies index 0
+    route_start = len(labels)
+    for route in routes:
+        mark = " *" if route.name == active_route else "  "
+        blocked = model_route.policy_refusal(route)
+        note = f"[red]{escape(blocked)}[/red]" if blocked else "[dim]your key, direct[/dim]"
+        labels.append(f"{mark}[cyan]{escape(route.model or '(no model)'):30}[/cyan] {'':3} "
+                      f"{escape(route.name)} {symbols.BULLET} {escape(route.spec.label)} {note}")
+        if route.name == active_route:
+            sel_idx = len(labels) - 1
     chosen = select_dialog(
         labels,
         title=f"Models — choose with {symbols.ARROW_U}{symbols.ARROW_D} and Enter",
         full_screen=True,
         selected_index=sel_idx,
-        hint=f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ select  Esc/q cancel",
+        hint=(f"{symbols.ARROW_U}{symbols.ARROW_D}/wheel navigate  ↵ or click twice "
+              "select  Esc/q cancel"),
     )
     if chosen is None:
         return None
     # If the user picked the auto virtual entry (index 0), return a synthetic record.
-    if labels.index(chosen) == 0:
+    index = labels.index(chosen)
+    if index == 0:
         return {"id": "auto", "provider": ""}
-    return models[labels.index(chosen) - 1]
+    if index >= route_start:
+        return {"route": routes[index - route_start].name}
+    return models[index - 1]
 
 
 def choose_login_method() -> Optional[str]:
@@ -9406,7 +9595,7 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
         return labels
 
     sel_idx = 0
-    base_hint = f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ resume  d details  x delete node/subtree  q cancel"
+    base_hint = f"{symbols.ARROW_U}{symbols.ARROW_D}/wheel navigate  ↵ or click twice resume  d details  x delete node/subtree  q cancel"
 
     def _on_action(action, idx):
         nonlocal tree_rows
@@ -10215,6 +10404,25 @@ def _call_backend_stream_impl(
             context_capture["client_payload"] = dict(payload)
 
     headers, cookies = backend_profiles.request_auth(backend_profile, session)
+    request_url = f"{backend_url}/api/chat/stream"
+    request_body = payload
+    # `/model route <route>`: the chat model is served by the user's own
+    # provider key instead of the backend. Only this call is rerouted; the
+    # response is the same OpenAI SSE stream the gateway passes through, so
+    # everything below stays one implementation. The Laintas session never
+    # travels this path — the provider gets its own key and nothing else.
+    direct_route, direct_note = model_route.resolve()
+    if direct_note:
+        return {"reply": f"Request refused: {direct_note}. "
+                         f"Use /model route {model_route.DEFAULT_ROUTE} to go through the backend.",
+                "tool_calls": [], "done": True, "error": True, "error_code": "model_route"}
+    if direct_route is not None:
+        request_url, request_body, headers = model_route.build_request(direct_route, payload)
+        cookies = {}
+        backend_url = direct_route.base_url
+        selected_model = direct_route.model
+        if _local_sink is not None:
+            _local_sink["payload"] = request_body
 
     try:
         # ── Retry loop for transient failures (opencode retry.ts pattern) ──
@@ -10232,8 +10440,8 @@ def _call_backend_stream_impl(
             try:
                 response = _post_with_interrupt(
                     interrupt_event,
-                    url=f"{backend_url}/api/chat/stream",
-                    json=payload,
+                    url=request_url,
+                    json=request_body,
                     headers=headers,
                     cookies=cookies,
                     stream=True,
@@ -10309,6 +10517,16 @@ def _call_backend_stream_impl(
                     time.sleep(_delay)
                 continue
 
+            # A direct provider that does not take `reasoning_effort` for this
+            # model says so with a 400. Drop it, remember, and ask again —
+            # the gateway's measured table does this job on the backend path.
+            if (direct_route is not None and response.status_code == 400
+                    and "reasoning_effort" in request_body
+                    and "reasoning" in (response.text or "").lower()):
+                request_body = {k: v for k, v in request_body.items() if k != "reasoning_effort"}
+                model_route.mark_reasoning_unsupported(direct_route.name, direct_route.model)
+                continue
+
             # Non-retryable error — return immediately
             try:
                 err_data = response.json()
@@ -10321,6 +10539,8 @@ def _call_backend_stream_impl(
                     return {"reply": _billing, "command": "", "rules": "", "done": True, "error": True,
                             "error_code": _code}
                 _msg = str(err_data.get("detail") or err_data.get("error") or response.text[:200])
+                if direct_route is not None:
+                    _msg = f"{direct_route.name}: {model_route.error_message(err_data) or response.text[:200]}"
                 _title = str(err_data.get("title") or err_data.get("error") or "")
                 if _title and _title not in _msg:
                     _msg = f"{_title}: {_msg}"
@@ -10335,6 +10555,12 @@ def _call_backend_stream_impl(
         # Parse SSE stream. Backend pass-through DeepSeek's OpenAI-compatible
         # chunks: each event is `{"choices":[{"delta":{"content":"..."}}]}`.
         # Accumulate deltas into one string, then parse JSON {reply,command,...}.
+        if (direct_route is not None and on_chunk is not None
+                and request_body.get("reasoning_effort")):
+            # The gateway reports the gear it actually applied (`_reasoning`);
+            # on a direct route the one sent is the one applied.
+            try: on_chunk("gear", str(payload.get("reasoningEffort") or ""))
+            except Exception: pass
         accumulated = ""
         reasoning_accumulated = ""  # reasoning models emit delta.reasoning_content
         billing_info: dict = {}
@@ -10400,6 +10626,10 @@ def _call_backend_stream_impl(
                     context_capture["gateway_receipt"] = dict(
                         evt.get("_context") or {})
                 continue
+            if direct_route is not None and isinstance(evt.get("usage"), dict):
+                # The provider's own token count, in the gateway's `_billing`
+                # shape so /usage records it (as external, zero cost).
+                billing_info = model_route.usage_billing(evt["usage"])
             if "_billing" in evt:
                 billing_info = dict(evt["_billing"] or {})
                 billing_info["billingDomain"] = backend_profile.kind
@@ -10510,6 +10740,12 @@ def _call_backend_stream_impl(
 
         if not got_any_event:
             return {"reply": "No response from AI", "tool_calls": [], "done": True, "error": True}
+
+        if direct_route is not None and direct_route.context_window and not budget_info:
+            # What the gateway's `_budget` carries on the backend path. Without
+            # it the loop keys the window on nothing and budgets against
+            # `/config budget assumed_window`.
+            budget_info = {"contextWindow": direct_route.context_window}
 
         # Native function-calls emitted out-of-band (delta.tool_calls), if any.
         _damaged_calls: list = []
@@ -11071,7 +11307,7 @@ class AgentRegistry:
         self._state_cb = None
         self._chat_cb = None
         self._heartbeat_thread: Optional[threading.Thread] = None
-        self._message_poll_thread: Optional[threading.Thread] = None
+        self._listening = False
         self._running = False
         self._session: Optional[dict] = None
         self._processing_message = threading.Event()
@@ -11113,9 +11349,21 @@ class AgentRegistry:
         self._pending_approvals: dict[str, tuple[threading.Event, dict]] = {}
         self._active_req_lock = threading.RLock()
 
-        # ── WebRTC peer-to-peer file channel (lazy) ─────────────────────
-        self._webrtc = None  # WebrtcManager | False(unavailable) | None(not yet)
-        self._rtc_config: dict = {}
+        # ── Transport: this machine's Helpwo kernel ─────────────────────
+        # The CLI no longer talks to Helpwo or the gateway's agent API
+        # itself. The kernel registers this session on our behalf, relays
+        # what Helpwo sends, and posts our events back (kernel/clirelay.py);
+        # its own peer connection carries the machine's files, terminal and
+        # this session's browser screen. `_shared` is the user's intent —
+        # it survives the kernel restarting, so the session comes back.
+        self._shared = False
+        # Hooks belong to a particular WindowsHost. /windows stop discards
+        # that host, and /windows start creates another in this same process.
+        self._kernel_hooks_host = None
+        self._kernel_hooks_lock = threading.Lock()
+        # The browser screens last announced to the kernel; None = say again.
+        self._announced_screens: Optional[list] = None
+        self._screens_thread: Optional[threading.Thread] = None
 
     def _new_remote_executor(self):
         return ThreadPoolExecutor(
@@ -11168,42 +11416,194 @@ class AgentRegistry:
                 self._remote_accepted[group] -= 1
                 self._remote_capacity_lock.notify_all()
 
-    def _ensure_webrtc(self):
-        """Lazily create the WebRTC manager. Returns it, or None if aiortc is
-        unavailable (file ops then fall back to the relay path)."""
-        if self._webrtc is None:
+    # ── kernel transport ────────────────────────────────────────────────
+
+    #: How long `register` waits for the kernel to dial this session. It
+    #: finds a new session's rendezvous file within about two seconds.
+    KERNEL_WAIT_SECONDS = 8.0
+    #: How long to keep trying to come back after the kernel reconnects.
+    KERNEL_RELINK_SECONDS = 120.0
+
+    @staticmethod
+    def _kernel_link(wait: float = 0.0):
+        """The connected kernel that relays sessions, or None."""
+        if sys.platform == "darwin":
+            return None  # The native Mac beta has no Helpwo Kernel.
+        import windows_host
+        deadline = time.time() + wait
+        while True:
+            host = windows_host.get_host()
+            if host is None and wait:
+                host = windows_host.start_host(primary=_REPL_PROCESS_DEPTH == 0)
+            if host is not None and host.supports("cli-relay"):
+                return host
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.1)
+
+    @staticmethod
+    def _kernel_missing_hint() -> str:
+        if sys.platform == "darwin":
+            return "Helpwo machine sharing is not included in the macOS beta."
+        import windows_host
+        host = windows_host.get_host()
+        if host is not None and host.connected:
+            return ("This machine's Helpwo kernel is too old to share a session. "
+                    "Update it: " + ("/windows update" if winbridge.in_wsl()
+                                     else "re-run the Linux installer from "
+                                          "helpwo.laintas.com → Settings → Runtime "
+                                          "environments") + ".")
+        if winbridge.in_wsl():
+            return "Start it with /windows start, then run /helpwo again."
+        return ("Install and run it (helpwo.laintas.com → Settings → Runtime "
+                "environments → Helpwo Kernel), then run /helpwo again.")
+
+    def _install_kernel_hooks(self, host) -> None:
+        with self._kernel_hooks_lock:
+            if self._kernel_hooks_host is host:
+                return
+            host.set_handler("cli-inputs", self._on_kernel_inputs)
+            host.set_handler("cli-agent", self._on_kernel_agent)
+            host.set_handler("cli-vnc", self._on_kernel_vnc)
+            self._kernel_hooks_host = host
+
+            def on_link(up: bool) -> None:
+                # The discarded host may still finish its disconnect callback
+                # after the replacement connects. Ignore its stale notification.
+                if self._kernel_hooks_host is host:
+                    self._on_kernel_link(up)
+
+            host.add_link_listener(on_link)
+
+    def _on_kernel_link(self, up: bool) -> None:
+        """The kernel restarted or went away: our registration went with it
+        (the kernel unregisters a departing client's sessions). Come back
+        under the same id when it returns, if the user still wants to share."""
+        if not self._shared:
+            return
+        if not up:
+            console.print("[dim]Helpwo kernel disconnected; this session is "
+                          "offline in Helpwo until it returns.[/dim]")
+            return
+        # Own thread: this runs on the link's greeting, and on the Windows
+        # build the machine tools are probed right after it — a registration
+        # retried for up to two minutes must not hold them back.
+        threading.Thread(target=self._relink, name="kernel-relink",
+                         daemon=True).start()
+
+    def _relink(self) -> None:
+        if self._session is None or not self._registration_lock.acquire(blocking=False):
+            return
+        try:
+            # Retried, not tried once: a restarting kernel dials running CLIs
+            # before its own registration is done, and a single refusal then
+            # left this session out of Helpwo for good.
+            delay = 1.0
+            deadline = time.time() + self.KERNEL_RELINK_SECONDS
+            while self._shared and time.time() < deadline:
+                link = self._kernel_link()
+                if link is None:
+                    return   # gone again; the next connection retries
+                if self.register(self._session, self.agent_name or None, quiet=True):
+                    console.print("[dim]Shared with Helpwo again (kernel reconnected).[/dim]")
+                    self.start_heartbeat()
+                    return
+                time.sleep(delay)
+                delay = min(delay * 2, 15.0)
+        finally:
+            self._registration_lock.release()
+
+    def _on_kernel_inputs(self, frame: dict) -> None:
+        if not self.agent_id or str(frame.get("agentId") or "") != self.agent_id:
+            return
+        inputs = frame.get("inputs")
+        if isinstance(inputs, list):
+            self._dispatch_inputs(inputs, self._state_cb, self._chat_cb)
+
+    def _on_kernel_agent(self, frame: dict) -> None:
+        if str(frame.get("previousAgentId") or "") == self.agent_id:
+            self.agent_id = str(frame.get("agentId") or self.agent_id)
+            self._last_agent_id = self.agent_id
+
+    def _on_kernel_vnc(self, frame: dict) -> None:
+        """Say where this session's browser screen is, so the kernel can
+        stream it to Helpwo over its own peer connection."""
+        reply = {"t": "cli-vnc-res", "id": frame.get("id"), "ok": False}
+        name = str(frame.get("name") or "default")
+        try:
+            import browser_session as _bs
+            sess = _bs.get_browser_session(name)
+            if sess is None:
+                # The live-view button always asks for "default" while
+                # browser.open names sessions browser1, browser2, ...
+                sess = _bs.get_latest_browser_session()
+            port = int(getattr(sess, "rfb_port", 0) or 0) if sess is not None else 0
+            if port:
+                reply.update(ok=True, host="127.0.0.1", port=port)
+            else:
+                reply["error"] = f"no browser session '{name}' is showing a screen"
+        except Exception as e:
+            reply["error"] = f"browser registry: {e}"
+        import windows_host
+        host = windows_host.get_host()
+        if host is not None:
             try:
-                from webrtc_channel import WebrtcManager
-                if not WebrtcManager.available():
-                    console.print(f"[dim]WebRTC disabled (aiortc not importable: "
-                                  f"{WebrtcManager.import_error()})[/dim]")
-                    self._webrtc = False
-                else:
-                    from webrtc_channel import configured_ice_servers
-                    self._webrtc = WebrtcManager(
-                        lambda sid, typ, meta: self._push(sid, typ, "", meta),
-                        ice_servers=configured_ice_servers(self._rtc_config),
-                    )
-                    # So the WebRTC path/exec checks can also allow the
-                    # folder explicitly shared via /helpwo
-                    # (self.workspace_path), not just policy.py's
-                    # allowedRoots (a separate, unrelated command-safety
-                    # list that doesn't include an arbitrary shared cwd by
-                    # default).
-                    from webrtc_channel import set_agent_registry
-                    set_agent_registry(self)
-            except Exception as e:
-                console.print(f"[dim]WebRTC unavailable: {e}[/dim]")
-                self._webrtc = False
-        return self._webrtc or None
+                host.send(reply)
+            except Exception:
+                pass
+
+    #: How often the browser screens are looked at while shared.
+    SCREENS_POLL_SECONDS = 2.0
+
+    def _start_screens_watch(self) -> None:
+        """Tell the kernel whenever this session's browser screens change,
+        so Helpwo's screen button lights up as soon as there is one."""
+        self._announced_screens = None      # a new registration hears it all
+        if self._screens_thread is not None and self._screens_thread.is_alive():
+            return
+
+        def watch() -> None:
+            while self._shared:
+                try:
+                    import browser_session as _bs
+                    names = _bs.screen_names()
+                except Exception:
+                    names = []
+                if self.agent_id and names != self._announced_screens:
+                    if self._kernel_send({"t": "cli-screens", "agentId": self.agent_id,
+                                          "screens": names}):
+                        self._announced_screens = names
+                time.sleep(self.SCREENS_POLL_SECONDS)
+
+        self._screens_thread = threading.Thread(target=watch, name="kernel-screens",
+                                                daemon=True)
+        self._screens_thread.start()
+
+    def _kernel_send(self, frame: dict) -> bool:
+        import windows_host
+        host = windows_host.get_host()
+        if host is None:
+            return False
+        if self._shared and self._kernel_hooks_host is not host:
+            # /windows stop discards the old host. The existing heartbeat
+            # keeps running, so its next send attaches the replacement and
+            # its immediate link callback re-registers this shared session.
+            self._install_kernel_hooks(host)
+        if not host.connected:
+            return False
+        try:
+            host.send(frame)
+            return True
+        except Exception:
+            return False
 
     def _agent_auth_headers(self) -> dict:
         """Bearer-style CLI credential; never place this secret in a URL."""
         return {"Authorization": f"Agent {self.agent_secret}"}
 
     def _recover_registration(self) -> None:
-        """Re-register after a server-side credential rotation or state loss."""
-        if ((get_backend_profile().sends_laintas_credentials and not self._session)
+        """Re-register through the kernel after it lost our session."""
+        if (not self._session
                 or time.time() - self._last_reregister < 10):
             return
         if not self._registration_lock.acquire(blocking=False):
@@ -11217,7 +11617,8 @@ class AgentRegistry:
         finally:
             self._registration_lock.release()
 
-    def register(self, session: dict, name: str = None, quiet: bool = False) -> bool:
+    def register(self, session: dict, name: str = None, quiet: bool = False,
+                 explain: Optional[bool] = None) -> bool:
         """Register this CLI as a remote agent with Helpwo backend."""
         # A disconnect shuts down the old pool; allow a later /helpwo to
         # create a fresh one on the same registry instance.
@@ -11270,56 +11671,62 @@ class AgentRegistry:
             payload["goal"] = (f"Sub-terminal '{self.terminal_meta.get('name', '')}'"
                                f" on {hostname}")
 
-        backend_url = profile.base_url
-        headers, cookies = backend_profiles.request_auth(profile, session)
-
-        try:
-            resp = requests.post(
-                f"{backend_url}/api/agents/register",
-                json=payload,
-                headers=headers,
-                cookies=cookies,
-                timeout=5,
-                allow_redirects=False,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                self.agent_id = data.get("agentId", "")
-                self.agent_secret = data.get("agentSecret", "")
-                rtc_config = data.get("rtcConfig")
-                self._rtc_config = rtc_config if isinstance(rtc_config, dict) else {}
-                self._last_agent_id = self.agent_id
-                if not quiet:
-                    console.print(Panel(
-                        f"[green]Agent linked to Helpwo AGENTS[/green]\n"
-                        f"Name: [bold]{self.agent_name}[/bold]\n"
-                        f"ID: {self.agent_id}\n"
-                        f"Backend: {backend_url}",
-                        title="Agent Registered",
-                        border_style="green",
-                    ))
-                return True
-            else:
-                if not quiet:
-                    console.print(Panel(
-                        f"Backend: {backend_url}\n"
-                        f"Response: HTTP {resp.status_code}\n\n"
-                        f"[dim]Agent won't appear in Helpwo AGENTS panel. You can still use all features.[/dim]",
-                        title="[yellow]Agent Not Linked[/yellow]",
-                        border_style="yellow",
-                    ))
-                return False
-        except requests.RequestException as e:
-            if not quiet:
+        # Through this machine's Helpwo kernel, never to the gateway
+        # directly: the kernel registers the session with its own sign-in,
+        # relays Helpwo's messages to us and our events back.
+        # `explain`: say why sharing failed even when success stays quiet —
+        # "not connected" without the reason is what nobody can act on.
+        explain = (not quiet) if explain is None else explain
+        waiting = self._kernel_link() is None
+        if waiting and explain:
+            console.print("[dim]Waiting for this machine's Helpwo kernel…[/dim]")
+        host = self._kernel_link(wait=self.KERNEL_WAIT_SECONDS)
+        if host is None:
+            if explain:
                 console.print(Panel(
-                    f"Backend: {backend_url}\n"
-                    f"Error: {e}\n\n"
-                    f"[dim]Is the Helpwo backend running? Agent won't appear in Helpwo AGENTS panel.[/dim]\n"
-                    f"[dim]You can still use all features normally.[/dim]",
-                    title="[yellow]Agent Not Linked[/yellow]",
+                    "Helpwo reaches this CLI through the Helpwo kernel running on "
+                    "this machine, and none is connected.\n\n"
+                    + self._kernel_missing_hint(),
+                    title="[yellow]Not shared with Helpwo[/yellow]",
                     border_style="yellow",
                 ))
             return False
+        self._install_kernel_hooks(host)
+        try:
+            reply = host.request({"t": "cli-register", "payload": payload,
+                                  "userId": str(session.get("userId") or "")},
+                                 timeout=30)
+        except Exception as e:
+            reply = {"ok": False, "error": str(e)}
+        if not reply.get("ok"):
+            if explain:
+                console.print(Panel(
+                    f"{reply.get('error') or 'the kernel refused'}",
+                    title="[yellow]Not shared with Helpwo[/yellow]",
+                    border_style="yellow",
+                ))
+            return False
+        self.agent_id = str(reply.get("agentId") or "")
+        # The gateway credential stays inside the kernel.
+        self.agent_secret = ""
+        self._last_agent_id = self.agent_id
+        self._shared = True
+        try:
+            import contract_notify
+            contract_notify.set_registry(self)
+        except Exception:
+            pass
+        self._start_screens_watch()
+        if not quiet:
+            console.print(Panel(
+                f"[green]Shared with Helpwo through this machine's Helpwo kernel[/green]\n"
+                f"Name: [bold]{self.agent_name}[/bold]\n"
+                f"ID: {self.agent_id}\n"
+                f"Kernel: {reply.get('hostAgentId') or '—'}",
+                title="Agent Registered",
+                border_style="green",
+            ))
+        return True
 
     def start_heartbeat(self):
         """Start heartbeat thread."""
@@ -11381,26 +11788,19 @@ class AgentRegistry:
         """Synchronous POST. Called only from the sender thread."""
         if not self.agent_id or not events:
             return
-        backend_url = get_backend_url()
-        headers = self._agent_auth_headers()
-        try:
-            requests.post(
-                f"{backend_url}/api/agents/{self.agent_id}/events",
-                json={
-                    "events": events,
+        self._kernel_send({
+            "t": "cli-events",
+            "agentId": self.agent_id,
+            "body": {
+                "events": events,
+                "instanceId": self.instance_id,
+                "state": {
+                    "cwd": os.getcwd(),
+                    "status": "running",
                     "instanceId": self.instance_id,
-                    "state": {
-                        "cwd": os.getcwd(),
-                        "status": "running",
-                        "instanceId": self.instance_id,
-                    },
                 },
-                headers=headers,
-                timeout=5,
-                allow_redirects=False,
-            )
-        except requests.RequestException:
-            pass
+            },
+        })
 
     def _flush_events(self, timeout: float = 2.0):
         """Block until the sender drains _event_q, capped at timeout seconds."""
@@ -11412,8 +11812,6 @@ class AgentRegistry:
 
     def _heartbeat_loop(self):
         """Send heartbeat every HEARTBEAT_INTERVAL seconds with extended state."""
-        backend_url = get_backend_url()
-
         # Try to import psutil for metrics (optional dependency)
         try:
             import psutil as _psutil_mod
@@ -11456,17 +11854,10 @@ class AgentRegistry:
                     except Exception:
                         pass
 
-                response = requests.post(
-                    f"{backend_url}/api/agents/heartbeat",
-                    json=payload,
-                    headers=self._agent_auth_headers(),
-                    timeout=5,
-                    allow_redirects=False,
-                )
-                if response.status_code in (403, 404):
-                    self._recover_registration()
-                beat_ok = response.status_code == 200
-            except requests.RequestException:
+                beat_ok = self._kernel_send({"t": "cli-heartbeat",
+                                             "agentId": self.agent_id,
+                                             "payload": payload})
+            except Exception:
                 beat_ok = False  # heartbeat failures are silent
 
             # A failed beat retries quickly so one transient error can't
@@ -11481,72 +11872,50 @@ class AgentRegistry:
             agent_state_cb: callable() → dict — returns current agent state
             chat_history_cb: callable() → list — returns current chat history
         """
-        if (not self.agent_id or
-                (get_backend_profile().sends_laintas_credentials and not self._session)):
+        if not self.agent_id:
             return
-        # Reconnect (/helpwo --remote again, /name) must not stack a second poll
-        # thread — the existing loop re-reads self.agent_id each iteration.
-        if self._message_poll_thread is not None and self._message_poll_thread.is_alive():
-            return
-        self._message_poll_thread = threading.Thread(
-            target=self._poll_loop,
-            args=(agent_state_cb, chat_history_cb),
-            daemon=True,
-        )
-        self._message_poll_thread.start()
-        console.print("[dim]Listening for remote messages from Helpwo...[/dim]")
+        # The kernel pushes Helpwo's messages to us (cli-inputs); there is
+        # nothing to poll. Keep the callbacks for the dispatcher.
+        self._state_cb = agent_state_cb
+        self._chat_cb = chat_history_cb
+        if not self._listening:
+            self._listening = True
+            console.print("[dim]Listening for remote messages from Helpwo...[/dim]")
 
-    def _poll_loop(self, agent_state_cb, chat_history_cb):
-        """Poll backend for incoming messages every 2 seconds."""
-        backend_url = get_backend_url()
+    def _dispatch_inputs(self, messages: list, agent_state_cb, chat_history_cb):
+        """Run what Helpwo sent, each in a bounded worker.
 
-        while self._running and self.agent_id:
-            try:
-                resp = requests.get(
-                    f"{backend_url}/api/agents/{self.agent_id}/poll",
-                    params={"instanceId": self.instance_id},
-                    headers=self._agent_auth_headers(),
-                    timeout=5,
-                    allow_redirects=False,
+        Dispatch in a worker so a long-running handler (chat/delegate can run
+        for minutes) never stalls delivery — term-new/term-close/abort from
+        Helpwo must stay responsive throughout.
+        """
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            kind = msg.get("kind")
+            control = kind in self.REMOTE_CONTROL_KINDS
+            executor = self._remote_control_executor if control else self._remote_executor
+            if executor is None or not self._reserve_remote_capacity(control):
+                req_id = msg.get("reqId") or msg.get("id")
+                self._push_final(
+                    req_id, "busy",
+                    "remote task capacity is full; retry later",
                 )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    messages = data.get("inputs", [])
-                    for msg in messages:
-                        # Dispatch in a worker so a long-running handler
-                        # (chat/delegate can run for minutes) never stalls
-                        # the poll loop — term-new/term-close/abort from
-                        # Helpwo must stay responsive throughout.
-                        kind = msg.get("kind")
-                        control = kind in self.REMOTE_CONTROL_KINDS
-                        executor = self._remote_control_executor if control else self._remote_executor
-                        if not self._reserve_remote_capacity(control):
-                            req_id = msg.get("reqId") or msg.get("id")
-                            self._push_final(
-                                req_id, "busy",
-                                "remote task capacity is full; retry later",
-                            )
-                            continue
+                continue
 
-                        try:
-                            executor.submit(
-                                self._run_bounded_remote, msg,
-                                agent_state_cb, chat_history_cb, control)
-                        except RuntimeError:
-                            group = "control" if control else "task"
-                            with self._remote_capacity_lock:
-                                self._remote_accepted[group] -= 1
-                                self._remote_capacity_lock.notify_all()
-                            req_id = msg.get("reqId") or msg.get("id")
-                            self._push_final(
-                                req_id, "busy", "remote task executor is stopping",
-                            )
-                elif resp.status_code in (403, 404):
-                    self._recover_registration()
-            except requests.RequestException:
-                pass  # poll failures are silent, retry next cycle
-
-            time.sleep(2)
+            try:
+                executor.submit(
+                    self._run_bounded_remote, msg,
+                    agent_state_cb, chat_history_cb, control)
+            except RuntimeError:
+                group = "control" if control else "task"
+                with self._remote_capacity_lock:
+                    self._remote_accepted[group] -= 1
+                    self._remote_capacity_lock.notify_all()
+                req_id = msg.get("reqId") or msg.get("id")
+                self._push_final(
+                    req_id, "busy", "remote task executor is stopping",
+                )
 
     def _handle_remote_message(self, msg: dict, agent_state_cb, chat_history_cb):
         """Dispatch an incoming message by 'kind' per HelpwoAI protocol.
@@ -11598,15 +11967,15 @@ class AgentRegistry:
             elif kind == "approval-response":
                 self._handle_approval_response(req_id, payload)
             elif kind == "rtc-offer":
-                self._handle_rtc_offer(req_id, payload)
-            elif kind == "rtc-ice":
-                # Non-trickle in Layer 1: candidates are embedded in the SDP,
-                # so standalone ICE messages are ignored for now.
+                # This session is not a peer-to-peer host any more: the
+                # machine's kernel is, and it carries this session's screen
+                # too. Answer rather than ignore, so the browser does not wait
+                # out a timeout on a connection nobody will make.
+                self._push(req_id, "rtc-error", "", {
+                    "error": "this laintas_cli session is reached through its "
+                             "machine's Helpwo kernel; connect to the kernel"})
+            elif kind in ("rtc-ice", "rtc-close"):
                 pass
-            elif kind == "rtc-close":
-                mgr = self._webrtc or None
-                if mgr:
-                    mgr.handle_close(req_id)
             else:
                 self._push_final(req_id, "fail", f"unknown kind '{kind}'")
         except Exception as e:
@@ -11615,21 +11984,6 @@ class AgentRegistry:
                 self._push_final(req_id, "fail", f"handler exception: {e}")
         finally:
             self._processing_message.clear()
-
-    def _handle_rtc_offer(self, req_id: str, payload: dict):
-        """Accept a WebRTC offer from the browser and answer it, establishing a
-        peer-to-peer DataChannel so file transfers bypass the relay server.
-        Does NOT push a 'final' — the answer/error is delivered as its own event
-        (rtc-answer / rtc-error / rtc-unavailable) keyed to this reqId."""
-        mgr = self._ensure_webrtc()
-        if mgr is None:
-            self._push(req_id, "rtc-unavailable", "", {"reason": "aiortc not installed on host"})
-            return
-        sdp = payload.get("sdp")
-        if not sdp:
-            self._push(req_id, "rtc-error", "", {"error": "missing sdp"})
-            return
-        mgr.handle_offer(req_id, sdp)
 
     def _handle_chat(self, req_id: str, payload: dict, agent_state_cb, chat_history_cb):
         """Run a remote chat message WITHOUT occupying the local REPL.
@@ -12310,6 +12664,14 @@ class AgentRegistry:
         AI-issued commands and destructive operations retain their independent
         policy approval paths.
         """
+        if not self.agent_secret:
+            # Shared through the kernel: the gateway credential this relay
+            # would dial with stays inside the kernel, and the kernel's own
+            # terminal is how Helpwo opens a shell on this machine.
+            self._push_final(req_id, "fail",
+                             "open a terminal on this machine through its Helpwo "
+                             "kernel (Runtime environments)")
+            return
         if get_runtime_config("disable_remote_terminal"):
             console.print("[yellow]Remote terminal request ignored (disable_remote_terminal is set).[/yellow]")
             self._push_final(req_id, "fail", "disable_remote_terminal is set on this CLI")
@@ -12852,6 +13214,7 @@ class AgentRegistry:
         finals/outputs make it to the backend before the process exits.
         """
         self._running = False
+        self._listening = False
         self._remote_stopping.set()
         with self._remote_capacity_lock:
             self._remote_capacity_lock.notify_all()
@@ -12873,22 +13236,18 @@ class AgentRegistry:
             except RuntimeError:
                 pass
 
+        self._shared = False
         if not self.agent_id:
             return
 
-        backend_url = get_backend_url()
-        headers = self._agent_auth_headers()
-
-        try:
-            requests.post(
-                f"{backend_url}/api/agents/unregister",
-                json={"agentId": self.agent_id, "instanceId": self.instance_id},
-                headers=headers,
-                timeout=5,
-                allow_redirects=False,
-            )
-        except requests.RequestException:
-            pass
+        import windows_host
+        host = windows_host.get_host()
+        if host is not None and host.connected:
+            try:
+                host.request({"t": "cli-unregister", "agentId": self.agent_id},
+                             timeout=5)
+            except Exception:
+                pass
         self.agent_id = None
         self.agent_secret = ""
 
@@ -13997,10 +14356,7 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     # its rule is deliberately looser than its siblings'.
     ("/training", "local"): _arg_rule(
         3, "/training local [status|on|off|purge|export <file>]"),
-    # --port/--host/--dist are key+value pairs, so the ceiling has to cover
-    # them together, not just the two it was written for.
-    ("/helpwo",): _arg_rule(
-        7, "/helpwo [--port N] [--host ADDR] [--dist <path>] [--remote] | stop"),
+    ("/helpwo",): _arg_rule(1, "/helpwo [stop]"),
     ("/helpwo", "stop"): _arg_rule(1, "/helpwo stop"),
     ("/app",): _arg_rule(2, "/app [list|start <name>|stop <name>|trust <name>|revoke <name>]"),
     ("/app", "list"): _arg_rule(1, "/app list"),
@@ -14029,7 +14385,14 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/shared", "help"): _arg_rule(1, "/shared help"),
     ("/windows", "status"): _arg_rule(1, "/windows status"),
     ("/windows", "stop"): _arg_rule(1, "/windows stop"),
-    ("/windows", "start"): _arg_rule(2, "/windows start [read|write]"),
+    ("/windows", "start"): _arg_rule(2, "/windows start [workspace|read|write]"),
+    ("/windows", "restart"): _arg_rule(2, "/windows restart [workspace|read|write]"),
+    ("/windows", "check"): _arg_rule(1, "/windows check"),
+    ("/windows", "uninstall"): _arg_rule(1, "/windows uninstall"),
+    ("/windows", "help"): _arg_rule(1, "/windows help"),
+    ("/windows", "update"): _arg_rule(
+        2, "/windows update [--force]", flag_start=1,
+        allowed_flags=("--force", "-f")),
     ("/windows", "install"): _arg_rule(
         2, "/windows install [--force]", flag_start=1,
         allowed_flags=("--force", "-f")),
@@ -14051,6 +14414,9 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/model", "reset"): _arg_rule(1, "/model reset"),
     ("/model", "clear"): _arg_rule(1, "/model clear"),
     ("/model", "default"): _arg_rule(1, "/model default"),
+    ("/model", "route"): _arg_rule(4, "/model route [<route> [model] [window]|list|status]"),
+    ("/model", "add"): _arg_rule(6, "/model add [provider] [key|$VAR] [model] [name]  (custom: /model add custom <base-url> <key|$VAR> [model] [name])"),
+    ("/model", "remove"): _arg_rule(2, "/model remove <route>"),
     ("/mode", "act"): _arg_rule(2, "/mode act [always]"),
     ("/mode", "always"): _arg_rule(1, "/mode always"),
     ("/mode", "act-always"): _arg_rule(1, "/mode act-always"),
@@ -16254,6 +16620,71 @@ def _cmd_model_aux(args: list, session: dict) -> None:
                       "extraction. The terminal's own model is unchanged.[/dim]")
 
 
+def _cmd_model_agent_base(agent, args: list, session: dict) -> None:
+    """``/model @<agent> [id|reset]`` for an Agent with no terminal.
+
+    Such an Agent runs on the model it was hired with (``base_model``); there
+    is no terminal override to set, so this changes that model itself and
+    saves it with the employee.
+    """
+    label = escape(str(agent.name or agent.id))
+    if agent.role == "subagent":
+        console.print(f"[yellow]{label} is a temporary sub-agent; it runs on "
+                      "its parent's model.[/yellow]")
+        return
+
+    def _apply(model: str, provider: str = "") -> None:
+        agent.base_model = str(model or "")
+        agent.base_provider = str(provider or "")
+        if agent.state.get("_persisted_employee"):
+            agent_persistence.save_agent_state(agent)
+
+    if args and args[0].lower() in ("reset", "clear", "default"):
+        _apply("")
+        console.print(f"[green]{label} now uses the backend default model.[/green]")
+        return
+    if args:
+        if len(args) != 1:
+            console.print("[yellow]Usage: /model @<agent> \\[id|reset][/yellow]")
+            return
+        _apply(args[0])
+        console.print(f"[green]Model for [bold]{label}[/bold] set to: "
+                      f"[bold]{escape(args[0])}[/bold][/green]"
+                      f"{_model_tier_suffix(args[0])}")
+        return
+    if not sys.stdin.isatty():
+        console.print(f"Current model for {label}: "
+                      f"[bold]{escape(agent.base_model or 'backend default')}[/bold]")
+        return
+    try:
+        with _safe_status(
+                f"[dim]Fetching available models… {symbols.BULLET} Esc/Ctrl+C cancel[/dim]"):
+            models, _endpoint = run_cancellable_blocking(
+                lambda cancel: fetch_available_models(
+                    session, cancel_event=cancel))
+    except BlockingOperationCancelled:
+        console.print("[dim]Model selection cancelled.[/dim]")
+        return
+    except Exception as exc:
+        console.print(f"[red]Failed to fetch models: {escape(str(exc))}[/red]")
+        return
+    if not models:
+        console.print("[yellow]The backend offered no models.[/yellow]")
+        return
+    _rprompt_refill_model_cache(models)
+    selected = show_model_selector(models, agent.base_model or "")
+    if not selected:
+        console.print("[dim]Model selection cancelled.[/dim]")
+        return
+    model_id = selected.get("id", "") if isinstance(selected, dict) else selected
+    provider_id = selected.get("provider", "") if isinstance(selected, dict) else ""
+    # "auto" is the selector's routing entry; for an Agent that means no pin.
+    _apply("" if model_id == "auto" else model_id,
+           "" if model_id == "auto" else provider_id)
+    console.print(f"[green]Model for [bold]{label}[/bold] set to: "
+                  f"[bold]{escape(model_id)}[/bold][/green]{_model_tier_suffix(model_id)}")
+
+
 def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
     """Manage deployment-model overrides without changing agent base models."""
     args = [_normalize_slash_arg(item) for item in parts[1:]]
@@ -16264,10 +16695,36 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
     if args and args[0].lower() == "aux":
         _cmd_model_aux(args[1:], session)
         return
+    # Direct provider routes (model_route.py): who serves the chat model of
+    # this CLI terminal. Also offered in the bare `/model` picker below.
+    if args and args[0].lower() == "route":
+        _cmd_model_route(args[1:])
+        return
+    if args and args[0].lower() in ("add", "remove"):
+        _cmd_model_route(args)
+        return
     current_agent = get_current_agent()
     current_terminal = agent_deployment_terminal(current_agent) or "term0"
     target_terminal = current_terminal
-    if args and get_terminal(args[0]) is not None:
+    # `/model @<agent>` aims at one Agent without switching the REPL to it
+    # (the /agents title bar's model button). A deployed Agent's model is its
+    # terminal's; an undeployed one has only its own, set at hire.
+    if args and args[0].startswith("@"):
+        reference = args.pop(0)[1:]
+        try:
+            target_agent = _resolve_agent_id_or_name(reference)
+        except ValueError as exc:
+            console.print(f"[red]{escape(str(exc))}[/red]")
+            return
+        if target_agent is None:
+            console.print(f"[red]No agent matches '{escape(reference)}'.[/red]")
+            return
+        deployed = agent_deployment_terminal(target_agent)
+        if not deployed:
+            _cmd_model_agent_base(target_agent, args, session)
+            return
+        target_terminal = deployed
+    elif args and get_terminal(args[0]) is not None:
         target_terminal = args.pop(0)
 
     terminal = get_terminal(target_terminal)
@@ -16288,12 +16745,18 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
             set_terminal_model_selection(
                 "term0", legacy_model, get_selected_provider())
 
+    # The direct route belongs to this CLI terminal, so it is offered — and
+    # left — only when /model aims at the terminal the REPL is running in.
+    routes_apply = target_terminal == current_terminal
+
     def _apply(model: str, provider: str = "") -> None:
         set_terminal_model_selection(target_terminal, model, provider)
         if target_terminal == "term0":
             set_model_selection(model, provider)
         if target_terminal == current_terminal:
             _update_status_cache(model=model)
+        if routes_apply:
+            _leave_direct_route()
 
     if args and args[0].lower() in ("reset", "clear", "default"):
         if len(args) != 1:
@@ -16331,69 +16794,87 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
             return
         except Exception as e:
             console.print(f"[red]Failed to fetch models: {e}[/red]")
-            console.print(f"Current model: [bold]{current or 'backend default'}[/bold]")
-            console.print("Usage: /model <model-id>  or  /model reset")
+            if not (routes_apply and model_route.list_routes()):
+                console.print(f"Current model: [bold]{current or 'backend default'}[/bold]")
+                console.print("Usage: /model <model-id>  or  /model reset")
+                return
+            # The backend's list is unavailable; the user's own routes are not.
+            models, endpoint = [], "backend unavailable"
         else:
             # /model already paid for the fetch; reuse it for the Alt+3 cycle.
             _rprompt_refill_model_cache(models)
-            if models and sys.stdin.isatty():
-                selected = show_model_selector(models, current)
-                if selected:
-                    model_id = selected.get("id", "") if isinstance(selected, dict) else selected
-                    provider_id = selected.get("provider", "") if isinstance(selected, dict) else ""
-                    _apply(model_id, provider_id)
-                    info = f"[bold]{model_id}[/bold]{_model_tier_suffix(model_id)}"
-                    if provider_id:
-                        info += f" ([dim]{_model_supply_label(provider_id)}[/dim])"
-                    console.print(
-                        f"[green]Model for [bold]{target_terminal}[/bold] "
-                        f"set to: {info}[/green]")
-                else:
-                    console.print("[dim]Model selection cancelled.[/dim]")
+        direct_routes = model_route.list_routes() if routes_apply else []
+        if (models or direct_routes) and sys.stdin.isatty():
+            selected = show_model_selector(
+                models, current, routes=direct_routes,
+                active_route=model_route.selected_name())
+            if selected and selected.get("route"):
+                _use_model_route(selected["route"])
+            elif selected:
+                model_id = selected.get("id", "") if isinstance(selected, dict) else selected
+                provider_id = selected.get("provider", "") if isinstance(selected, dict) else ""
+                _apply(model_id, provider_id)
+                info = f"[bold]{model_id}[/bold]{_model_tier_suffix(model_id)}"
+                if provider_id:
+                    info += f" ([dim]{_model_supply_label(provider_id)}[/dim])"
+                console.print(
+                    f"[green]Model for [bold]{target_terminal}[/bold] "
+                    f"set to: {info}[/green]")
             else:
-                table = Table(title=f"Available Models ({endpoint})")
-                table.add_column("#", style="dim")
-                table.add_column("Current", style="green")
-                table.add_column("Model ID", style="cyan")
-                table.add_column("Tier", justify="center")
-                table.add_column("Name")
-                table.add_column("Provider")
-                # Prepend the auto-routing virtual entry at the top of the table.
-                auto_marker = "*" if current in ("auto", "") else ""
+                console.print("[dim]Model selection cancelled.[/dim]")
+        else:
+            table = Table(title=f"Available Models ({endpoint})")
+            table.add_column("#", style="dim")
+            table.add_column("Current", style="green")
+            table.add_column("Model ID", style="cyan")
+            table.add_column("Tier", justify="center")
+            table.add_column("Name")
+            table.add_column("Provider")
+            # Prepend the auto-routing virtual entry at the top of the table.
+            auto_marker = "*" if current in ("auto", "") else ""
+            table.add_row(
+                "1",
+                auto_marker,
+                "auto-routing",
+                "",
+                "Auto-routing (embedding-based)",
+                "",
+            )
+            for idx, m in enumerate(models, start=2):
+                marker = "*" if current and m["id"] == current else ""
                 table.add_row(
-                    "1",
-                    auto_marker,
-                    "auto-routing",
-                    "",
-                    "Auto-routing (embedding-based)",
-                    "",
+                    str(idx),
+                    marker,
+                    m["id"],
+                    m.get("tier") or "—",
+                    m.get("name", ""),
+                    m.get("supply") or _model_supply_label(
+                        str(m.get("provider") or "")),
                 )
-                for idx, m in enumerate(models, start=2):
-                    marker = "*" if current and m["id"] == current else ""
-                    table.add_row(
-                        str(idx),
-                        marker,
-                        m["id"],
-                        m.get("tier") or "—",
-                        m.get("name", ""),
-                        m.get("supply") or _model_supply_label(
-                            str(m.get("provider") or "")),
-                    )
-                if not models:
-                    table.add_row("", "", "(none)", "", "", "")
-                console.print(table)
-                console.print(f"Terminal {target_terminal} override: [bold]{current or '(none)'}[/bold]" +
-                              _model_tier_suffix(current) +
-                              (f" ([dim]{_model_supply_label(current_provider)}[/dim])"
-                               if current_provider else ""))
-                if models and not sys.stdin.isatty():
-                    console.print(
-                        "[dim]Non-interactive terminal: select explicitly with "
-                        "/model <model-id>.[/dim]")
+            if not models:
+                table.add_row("", "", "(none)", "", "", "")
+            for route in direct_routes:
+                table.add_row(
+                    "", "*" if route.name == model_route.selected_name() else "",
+                    route.model or "(no model)", "",
+                    f"direct route {route.name}", route.spec.label)
+            console.print(table)
+            console.print(f"Terminal {target_terminal} override: [bold]{current or '(none)'}[/bold]" +
+                          _model_tier_suffix(current) +
+                          (f" ([dim]{_model_supply_label(current_provider)}[/dim])"
+                           if current_provider else ""))
+            if models and not sys.stdin.isatty():
+                console.print(
+                    "[dim]Non-interactive terminal: select explicitly with "
+                    "/model <model-id>.[/dim]")
+        console.print(
+            "Set with [bold]/model \\[terminal] <model-id>[/bold], reset with "
+            "[bold]/model \\[terminal] reset[/bold]. This never changes the "
+            "employee base model.")
+        if routes_apply:
             console.print(
-                "Set with [bold]/model \\[terminal] <model-id>[/bold], reset with "
-                "[bold]/model \\[terminal] reset[/bold]. This never changes the "
-                "employee base model.")
+                "[dim]Your own provider key: [bold]/model add[/bold] (walks you "
+                "through provider, key and model); routes: [bold]/model route list[/bold].[/dim]")
 
 
 def _cmd_name(raw_args: str, session: dict, agent_registry: AgentRegistry) -> None:
@@ -17797,132 +18278,210 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
     return False
 
 
-def _cmd_windows(parts: list) -> None:
-    """`/windows` — the Windows machine this CLI is running inside of.
+def _kernel_status_text(state: dict) -> str:
+    if not state["wsl"]:
+        return "Helpwo Kernel here manages the Windows helper. Use it from Windows / WSL."
+    connected = state.get("connected")
+    running = state.get("processRunning")
+    state_label = ("Connected" if connected else "Running · waiting for connection"
+                   if running else "Stopped" if state.get("installed") else "Not installed")
+    tiers = state.get("tiers") or {}
+    access = ("Desktop control" if tiers.get("machineWrite") else
+              "Desktop read-only" if tiers.get("machineRead") else "Workspace only")
+    lines = [f"Status     {state_label}",
+             f"Version    {state.get('version') or '—'}",
+             f"Access     {access if connected else 'Not connected'}"]
+    if state.get("path"):
+        lines.append(f"Installed  {state['path']}")
+    if connected:
+        lines.append(f"Tools      {len(state.get('tools') or [])} available")
+    elif running:
+        lines += ["", "Finish signing in in the kernel window, then refresh here."]
+    else:
+        lines += ["", "Start: /windows start · /windows start read · /windows start write"]
+    lines += ["", "Update: /windows update     Remove: /windows uninstall"]
+    return "\n".join(lines)
 
-    Install and start are separate commands on purpose. Installing puts a
-    program on the user's disk; starting it with `write` hands the agent the
-    keyboard, the mouse and every window on the machine. Rolling those into
-    one step would mean the second decision was made by whoever wanted the
-    first.
-    """
-    import windows_kernel
+
+def _kernel_progress(done: int, total: int) -> None:
+    # Called through the throttled wrapper in _kernel_action.
+    label = f"{done * 100 // total}%" if total else f"{done // 1048576} MB"
+    console.print(Text(f"Downloading Helpwo Kernel… {label}", style="dim"))
+
+
+def _kernel_action(sub: str, args: list) -> str:
+    """Run one deliberate operation; returns feedback shared by CLI and manager."""
+    import windows_kernel as kernel
+    import windows_host
     import windows_tools
 
-    sub = (parts[1].lower() if len(parts) > 1 else "status")
+    last = [-1]
+    def progress(done, total):
+        step = done * 10 // total if total else done // (5 * 1048576)
+        if step > last[0]:
+            last[0] = step
+            _kernel_progress(done, total)
 
-    if not winbridge.in_wsl() and sub != "status":
-        console.print("[yellow]/windows only does anything on the Windows "
-                      "build, which runs inside WSL.[/yellow]")
-        return
-
-    if sub == "status":
-        try:
-            state = windows_kernel.status()
-        except Exception as exc:
-            console.print(f"[red]could not read the kernel status: {exc}[/red]")
-            return
-        if not state["wsl"]:
-            console.print(Panel(
-                "This is not the Windows build, so there is no Windows "
-                "machine to reach.",
-                title="Windows", border_style="dim"))
-            return
-        tiers = state.get("tiers") or {}
-        if state["connected"]:
-            granted = ("machine-write" if tiers.get("machineWrite")
-                       else "machine-read" if tiers.get("machineRead")
-                       else "workspace only")
-        else:
-            granted = "—"
-        tools = state.get("tools") or []
-        lines = [
-            f"Installed    {'yes' if state['installed'] else 'no'}"
-            + (f"  (v{state['version']})" if state.get("version") else ""),
-            f"Running      {'yes' if state['processRunning'] else 'no'}",
-            f"Connected    {'yes' if state['connected'] else 'no'}",
-            f"Granted      {granted}",
-            f"Tools        {', '.join(tools) if tools else '(none)'}",
-        ]
-        if not state["installed"]:
-            lines += ["", "Install it with:  /windows install"]
-        elif not state["connected"]:
-            lines += ["", "Start it with:    /windows start read",
-                      "                  /windows start write"]
-        console.print(Panel("\n".join(lines), title="Windows kernel",
-                            border_style="cyan"))
-        return
-
-    if sub == "install":
-        force = any(p.lower() in ("--force", "-f") for p in parts[2:])
-        console.print("[dim]checking helpwo.laintas.com…[/dim]")
-        last = [-1]
-
-        def progress(done: int, total: int) -> None:
-            if not total:
-                return
-            percent = int(done * 100 / total)
-            if percent >= last[0] + 10:
-                last[0] = percent
-                console.print(f"[dim]  {percent}%  "
-                              f"({done // 1048576} of {total // 1048576} MB)"
-                              f"[/dim]")
-
-        try:
-            result = windows_kernel.install(progress=progress, force=force)
-        except windows_kernel.KernelInstallError as exc:
-            console.print(f"[red]{exc}[/red]")
-            return
+    if sub == "check":
+        console.print("[dim]Checking for a kernel update…[/dim]")
+        release = kernel.latest()
+        have = kernel.installed_version()
+        if not have:
+            return f"Latest: v{release.version}. Run /windows update to install."
+        if tuple(map(int, have.split('.'))) >= tuple(map(int, release.version.split('.'))):
+            return f"Installed v{have}; latest v{release.version}. No update needed."
+        return f"Update available: v{have} → v{release.version}. Run /windows update."
+    if sub in ("install", "update"):
+        console.print("[dim]Checking for a kernel update…[/dim]")
+        action = kernel.update if sub == "update" else kernel.install
+        result = action(progress=progress, force=bool(args))
         if result["action"] == "kept":
-            console.print(f"[green]Already on v{result['version']}.[/green] "
-                          "Use /windows install --force to reinstall.")
-            return
-        console.print(Panel(
-            f"{result['action'].title()} v{result['version']}\n"
-            f"{result['path']}\n\n"
-            "Nothing can reach your machine yet. Start it with one of:\n"
-            "  /windows start          workspace folder only\n"
-            "  /windows start read     + see every window and the screen\n"
-            "  /windows start write    + drive applications, keyboard, mouse",
-            title="Windows kernel", border_style="green"))
-        return
-
-    if sub == "start":
-        tier = (parts[2].lower() if len(parts) > 2 else "workspace")
-        if tier in ("--read", "-r"):
-            tier = "read"
-        elif tier in ("--write", "-w"):
-            tier = "write"
-        try:
-            result = windows_kernel.start(tier)
-        except windows_kernel.KernelInstallError as exc:
-            console.print(f"[red]{exc}[/red]")
-            return
-        note = {
-            "workspace": "It can see its workspace folder and nothing else.",
-            "read": "It can see every window and the screen. It changes "
-                    "nothing.",
-            "write": "It can drive applications and use your real keyboard "
-                     "and mouse.",
-        }[result["tier"]]
-        console.print(Panel(
-            f"Started in its own window.\n{note}\n\n"
-            "The first run signs in through your browser. Leave that window "
-            "open — closing it disconnects the machine, and that is also how "
-            "you revoke access in a hurry.",
-            title=f"Windows kernel · {result['tier']}",
-            border_style="yellow" if result["tier"] == "write" else "cyan"))
-        return
-
-    if sub == "stop":
-        if windows_kernel.stop():
-            console.print("[green]Stopped.[/green]")
+            return f"Already up to date (v{result['version']}). Nothing changed."
+        message = f"{result['action'].title()} Helpwo Kernel v{result['version']}."
+        if result.get("restarted"):
+            message += f" Restarted with the same {result['tier']} access; reconnecting."
+        elif result.get("restartNeeded"):
+            message += " It is stopped. Choose access with /windows start [read|write]."
         else:
-            console.print("[dim]Nothing was running.[/dim]")
-        return
+            message += " Ready to start: /windows start [read|write]."
+        if result.get("warning"):
+            message += "\n" + result["warning"]
+        return message
+    if sub in ("start", "restart"):
+        tier = (args[0].lower() if args else
+                (kernel._connected_tier() or "workspace") if sub == "restart" else "workspace")
+        tier = {"--read": "read", "-r": "read", "--write": "write", "-w": "write"}.get(tier, tier)
+        console.print("[dim]Preparing Helpwo Kernel…[/dim]")
+        result = kernel.ensure_started(tier, restart=sub == "restart", progress=progress)
+        if result["action"] == "running":
+            return f"Already connected with {tier} access."
+        return (f"Started with {tier} access in its own Windows window.\n"
+                "Finish signing in there if asked; connection is automatic. "
+                "Closing that window stops access.")
+    if sub == "stop":
+        stopped = kernel.stop()
+        windows_host.stop_host()
+        windows_tools.unregister()
+        return "Stopped. Start again with /windows start." if stopped else "Already stopped."
+    if sub == "uninstall":
+        console.print("[dim]Stopping and uninstalling Helpwo Kernel…[/dim]")
+        result = kernel.uninstall()
+        return ("Already uninstalled." if result["action"] == "absent" else
+                "Helpwo Kernel uninstalled. Your workspace files were kept. "
+                "Use /windows start to install and start again.")
+    raise kernel.KernelInstallError(f"Unknown action: {sub}. Run /windows help.")
 
-    console.print("usage: /windows [status | install [--force] | "
-                  "start [read|write] | stop]")
+
+class _KernelBrowser(resource_ui.ResourceBrowser):
+    def __init__(self, *, feedback="", **kwargs):
+        self.feedback = feedback
+        super().__init__(**kwargs)
+
+    def _pre_run(self):
+        super()._pre_run()
+        self.status = self.feedback or self.status
+
+    def _move_selection(self, delta):
+        self.status = ""
+        super()._move_selection(delta)
+
+
+def _kernel_manager() -> None:
+    """Shared full-screen UI: actions on the left, state and effects on the right."""
+    import windows_kernel as kernel
+    feedback = ""
+    selected = "start"
+    while True:
+        state = kernel.status()
+        summary = _kernel_status_text(state)
+        entries = [
+            ("start", "Start · workspace only", "Install if needed; access only the kernel workspace.", ["start"]),
+            ("read", "Start · desktop read-only", "See Windows applications and the screen; no keyboard or mouse control.", ["start", "read"]),
+            ("write", "Start · desktop control", "Control Windows applications, keyboard and mouse.", ["start", "write"]),
+            ("update", "Update" if state["installed"] else "Install", "Download only when needed. Updates restore connected access; a fresh install stays stopped.", ["update"]),
+            ("check", "Check for updates", "Show the latest version without installing anything.", ["check"]),
+        ]
+        if state["installed"]:
+            entries += [
+                ("restart", "Restart", "Restart with the connected access level; otherwise workspace only.", ["restart"]),
+                ("stop", "Stop", "Disconnect and close the kernel. Keep it installed.", ["stop"]),
+                ("uninstall", "Uninstall", "Stop and remove the kernel and its saved sign-in. Keep workspace files.", ["uninstall"]),
+            ]
+        items = [resource_ui.UIItem(
+            key=key, title=title, subtitle=description, payload=command,
+            badge="REMOVE" if key == "uninstall" else "")
+            for key, title, description, command in entries]
+        def detail(item):
+            return resource_ui.UIDetail.text(
+                item.title, summary + "\n\n" + item.subtitle + "\n\n"
+                + "Command: /windows " + " ".join(item.payload)
+                + ("\n\n" + feedback if feedback else ""))
+        label = ("Connected" if state["connected"] else "Connecting" if state["processRunning"]
+                 else "Stopped" if state["installed"] else "Not installed")
+        browser = _KernelBrowser(
+            title=f"Helpwo Kernel · {label} · {state.get('version') or '—'}",
+            feedback=feedback, load_items=lambda: items, load_detail=detail,
+            primary_action="execute", primary_label="Run", searchable=False,
+            initial_key=selected, pane_labels=("ACTIONS", "STATUS & DETAILS"),
+            actions=[resource_ui.UIAction("r", "refresh", "Refresh", allow_empty=True),
+                     resource_ui.UIAction("i", "info", "Details", lambda item:
+                                          resource_ui.UIActionResult(detail=detail(item)))],
+            refresh_interval=0)
+        outcome = browser.run()
+        if outcome.action == "cancel":
+            return
+        if outcome.action == "refresh":
+            continue
+        if outcome.action != "execute" or outcome.item is None:
+            continue
+        selected = outcome.item.key
+        command = outcome.item.payload
+        try:
+            feedback = _kernel_action(command[0], command[1:])
+        except kernel.KernelInstallError as exc:
+            feedback = str(exc)
+        console.print(Text(feedback))
+
+
+def _cmd_windows(parts: list) -> None:
+    """/windows manages the Helpwo Kernel; /kernel is an alias."""
+    import windows_kernel as kernel
+    sub = parts[1].lower() if len(parts) > 1 else ""
+    args = parts[2:]
+    usage = ("/windows — open the manager\n"
+             "/windows start [workspace|read|write] — install if needed and start\n"
+             "/windows update [--force] — update and restore connected access\n"
+             "/windows uninstall — stop and remove; keep workspace files\n"
+             "/windows restart [workspace|read|write] · stop · status · check\n"
+             "/windows install [--force] — install without starting\n"
+             "/kernel is an alias of /windows.")
+    if sub in ("help", "--help", "-h"):
+        console.print(Text(usage))
+        return
+    valid = {"", "status", "check", "install", "update", "start", "restart", "stop", "uninstall"}
+    if sub not in valid or (args and sub not in {"install", "update", "start", "restart"}):
+        console.print(Text(usage, style="yellow"))
+        return
+    if sub in {"install", "update"} and (len(args) > 1 or any(a not in {"--force", "-f"} for a in args)):
+        console.print(Text(usage, style="yellow"))
+        return
+    if sub in {"start", "restart"} and (len(args) > 1 or any(a.lower() not in {"workspace", "read", "write", "--read", "-r", "--write", "-w"} for a in args)):
+        console.print(Text(usage, style="yellow"))
+        return
+    if not winbridge.in_wsl():
+        console.print(Text("Helpwo Kernel management here requires Windows / WSL."))
+        return
+    try:
+        if not sub and sys.stdin.isatty():
+            _kernel_manager()
+        elif sub in ("", "status"):
+            console.print(Text(_kernel_status_text(kernel.status())))
+        else:
+            console.print(Text(_kernel_action(sub, args)))
+    except kernel.KernelInstallError as exc:
+        console.print(Text(f"Kernel: {exc}", style="red"))
+    except (OSError, subprocess.SubprocessError) as exc:
+        console.print(Text(f"Kernel operation failed: {exc}. Run /windows status.", style="red"))
 
 
 def _cmd_trust(parts: list) -> None:
@@ -17988,7 +18547,8 @@ def _cmd_backend(parts: list) -> None:
         console.print(Panel(
             f"Profile: {profile.name}\nKind: {profile.kind}\n"
             f"URL: {profile.base_url}\nBilling: {profile.billing_label}\n"
-            f"Sends Laintas credentials: {profile.sends_laintas_credentials}",
+            f"Sends Laintas credentials: {profile.sends_laintas_credentials}\n"
+            f"Model route: {model_route.selected_name()} (/model route)",
             title="Backend", border_style=(
                 "green" if profile.sends_laintas_credentials else "yellow"),
         ))
@@ -18030,6 +18590,376 @@ def _cmd_backend(parts: list) -> None:
         console.print(str(backend_profiles.ensure_template()))
     else:
         console.print("[yellow]Usage: /backend \\[status|list|use <name>|config][/yellow]")
+
+
+_MODEL_ROUTE_USAGE = ("Usage: /model route \\[<route> \\[model] \\[window]|list], "
+                      "/model add \\[provider] \\[key|$VAR] \\[model] \\[name], /model remove <route>  "
+                      f"— '{model_route.DEFAULT_ROUTE}' (default) = the backend serves the model")
+
+
+def _model_route_row(route) -> str:
+    return (f"{route.spec.label} {symbols.BULLET} {route.model or '(no model)'} "
+            f"{symbols.BULLET} {route.base_url} {symbols.BULLET} key {model_route.key_preview(route)}")
+
+
+def _leave_direct_route() -> None:
+    """Choosing a backend model means the backend serves the chat again."""
+    if model_route.selected_name() == model_route.DEFAULT_ROUTE:
+        return
+    if os.environ.get(model_route.ENV_OVERRIDE):
+        console.print(
+            f"[yellow]{model_route.ENV_OVERRIDE} still routes chat to "
+            f"{escape(model_route.selected_name())}; unset it to use this model.[/yellow]")
+        return
+    model_route.select(model_route.DEFAULT_ROUTE)
+    console.print(f"[dim]Model route: back to {model_route.DEFAULT_ROUTE} "
+                  "(the backend serves the model).[/dim]")
+
+
+def _cmd_model_route(args: list) -> None:
+    """/model route|add|remove — who serves the chat model (see model_route.py)."""
+    sub = args[0] if args else ""
+    active = model_route.selected_name()
+
+    if sub in ("", "status") and not (sub == "" and sys.stdin.isatty()):
+        route, note = model_route.resolve()
+        if route is None and not note:
+            console.print(f"Model route: [bold]{model_route.DEFAULT_ROUTE}[/bold] "
+                          f"[dim]— served by backend {get_backend_profile().base_url}[/dim]")
+        elif route is not None:
+            console.print(Panel(
+                f"Route: {route.name}\nProvider: {route.spec.label}\nModel: {route.model}\n"
+                f"URL: {route.base_url}\nKey: {model_route.key_preview(route)}\n"
+                f"Context window: {f'{route.context_window:,}' if route.context_window else 'unknown (/config budget assumed_window)'}\n"
+                f"Thinking: {get_runtime_config('reasoning_effort')}"
+                f"{' (not accepted by this model)' if route.reasoning_unsupported else ''}\n"
+                "Billing: your provider account — not metered by Laintas\n"
+                f"Other services (search, OCR, images…): backend {get_backend_profile().base_url}",
+                title="Model route (direct)", border_style="yellow"))
+        else:
+            console.print(f"[red]{escape(note)}[/red]")
+        return
+
+    if sub == "list":
+        marker = "*" if active == model_route.DEFAULT_ROUTE else " "
+        console.print(f"{marker} [bold]{model_route.DEFAULT_ROUTE}[/bold] [dim]served by the backend[/dim]")
+        for route in model_route.list_routes():
+            marker = "*" if route.name == active else " "
+            blocked = model_route.policy_refusal(route)
+            console.print(f"{marker} [bold]{route.name}[/bold] {escape(_model_route_row(route))}"
+                          + (f" [red]({escape(blocked)})[/red]" if blocked else ""))
+        return
+
+    if sub == "help":
+        console.print(f"[dim]{_MODEL_ROUTE_USAGE}[/dim]")
+        return
+
+    if sub == "add":
+        _model_route_add(args[1:])
+        return
+
+    if sub == "remove":
+        name = args[1] if len(args) > 1 else ""
+        if not name:
+            console.print("[yellow]Usage: /model remove <route>[/yellow]")
+        elif model_route.remove_route(name):
+            console.print(f"[green]Removed model route {name} and its stored key.[/green]")
+        else:
+            console.print(f"[red]Unknown model route: {escape(name)}[/red]")
+        return
+
+    if os.environ.get(model_route.ENV_OVERRIDE):
+        console.print(f"[red]{model_route.ENV_OVERRIDE} currently overrides the selection; unset it first.[/red]")
+        return
+
+    name = sub
+    if not name:
+        routes = {r.name: r for r in model_route.list_routes()}
+        names = [model_route.DEFAULT_ROUTE, *routes]
+        name = choose_record(
+            names, title="Model Route",
+            label=lambda n: f"{symbols.DOT if n == active else symbols.DOT_OPEN} {n}",
+            description=lambda n: (_model_route_row(routes[n]) if n in routes
+                                   else "served by the backend (default)"),
+            selected_index=names.index(active) if active in names else 0,
+        ) or ""
+        if not name:
+            console.print(f"[dim]Unchanged: {active}. /model route {model_route.DEFAULT_ROUTE} "
+                          "returns to the backend.[/dim]")
+            return
+    _use_model_route(name, args[1:])
+
+
+def _use_model_route(name: str, extra: Optional[list] = None) -> bool:
+    """Make *name* the model route of this terminal; False (and why) if it cannot be."""
+    if os.environ.get(model_route.ENV_OVERRIDE):
+        console.print(f"[red]{model_route.ENV_OVERRIDE} currently overrides the selection; unset it first.[/red]")
+        return False
+    if name == model_route.DEFAULT_ROUTE:
+        model_route.select(name)
+        console.print(f"[green]Model route: {name} — the backend serves the model.[/green]")
+        return True
+
+    route = model_route.get_route(name)
+    if route is None:
+        console.print(f"[red]Unknown model route: {escape(name)}[/red] [dim](/model add)[/dim]")
+        return False
+    refusal = model_route.policy_refusal(route)
+    if refusal:
+        console.print(f"[red]Cannot use {escape(name)}: {escape(refusal)}[/red]")
+        return False
+    extra = list(extra or [])
+    window = int(extra.pop()) if extra and extra[-1].isdigit() else 0
+    if extra or window:
+        model_route.set_route_model(name, extra[0] if extra else "", window)
+        route = model_route.get_route(name)
+    model_route.select(name)
+    console.print(f"[green]Model route: {name} — {escape(route.model)} via {escape(route.base_url)}[/green]")
+    console.print(f"[dim]Context window: "
+                  + (f"{route.context_window:,} tokens" if route.context_window else
+                     f"unknown — budgeting with /config budget assumed_window; "
+                     f"set it with /model route {name} {route.model} <tokens>")
+                  + f". Thinking: /config reasoning_effort"
+                  + (" (not accepted by this model)" if route.reasoning_unsupported else "")
+                  + "[/dim]")
+    console.print("[dim]Chat goes directly to this provider with your key; Laintas does not "
+                  "meter it. Search, OCR and images still use the backend.[/dim]")
+    return True
+
+
+_MODEL_ADD_USAGE = ("/model add [provider] [key|$VAR] [model] [name]   "
+                    "(custom: /model add custom <base-url> <key|$VAR> [model] [name])")
+
+
+def _model_add_positions(words: list) -> list[tuple[str, str]]:
+    """The argument slots of `/model add`, given the words after `add`.
+
+    One table for the parser, the Tab completion and the status-bar hint, so
+    what the bar says is always what the parser expects next.
+    """
+    slots = [("provider", ", ".join(model_route.PRESETS))]
+    if words and words[0].casefold() == "custom":
+        slots.append(("base-url", "the provider's OpenAI-compatible base URL, e.g. https://host/v1"))
+    slots += [
+        ("key", "your API key, or $VAR to read it from an environment variable "
+                "(a typed key stays out of the history file)"),
+        ("model", "model id — omit it to choose from the provider's own list"),
+        ("name", "route name — omit it to use the provider name"),
+    ]
+    return slots
+
+
+_MODEL_ADD_CATALOGS: dict = {}
+
+
+def _model_add_catalog(base_url: str, key: str) -> tuple[list, str]:
+    """The provider's model ids for the completion menu, cached per key."""
+    cache_key = (base_url, hashlib.sha256(key.encode()).hexdigest())
+    hit = _MODEL_ADD_CATALOGS.get(cache_key)
+    if hit and time.time() - hit[0] < 300:
+        return hit[1], hit[2]
+    try:
+        models, error = sorted(model_route.fetch_catalog(base_url, key, timeout=6.0)), ""
+    except Exception as exc:
+        models, error = [], str(exc)[:120]
+    _MODEL_ADD_CATALOGS[cache_key] = (time.time(), models, error)
+    return models, error
+
+
+def _model_add_arg_candidates(fragment: str, prior: list) -> list[tuple[str, str]]:
+    """Completion rows for the argument being typed after `/model add`.
+
+    A row shown as `<slot>` is a hint, not a value: it inserts nothing and
+    says what goes here. Every position carries one, so the user always sees
+    what the command expects next without knowing its grammar.
+    """
+    after = prior[1:]
+    slots = _model_add_positions(after)
+    if len(after) >= len(slots):
+        return [("<Enter>", "all set — press Enter to add")] if not fragment else []
+    slot, description = slots[len(after)]
+    if slot == "provider":
+        # The choices say it themselves; a hint row here was one more
+        # "provider" to pick that picked nothing.
+        return [(name, f"{spec.label} {symbols.BULLET} {spec.base_url or 'your own OpenAI-compatible URL'}")
+                for name, spec in model_route.PRESETS.items()]
+    rows = [(f"<{slot}>", description)]
+    if slot == "base-url":
+        rows.append(("https://", "start the URL"))
+    elif slot == "key":
+        rows += _model_key_env_candidates()
+        rows.append(("$", "an environment variable holding the key"))
+    elif slot == "model":
+        preset = after[0].casefold()
+        spec = model_route.PRESETS.get(preset)
+        key = after[-1]
+        if key.startswith("$"):
+            key = os.environ.get(key[1:], "").strip()
+        try:
+            base_url = model_route.normalize_url(
+                after[1] if preset == "custom" else (spec.base_url if spec else ""))
+        except ValueError as exc:
+            return rows + [("<error>", str(exc))]
+        if key and base_url:
+            models, error = _model_add_catalog(base_url, key)
+            if error:
+                rows.append(("<error>", f"key check failed: {error}"))
+            rows += [(model, "from the provider's list") for model in models]
+    elif slot == "name":
+        rows.append((after[0].casefold(), "the provider name (default)"))
+    return rows
+
+
+def _model_add_step(step: int, total: int, text: str) -> None:
+    console.print(f"[bold]Step {step}/{total}[/bold] {text}")
+
+
+def _model_route_add(args: list) -> None:
+    """/model add — save a provider key (and a default model) as a route.
+
+    Every missing argument is asked for in a terminal, with a line saying what
+    it is; outside one, the usage names what is still missing.
+    """
+    import getpass
+    interactive = sys.stdin.isatty()
+    words = list(args)
+    total = 4
+
+    # 1. provider
+    preset = words.pop(0).casefold() if words else ""
+    if preset and preset not in model_route.PRESETS:
+        console.print(f"[red]Unknown provider: {escape(preset)}.[/red] "
+                      f"[dim]Choose one of: {', '.join(model_route.PRESETS)}[/dim]")
+        return
+    if not preset:
+        if not interactive:
+            console.print(f"[yellow]Usage: {escape(_MODEL_ADD_USAGE)}[/yellow]")
+            return
+        console.print("[dim]Add your own model provider: the chat then goes straight to it "
+                      "with your key (Laintas does not meter it). Esc in a list, or Ctrl+C, cancels.[/dim]")
+        _model_add_step(1, total, "Provider — pick who serves the model. "
+                        "Custom = any OpenAI-compatible endpoint.")
+        presets = list(model_route.PRESETS.items())
+        picked = choose_record(presets, title="Step 1/4 · Provider — who serves the model "
+                               "(Custom = any OpenAI-compatible URL)", label=lambda p: p[1].label,
+                               description=lambda p: p[1].base_url or "any OpenAI-compatible URL")
+        if not picked:
+            console.print("[dim]Cancelled; nothing saved.[/dim]")
+            return
+        preset = picked[0]
+    spec = model_route.PRESETS[preset]
+    console.print(f"[dim]Provider: {escape(spec.label)}[/dim]")
+
+    try:
+        # 1b. base URL (custom only)
+        base_url = spec.base_url
+        if preset == "custom":
+            base_url = words.pop(0) if words else ""
+            if not base_url:
+                if not interactive:
+                    console.print("[yellow]Usage: /model add custom <base-url> <key|$VAR> [model] [name][/yellow]")
+                    return
+                console.print("[dim]  The URL that ends before /chat/completions, e.g. "
+                              "https://api.example.com/v1[/dim]")
+                base_url = input("  Base URL: ").strip()
+        base_url = model_route.normalize_url(base_url)
+
+        # 2. key
+        key = words.pop(0) if words else ""
+        if not key:
+            if not interactive:
+                console.print(f"[yellow]Missing the key. Usage: {escape(_MODEL_ADD_USAGE)}[/yellow]")
+                return
+            _model_add_step(2, total, "API key — paste it (hidden), or type $VAR to read "
+                            "it from an environment variable instead of storing it. "
+                            "Empty Enter cancels.")
+            key = getpass.getpass("  API key: ").strip()
+    except (EOFError, KeyboardInterrupt, ValueError) as exc:
+        console.print(f"[red]{escape(str(exc)) or 'Cancelled; nothing saved.'}[/red]")
+        return
+    key_env = key[1:] if key.startswith("$") else ""
+    probe_key = os.environ.get(key_env, "").strip() if key_env else key
+    if not probe_key:
+        console.print(f"[red]{'$' + escape(key_env) + ' is empty or unset' if key_env else 'No key given'}; "
+                      "nothing saved.[/red]")
+        return
+
+    # 3. model — checking the key and listing the models is one request
+    model = words.pop(0) if words else ""
+    console.print(f"[dim]Checking the key with {escape(base_url)}/models …[/dim]")
+    try:
+        catalog = model_route.fetch_catalog(base_url, probe_key)
+    except Exception as exc:
+        console.print(f"[red]Key check failed: {escape(str(exc))}. Nothing saved.[/red]")
+        return
+    console.print(f"[green]Key works[/green] [dim]— {len(catalog)} model(s) listed.[/dim]")
+    if model:
+        if catalog and model not in catalog:
+            console.print(f"[yellow]{escape(model)} is not in the provider's list; saving it "
+                          "anyway (some providers list only part of what they serve).[/yellow]")
+    elif not interactive:
+        sample = ", ".join(sorted(catalog)[:8]) or "(the provider listed none)"
+        console.print(f"[yellow]Missing the model. Available: {escape(sample)}. "
+                      "Run again with the model id after the key.[/yellow]")
+        return
+    else:
+        _model_add_step(3, total, "Model — the one this route calls. Type to search. "
+                        "You can change it later with /model route <name> <model>.")
+        models = sorted(catalog)
+        if models:
+            model = choose_record(models, title="Step 3/4 · Model — type to search; change "
+                                  "it later with /model route <name> <model>",
+                                  label=lambda m: m, search=True) or ""
+        else:
+            try:
+                model = input("  The provider listed no models; model id: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                model = ""
+        if not model:
+            console.print("[dim]Cancelled; nothing saved.[/dim]")
+            return
+
+    # 4. name
+    name = words.pop(0) if words else ""
+    if not name:
+        name = preset
+        if interactive:
+            _model_add_step(4, total, "Route name — how /model lists it. Enter keeps "
+                            f"'{preset}'.")
+            try:
+                name = input(f"  Name [{preset}]: ").strip() or preset
+            except (EOFError, KeyboardInterrupt):
+                console.print("[dim]Cancelled; nothing saved.[/dim]")
+                return
+    if words:
+        console.print(f"[yellow]Unexpected extra arguments. Usage: {escape(_MODEL_ADD_USAGE)}[/yellow]")
+        return
+    replacing = model_route.get_route(name) is not None
+    try:
+        route = model_route.save_route(name, preset, base_url, model,
+                                       key="" if key_env else key, key_env=key_env,
+                                       windows=catalog)
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        return
+    console.print(f"[green]{'Replaced' if replacing else 'Saved'} model route "
+                  f"[bold]{route.name}[/bold]: {escape(route.model)} via {escape(route.base_url)}.[/green]")
+    refusal = model_route.policy_refusal(route)
+    if refusal:
+        console.print(f"[yellow]Note: {escape(refusal)} — it cannot be selected here.[/yellow]")
+        return
+    if interactive and model_route.selected_name() != route.name:
+        choice = choose_record(
+            ["now", "later"], title=f"Use {route.name} now?",
+            label=lambda c: ("Use it now" if c == "now" else "Not now"),
+            description=lambda c: ("the chat goes to this provider from the next message"
+                                   if c == "now" else "keep the current model"))
+        if choice == "now":
+            _use_model_route(route.name)
+            return
+    console.print(f"[dim]Switch to it any time: /model (it is listed at the bottom) "
+                  f"or /model route {route.name}. Back to Laintas: /model route "
+                  f"{model_route.DEFAULT_ROUTE}.[/dim]")
 
 
 def _cmd_hooks(parts: list) -> None:
@@ -21324,6 +22254,15 @@ def _open_agents_view(session: dict, agent_registry=None,
 
     def _closed() -> None:
         _exit_agents_view()
+        # A title-bar button (resume / model) asked for slash commands on the
+        # SELECTED agent: hand them to the REPL now that the screen is back in
+        # the main loop's hands, in order (/agent <id>, the picker, then
+        # /agents <id> to come back).
+        pending = getattr(controller, "pending_commands", None)
+        if isinstance(pending, list) and pending:
+            controller.pending_commands = []
+            for command in pending:
+                _inject_input(str(command), threading.Event())
         if on_close is not None:
             try:
                 on_close()
@@ -21370,6 +22309,18 @@ def _open_agents_view(session: dict, agent_registry=None,
             repl_submit_cb=_agents_repl_submit,
             terminal_label=_terminal_display_name,
             mirror=repl_mirror.hub)
+
+        # Whether each Agent's model is actually offered: one model-list
+        # fetch in the background; the view shows "checking…" until then.
+        def _probe_models():
+            try:
+                models, _endpoint = fetch_available_models(session)
+            except Exception:
+                models = None
+            controller.set_available_models(models)
+        controller.begin_model_probe()
+        threading.Thread(target=_probe_models, daemon=True,
+                         name="agents-model-probe").start()
 
         # The view is only a display + router: it runs in its own thread
         # while the main thread stays where it was — back in the REPL loop
@@ -21974,8 +22925,7 @@ def _disconnect_from_helpwo(agent_registry: AgentRegistry) -> None:
         console.print(f"[yellow]Sub-terminal [bold]{name}[/bold] withdrawn from Helpwo.[/yellow]")
 
 
-_HELPWO_USAGE = (r"[dim]Usage: /helpwo \[--port N] \[--host ADDR] \[--dist <path>] "
-                 r"\[--remote] | stop[/dim]")
+_HELPWO_USAGE = r"[dim]Usage: /helpwo \[stop][/dim]"
 
 # The application this process hosts, when it is an app sub-terminal
 # (--app). Empty in every ordinary CLI.
@@ -21996,224 +22946,67 @@ def _hosts_helpwo_here() -> bool:
 
 
 def _parse_helpwo_flags(parts: list) -> Optional[dict]:
-    """/helpwo flags → options, or None after saying what was wrong."""
-    import helpwo_server
+    """/helpwo flags → options, or None after saying what was wrong.
 
-    opts = {"port": None, "dist": None, "remote": False, "host": "127.0.0.1"}
-    args = parts[1:]
-    i = 0
-    while i < len(args):
-        arg = args[i]
-        if arg == "--port":
-            if i + 1 >= len(args):
-                console.print("[red]--port requires a value.[/red]")
-                console.print(_HELPWO_USAGE)
-                return None
-            try:
-                port = int(args[i + 1])
-            except ValueError:
-                console.print(f"[red]Invalid port: {escape(args[i + 1])}[/red]")
-                return None
-            if port < 1 or port > 65535:
-                console.print(f"[red]Port must be 1-65535, got {port}[/red]")
-                return None
-            opts["port"] = port
-            i += 2
-        elif arg == "--dist":
-            if i + 1 >= len(args):
-                console.print("[red]--dist requires a path.[/red]")
-                console.print(_HELPWO_USAGE)
-                return None
-            opts["dist"] = args[i + 1]
-            i += 2
-        elif arg == "--host":
-            if i + 1 >= len(args):
-                console.print("[red]--host requires an address.[/red]")
-                return None
-            # Loopback only, and not as caution — as correctness. A browser
-            # withholds Web Crypto, Service Workers, File System Access and the
-            # clipboard outside a secure context, and plain HTTP on a routable
-            # address is not one, so the terminal, the AI and the browser
-            # runtime fail there rather than merely losing features. Loopback
-            # IS a secure context. The two ways to reach this from elsewhere
-            # keep that property instead of fighting it.
-            if args[i + 1] not in helpwo_server.LOOPBACK_HOSTS:
-                port = opts["port"] or helpwo_server.DEFAULT_PORT
-                console.print(
-                    f"[red]--host must be loopback "
-                    f"({', '.join(helpwo_server.LOOPBACK_HOSTS)}).[/red]")
-                console.print(
-                    "[dim]Serving this on a routable address over plain HTTP is not a "
-                    "secure context, so the browser hides Web Crypto and the terminal, "
-                    "the AI and the browser runtime stop working.[/dim]")
-                console.print("[dim]From another machine, either:[/dim]")
-                console.print(
-                    f"[dim]  ssh -N -L {port}:127.0.0.1:{port} <user>@<this-host>   "
-                    f"# then open http://127.0.0.1:{port}/[/dim]")
-                console.print(
-                    "[dim]  /helpwo --remote                                  "
-                    "# share this environment peer-to-peer instead[/dim]")
-                return None
-            opts["host"] = args[i + 1]
-            i += 2
-        elif arg == "--remote":
-            opts["remote"] = True
-            i += 1
-        elif arg.startswith("--"):
-            console.print(f"[red]Unknown option: {escape(arg)}[/red]")
-            console.print(_HELPWO_USAGE)
+    laintas_cli no longer serves Helpwo itself or registers with it: Helpwo
+    reaches this machine through its Helpwo kernel, and /helpwo shares a
+    session through that kernel. The local-server flags are refused with the
+    reason rather than as unknown, since people have them in muscle memory;
+    `--remote` is what /helpwo now always does, so it is accepted and ignored.
+    """
+    opts = {"remote": True}
+    for arg in parts[1:]:
+        if arg == "--remote":
+            continue
+        if arg in ("--port", "--host", "--dist"):
+            console.print(
+                f"[yellow]{escape(arg)} is gone: laintas_cli no longer serves "
+                f"Helpwo locally. Helpwo reaches this machine through its Helpwo "
+                f"kernel, and /helpwo shares a session through it.[/yellow]")
             return None
+        if arg.startswith("--"):
+            console.print(f"[red]Unknown option: {escape(arg)}[/red]")
         else:
             # Refused rather than ignored: "/helpwo stpo" used to start the
             # gateway it was meant to stop.
             console.print(f"[red]Unexpected argument: {escape(arg)}[/red]")
-            console.print(_HELPWO_USAGE)
-            return None
+        console.print(_HELPWO_USAGE)
+        return None
     return opts
 
 
 def _helpwo_start_in_process(opts: dict, agent_registry: AgentRegistry,
                              session: dict, *, state: Optional[dict] = None,
                              state_dir=None, open_browser: bool = True) -> dict:
-    """Serve Helpwo from THIS process. Returns a runtime record.
+    """Share THIS session with Helpwo through the machine's Helpwo kernel.
 
-    This is what runs inside the Helpwo sub-terminal. With ``state`` (from
-    app_host) the token, port and agent ids are the persisted ones, so the
-    browser's cookie, origin and stored conversations all carry over.
+    This is what runs inside the Helpwo sub-terminal. The kernel registers
+    the session with its own sign-in and relays Helpwo's messages; the
+    session appears in Helpwo's terminal list under this machine. With
+    ``state`` (from app_host) the session asks for the agent id it had last
+    time, so Helpwo's tabs and conversations for it carry over.
 
     Record: {"status": "ready"|"error", "mode", "url", "open_url", "message"}.
     """
-    import helpwo_server
-
-    if helpwo_server.is_running():
-        url = helpwo_server.get_url()
-        console.print(f"[dim]Helpwo gateway already running at "
-                      f"{helpwo_server.get_url(with_token=True)}[/dim]")
-        console.print(f"[dim]Open {url} in your browser, or /helpwo stop to stop.[/dim]")
-        return {"status": "ready", "mode": "local", "url": url,
-                "open_url": helpwo_server.get_url(with_token=True),
-                "message": "already running"}
-
-    remote = bool(opts.get("remote"))
-    dist_path = None
-    if not remote:
-        if opts.get("dist"):
-            from pathlib import Path
-            p = Path(opts["dist"]).expanduser()
-            if not p.is_dir() or not (p / "index.html").is_file():
-                console.print(f"[red]Invalid dist directory: {p}[/red]")
-                console.print("[dim]The directory must contain index.html.[/dim]")
-                return {"status": "error", "message": f"invalid dist directory: {p}"}
-            dist_path = p.resolve()
-        else:
-            dist_path = helpwo_server._find_dist()
-            if dist_path is None:
-                # No local build available — fall back to the hosted web
-                # app instead of a bare error, so /helpwo always gets you
-                # to a working Helpwo one way or another.
-                remote = True
-
-    # --remote is "expose this environment where I am right now" — every call
-    # re-shares the CURRENT cwd as the environment's workspace, not just the
-    # first one. cd elsewhere and re-run /helpwo --remote and the environment
-    # follows you there.
-    #
-    # Local mode has no such standing "where am I" question — it only shares
-    # automatically the first time (nothing shared yet); once a workspace has
-    # been established (a prior /helpwo --remote), local mode leaves it alone
-    # rather than silently overwriting it.
-    _auto_workspace = (
-        os.getcwd() if remote
-        else (None if agent_registry.workspace_path else os.getcwd())
-    )
-
-    if remote:
-        url = _helpwo_web_app_url()
-        if url is None:
-            message = ("No hosted Helpwo web app for the current backend "
-                       f"({get_backend_profile().base_url}). Set LAINTAS_HELPWO_DIST "
-                       "or use --dist to point at a local build instead.")
-            console.print(f"[red]{message}[/red]")
-            return {"status": "error", "message": message}
-        # Helpwo keys this environment's tabs and conversations by agent id;
-        # the gateway revives a previous id when asked, so ask for ours.
-        if state and state.get("persistent") and not agent_registry.agent_id:
-            agent_registry._last_agent_id = str(state.get("remote_agent_id") or "")
-        # Best-effort link: a failed handshake (not logged in, backend
-        # unreachable) shouldn't block opening the web app itself — same
-        # graceful-degradation as local mode, which starts the server either
-        # way and only warns that no agent is registered.
-        linked = connect_terminal_to_helpwo(agent_registry, session, quiet=False,
-                                            workspace=_auto_workspace)
-        if linked and state_dir is not None and state and state.get("persistent"):
-            app_host.update_state(state_dir, remote_agent_id=agent_registry.agent_id or "")
-        if open_browser:
-            console.print(f"[dim]Opening {url}[/dim]")
-            try:
-                _open_external_url(url)
-            except Exception:
-                pass
-        return {"status": "ready", "mode": "remote", "url": url, "open_url": url,
-                "linked": bool(linked),
-                "message": ("environment linked" if linked else
-                            "web app available, but this environment is not linked "
-                            "(log in with /login inside the sub-terminal)")}
-
-    persisted_port = (state or {}).get("port")
-    port = opts.get("port") or persisted_port or helpwo_server.DEFAULT_PORT
-    start_kwargs = dict(dist_dir=dist_path, session=session, host=opts.get("host") or "127.0.0.1")
-    if state:
-        start_kwargs["token"] = state.get("token") or None
-        start_kwargs["agent_id"] = state.get("local_agent_id") or None
-    ok, msg = helpwo_server.start_server(agent_registry, port=port, **start_kwargs)
-    if not ok and state and not opts.get("port") and not persisted_port:
-        # First launch for this folder and the default port is taken: take
-        # any free one. It is remembered below, so the browser origin — and
-        # with it everything Helpwo stored — stays the same from now on.
-        ok, msg = helpwo_server.start_server(agent_registry, port=0, **start_kwargs)
-    if not ok:
-        if persisted_port and not opts.get("port"):
-            msg += (f" — this folder's Helpwo always uses port {persisted_port} so its "
-                    f"browser data stays reachable; free it, or pass --port N to move "
-                    f"(data stored under the old port stays with the old port)")
-        console.print(f"[red]{msg}[/red]")
-        return {"status": "error", "message": msg}
-
-    bound_port = helpwo_server._server_port()
-    if state_dir is not None and state and state.get("persistent"):
-        app_host.update_state(state_dir, port=bound_port)
-
-    # The token rides in the URL on the first visit only; after that the
-    # browser's cookie carries it. Same shape as Jupyter.
-    url = helpwo_server.get_url(with_token=True)
-    console.print(f"[green bold]Helpwo gateway started[/green bold]")
-    console.print(f"  URL: [cyan]{url}[/cyan]")
-    console.print(f"  Dist: [dim]{helpwo_server._dist_dir()}[/dim]")
-
-    # Loopback-only by construction, so there is no insecure-origin case left
-    # to warn about — only the question of how to reach it from elsewhere.
-    console.print(f"  [dim]Remote machine? Forward the port from your own computer:[/dim]")
-    console.print(f"  [dim]  ssh -N -L {bound_port}:127.0.0.1:{bound_port} <user>@<this-host>[/dim]")
-    console.print(
-        f"  [dim]then open the URL above — loopback is a secure context, so every "
-        f"browser feature keeps working. To share the environment itself instead, "
-        f"use /helpwo --remote.[/dim]")
-
-    console.print("  Runtime: [dim]local loopback (offline-capable)[/dim]")
-    if agent_registry and agent_registry.agent_id:
-        console.print(f"  Cloud link: [dim]{agent_registry.agent_name} ({agent_registry.agent_id})[/dim]")
-    else:
-        console.print("  Cloud link: [dim]off — use /helpwo --remote to expose this environment to the hosted app[/dim]")
-
-    console.print("[dim]  /helpwo stop to stop the gateway and go offline.[/dim]")
-
-    if open_browser:
+    url = _helpwo_web_app_url()
+    if state and state.get("persistent") and not agent_registry.agent_id:
+        agent_registry._last_agent_id = str(state.get("remote_agent_id") or "")
+    linked = connect_terminal_to_helpwo(agent_registry, session, quiet=False)
+    if linked and state_dir is not None and state and state.get("persistent"):
+        app_host.update_state(state_dir, remote_agent_id=agent_registry.agent_id or "")
+    if not linked:
+        return {"status": "error", "mode": "kernel", "url": url, "open_url": url,
+                "linked": False,
+                "message": "not shared: this machine's Helpwo kernel is not "
+                           "connected, or refused (see the sub-terminal)"}
+    if open_browser and url:
+        console.print(f"[dim]Opening {url}[/dim]")
         try:
             _open_external_url(url)
         except Exception:
             pass
-    return {"status": "ready", "mode": "local", "url": helpwo_server.get_url(),
-            "open_url": url, "port": bound_port, "message": msg}
+    return {"status": "ready", "mode": "kernel", "url": url, "open_url": url,
+            "linked": True, "message": "shared through the Helpwo kernel"}
 
 
 def _can_open_graphical_browser() -> bool:
@@ -22784,25 +23577,19 @@ def _app_session_start_in_process(name: str, options: dict,
 
 def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
                 session: dict) -> None:
-    """Run Helpwo in its own sub-terminal, with its own agent.
+    """Share a session with Helpwo through this machine's Helpwo kernel.
 
-    /helpwo              - local dist if found, else the hosted web app
-    /helpwo --port 8080  - start the local server on a custom port
-    /helpwo --dist <p>   - use a custom local dist directory
-    /helpwo --remote     - skip the local server; open the hosted web app
-    /helpwo stop         - close the Helpwo sub-terminal (and, inside a
-                           sub-terminal, stop the gateway / withdraw the
-                           environment served from there)
+    /helpwo       - share (from the main terminal: in the Helpwo sub-terminal)
+    /helpwo stop  - stop sharing / close the Helpwo sub-terminal
 
     From the main terminal this creates the sub-terminal ``helpwo``: a nested
     CLI whose agent serves only Helpwo, so Helpwo's conversation is never this
-    terminal's. Its folder is Helpwo's workspace, and what Helpwo keys its data
-    by — login token, port (the browser origin), agent id, the agent's own
-    conversation — is kept per folder, so a restart picks up where it was.
+    terminal's. The agent id it had is kept per folder, so a restart comes
+    back as the same session in Helpwo.
 
-    Inside a sub-terminal (including that one) it serves Helpwo in place, as
-    before: local mode is loopback and offline-capable; ``--remote``
-    registers with the hosted app.
+    laintas_cli never talks to Helpwo itself: the kernel registers the
+    session and relays it (kernel/clirelay.py in the kernel repository).
+    Inside a sub-terminal, /helpwo shares that sub-terminal in place.
     """
     import helpwo_server
 
@@ -25316,7 +26103,7 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
     elif action == "/mode":
         return _cmd_mode(raw_args, parts)
 
-    elif action == "/windows":
+    elif action in ("/windows", "/kernel"):
         _cmd_windows(parts)
 
     elif action == "/trust":
@@ -25532,6 +26319,10 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict,
             # Vault errors must not reach the generic debug record, which
             # stores raw command text and exception strings.
             console.print("[red]Password vault unavailable. No diagnostic contents were recorded.[/red]")
+            return False
+        if _carries_model_key(cmd):
+            console.print(f"[red]/model add failed ({escape(type(exc).__name__)}); "
+                          "the command line was not recorded because it holds a key.[/red]")
             return False
         try:
             action = (cmd or "").strip().split(maxsplit=1)[0]
@@ -27860,7 +28651,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="Laintas CLI — Autonomous AI agent")
     parser.add_argument("--version", "-V", action="version",
-                        version=f"laintas-cli {__version__}")
+                        version=RELEASE_NAME)
     parser.add_argument("--name", type=str, help="Set agent name (shows in Helpwo AGNETS)")
     parser.add_argument(
         "--backend", type=str,
@@ -28203,15 +28994,16 @@ def main():
                     action="" if _checkout else "/v update", level="good")
         except Exception:
             pass
-    # Wait for a Windows kernel, if this is the Windows build. The kernel
-    # dials us; `win.*` tools appear when it arrives and disappear when it
-    # goes, so a machine without one has exactly the tool surface it had
-    # before. Never blocks startup and never raises.
-    try:
-        import windows_host as _windows_host
-        _windows_host.start_host()
-    except Exception:
-        pass
+    # Wait for this machine's Helpwo kernel. The kernel dials us; through
+    # it this session can be shared with Helpwo (/helpwo), and on the Windows
+    # build `win.*` tools appear when it arrives and disappear when it goes.
+    # Never blocks startup and never raises.
+    if sys.platform != "darwin":
+        try:
+            import windows_host as _windows_host
+            _windows_host.start_host(primary=args.depth == 0)
+        except Exception:
+            pass
 
     # Say once, on the Windows build, that the machine is reachable and how.
     # Not a background download: 63 MB and an installer are a decision, and
@@ -28227,8 +29019,8 @@ def main():
                         "This CLI can drive Windows itself",
                         "Reading windows, clicking buttons and taking "
                         "screenshots need a small helper on the Windows "
-                        "side. Install it with /windows install.",
-                        action="/windows install", level="info")
+                        "side. Open /windows to choose access and get started.",
+                        action="/windows", level="info")
         except Exception:
             pass
 
@@ -28402,18 +29194,18 @@ def main():
         elif args.connect:
             # --connect (any depth; used by Helpwo's term-new for sub-terminals).
             connect_terminal_to_helpwo(agent_registry, session)
-        elif args.depth == 0:
+        elif args.depth == 0 and sys.platform != "darwin":
             # Two-end handshake: NO auto-link. The primary CLI goes online in
             # Helpwo only when the user runs /helpwo here.
             startup_mail.post(
                 "helpwo", "Not connected to Helpwo",
-                "Expose this CLI (its shell and this folder) as a runtime "
-                "environment there.",
+                "Share a session with Helpwo through this machine's Helpwo "
+                "kernel.",
                 action="/helpwo")
         else:
             startup_mail.post(
                 "helpwo", "This sub-terminal isn't linked to Helpwo yet.",
-                action="/helpwo --remote")
+                action="/helpwo")
 
     # PTY session managed at REPL level (must be before shutdown for nonlocal)
     interactive_session = None

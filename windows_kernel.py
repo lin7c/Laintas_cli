@@ -45,7 +45,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
+import tempfile
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -108,6 +111,13 @@ class Release:
 # -- what is on the machine ---------------------------------------------
 
 def install_dir() -> Optional[Path]:
+    # The official installer lets the user move the application. Its registry
+    # entry is authoritative; assuming LOCALAPPDATA hides those installations
+    # from update/uninstall and can leave a second copy behind.
+    if winbridge.in_wsl():
+        registered = winbridge.registered_kernel_dir()
+        if registered is not None:
+            return registered
     base = winbridge.localappdata()
     return (base / INSTALL_DIRNAME) if base else None
 
@@ -131,6 +141,8 @@ def installed_version() -> Optional[str]:
                               timeout=30, cwd="/")
     except (OSError, subprocess.SubprocessError):
         return None
+    if done.returncode != 0:
+        return None
     text = winbridge.decode(done.stdout or done.stderr or b"").strip()
     match = re.search(r"\d+\.\d+\.\d+", text)
     return match.group(0) if match else None
@@ -148,9 +160,13 @@ def latest() -> Release:
     except (urllib.error.URLError, ValueError, OSError) as exc:
         raise KernelInstallError(
             f"could not reach {url}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise KernelInstallError("the published listing must be an object")
     asset = str(payload.get("asset") or "")
     digest = str(payload.get("sha256") or "").lower()
     version = str(payload.get("version") or "")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise KernelInstallError("the published listing carries no usable version")
     # The asset name becomes part of a URL and a filename on disk. It comes
     # from the network, so it is validated rather than trusted — a name with
     # a path separator in it would write outside the download directory.
@@ -190,9 +206,11 @@ def _download(release: Release, into: Path,
                     handle.write(chunk)
                     if progress:
                         progress(written, total)
-    except (urllib.error.URLError, OSError) as exc:
+    except BaseException as exc:
         partial.unlink(missing_ok=True)
-        raise KernelInstallError(f"the download failed: {exc}") from exc
+        if isinstance(exc, (urllib.error.URLError, OSError)):
+            raise KernelInstallError(f"the download failed: {exc}") from exc
+        raise
 
     if digest.hexdigest() != release.sha256:
         # Deleted, not kept for inspection: a file that failed its checksum
@@ -236,7 +254,27 @@ def _run_installer(installer: Path, windows_path: str):
 
 def install(progress: Optional[Callable[[int, int], None]] = None,
             force: bool = False) -> dict:
-    """Download, verify and install the kernel. Returns what happened."""
+    """Install without granting access or starting a new kernel session."""
+    return _install(progress, force, resume=False)
+
+
+def update(progress: Optional[Callable[[int, int], None]] = None,
+           force: bool = False) -> dict:
+    """Update and restore the connected session's existing access tier."""
+    return _install(progress, force, resume=True)
+
+
+def _connected_tier() -> Optional[str]:
+    import windows_host
+    host = windows_host.get_host()
+    if not host or not host.connected:
+        return None
+    tiers = host.tiers()
+    return ("write" if tiers.get("machineWrite") else
+            "read" if tiers.get("machineRead") else "workspace")
+
+
+def _install(progress, force: bool, *, resume: bool) -> dict:
     if not winbridge.in_wsl():
         raise KernelInstallError(
             "the Windows kernel is only useful on the Windows build of this "
@@ -244,7 +282,7 @@ def install(progress: Optional[Callable[[int, int], None]] = None,
 
     release = latest()
     have = installed_version()
-    if have and have == release.version and not force:
+    if have and tuple(map(int, have.split("."))) >= tuple(map(int, release.version.split("."))) and not force:
         return {"action": "kept", "version": have,
                 "path": str(kernel_exe() or "")}
 
@@ -253,41 +291,112 @@ def install(progress: Optional[Callable[[int, int], None]] = None,
         raise KernelInstallError(
             "could not find the Windows temp directory; is interop enabled "
             "in wsl.conf?")
-    folder = temp / "laintas-kernel"
     try:
-        folder.mkdir(parents=True, exist_ok=True)
+        folder = Path(tempfile.mkdtemp(prefix="laintas-kernel-", dir=temp))
     except OSError as exc:
-        raise KernelInstallError(f"could not write to {folder}: {exc}") from exc
-
-    installer = _download(release, folder, progress)
-    windows_installer = winbridge.to_windows_path(installer)
-    if windows_installer is None:
-        raise KernelInstallError(
-            "the installer landed somewhere Windows cannot run it from")
+        raise KernelInstallError(f"could not write to {temp}: {exc}") from exc
 
     try:
-        done = _run_installer(installer, windows_installer)
-    except subprocess.TimeoutExpired as exc:
-        raise KernelInstallError(
-            "the installer did not finish in ten minutes; run it yourself "
-            f"from {windows_installer}") from exc
-    except OSError as exc:
-        raise KernelInstallError(
-            f"could not run the installer: {exc}. Run it yourself from "
-            f"{windows_installer}") from exc
+        installer = _download(release, folder, progress)
+        windows_installer = winbridge.to_windows_path(installer)
+        if windows_installer is None:
+            raise KernelInstallError(
+                "the installer landed somewhere Windows cannot run it from")
+        # Do not interrupt a working kernel until the replacement is verified.
+        was_running = running()
+        tier = _connected_tier() if resume and was_running else None
+        if was_running:
+            stop()
+        try:
+            try:
+                done = _run_installer(installer, windows_installer)
+            except subprocess.TimeoutExpired as exc:
+                raise KernelInstallError(
+                    "the installer timed out; check Windows, then retry /windows update") from exc
+            except OSError as exc:
+                raise KernelInstallError(
+                    f"could not run the installer at {windows_installer}: {exc}") from exc
+            finally:
+                # The installer may have put it somewhere else (custom path).
+                _forget_install_dir()
+            if done.returncode != 0:
+                detail = winbridge.decode(done.stderr or done.stdout or b"").strip()[:400]
+                raise KernelInstallError(
+                    f"the installer failed (exit {done.returncode})"
+                    + (f": {detail}" if detail else "")
+                    + "; retry /windows update after resolving the error")
+            exe = kernel_exe()
+            actual = installed_version()
+            if exe is None or actual != release.version:
+                raise KernelInstallError(
+                    f"installation could not be verified: expected v{release.version}, "
+                    f"found {actual or 'no readable version'}. Retry /windows update --force")
+        except KernelInstallError as exc:
+            if was_running:
+                # It was stopped for the update and is still stopped; saying
+                # only "the installer failed" leaves the user wondering why
+                # their Windows tools vanished.
+                raise KernelInstallError(
+                    f"{exc} (the kernel was stopped for the update; "
+                    "/windows start brings it back)") from exc
+            raise
+        result = {"action": "upgraded" if have else "installed",
+                  "version": actual, "previous": have, "path": str(exe),
+                  "restartNeeded": was_running}
+        if tier is not None:
+            try:
+                start(tier)
+                result.update(restarted=True, tier=tier, restartNeeded=False)
+            except KernelInstallError as exc:
+                result["warning"] = f"Updated, but restart failed: {exc}"
+        return result
+    finally:
+        # Best effort: an installer Windows still holds open must not turn a
+        # finished install into a reported failure, or hide the real error.
+        shutil.rmtree(folder, ignore_errors=True)
 
-    exe = kernel_exe()
-    if exe is None:
-        detail = winbridge.decode(done.stderr or done.stdout or b"").strip()[:400]
-        raise KernelInstallError(
-            "the installer ran but the kernel is not where it should be"
-            + (f": {detail}" if detail else "")
-            + f". Try running {windows_installer} yourself.")
 
-    installer.unlink(missing_ok=True)
-    return {"action": "upgraded" if have else "installed",
-            "version": installed_version() or release.version,
-            "previous": have, "path": str(exe)}
+def _forget_install_dir() -> None:
+    winbridge.forget("kernel_dir")
+
+
+def uninstall() -> dict:
+    """Stop and run the official uninstaller; user workspaces stay untouched."""
+    if not winbridge.in_wsl():
+        raise KernelInstallError("Kernel uninstall requires Windows / WSL")
+    folder = install_dir()
+    uninstaller = folder / "uninstall.exe" if folder else None
+    if uninstaller is None or not uninstaller.is_file():
+        if kernel_exe() is None:
+            return {"action": "absent"}
+        raise KernelInstallError(
+            "the uninstaller is missing; repair with /windows install --force, "
+            "then retry /windows uninstall")
+    windows_path = winbridge.to_windows_path(uninstaller)
+    if windows_path is None:
+        raise KernelInstallError("the uninstaller is not on a Windows drive")
+    stop()
+    try:
+        done = _run_installer(uninstaller, windows_path)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise KernelInstallError(f"could not uninstall the kernel: {exc}") from exc
+    if done.returncode != 0:
+        raise KernelInstallError(f"the uninstaller failed (exit {done.returncode})")
+    # NSIS may copy itself to TEMP and let the original process exit first.
+    # Wait for that worker's effects instead of announcing premature success.
+    deadline = time.monotonic() + 60
+    while uninstaller.exists() or (folder / KERNEL_EXE).exists():
+        if time.monotonic() >= deadline:
+            raise KernelInstallError(
+                "uninstall has not finished; check its Windows window, "
+                "then run /windows status")
+        time.sleep(0.2)
+    _forget_install_dir()
+    import windows_host
+    import windows_tools
+    windows_host.stop_host()
+    windows_tools.unregister()
+    return {"action": "uninstalled"}
 
 
 # -- running -------------------------------------------------------------
@@ -324,11 +433,19 @@ def start(tier: str = "workspace", root: Optional[str] = None) -> dict:
     # empty string is the window title `start` otherwise steals the first
     # quoted argument for.
     argv = ["cmd.exe", "/c", "start", "", windows_exe, *flags]
+    # No captured pipes: `start` lets the kernel inherit cmd's handles, so a
+    # captured stdout stays open for as long as the kernel runs and `run`
+    # would wait out its timeout — then report a launch that succeeded as a
+    # failure. The exit status of `start` itself is all this needs.
     try:
-        subprocess.Popen(argv, cwd="/", stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL)
-    except OSError as exc:
+        done = subprocess.run(argv, cwd="/", stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
         raise KernelInstallError(f"could not start the kernel: {exc}") from exc
+    if done.returncode != 0:
+        raise KernelInstallError(
+            f"Windows could not launch the kernel (exit {done.returncode})")
     return {"started": windows_exe, "tier": tier, "flags": flags}
 
 
@@ -340,8 +457,10 @@ def running() -> bool:
         done = subprocess.run(
             ["tasklist.exe", "/FI", f"IMAGENAME eq {KERNEL_EXE}", "/NH"],
             capture_output=True, timeout=30, cwd="/")
-    except (OSError, subprocess.SubprocessError):
-        return False
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise KernelInstallError(f"could not check kernel processes: {exc}") from exc
+    if getattr(done, "returncode", 0) != 0:
+        raise KernelInstallError("Windows could not list kernel processes; check WSL interop")
     # "no tasks match" is a localised sentence in the OEM code page, which is
     # why this decodes defensively and then only looks for an ASCII name.
     return KERNEL_EXE.lower() in winbridge.decode(done.stdout or b"").lower()
@@ -352,11 +471,34 @@ def stop() -> bool:
     if not running():
         return False
     try:
-        subprocess.run(["taskkill.exe", "/IM", KERNEL_EXE, "/F"],
-                       capture_output=True, timeout=30, cwd="/")
-    except (OSError, subprocess.SubprocessError):
-        return False
+        done = subprocess.run(["taskkill.exe", "/IM", KERNEL_EXE, "/F"],
+                              capture_output=True, timeout=30, cwd="/")
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise KernelInstallError(f"could not stop the kernel: {exc}") from exc
+    if running():
+        detail = winbridge.decode(done.stderr or done.stdout or b"").strip()[:400]
+        raise KernelInstallError("the kernel is still running"
+                                 + (f": {detail}" if detail else ""))
     return True
+
+
+def ensure_started(tier: str = "workspace", *, restart: bool = False,
+                   progress=None) -> dict:
+    """An explicit start request also installs if missing; never stacks windows."""
+    if tier not in ("workspace", "read", "write"):
+        raise KernelInstallError("expected workspace, read or write")
+    if not winbridge.in_wsl():
+        raise KernelInstallError("Kernel start requires Windows / WSL")
+    if kernel_exe() is None:
+        install(progress=progress)
+    import windows_host
+    if windows_host.start_host() is None:
+        raise KernelInstallError("could not open the local connection; retry /windows start")
+    if running():
+        if not restart and _connected_tier() == tier:
+            return {"action": "running", "tier": tier}
+        stop()
+    return {"action": "started", **start(tier)}
 
 
 # -- status --------------------------------------------------------------
@@ -368,10 +510,11 @@ def status() -> dict:
     host = windows_host.get_host()
     connected = bool(host and host.connected)
     tiers = host.tiers() if connected else {}
+    exe = kernel_exe()
     return {
         "wsl": winbridge.in_wsl(),
-        "installed": bool(kernel_exe()),
-        "path": str(kernel_exe() or ""),
+        "installed": bool(exe),
+        "path": str(exe or ""),
         "version": installed_version(),
         "processRunning": running(),
         "connected": connected,

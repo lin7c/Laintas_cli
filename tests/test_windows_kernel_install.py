@@ -14,7 +14,7 @@ expensive and neither needs Windows to test:
 import hashlib
 import http.server
 import json
-import socket
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -52,12 +52,8 @@ def served(tmp_path, monkeypatch):
                                                   ConnectionResetError)):
                 super().handle_error(request, client_address)
 
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-
-    server = Server(("127.0.0.1", port), Handler)
+    server = Server(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     monkeypatch.setattr(windows_kernel, "DOWNLOAD_ORIGIN",
@@ -66,6 +62,8 @@ def served(tmp_path, monkeypatch):
         yield root
     finally:
         server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def publish(root: Path, name="helpwo-kernel-setup-1.2.3-abcdef01.exe",
@@ -167,6 +165,25 @@ def test_progress_is_reported(served, tmp_path):
     assert seen and seen[-1][0] == 600 * 1024
 
 
+def test_interrupted_progress_cleans_partial_download(served, tmp_path):
+    publish(served, body=b"y" * (600 * 1024))
+    release = windows_kernel.latest()
+    into = tmp_path / "interrupted"
+    into.mkdir()
+    def interrupt(done, total):
+        raise KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        windows_kernel._download(release, into, interrupt)
+    assert list(into.iterdir()) == []
+
+
+@pytest.mark.parametrize("payload", [[], None, {"version": "bad"}])
+def test_invalid_release_shape_is_a_readable_error(served, payload):
+    (served / "latest.json").write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(KernelInstallError):
+        windows_kernel.latest()
+
+
 # -- what install does and does not do ------------------------------------
 
 def test_install_refuses_outside_wsl(monkeypatch):
@@ -206,8 +223,10 @@ def test_start_maps_tiers_to_the_kernels_own_flags(monkeypatch, tmp_path):
     monkeypatch.setattr(windows_kernel, "kernel_exe", lambda: exe)
     monkeypatch.setattr(winbridge, "to_windows_path",
                         lambda p: "C:\\HelpwoKernel\\helpwo-kernel.exe")
-    monkeypatch.setattr(windows_kernel.subprocess, "Popen",
-                        lambda argv, **kw: launched.setdefault("argv", argv))
+    def launch(argv, **kw):
+        launched["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+    monkeypatch.setattr(windows_kernel.subprocess, "run", launch)
 
     assert windows_kernel.start("workspace")["flags"] == []
     assert windows_kernel.start("read")["flags"] == ["--allow-machine-read"]
@@ -261,6 +280,28 @@ def test_decode_never_raises_on_any_byte():
     assert winbridge.decode(b"plain ascii") == "plain ascii"
     assert winbridge.decode("信息".encode("gbk"))  # no exception
     assert winbridge.decode(bytes(range(256)))    # no exception
+
+
+def test_custom_install_directory_comes_from_windows_registry(monkeypatch):
+    windows_path = r"D:\Apps\张 三\HelpwoKernel"
+    calls = []
+    def query(argv):
+        calls.append(argv)
+        return f"HKEY_CURRENT_USER\\Software\\HelpwoKernel\n    InstallDir    REG_SZ    {windows_path}\n"
+    monkeypatch.setattr(winbridge, "_run", query)
+    translated = []
+    monkeypatch.setattr(winbridge, "to_wsl_path", lambda p: translated.append(p) or Path("/custom/kernel"))
+    monkeypatch.setattr(winbridge, "in_wsl", lambda: True)
+    assert windows_kernel.install_dir() == Path("/custom/kernel")
+    assert translated == [windows_path]
+    assert "chcp 65001" in calls[0][-1]
+
+
+def test_failed_process_probe_is_not_reported_as_stopped(monkeypatch):
+    monkeypatch.setattr(winbridge, "in_wsl", lambda: True)
+    monkeypatch.setattr(windows_kernel.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess([], 1, b"", b"error"))
+    with pytest.raises(KernelInstallError, match="list kernel processes"):
+        windows_kernel.running()
 
 
 def test_the_localappdata_lookup_asks_windows_for_utf8(monkeypatch):
@@ -365,6 +406,7 @@ def test_a_failure_to_run_names_the_file_the_user_can_run(tmp_path,
     monkeypatch.setattr(windows_kernel, "latest",
                         lambda: Release("9.9.9", "s.exe", "0" * 64))
     monkeypatch.setattr(windows_kernel, "installed_version", lambda: None)
+    monkeypatch.setattr(windows_kernel, "running", lambda: False)
     monkeypatch.setattr(winbridge, "windows_temp", lambda: tmp_path)
     monkeypatch.setattr(windows_kernel, "_download",
                         lambda *a, **k: tmp_path / "s.exe")

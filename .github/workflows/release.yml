@@ -12,6 +12,7 @@ on:
       - main
     tags:
       - "v*"
+      - "laintas-cli-beta-v*"
 
 permissions:
   contents: write
@@ -63,6 +64,31 @@ jobs:
         with:
           name: linux-${{ matrix.arch }}
           path: "laintas-cli_linux_${{ matrix.arch }}.tar.gz"
+
+  mac:
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: amd64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CLI and packager
+        run: python3 -m pip install . 'pyinstaller>=6.16,<7' pytest
+      - name: Check macOS-specific behavior
+        run: python3 -m pytest -q tests/test_mac_beta.py
+      - name: Build and smoke-test native Mac package
+        run: bash build/mac/build_mac_package.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-${{ matrix.arch }}
+          path: "laintas-cli_darwin_${{ matrix.arch }}.tar.gz"
 
   source:
     runs-on: ubuntu-latest
@@ -173,9 +199,10 @@ jobs:
         shell: pwsh
         run: |
           $version = python -c "import sys; sys.path.insert(0,'.'); from version import __version__; print(__version__)"
+          $numericVersion = $version -replace '^(\d+\.\d+\.\d+).*$', '$1'
           $makensis = "C:\Program Files (x86)\NSIS\makensis.exe"
           if (-not (Test-Path $makensis)) { $makensis = "makensis.exe" }
-          $log = & $makensis "/DAPP_VERSION=$version" build/windows/installer.nsi 2>&1
+          $log = & $makensis "/DAPP_VERSION=$version" "/DAPP_VERSION_NUMERIC=$numericVersion" build/windows/installer.nsi 2>&1
           if ($LASTEXITCODE -ne 0) {
             $log | Select-Object -Last 80 | ForEach-Object { Write-Host $_ }
             throw "NSIS installer build failed (exit $LASTEXITCODE)"
@@ -213,8 +240,8 @@ jobs:
           path: laintas-cli.deb
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux, windows, source, deb]
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/laintas-cli-beta-v')
+    needs: [linux, mac, windows, source, deb]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -234,12 +261,15 @@ jobs:
           mkdir -p release
           cp artifacts/linux-amd64/laintas-cli_linux_amd64.tar.gz release/
           cp artifacts/linux-arm64/laintas-cli_linux_arm64.tar.gz release/
+          cp artifacts/mac-amd64/laintas-cli_darwin_amd64.tar.gz release/
+          cp artifacts/mac-arm64/laintas-cli_darwin_arm64.tar.gz release/
           cp artifacts/windows-amd64/laintas-cli_windows_amd64_setup.exe release/
           cp artifacts/source/laintas-cli_source.zip release/
           cp artifacts/source/src_manifest.zip release/
           cp artifacts/deb/laintas-cli.deb "release/laintas-cli_${{ steps.ver.outputs.version }}_amd64.deb"
           cd release
           sha256sum laintas-cli_linux_amd64.tar.gz laintas-cli_linux_arm64.tar.gz \
+            laintas-cli_darwin_amd64.tar.gz laintas-cli_darwin_arm64.tar.gz \
             laintas-cli_windows_amd64_setup.exe \
             laintas-cli_source.zip "laintas-cli_${{ steps.ver.outputs.version }}_amd64.deb" > SHA256SUMS.txt
           unzip -o src_manifest.zip -d src/ >/dev/null
@@ -248,12 +278,22 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ steps.ver.outputs.tag }}" \
-            --title "${{ steps.ver.outputs.tag }}" \
-            --notes "Linux amd64/arm64, a single-file Windows amd64 installer with a private WSL runtime, Debian amd64, and source packages." \
+          release_flags=()
+          case "${{ steps.ver.outputs.tag }}" in
+            *-beta.*|*-rc.*|laintas-cli-beta-v*) release_flags+=(--prerelease) ;;
+          esac
+          release_title="${{ steps.ver.outputs.tag }}"
+          if [[ "$release_title" == laintas-cli-beta-v* ]]; then
+            release_title="laintas-cli-beta v${release_title##*-v}"
+          fi
+          gh release create "${{ steps.ver.outputs.tag }}" "${release_flags[@]}" \
+            --title "$release_title" \
+            --notes "Linux amd64/arm64, macOS Intel/Apple Silicon (CLI only; no Helpwo Kernel), Windows amd64 with a private WSL runtime, Debian amd64, and source packages." \
             --generate-notes \
             release/laintas-cli_linux_amd64.tar.gz \
             release/laintas-cli_linux_arm64.tar.gz \
+            release/laintas-cli_darwin_amd64.tar.gz \
+            release/laintas-cli_darwin_arm64.tar.gz \
             release/laintas-cli_windows_amd64_setup.exe \
             release/laintas-cli_source.zip \
             "release/laintas-cli_${{ steps.ver.outputs.version }}_amd64.deb" \

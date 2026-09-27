@@ -536,10 +536,10 @@ html { scroll-behavior: smooth; }
 .st-facts dt { color: var(--ops-ink); font: 600 19px/1.2 var(--font-display); }
 .st-facts dd { margin: 7px 0 0; color: var(--ops-copy); font-size: 12px; line-height: 1.6; }
 
-.st-replay { margin: 76px 0 0; }
+.st-replay { margin: 32px 0 28px; }
 .st-replay figcaption { display: flex; flex-direction: column; gap: 6px; padding: 16px 2px 0; }
 .st-replay figcaption strong { color: var(--ops-ink); font-size: 13px; font-weight: 600; }
-.st-replay figcaption span { color: var(--ops-muted); font-size: 12px; line-height: 1.7; }
+.st-replay figcaption span { color: var(--ops-muted); font-size: 12px; line-height: 1.5; }
 
 /* Why: chat window vs CLI, then four capabilities. */
 .st-compare { margin-top: 40px; border-top: 1px solid var(--ops-line-strong); }

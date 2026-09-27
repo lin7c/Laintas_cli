@@ -655,7 +655,7 @@ def uuid_hex() -> str:
 # ── External writers (Helpwo over P2P or the local bridge) ─────────────
 #
 # Helpwo edits the same working directory as the CLI's own agent loop, but it
-# does so *through this process* — the P2P filesystem RPC in webrtc_channel.py
+# does so *through this process* — the P2P filesystem RPC this CLI used to host (now the Helpwo kernel's)
 # and the /api/local-fs endpoints in helpwo_server.py both write the disk from
 # inside the CLI. That made the two agents invisible to each other here: the
 # activation scan counts processes, and both writers live in one.

@@ -213,6 +213,12 @@ class MidRunHandoverTests(_RegistryCase):
             def __init__(self, *_a, **_kw):
                 pass
 
+            def begin_model_probe(self):
+                pass
+
+            def set_available_models(self, _models):
+                pass
+
             def run(self):
                 view_open.set()
                 may_finish.wait(5)

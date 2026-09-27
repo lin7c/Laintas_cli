@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -467,6 +468,10 @@ def _has_cmdline(pid: int) -> bool:
     those in one deployment carried ``"pid": 2`` — kthreadd, which never
     exits, so those worktrees were immortal under a bare liveness check.
     """
+    if sys.platform == "darwin":
+        # macOS has no /proc. _pid_alive() is checked by the caller; treating
+        # a live PID as unknown/active is safer than deleting its worktree.
+        return True
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as fh:
             return bool(fh.read().strip(b"\x00"))
@@ -668,6 +673,11 @@ def reap_orphan_worktrees(base_cwd: str, *,
                 # No record: created by an older build, or the record was lost.
                 # Fall back to mtime, and refuse to touch anything a live
                 # process is sitting in.
+                if sys.platform == "darwin":
+                    # There is no /proc/<pid>/cwd scan on macOS. Without an
+                    # owner record we cannot prove this checkout is idle.
+                    result["kept"].append(path)
+                    continue
                 if in_use is None:
                     in_use = _cwds_in_use()
                 if path in in_use or os.path.realpath(path) in in_use:

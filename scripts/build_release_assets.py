@@ -34,6 +34,8 @@ DIST_RELEASES = os.path.join(REPO, "laintas_cli_download", "dist", "releases")
 RELEASE_ASSET_TEMPLATES = (
     "laintas-cli_linux_amd64.tar.gz",
     "laintas-cli_linux_arm64.tar.gz",
+    "laintas-cli_darwin_amd64.tar.gz",
+    "laintas-cli_darwin_arm64.tar.gz",
     "laintas-cli_windows_amd64_setup.exe",
     "laintas-cli_source.zip",
     "laintas-cli_{version}_amd64.deb",
@@ -103,10 +105,16 @@ def main() -> int:
         # self-hosted channel, so a failed download cannot publish partial data.
         assets_dir = os.path.join(tmp, "assets")
         os.makedirs(assets_dir, exist_ok=True)
-        release_assets = _fetch_release_assets(f"v{version}", version, assets_dir)
+        tag = os.environ.get("LAINTAS_RELEASE_TAG") or f"v{version}"
+        release_assets = _fetch_release_assets(tag, version, assets_dir)
         _verify_release_assets(release_assets, assets_dir)
 
-        for channel in ("latest", f"v{version}"):
+        # A beta is opt-in. Never replace the stable self-hosted `latest`
+        # mirror while syncing a GitHub prerelease.
+        channels = ((tag,) if tag.startswith("laintas-cli-beta-v")
+                    or "-" in version or "b" in version
+                    else ("latest", tag))
+        for channel in channels:
             outdir = os.path.join(DIST_RELEASES, channel)
             os.makedirs(outdir, exist_ok=True)
             _remove_stale_release_assets(outdir)
@@ -118,7 +126,7 @@ def main() -> int:
                   + ", " + ", ".join(release_assets))
 
     nfiles = len(manifest["files"])
-    print(f"Published v{version} assets ({nfiles} source files + "
+    print(f"Published {tag} assets ({nfiles} source files + "
           f"{len(release_assets)} release assets) to {DIST_RELEASES}")
     return 0
 

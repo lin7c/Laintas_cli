@@ -40,22 +40,30 @@ _last_push = 0.0
 _last_summary = ""
 
 
-def _registry() -> Optional[Any]:
-    """The agent registry, if a Helpwo is attached by either transport.
+#: The session registry shared with Helpwo through the machine's kernel, set
+#: by AgentRegistry when a share succeeds. Looked up rather than imported:
+#: this module must not pull the CLI's main module in.
+_shared_registry: Optional[Any] = None
 
-    Nothing to notify when neither is up — which is also the only state where
-    the answer being None is correct rather than a failure.
+
+def set_registry(registry: Optional[Any]) -> None:
+    """Record (or clear) the registry that is shared with Helpwo."""
+    global _shared_registry
+    _shared_registry = registry
+
+
+def _registry() -> Optional[Any]:
+    """The agent registry, if this session is shared with Helpwo.
+
+    Nothing to notify when it is not — which is also the only state where the
+    answer being None is correct rather than a failure.
     """
+    registry = _shared_registry
+    if registry is not None and getattr(registry, "agent_id", None):
+        return registry
     try:
         import helpwo_server
-        registry = helpwo_server._agent_registry()
-        if registry is not None:
-            return registry
-    except Exception:
-        pass
-    try:
-        import webrtc_channel
-        return getattr(webrtc_channel, "_registry_ref", None)
+        return helpwo_server._agent_registry()
     except Exception:
         return None
 

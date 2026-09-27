@@ -2,7 +2,7 @@
 
 **Cross-platform autonomous AI agent for terminal work**
 
-[Download](https://cli.laintas.com) · [Documentation](https://laintas.com/docs) · [Releases](https://github.com/lin7c/Laintas_cli/releases) · [Laintas](https://laintas.com)
+[Download](https://cli.laintas.com) · [Documentation](https://cli.laintas.com/docs) · [Releases](https://github.com/lin7c/Laintas_cli/releases) · [Laintas](https://laintas.com)
 
 [![A recorded laintas-cli session: it runs the test suite, finds why one test fails, shows the patch, waits for approval, applies it, and re-runs the suite green](docs/assets/terminal-session.svg)](https://cli.laintas.com)
 
@@ -45,6 +45,34 @@ to start Laintas CLI on its final page:
 irm https://cli.laintas.com/install.ps1 | iex
 laintas-cli
 ```
+
+The macOS beta is a native terminal build for Apple Silicon and Intel. It
+does not include Helpwo Kernel or Helpwo machine sharing. Install the pinned
+prerelease (the script checks the archive's SHA-256):
+
+```bash
+curl -fsSL https://cli.laintas.com/install.sh | LAINTAS_INSTALL_TAG=laintas-cli-beta-v1 bash
+laintas-cli
+```
+
+The Mac installer writes to `~/.local/bin`; add that directory to `PATH` if
+your shell does not already use it. See [the release guide](build/RELEASE.md)
+for the Mac build and verification steps.
+
+Manage the Windows helper from `/windows` (alias `/kernel`). The full-screen
+manager shows its status and offers the same operations as these shortcuts:
+
+| Command | Result |
+|---|---|
+| `/windows start` | Install if missing, then start with workspace-only access |
+| `/windows start read` / `/windows start write` | Start with desktop read-only access or desktop control |
+| `/windows update` | Update only when needed; restore a connected kernel's current access |
+| `/windows stop` | Disconnect and stop, keeping the installation |
+| `/windows uninstall` | Stop and uninstall, removing its saved sign-in while keeping workspace files |
+| `/windows check` / `/windows status` | Check for updates / inspect local status |
+
+`/windows restart` reuses connected access (otherwise workspace only).
+`/windows install --force` repairs an installation without starting it.
 
 Check the host before installing:
 
@@ -129,7 +157,7 @@ The runtime policy—not the prompt—is the security boundary. Prompt instructi
 | Plugin systems | `skills.py`, `skill_router.py`, `mcp_client.py`, `extension_runtime.py`, `extension_manager.py`, `evolution_lab.py`, `evolution_runner.py` | Discovery, trust, lifecycle, registration, cleanup, experimental activation | `SKILL.md`, `skill.py`, `mcp.json`, extension packages |
 | Backend boundary | `backend_profiles.py` | Origin classification, credential isolation, backend selection | Backend profiles and environment references |
 | Web and browser | `browser_session.py`, `web_search.py`, `cookie_store.py`, `identity_store.py` | CDP browser control, search/fetch chain, explicit browsing identity | `/web`, `/identity`, proxy and browser config |
-| Remote integrations | `helpwo_server.py`, `shared_storage.py`, `webrtc_channel.py` | Browser-to-local runtime bridge, file sharing, peer transport | Helpwo and account configuration |
+| Remote integrations | `windows_host.py`, `helpwo_server.py`, `shared_storage.py` | Link to this machine's Helpwo kernel (sessions reach Helpwo through it), hosted-app bridge, file sharing | Helpwo and account configuration |
 | Distribution | `updater.py`, `release.py`, `enterprise.py`, `enterprise_installer.py`, `migrate.py` | Updates, signed packages, Enterprise add-ons, migrations | Release channel and signed extensions |
 
 ### UI architecture
@@ -433,7 +461,7 @@ Role selection and routing never broaden the parent's tool permissions.
 | Execution | `/term`, `/spawn`, `/agents`, `/task` | Terminals, delegated agents, and task tracking |
 | Workflows | `/hwo`, `/hwg` | Live orchestration and durable graph execution |
 | Plugins | `/mcp`, `/extensions`, `/evolve`, `/reload`, `/trust` | External tools and executable customization |
-| Connectivity | `/backend`, `/web`, `/identity`, `/helpwo`, `/shared` | Inference, search/fetch, browser identity, Helpwo in its own sub-terminal, the cloud folder Helpwo mounts |
+| Connectivity | `/backend`, `/web`, `/identity`, `/helpwo`, `/shared` | Inference, search/fetch, browser identity, sharing a session with Helpwo through the machine's Helpwo kernel, the cloud folder Helpwo mounts |
 | Applications | `/app` | Run a registered application in its own sub-terminal with its own agent |
 | Administration | `/policy`, `/usage`, `/training`, `/v`, `/org` | Policy, allowance, data preference, updates, Enterprise |
 
@@ -465,15 +493,23 @@ closes that view. Protected browser autofill remains unavailable.
 
 ### Hosted applications: `/helpwo` and `/app`
 
-`/helpwo` no longer serves Helpwo from the terminal you typed it in. It opens a
-sub-terminal named `helpwo` — a nested CLI whose agent serves only Helpwo — so
-Helpwo's conversation is never the main terminal's. The sub-terminal's folder is
-Helpwo's workspace, and everything Helpwo keys its data by is kept per folder in
-`~/.laintas/app-state/helpwo/<folder-hash>/`: the login token (the cookie keeps
-working), the port (the browser origin, so IndexedDB data stays reachable), the
-bridge agent id, and the agent's conversation (`~/.laintas/agents/app-helpwo-*.json`).
-`/helpwo stop` closes the sub-terminal and everything in it. Typed inside any
-sub-terminal, `/helpwo` serves in place as before.
+laintas_cli never talks to Helpwo itself. Helpwo reaches a machine through the
+**Helpwo kernel** running on it, and a CLI session reaches Helpwo through that
+same kernel: the kernel registers the session with its own sign-in, relays what
+Helpwo sends, and carries the session's browser screen over its own peer
+connection. Each session publishes a rendezvous file (`kernel-rendezvous/` under
+the laintas home, or under `%LOCALAPPDATA%\Laintas` on the Windows build) and
+the kernel dials it; nothing is exposed to the network.
+
+`/helpwo` opens a sub-terminal named `helpwo` — a nested CLI whose agent serves
+only Helpwo, so Helpwo's conversation is never the main terminal's — and shares
+it through the kernel. It appears in Helpwo's terminal list under the machine.
+The agent id it had is kept per folder in
+`~/.laintas/app-state/helpwo/<folder-hash>/`, so a restart comes back as the same
+session. `/helpwo stop` closes the sub-terminal. Typed inside any sub-terminal,
+`/helpwo` shares that sub-terminal in place. Without a kernel it says how to
+start one (`/windows start` on the Windows build). The old `--port`, `--host`
+and `--dist` flags are gone: laintas_cli no longer serves Helpwo locally.
 
 `/app` runs other applications the same way, from manifests in
 `~/.laintas/apps/*.json` or `./.laintas/apps/*.json`:

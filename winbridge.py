@@ -153,6 +153,27 @@ def windows_temp() -> Optional[Path]:
     return _cached("temp", lambda: _env("TEMP"))
 
 
+def registered_kernel_dir() -> Optional[Path]:
+    """Read the official per-user install location, including custom paths."""
+    import re
+    # Cached: every kernel_exe() lands here (status alone asks several
+    # times, and startup asks once), and each uncached answer is a cmd.exe
+    # round trip across interop. windows_kernel forgets it after an install
+    # or uninstall, the only things that move it.
+    def resolve() -> Optional[Path]:
+        raw = _run(["cmd.exe", "/c",
+                    r'chcp 65001 > nul & reg.exe query "HKCU\Software\HelpwoKernel" /v InstallDir'])
+        found = re.search(r"(?m)^\s*InstallDir\s+REG_SZ\s+(.+?)\s*$", raw)
+        return to_wsl_path(found.group(1)) if found else None
+    return _cached("kernel_dir", resolve)
+
+
+def forget(key: str) -> None:
+    """Drop one cached answer that an action on this machine just changed."""
+    with _lock:
+        _cache.pop(key, None)
+
+
 def reset_cache() -> None:
     """Test hook. Nothing in production has a reason to call this."""
     with _lock:

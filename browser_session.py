@@ -5,7 +5,7 @@ x11vnc. The AI side drives Chrome over CDP (http://127.0.0.1:<debug-port>) —
 see the browser.* tools in tools.py.
 
 The user-facing live view is peer-to-peer: x11vnc serves RFB on
-127.0.0.1:<rfb_port>, and webrtc_channel.py's VNC bridge carries those bytes to
+127.0.0.1:<rfb_port>, and the Helpwo kernel's screen relay carries those bytes to
 the browser's noVNC over a WebRTC DataChannel, so the framebuffer never touches
 the backend. See Helpwo/docs/vnc-p2p-design.md. (An earlier revision relayed RFB
 through a backend /vnc WebSocket; that endpoint was never deployed and the code
@@ -960,7 +960,7 @@ class BrowserSession:
       close()  → kill subprocesses, drop the proxy relay, remove user-data-dir.
 
     Nothing here reaches out to the backend: the live view is attached
-    separately by webrtc_channel.py, which connects to rfb_port on demand.
+    separately by the Helpwo kernel, which connects to rfb_port on demand.
     """
 
     def __init__(self, backend_url: str, agent_id: str,
@@ -1548,7 +1548,7 @@ class BrowserSession:
                                f"banner (see {self._log('x11vnc')})")
 
         # The screen is now served by x11vnc on 127.0.0.1:rfb_port; the live
-        # view attaches to it peer-to-peer when a viewer asks (webrtc_channel.py's
+        # view attaches to it peer-to-peer when a viewer asks (the kernel's
         # VNC bridge). Nothing is pushed to the backend from here.
 
         # Connect Playwright, attach the capture listeners, and only then go
@@ -1867,6 +1867,17 @@ def get_browser_session(name: str) -> Optional[BrowserSession]:
 def get_all_browser_sessions() -> List[BrowserSession]:
     with _browser_lock:
         return list(_browser_sessions.values())
+
+
+def screen_names() -> List[str]:
+    """Names of the sessions showing a live screen right now (x11vnc up).
+
+    What this CLI tells the Helpwo kernel it can show, so Helpwo offers the
+    screen as soon as it exists instead of the user having to know to ask.
+    """
+    with _browser_lock:
+        return [name for name, session in _browser_sessions.items()
+                if int(getattr(session, "rfb_port", 0) or 0) > 0]
 
 
 def get_latest_browser_session() -> Optional[BrowserSession]:

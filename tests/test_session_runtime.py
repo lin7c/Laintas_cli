@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -1498,94 +1499,209 @@ class RemoteAgentIdentityTests(unittest.TestCase):
         timeout.assert_called_once_with(destructive=True)
         self.assertEqual(pushed[0]["meta"]["autoApproveAfter"], 0.01)
 
-    def test_remote_poll_includes_instance_id(self):
+    # ── transport: through the machine's Helpwo kernel ─────────────────
+
+    class _FakeKernelLink:
+        """Stands in for windows_host's connection to the Helpwo kernel."""
+
+        def __init__(self, register_reply=None):
+            self.sent = []
+            self.requests = []
+            self.handlers = {}
+            self.listeners = []
+            self.connected = True
+            self.register_reply = register_reply or {
+                "ok": True, "agentId": "agent-1", "hostAgentId": "kernel-1"}
+
+        def supports(self, feature):
+            return feature == "cli-relay"
+
+        def set_handler(self, kind, handler):
+            self.handlers[kind] = handler
+
+        def add_link_listener(self, callback):
+            self.listeners.append(callback)
+
+        def send(self, frame):
+            self.sent.append(frame)
+
+        def request(self, frame, timeout=30):
+            self.requests.append(frame)
+            if frame["t"] == "cli-register":
+                return dict(self.register_reply)
+            return {"ok": True}
+
+    def _with_link(self, link):
+        import windows_host
+        return mock.patch.object(windows_host, "get_host", return_value=link)
+
+    def test_kernel_hooks_follow_a_replaced_host(self):
+        registry = laintas_cli.AgentRegistry()
+        old_host = self._FakeKernelLink()
+        new_host = self._FakeKernelLink()
+        def attach_connected_listener(callback):
+            new_host.listeners.append(callback)
+            callback(True)
+        new_host.add_link_listener = attach_connected_listener
+        try:
+            with mock.patch.object(registry, "_on_kernel_link") as on_link:
+                registry._install_kernel_hooks(old_host)
+                registry._install_kernel_hooks(old_host)
+                self.assertEqual(len(old_host.listeners), 1)
+
+                registry._shared = True
+                with self._with_link(new_host):
+                    self.assertTrue(registry._kernel_send({"t": "cli-heartbeat"}))
+                self.assertEqual(len(new_host.listeners), 1)
+                self.assertEqual(set(new_host.handlers),
+                                 {"cli-inputs", "cli-agent", "cli-vnc"})
+                self.assertEqual(new_host.sent, [{"t": "cli-heartbeat"}])
+                on_link.assert_called_once_with(True)
+                old_host.listeners[0](False)
+                on_link.assert_called_once_with(True)
+        finally:
+            registry.unregister()
+
+    def test_register_goes_through_the_kernel_with_instance_and_account(self):
+        session = {"userId": "u1", "userEmail": "user@example.com", "userName": "User"}
+        link = self._FakeKernelLink()
         with mock.patch.object(paths, "PROCESS_INSTANCE_ID", "process-a"), \
-                mock.patch.object(laintas_cli, "get_backend_url",
-                                  return_value="https://laintas.com"), \
-                mock.patch.object(laintas_cli.time, "sleep"), \
-                mock.patch.object(laintas_cli.requests, "get") as get:
-            registry = laintas_cli.AgentRegistry()
-            registry.agent_id = "agent-1"
-            registry.agent_secret = "secret-1"
-            registry._running = True
-
-            response = mock.Mock(status_code=200)
-            response.json.return_value = {"inputs": []}
-
-            def _get(*args, **kwargs):
-                registry._running = False
-                return response
-
-            get.side_effect = _get
-            registry._poll_loop(lambda: {}, lambda: [])
-
-            self.assertEqual(
-                get.call_args.kwargs["params"], {"instanceId": "process-a"})
-
-    def test_remote_heartbeat_includes_instance_id(self):
-        with mock.patch.object(paths, "PROCESS_INSTANCE_ID", "process-a"), \
-                mock.patch.object(laintas_cli, "get_backend_url",
-                                  return_value="https://laintas.com"), \
-                mock.patch.object(laintas_cli, "get_all_terminals",
-                                  return_value=[]), \
-                mock.patch.object(laintas_cli.time, "sleep"), \
+                self._with_link(link), \
                 mock.patch.object(laintas_cli.requests, "post") as post:
             registry = laintas_cli.AgentRegistry()
-            registry.agent_id = "agent-1"
-            registry.agent_secret = "secret-1"
-            registry._running = True
-
-            response = mock.Mock(status_code=200)
-
-            def _post(*args, **kwargs):
-                registry._running = False
-                return response
-
-            post.side_effect = _post
-            registry._heartbeat_loop()
-
-            self.assertEqual(
-                post.call_args.kwargs["json"]["instanceId"], "process-a")
-
-    def test_remote_register_events_and_unregister_include_instance_id(self):
-        profile = laintas_cli.backend_profiles.BackendProfile(
-            "test", "official", "https://laintas.com")
-        session = {
-            "headers": {"Authorization": "Bearer token"},
-            "cookies": {},
-            "userEmail": "user@example.com",
-            "userName": "User",
-        }
-
-        with mock.patch.object(paths, "PROCESS_INSTANCE_ID", "process-a"), \
-                mock.patch.object(laintas_cli, "get_backend_profile",
-                                  return_value=profile), \
-                mock.patch.object(laintas_cli, "get_backend_url",
-                                  return_value="https://laintas.com"), \
-                mock.patch.object(laintas_cli.requests, "post") as post:
-            register_resp = mock.Mock(status_code=200)
-            register_resp.json.return_value = {
-                "agentId": "agent-1",
-                "agentSecret": "secret-1",
-            }
-            event_resp = mock.Mock(status_code=200)
-            unregister_resp = mock.Mock(status_code=200)
-            post.side_effect = [register_resp, event_resp, unregister_resp]
-
-            registry = laintas_cli.AgentRegistry()
-            self.assertEqual(registry.instance_id, "process-a")
             self.assertTrue(registry.register(session, name="primary", quiet=True))
             registry._do_post_events([{"type": "user", "content": "hello"}])
             registry.unregister()
+        post.assert_not_called()  # never the gateway directly
+        register = link.requests[0]
+        self.assertEqual(register["t"], "cli-register")
+        self.assertEqual(register["userId"], "u1")
+        self.assertEqual(register["payload"]["instanceId"], "process-a")
+        events = [f for f in link.sent if f["t"] == "cli-events"][0]
+        self.assertEqual(events["agentId"], "agent-1")
+        self.assertEqual(events["body"]["instanceId"], "process-a")
+        self.assertEqual(events["body"]["state"]["instanceId"], "process-a")
+        self.assertEqual(link.requests[-1], {"t": "cli-unregister", "agentId": "agent-1"})
+        self.assertEqual(registry.agent_secret, "", "the gateway credential stays in the kernel")
 
-            register_payload = post.call_args_list[0].kwargs["json"]
-            events_payload = post.call_args_list[1].kwargs["json"]
-            unregister_payload = post.call_args_list[2].kwargs["json"]
+    def test_without_a_kernel_nothing_is_registered(self):
+        with self._with_link(None), \
+                mock.patch.object(laintas_cli.AgentRegistry, "KERNEL_WAIT_SECONDS", 0.05), \
+                mock.patch("windows_host.start_host", return_value=None), \
+                mock.patch.object(laintas_cli.requests, "post") as post:
+            registry = laintas_cli.AgentRegistry()
+            self.assertFalse(registry.register({"userId": "u1"}, quiet=True))
+        post.assert_not_called()
+        self.assertIsNone(registry.agent_id)
 
-        self.assertEqual(register_payload["instanceId"], "process-a")
-        self.assertEqual(events_payload["instanceId"], "process-a")
-        self.assertEqual(events_payload["state"]["instanceId"], "process-a")
-        self.assertEqual(unregister_payload["instanceId"], "process-a")
+    def test_a_refusal_from_the_kernel_is_not_a_registration(self):
+        link = self._FakeKernelLink({"ok": False, "error": "different laintas account"})
+        with self._with_link(link):
+            registry = laintas_cli.AgentRegistry()
+            self.assertFalse(registry.register({"userId": "u1"}, quiet=True))
+        self.assertIsNone(registry.agent_id)
+
+    def test_heartbeat_goes_through_the_kernel_with_instance_id(self):
+        link = self._FakeKernelLink()
+        with mock.patch.object(paths, "PROCESS_INSTANCE_ID", "process-a"), \
+                self._with_link(link), \
+                mock.patch.object(laintas_cli, "get_all_terminals", return_value=[]), \
+                mock.patch.object(laintas_cli.time, "sleep") as sleep:
+            registry = laintas_cli.AgentRegistry()
+            registry.agent_id = "agent-1"
+            registry._running = True
+            sleep.side_effect = lambda *_: setattr(registry, "_running", False)
+            registry._heartbeat_loop()
+        beat = [f for f in link.sent if f["t"] == "cli-heartbeat"][0]
+        self.assertEqual(beat["agentId"], "agent-1")
+        self.assertEqual(beat["payload"]["instanceId"], "process-a")
+
+    def test_inputs_are_dispatched_only_for_this_session(self):
+        registry = laintas_cli.AgentRegistry()
+        registry.agent_id = "agent-1"
+        with mock.patch.object(registry, "_dispatch_inputs") as dispatch:
+            registry._on_kernel_inputs({"agentId": "agent-2", "inputs": [{"kind": "chat"}]})
+            dispatch.assert_not_called()
+            registry._on_kernel_inputs({"agentId": "agent-1", "inputs": [{"kind": "chat"}]})
+            dispatch.assert_called_once()
+        registry._remote_executor.shutdown(wait=False, cancel_futures=True)
+        registry._remote_control_executor.shutdown(wait=False, cancel_futures=True)
+
+    def test_an_rtc_offer_is_answered_not_left_to_time_out(self):
+        registry = laintas_cli.AgentRegistry()
+        pushed = []
+        with mock.patch.object(registry, "_push",
+                               side_effect=lambda *a, **k: pushed.append(a)):
+            registry._handle_remote_message(
+                {"kind": "rtc-offer", "reqId": "r1", "payload": {"sdp": "x"}},
+                lambda: {}, lambda: [])
+        self.assertEqual(pushed[0][0], "r1")
+        self.assertEqual(pushed[0][1], "rtc-error")
+        self.assertIn("kernel", pushed[0][3]["error"])
+        registry._remote_executor.shutdown(wait=False, cancel_futures=True)
+        registry._remote_control_executor.shutdown(wait=False, cancel_futures=True)
+
+    def test_a_restarted_kernel_gets_the_session_back_after_a_refusal(self):
+        """A restarting kernel dials running CLIs before its own registration
+        is done and refuses them; one refusal must not drop the session."""
+        link = self._FakeKernelLink()
+        registry = laintas_cli.AgentRegistry()
+        registry._shared = True
+        registry._session = {"userId": "u1"}
+        with self._with_link(link), \
+                mock.patch.object(registry, "register", side_effect=[False, True]) as reg, \
+                mock.patch.object(registry, "start_heartbeat") as beat, \
+                mock.patch.object(laintas_cli.time, "sleep"):
+            registry._relink()
+        self.assertEqual(reg.call_count, 2)
+        beat.assert_called_once()
+        registry._remote_executor.shutdown(wait=False, cancel_futures=True)
+        registry._remote_control_executor.shutdown(wait=False, cancel_futures=True)
+
+    def test_a_session_nobody_shared_is_not_brought_back(self):
+        registry = laintas_cli.AgentRegistry()
+        with mock.patch.object(registry, "register") as reg:
+            registry._on_kernel_link(True)
+        reg.assert_not_called()
+        registry._remote_executor.shutdown(wait=False, cancel_futures=True)
+        registry._remote_control_executor.shutdown(wait=False, cancel_futures=True)
+
+    def test_browser_screens_are_announced_to_the_kernel_when_they_change(self):
+        link = self._FakeKernelLink()
+        registry = laintas_cli.AgentRegistry()
+        registry.agent_id = "agent-1"
+        registry._shared = True
+        names = [["browser1"]]
+        with self._with_link(link), \
+                mock.patch.object(laintas_cli.AgentRegistry, "SCREENS_POLL_SECONDS", 0.01), \
+                mock.patch("browser_session.screen_names", side_effect=lambda: list(names[0])):
+            registry._start_screens_watch()
+            deadline = time.time() + 2
+            while not link.sent and time.time() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.1)
+            names[0] = []
+            deadline = time.time() + 2
+            while len(link.sent) < 2 and time.time() < deadline:
+                time.sleep(0.01)
+            registry._shared = False
+            registry._screens_thread.join(timeout=2)
+        self.assertEqual([f["screens"] for f in link.sent if f["t"] == "cli-screens"],
+                         [["browser1"], []], "announced on change, not on every poll")
+        registry._remote_executor.shutdown(wait=False, cancel_futures=True)
+        registry._remote_control_executor.shutdown(wait=False, cancel_futures=True)
+
+    def test_the_screen_request_answers_with_the_browser_port(self):
+        link = self._FakeKernelLink()
+        registry = laintas_cli.AgentRegistry()
+        session = mock.Mock(rfb_port=5901)
+        with self._with_link(link), \
+                mock.patch("browser_session.get_browser_session", return_value=session):
+            registry._on_kernel_vnc({"id": "vnc-1", "name": "default"})
+        self.assertEqual(link.sent[-1], {"t": "cli-vnc-res", "id": "vnc-1", "ok": True,
+                                         "host": "127.0.0.1", "port": 5901})
+        registry._remote_executor.shutdown(wait=False, cancel_futures=True)
+        registry._remote_control_executor.shutdown(wait=False, cancel_futures=True)
 
 
 @contextmanager

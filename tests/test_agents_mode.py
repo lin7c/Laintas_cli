@@ -14,6 +14,7 @@ from prompt_toolkit.data_structures import Size
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.output.vt100 import Vt100_Output
 from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.mouse_events import MouseEventType
 from rich.console import Console
 
 import agent_loop
@@ -145,11 +146,12 @@ class AgentsModeTests(unittest.TestCase):
             {"type": "ai_end"},
         ], "term0")
 
-        lines = controller._event_lines(agent.id)
+        rows = controller._transcript_text(agent.id)
+        replies = [row for row in rows if row.startswith("● ")]
 
-        self.assertEqual(sum(text == "writer" for _style, text in lines), 1)
-        self.assertIn(("", "hello world"), lines)
-        self.assertIn(("", "next"), lines)
+        # One assistant message, not one per chunk: the chunks join.
+        self.assertEqual(replies, ["● hello world"])
+        self.assertIn("  next", rows)
 
     def test_accepted_input_is_not_rendered_twice_as_agent_started(self):
         agent = self._agent("writer")
@@ -165,14 +167,10 @@ class AgentsModeTests(unittest.TestCase):
             "ai_end", agent_id=agent.id, terminal_name="term0",
             summary="ai_end")
 
-        focus_text = [text for _style, text
-                      in controller._event_lines(agent.id)]
-        feed_text = "".join(fragment[1]
-                            for fragment in controller.feed_fragments())
+        focus_text = "\n".join(controller._transcript_text(agent.id))
 
         self.assertEqual(focus_text.count("hello"), 1)
-        self.assertEqual(feed_text.count("hello"), 1)
-        self.assertNotIn("ai_end", feed_text)
+        self.assertNotIn("ai_end", focus_text)
 
     def test_unauthenticated_input_is_rejected_immediately_and_visibly(self):
         agent = self._agent("primary", role="primary")
@@ -200,16 +198,21 @@ class AgentsModeTests(unittest.TestCase):
             "type": "tool_started", "toolCallId": "call-1",
             "name": "shell.exec", "command": "pytest -q",
         }], "term0")
-        running = controller._event_lines(agent.id)
-        self.assertTrue(any(text.startswith("◐ shell.exec") for _s, text in running))
+        agent.status = "running"
+        running = controller._transcript_rows(agent.id, 80)
+        heads = [row for row in running if row.text.startswith("● shell.exec")]
+        self.assertEqual(len(heads), 1)
+        self.assertEqual(heads[0].anim, "tool")
         agent_ui_events.hub.ingest(agent.id, [{
             "type": "system", "kind": "tool", "content": "shell.exec",
             "meta": {"call_id": "call-1", "salient": "pytest -q", "ok": True},
         }], "term0")
-        finished = controller._event_lines(agent.id)
-        self.assertFalse(any(text.startswith("◐ shell.exec") for _s, text in finished))
-        self.assertEqual(sum(text.startswith("● shell.exec")
-                             for _s, text in finished), 1)
+        finished = controller._transcript_rows(agent.id, 80)
+        heads = [row for row in finished if row.text.startswith("● shell.exec")]
+        # Replaced in place: still one row, no longer animated as running.
+        self.assertEqual(len(heads), 1)
+        self.assertEqual(heads[0].anim, "")
+        self.assertIn("class:tool.ok", heads[0].fragments[0][0])
 
     def test_events_are_isolated_but_cross_terminal_message_is_visible_to_both(self):
         self._terminal("child", "term0")
@@ -396,6 +399,31 @@ class AgentsModeTests(unittest.TestCase):
         self.assertEqual(agent.status, "idle")
         self.assertIn("outer mapped reply", output.getvalue())
 
+    def test_ctrl_c_clears_the_prompt_but_never_leaves_the_view(self):
+        self._agent("worker")
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        seen = {}
+        with create_pipe_input() as pipe_input:
+            def keys():
+                time.sleep(0.3)
+                pipe_input.send_text("draft")
+                time.sleep(0.1)
+                pipe_input.send_text("\x03")            # clears the draft
+                time.sleep(0.1)
+                seen["after_clear"] = controller._input_buffer.text
+                pipe_input.send_text("\x03")            # empty: only a hint
+                time.sleep(0.1)
+                seen["running"] = controller.app is not None
+                seen["notice"] = controller.notice
+                pipe_input.send_text("\x1b")
+            sender = threading.Thread(target=keys)
+            sender.start()
+            controller.run(input=pipe_input, output=DummyOutput())
+            sender.join(timeout=2)
+        self.assertEqual(seen["after_clear"], "")
+        self.assertTrue(seen["running"])
+        self.assertIn("Esc", seen["notice"])
+
     def test_escape_exits_even_when_input_buffer_has_unsubmitted_text(self):
         self._agent("primary", role="primary")
         controller = agents_mode.AgentsModeController(
@@ -483,7 +511,7 @@ class AgentsModeTests(unittest.TestCase):
         controller.terminal_name = "child"
         rendered = "".join(
             fragment[1] for fragment in controller.approval_fragments())
-        self.assertIn("Terminal: term0", rendered)
+        self.assertIn("on term0", rendered)
         self.assertIn("old.log", rendered)
         controller.resolve_approval(False)
         thread.join(timeout=1)
@@ -611,15 +639,16 @@ class AgentsModeTests(unittest.TestCase):
             "agent_done", agent_id=agent.id, terminal_name="term0",
             summary="done", status="completed")
 
-        lines = controller._event_lines(agent.id)
-        focus = list(controller.focus_fragments())
+        rows = controller._transcript_rows(agent.id, 80)
+        fragments = [fragment for row in rows for fragment in row.fragments]
 
-        self.assertIn(("class:md.h1", "Result"), lines)
-        self.assertTrue(any(style == "class:md.bold" and text == "bold"
-                            for style, text, *_ in focus))
+        self.assertIn(("class:md.h1", "Result"), fragments)
+        self.assertTrue(any("class:md.bold" in style and text == "bold"
+                            for style, text in fragments))
         self.assertTrue(any(style == "class:md.code" and text == "code"
-                            for style, text, *_ in focus))
-        self.assertNotIn("Task completed", "".join(text for _style, text in lines))
+                            for style, text in fragments))
+        self.assertNotIn("Task completed",
+                         "".join(row.text for row in rows))
 
     def test_a_working_agent_gets_the_cli_status_row_not_a_placeholder(self):
         """The same row the plain CLI paints during a turn — branded relay
@@ -688,7 +717,9 @@ class AgentsModeTests(unittest.TestCase):
         with mock.patch.object(agents_mode.time, "monotonic", return_value=31):
             self.assertEqual(1, round(controller._working_elapsed(agent)))
 
-    def test_primary_follow_uses_wrapped_screen_rows_after_five_turns(self):
+    def test_primary_raw_view_follows_wrapped_screen_rows(self):
+        """Ctrl+R shows the REPL's own output; follow means the true bottom
+        after wrapping, and scrolling is by physical rows."""
         agent = self._agent("primary", role="primary")
         lines = [
             f"TURN-{turn} " + (str(turn) * 90) + f" END-{turn}"
@@ -703,16 +734,18 @@ class AgentsModeTests(unittest.TestCase):
         controller = agents_mode.AgentsModeController(
             "term0", object(), {}, mirror=Mirror())
         controller.selected_id = agent.id
-        with mock.patch.object(
-                controller, "_terminal_size", return_value=(40, 18)):
-            bottom = "".join(
-                text for _style, text in controller.focus_fragments())
-            controller.scroll(6)
-            scrolled = "".join(
-                text for _style, text in controller.focus_fragments())
-            controller.scroll(-6)
-            followed = "".join(
-                text for _style, text in controller.focus_fragments())
+        controller._raw[agent.id] = True
+
+        def screen():
+            return "".join(
+                text for line in controller.transcript_lines(40, 8)
+                for _style, text, *_ in line)
+
+        bottom = screen()
+        controller.scroll(6, smooth=False)
+        scrolled = screen()
+        controller.scroll(-6, smooth=False)
+        followed = screen()
 
         self.assertIn("END-5", bottom)
         self.assertNotIn("TURN-1", bottom)
@@ -720,60 +753,281 @@ class AgentsModeTests(unittest.TestCase):
         self.assertNotIn("END-5", scrolled)
         self.assertIn("END-5", followed)
 
-    def test_the_newest_wrapped_row_survives_and_activity_moves_to_the_band(self):
-        agent = self._agent("primary", role="primary")
+    def test_scrolled_view_holds_still_while_new_rows_arrive(self):
+        agent = self._agent("writer")
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        controller.selected_id = agent.id
+        controller._profile_pinned = True     # no card: rows are all events
+        for index in range(30):
+            agent_ui_events.hub.emit(
+                "ai", agent_id=agent.id, terminal_name="term0",
+                detail=f"reply {index}")
+
+        def screen():
+            return "".join(
+                text for line in controller.transcript_lines(60, 10)
+                for _style, text, *_ in line)
+
+        screen()
+        controller.scroll(20, smooth=False)
+        before = screen()
+        agent_ui_events.hub.emit(
+            "ai", agent_id=agent.id, terminal_name="term0", detail="late")
+        after = screen()
+
+        self.assertIn("reply 17", before)
+        self.assertIn("reply 17", after)
+        self.assertNotIn("late", after)
+        self.assertIn("new line", after)      # the jump-to-latest pill
+
+    def test_status_row_follows_the_newest_output_like_the_cli(self):
+        agent = self._agent("writer")
         agent.status = "thinking"
-
-        class Mirror:
-            @staticmethod
-            def read_lines(_agent_id):
-                # A wide character, so the trim is exercised in cells
-                # rather than in characters.
-                return ["latest " + ("界" * 80) + " END-LATEST"]
-
-        controller = agents_mode.AgentsModeController(
-            "term0", object(), {}, mirror=Mirror())
+        agent_ui_events.hub.emit(
+            "ai", agent_id=agent.id, terminal_name="term0",
+            detail="latest " + ("界" * 80) + " ENDLATEST")
+        controller = agents_mode.AgentsModeController("term0", object(), {})
         controller.selected_id = agent.id
-        with mock.patch.object(
-                controller, "_terminal_size", return_value=(40, 18)), \
-                mock.patch.object(agents_mode.time, "monotonic", return_value=0):
-            rendered = "".join(
-                text for _style, text in controller.focus_fragments())
+        with mock.patch.object(agents_mode.time, "monotonic", return_value=0):
+            lines = ["".join(text for _style, text, *_ in line).strip(" │┃")
+                     for line in controller.transcript_lines(40, 12)]
+        filled = [line for line in lines if line.strip()]
+        # The newest wrapped output is on screen, measured in cells, and the
+        # status row sits directly under it, as in the plain CLI.
+        self.assertIn("ENDLATEST", filled[-2])
+        self.assertTrue(filled[-1].startswith("L· Thinking…"), filled[-1])
 
-        # The newest physical row is still on screen after wrapping...
-        self.assertIn("END-LATEST", rendered)
-        # ...and the transcript no longer carries a copy of the status: that
-        # belongs to the band above the input, so it appears once per screen.
-        self.assertNotIn("Thinking…", rendered)
-        band = "".join(text for _style, text in controller.band_fragments())
-        self.assertIn("Thinking…", band)
+        agent.status = "idle"
+        idle = "".join(text for line in controller.transcript_lines(40, 12)
+                       for _style, text, *_ in line)
+        self.assertNotIn("Thinking…", idle)
 
-    def test_focus_height_matches_full_layout_at_standard_terminal_size(self):
-        agent = self._agent("primary", role="primary")
-        controller = agents_mode.AgentsModeController(
-            "term0", object(), {})
+    def test_every_pane_row_is_exactly_its_width(self):
+        """Rows are padded to the pane so each cell maps to a position:
+        a click right of the text, or on the scrollbar, lands where aimed."""
+        agent = self._agent("writer")
+        for index in range(40):
+            agent_ui_events.hub.emit(
+                "ai", agent_id=agent.id, terminal_name="term0",
+                detail=f"**reply** {index} " + "界" * (index % 7))
+        controller = agents_mode.AgentsModeController("term0", object(), {})
         controller.selected_id = agent.id
+        for render, width in ((controller.transcript_lines, 57),
+                              (controller.rail_lines, 26),
+                              (controller.title_lines, 57),
+                              (controller.footer_lines, 57)):
+            for line in render(width, 12):
+                cells = sum(agents_mode.get_cwidth(ch)
+                            for _style, text, *_ in line for ch in text)
+                self.assertEqual(cells, width, (render.__name__, line))
 
-        with mock.patch.object(
-                controller, "_terminal_size", return_value=(80, 25)):
-            width, body_height = controller._focus_body_height()
+    def test_clicking_a_long_tool_output_expands_it_in_place(self):
+        agent = self._agent("worker")
+        agent_ui_events.hub.ingest(agent.id, [
+            {"type": "tool_started", "toolCallId": "c1", "name": "read",
+             "command": "big.txt"},
+            {"type": "system", "kind": "tool", "content": "read",
+             "meta": {"call_id": "c1", "ok": True, "salient": "big.txt"}},
+            {"type": "system", "kind": "output",
+             "content": "\n".join(f"line {i}" for i in range(50))},
+        ], "term0")
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        controller.selected_id = agent.id
+        controller._profile_pinned = True
+        collapsed = controller._transcript_text(agent.id)
+        self.assertNotIn("line 1", "\n".join(collapsed))
+        self.assertTrue(any("50L" in row for row in collapsed))
 
-        # Below 96 columns the roster is hidden, so Focus gets the lot.
-        self.assertEqual(width, 80)
-        # Every row of the root layout that is not Focus's body, named. If a
-        # row is added or removed on one side and not the other, the newest
-        # transcript line gets clipped off the bottom — which is invisible
-        # until someone notices output going missing.
-        chrome = (
-            1     # header
-            + 1   # header rule
-            + 1   # status band rule
-            + 2   # status band
-            + 1   # input
-            + 1   # key hints
-        )
-        focus_title = 2   # Agent name and its rule
-        self.assertEqual(body_height, 25 - chrome - focus_title)
+        controller.transcript_lines(80, 20)
+        toggle_row = next(index for index, row in enumerate(
+            controller._transcript_rows(agent.id, 77)) if "50L" in row.text)
+        start = controller._viewport[1]
+        from prompt_toolkit.mouse_events import MouseEvent, MouseButton
+        from prompt_toolkit.data_structures import Point
+        for kind in (MouseEventType.MOUSE_DOWN, MouseEventType.MOUSE_UP):
+            controller._transcript_mouse(MouseEvent(
+                Point(x=8, y=toggle_row - start), kind,
+                MouseButton.LEFT, frozenset()))
+        expanded = "\n".join(controller._transcript_text(agent.id))
+        self.assertIn("line 49", expanded)
+
+    def test_drag_selection_copies_the_text_shown(self):
+        agent = self._agent("writer")
+        agent_ui_events.hub.emit(
+            "ai", agent_id=agent.id, terminal_name="term0",
+            detail="alpha beta\ngamma delta")
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        controller.selected_id = agent.id
+        controller._profile_pinned = True
+        controller.transcript_lines(60, 6)
+        start = controller._viewport[1]
+        rows = controller._transcript_text(agent.id, 57)
+        first = rows.index("● alpha beta")
+        from prompt_toolkit.mouse_events import MouseEvent, MouseButton
+        from prompt_toolkit.data_structures import Point
+        copied = []
+        controller._copy_to_clipboard = lambda text: copied.append(text) or True
+
+        def event(kind, x, y):
+            controller._transcript_mouse(MouseEvent(
+                Point(x=x, y=y), kind, MouseButton.LEFT, frozenset()))
+        event(MouseEventType.MOUSE_DOWN, 3, first - start)
+        event(MouseEventType.MOUSE_MOVE, 7, first - start + 1)
+        event(MouseEventType.MOUSE_UP, 7, first - start + 1)
+
+        self.assertEqual(copied, ["alpha beta\n  gamma"])
+        self.assertIn("Copied", controller.notice)
+
+    # ── title-bar buttons ───────────────────────────────────────────────
+    def _title_click(self, controller, name, press_on=None):
+        from prompt_toolkit.mouse_events import MouseEvent, MouseButton
+        from prompt_toolkit.data_structures import Point
+        # No app is running, so delivery would go straight to the REPL queue.
+        controller._deliver_pending_command = lambda: None
+        controller.title_lines(100, 1)
+        spans = {hit[2]: hit for hit in controller._title_hits}
+        x = spans[name][0] + 1
+        press_x = spans[press_on][0] + 1 if press_on else x
+        controller._title_mouse(MouseEvent(
+            Point(x=press_x, y=0), MouseEventType.MOUSE_DOWN,
+            MouseButton.LEFT, frozenset()))
+        controller._title_mouse(MouseEvent(
+            Point(x=x, y=0), MouseEventType.MOUSE_UP,
+            MouseButton.LEFT, frozenset()))
+
+    def test_title_buttons_have_one_shape_and_statuses_have_no_fill(self):
+        agent = self._agent("reviewer")
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        controller.selected_id = agent.id
+        line = controller.title_lines(100, 1)[0]
+        filled = [(style, text) for style, text, *_ in line if "chip" in style]
+        self.assertEqual([text.strip() for _s, text in filled][:1], ["resume"])
+        self.assertEqual({len(text) - len(text.strip()) for _s, text in filled}, {2})
+        # ●/○ come from a fallback font; behind a fill they change its height.
+        for style, text in filled:
+            self.assertTrue(text.isascii(), text)
+        self.assertIn("not deployed", "".join(t for _s, t, *_ in line))
+
+    def test_title_hits_line_up_with_the_painted_buttons(self):
+        agent = self._agent("reviewer")
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        controller.selected_id = agent.id
+        line = controller.title_lines(100, 1)[0]
+        painted = "".join(t for _s, t, *_ in line)
+        for lo, hi, name in controller._title_hits:
+            label = painted[lo:hi].strip()
+            self.assertEqual(label, "resume" if name == "resume"
+                             else controller._agent_profile(agent)["model"]
+                             or "default model")
+
+    def test_model_button_targets_the_agent_without_switching(self):
+        agent = self._agent("reviewer")
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        controller.selected_id = agent.id
+        self._title_click(controller, "model")
+        self.assertEqual(controller.pending_commands,
+                         [f"/model @{agent.id}", f"/agents {agent.id}"])
+
+    def test_resume_button_switches_by_id_then_reopens_the_view(self):
+        primary = self._agent("primary", role="primary")
+        self.assertTrue(agent_loop.switch_to_agent(primary.id))
+        agent = self._agent("reviewer")
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        controller.selected_id = agent.id
+        self._title_click(controller, "resume")
+        self.assertEqual(controller.pending_commands,
+                         [f"/agent {agent.id}", "/resume", f"/agents {agent.id}"])
+
+    def test_resume_button_refuses_a_working_agent(self):
+        """/agent would refuse the switch and /resume would then restore
+        into the REPL's current Agent instead."""
+        agent = self._agent("reviewer")
+        agent.status = "running"
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        controller.selected_id = agent.id
+        self._title_click(controller, "resume")
+        self.assertEqual(controller.pending_commands, [])
+        self.assertIn("Cannot resume", controller.notice)
+
+    def test_selection_released_on_a_button_does_not_fire_it(self):
+        agent = self._agent("reviewer")
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        controller.selected_id = agent.id
+        self._title_click(controller, "model", press_on="resume")
+        self.assertEqual(controller.pending_commands, [])
+
+    def test_subagent_has_no_title_buttons(self):
+        agent = self._agent("helper", role="subagent")
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        controller.selected_id = agent.id
+        controller.title_lines(100, 1)
+        self.assertEqual(controller._title_hits, [])
+
+    def test_rail_click_targets_stay_aligned_when_scrolled(self):
+        agents = [self._agent(f"a{index}") for index in range(8)]
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        controller._terminal_size = lambda: (120, 24)
+        controller.agents()
+        controller.rail_offset = 2
+        lines = controller.rail_lines(30, 24)
+        self.assertEqual(len(lines), 24)
+        for row, hit in controller._rail_hits.items():
+            text = "".join(t for _s, t, *_ in lines[row])
+            if hit[0] == "scroll":
+                self.assertIn("more", text)
+        texts = ["".join(t for _s, t, *_ in line) for line in lines]
+        firsts = {}
+        for row in sorted(controller._rail_hits):
+            hit = controller._rail_hits[row]
+            if hit[0] == "agent":
+                firsts.setdefault(hit[1], row)
+        self.assertEqual(len(firsts), 4)
+        for agent_id, row in firsts.items():
+            # The first row a card's hit covers is the row with its name.
+            self.assertEqual(texts[row].split()[-1],
+                             agent_loop.get_agent(agent_id).name)
+        scroll_rows = [row for row, hit in controller._rail_hits.items()
+                       if hit[0] == "scroll"]
+        self.assertEqual(len(scroll_rows), 2)
+        self.assertTrue(all("more" in texts[row] for row in scroll_rows))
+
+    def test_model_at_agent_sets_an_undeployed_agents_own_model(self):
+        agent = self._agent("reviewer")
+        agent.base_model = "glm-5.3"
+        term0 = agent_loop.get_terminal("term0")
+        before = term0.model_override
+        with mock.patch.object(laintas_cli.agent_persistence,
+                               "save_agent_state") as save:
+            laintas_cli._cmd_model(
+                ["/model", f"@{agent.id}", "kimi-k2.7-code"],
+                f"@{agent.id} kimi-k2.7-code", {})
+        self.assertEqual(agent.base_model, "kimi-k2.7-code")
+        self.assertEqual(term0.model_override, before)
+        save.assert_not_called()   # not a persisted employee
+        laintas_cli._cmd_model(["/model", f"@{agent.id}", "reset"],
+                               f"@{agent.id} reset", {})
+        self.assertEqual(agent.base_model, "")
+
+    def test_model_at_agent_uses_the_deployed_agents_terminal(self):
+        self._terminal("build")
+        agent = self._agent("builder", terminal="build")
+        self.assertTrue(agent_loop.station_agent(agent.id, "build"))
+        with mock.patch.object(laintas_cli, "set_model_selection"):
+            laintas_cli._cmd_model(["/model", f"@{agent.id}", "glm-5.3"],
+                                   f"@{agent.id} glm-5.3", {})
+        self.assertEqual(agent_loop.get_terminal("build").model_override,
+                         "glm-5.3")
+        self.assertEqual(agent.base_model, "")
+
+    def test_switching_terminal_skips_the_agent_deployed_there(self):
+        self._terminal("build")
+        deployed = self._agent("builder", terminal="build")
+        self.assertTrue(agent_loop.station_agent(deployed.id, "build"))
+        other = self._agent("tester", terminal="build")
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        while controller.terminal_name != "build":
+            controller.cycle_terminal(1)
+        self.assertEqual(controller.selected_id, other.id)
 
     def test_assignment_uses_employee_channels_and_reports_failed_loop(self):
         agent = self._agent("employee")
@@ -1025,35 +1279,66 @@ class AgentsModeRenderingTests(unittest.TestCase):
         agent_loop.close_all_terminals()
         agent_ui_events.hub.reset()
 
-    def test_event_lines_reuse_parsed_cache_until_agent_changes(self):
+    def test_transcript_rows_are_cached_until_the_agent_changes(self):
         agent = agent_loop.register_agent(name="cached", role="pool")
         agent.home_terminal = "term0"
         controller = agents_mode.AgentsModeController("term0", object(), {})
         agent_ui_events.hub.emit(
             "ai", agent_id=agent.id, terminal_name="term0", detail="answer")
         with mock.patch.object(
-                controller, "_agent_name", wraps=controller._agent_name) as names:
-            first = controller._event_lines(agent.id)
-            first_calls = names.call_count
-            second = controller._event_lines(agent.id)
-        self.assertEqual(first, second)
-        self.assertGreater(first_calls, 0)
-        self.assertEqual(names.call_count, first_calls)
+                agents_mode.agents_transcript, "build_blocks",
+                wraps=agents_mode.agents_transcript.build_blocks) as build:
+            first = controller._transcript_rows(agent.id, 60)
+            second = controller._transcript_rows(agent.id, 60)
+            self.assertIs(first, second)
+            self.assertEqual(build.call_count, 1)
+            agent_ui_events.hub.emit(
+                "ai", agent_id=agent.id, terminal_name="term0", detail="more")
+            controller._transcript_rows(agent.id, 60)
+            self.assertEqual(build.call_count, 2)
 
-    def test_wide_inspector_contains_runtime_context(self):
+    def test_profile_panel_shows_positioning_model_and_deployment(self):
         agent = agent_loop.register_agent(name="worker", role="pool")
         agent.home_terminal = "term0"
+        agent.base_model = "glm-5.3"
+        agent.profile.title = "Release engineer"
+        agent.profile.description = "Builds and ships packages"
         agent.state["objective"] = "verify release"
         controller = agents_mode.AgentsModeController("term0", object(), {})
         controller.selected_id = agent.id
+        controller.set_available_models([{"id": "gpt-x"}])
         agent_ui_events.hub.emit(
             "tool_finished", agent_id=agent.id, terminal_name="term0",
             summary="pytest", status="done")
         text = "".join(value for _style, value in controller.inspector_fragments())
-        self.assertIn("CONTEXT", text)
-        self.assertIn("verify release", text)
-        self.assertIn("tools", text)
+        for expected in ("Release engineer", "Builds and ships packages",
+                         "glm-5.3", "not offered by backend", "not deployed",
+                         "verify release", "1 call", "/agent worker"):
+            self.assertIn(expected, text)
 
+        agent.deployment_terminal = "term0"
+        controller.set_available_models([{"id": "glm-5.3"}])
+        text = "".join(value for _style, value in controller.inspector_fragments())
+        self.assertIn("deployed in term0", text)
+        self.assertIn("available", text)
+        self.assertNotIn("not offered", text)
+
+    def test_card_replaces_panel_when_the_panel_does_not_fit(self):
+        agent = agent_loop.register_agent(name="worker", role="pool")
+        agent.home_terminal = "term0"
+        agent.profile.title = "Release engineer"
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        controller.selected_id = agent.id
+        with mock.patch.object(controller, "_terminal_size",
+                               return_value=(100, 30)):
+            rows = "\n".join(controller._transcript_text(agent.id))
+        self.assertIn("Release engineer", rows)
+        self.assertIn("No conversation yet", rows)
+        with mock.patch.object(controller, "_terminal_size",
+                               return_value=(170, 30)):
+            controller._rows_cache.clear()
+            rows = "\n".join(controller._transcript_text(agent.id))
+        self.assertNotIn("Release engineer", rows)
 
 class HwoUIRuntimeEventTests(unittest.TestCase):
     def test_step_binding_and_updates_are_exact(self):
