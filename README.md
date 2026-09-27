@@ -46,12 +46,12 @@ irm https://cli.laintas.com/install.ps1 | iex
 laintas-cli
 ```
 
-The macOS beta is a native terminal build for Apple Silicon and Intel. It
-does not include Helpwo Kernel or Helpwo machine sharing. Install the pinned
-prerelease (the script checks the archive's SHA-256):
+The macOS build is a native terminal CLI for Apple Silicon and Intel. It
+does not include Helpwo Kernel or Helpwo machine sharing. Install the current
+release (the script checks the archive's SHA-256):
 
 ```bash
-curl -fsSL https://cli.laintas.com/install.sh | LAINTAS_INSTALL_TAG=laintas-cli-beta-v1 bash
+curl -fsSL https://cli.laintas.com/install.sh | bash
 laintas-cli
 ```
 

@@ -280,7 +280,7 @@ jobs:
         run: |
           release_flags=()
           case "${{ steps.ver.outputs.tag }}" in
-            *-beta.*|*-rc.*|laintas-cli-beta-v*) release_flags+=(--prerelease) ;;
+            *-beta.*|*-rc.*) release_flags+=(--prerelease) ;;
           esac
           release_title="${{ steps.ver.outputs.tag }}"
           if [[ "$release_title" == laintas-cli-beta-v* ]]; then

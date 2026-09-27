@@ -1,0 +1,23 @@
+name: Promote laintas-cli-beta v1
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/promote-beta-v1.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark the existing release as ordinary and latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit laintas-cli-beta-v1 \
+            --repo lin7c/Laintas_cli \
+            --prerelease=false --latest

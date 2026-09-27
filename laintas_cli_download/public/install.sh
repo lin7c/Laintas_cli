@@ -74,17 +74,17 @@ elif [ "$INSTALL_MODE" = "mac" ]; then
         arm64) ARCH="arm64" ;;
         *) echo "Unsupported Mac architecture: $(uname -m)"; exit 1 ;;
     esac
-    # Prereleases do not replace GitHub's stable /latest pointer. The beta
-    # install command supplies LAINTAS_INSTALL_TAG explicitly.
+    # LAINTAS_INSTALL_TAG optionally pins an exact release; by default macOS
+    # follows the same latest release as Linux.
     RELEASE_TAG="${LAINTAS_INSTALL_TAG:-}"
-    if [ -z "$RELEASE_TAG" ]; then
-        echo "macOS is in beta. Set LAINTAS_INSTALL_TAG to the beta release tag."
-        exit 1
+    if [ -n "$RELEASE_TAG" ]; then
+        case "$RELEASE_TAG" in
+            *[!a-zA-Z0-9._-]*) echo "Invalid release tag"; exit 1 ;;
+        esac
+        TAG_BASE="https://github.com/lin7c/Laintas_cli/releases/download/$RELEASE_TAG"
+    else
+        TAG_BASE="$RELEASE_BASE"
     fi
-    case "$RELEASE_TAG" in
-        *[!a-zA-Z0-9._-]*) echo "Invalid release tag"; exit 1 ;;
-    esac
-    TAG_BASE="https://github.com/lin7c/Laintas_cli/releases/download/$RELEASE_TAG"
     ASSET="laintas-cli_darwin_${ARCH}.tar.gz"
     curl --fail --location --show-error --progress-bar \
         --retry 2 --connect-timeout 15 --max-time 900 \

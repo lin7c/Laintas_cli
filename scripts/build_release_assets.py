@@ -109,10 +109,9 @@ def main() -> int:
         release_assets = _fetch_release_assets(tag, version, assets_dir)
         _verify_release_assets(release_assets, assets_dir)
 
-        # A beta is opt-in. Never replace the stable self-hosted `latest`
-        # mirror while syncing a GitHub prerelease.
-        channels = ((tag,) if tag.startswith("laintas-cli-beta-v")
-                    or "-" in version or "b" in version
+        # Only an explicitly marked prerelease stays out of the latest mirror.
+        # `laintas-cli-beta-v1` is published as an ordinary release.
+        channels = ((tag,) if "-beta." in tag or "-rc." in tag
                     else ("latest", tag))
         for channel in channels:
             outdir = os.path.join(DIST_RELEASES, channel)

@@ -38,9 +38,9 @@ required before treating this as the general public Mac installer.
 Publish after both Mac jobs pass. `version.py` keeps the PEP 440 package
 version `1.32.5b1` for pip and Debian packaging, while the public release
 name is `laintas-cli-beta v1`. Commit the intended source, tag that commit
-`laintas-cli-beta-v1`, and push the tag. The workflow marks this tag as a
-GitHub prerelease, so the stable `latest` URL remains on the
-previous stable version. Check the release and both architecture archives:
+`laintas-cli-beta-v1`, and push the tag. This tag is published as an ordinary
+GitHub Release and is marked `latest`. Check the release and both architecture
+archives:
 
 ```bash
 gh release view laintas-cli-beta-v1 --json isPrerelease,assets
@@ -48,18 +48,19 @@ curl -fsSIL https://github.com/lin7c/Laintas_cli/releases/download/laintas-cli-b
 curl -fsSIL https://github.com/lin7c/Laintas_cli/releases/download/laintas-cli-beta-v1/laintas-cli_darwin_amd64.tar.gz
 ```
 
-Mac beta testers install the pinned tag, never the stable `latest` channel:
+Mac users can install the current release with the same command as Linux:
 
 ```bash
-curl -fsSL https://cli.laintas.com/install.sh | LAINTAS_INSTALL_TAG=laintas-cli-beta-v1 bash
+curl -fsSL https://cli.laintas.com/install.sh | bash
 ```
 
+To pin this release, set `LAINTAS_INSTALL_TAG=laintas-cli-beta-v1` for the
+installer or `LAINTAS_UPDATE_CHANNEL=laintas-cli-beta-v1` for `/v update`.
 The installer verifies the archive against the release's `SHA256SUMS.txt`.
-For `/v update` on a beta, set `LAINTAS_UPDATE_CHANNEL=laintas-cli-beta-v1`;
-the default update channel remains stable. If the optional site mirror is
-synced, run `LAINTAS_RELEASE_TAG=laintas-cli-beta-v1 python3 scripts/build_release_assets.py`.
-It writes only to `dist/releases/laintas-cli-beta-v1/` and leaves
-`dist/releases/latest/` untouched.
+Sync the site mirror with
+`LAINTAS_RELEASE_TAG=laintas-cli-beta-v1 python3 scripts/build_release_assets.py`.
+It writes both `dist/releases/latest/` and
+`dist/releases/laintas-cli-beta-v1/`.
 
 Run one real smoke test on each Mac architecture before announcing the beta:
 install the archive, launch `laintas-cli --version`, execute a shell command,
