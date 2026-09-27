@@ -1,23 +1,26 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   ArrowDownToLine, ArrowRight, ArrowUpRight, Check, Code2, Copy, Layers3,
-  Monitor, Package, ShieldCheck, TerminalSquare, Waypoints,
+  Laptop, Monitor, Package, ShieldCheck, TerminalSquare, Waypoints,
 } from 'lucide-react';
 import { useLanguage } from '@/contexts/LanguageContext';
 import SiteFooter from './SiteFooter';
 import TerminalReplay from './TerminalReplay';
 
-const RELEASE_FALLBACK = 'v1.32.4';
-// Release files are served by GitHub Releases, the one place CI publishes to.
-const RELEASE_BASE = 'https://github.com/lin7c/Laintas_cli/releases/latest/download';
+const RELEASE_FALLBACK = 'laintas-cli-beta-v1';
+// The site mirrors the verified assets from the latest GitHub Release.
+const RELEASE_BASE = 'https://cli.laintas.com/releases/latest';
 const RELEASE_API = 'https://api.github.com/repos/lin7c/Laintas_cli/releases/latest';
 const INSTALL_COMMANDS = {
   linux: 'curl -fsSL https://cli.laintas.com/install.sh | bash',
+  mac: 'curl -fsSL https://cli.laintas.com/install.sh | bash',
   windows: "irm https://cli.laintas.com/install.ps1 | iex",
 };
 
 const DOWNLOADS = [
   { id: 'linux', names: { zh: 'Linux', en: 'Linux' }, details: { zh: 'x86_64 / arm64 · 安装脚本自动识别架构', en: 'x86_64 / arm64 · installer picks the architecture' }, href: 'https://cli.laintas.com/install.sh', icon: Package },
+  { id: 'mac-arm64', names: { zh: 'Mac · Apple Silicon', en: 'Mac · Apple Silicon' }, details: { zh: 'arm64 · macOS 原生终端版', en: 'arm64 · native macOS terminal build' }, file: 'laintas-cli_darwin_arm64.tar.gz', icon: Laptop },
+  { id: 'mac-intel', names: { zh: 'Mac · Intel', en: 'Mac · Intel' }, details: { zh: 'x86_64 · macOS 原生终端版', en: 'x86_64 · native macOS terminal build' }, file: 'laintas-cli_darwin_amd64.tar.gz', icon: Laptop },
   { id: 'windows', names: { zh: 'Windows', en: 'Windows' }, details: { zh: 'x86_64 · 单文件安装器 · 自带独立 WSL 2', en: 'x86_64 · single installer · private WSL 2' }, file: 'laintas-cli_windows_amd64_setup.exe', icon: Monitor },
   { id: 'source', names: { zh: '源码包', en: 'Source package' }, details: { zh: 'Python 3.10+ · 审计与二次开发', en: 'Python 3.10+ · audit and extend' }, file: 'laintas-cli_source.zip', icon: Code2 },
 ];
@@ -72,7 +75,7 @@ const COPY = {
     title: ['命令照常敲，', '其余交给 agent。'],
     lead: 'Laintas CLI 是装进 shell 的自主 agent。ls、git、vim 这类命令照旧直接在真实 PTY 里运行，不经过模型；用一句话描述的任务，交给 agent 去读代码、跑命令、改文件 —— 每一步都摆在你眼前，关键操作等你点头。',
     install: '安装 Laintas CLI', seeHow: '看它怎么工作',
-    facts: [['免费', '运行时免费使用，可下载源码审计'], ['Linux · Windows', 'x86_64 / arm64，Windows 10 2004+ / 11'], ['一个账号', '与 Helpwo、插件市场共用 Laintas 账号']],
+    facts: [['免费', '运行时免费使用，可下载源码审计'], ['Linux · macOS · Windows', 'x86_64 / arm64，Windows 10 2004+ / 11'], ['一个账号', '与 Helpwo、插件市场共用 Laintas 账号']],
     realEyebrow: '真实会话录像 · v1.29.4', realTitle: '一段真实会话，逐帧回放',
     realNote: 'agent 读项目、跑 pytest、找到失败用例的根因，把补丁摆出来等你批准，落盘后再跑一遍测试。只剪掉了等待模型的空白，画面一个字没改。',
 
@@ -122,10 +125,10 @@ const COPY = {
 
     downloadKicker: '04 · 下载', downloadTitle: ['现在，', '交给你的终端。'],
     downloadIntro: '推荐一行命令安装；也可以直接下载安装包，或拿源码包审计与二次开发。',
-    platformLabel: '选择安装平台', linux: 'Linux', windows: 'Windows', copied: '已复制', copy: '复制',
+    platformLabel: '选择安装平台', linux: 'Linux', mac: 'macOS', windows: 'Windows', copied: '已复制', copy: '复制',
     startSteps: [['运行安装命令', '自动识别架构并完成安装'], ['启动并登录', '输入 laintas-cli，按提示登录 Laintas 账号'], ['说出第一个任务', '比如“看看这个项目怎么跑起来”']],
     packages: '安装包', download: '下载',
-    requirements: 'Linux 需 64 位 glibc 系统（x86_64 / arm64）；Windows 需 x86_64、Windows 10 2004+ 或 Windows 11，并启用 WSL 2。',
+    requirements: 'Linux 需 64 位 glibc 系统；Mac 支持 Apple Silicon 和 Intel，暂不包含 Helpwo Kernel；Windows 需 x86_64、Windows 10 2004+ 或 Windows 11，并启用 WSL 2。',
   },
   en: {
     chapters: ['Intro', 'Why', 'How it works', 'Pricing', 'Download'],
@@ -140,7 +143,7 @@ const COPY = {
     title: ['Your shell, as usual.', 'Plus an agent.'],
     lead: 'Laintas CLI is an autonomous agent that lives in your shell. Commands like ls, git and vim still run straight in a real PTY, never through the model. Describe a task in a sentence and the agent reads code, runs commands and edits files — every step in front of you, every risky one waiting for your yes.',
     install: 'Install Laintas CLI', seeHow: 'See how it works',
-    facts: [['Free', 'Free runtime, source you can download and audit'], ['Linux · Windows', 'x86_64 / arm64, Windows 10 2004+ / 11'], ['One account', 'Shared with Helpwo and the plugin market']],
+    facts: [['Free', 'Free runtime, source you can download and audit'], ['Linux · macOS · Windows', 'x86_64 / arm64, Windows 10 2004+ / 11'], ['One account', 'Shared with Helpwo and the plugin market']],
     realEyebrow: 'RECORDED SESSION · v1.29.4', realTitle: 'A real session, replayed frame for frame',
     realNote: 'The agent reads the project, runs pytest, traces the failing case to its root cause, shows the patch and waits for approval, then re-runs the suite. Only the model pauses are cut; nothing on screen is rewritten.',
 
@@ -190,10 +193,10 @@ const COPY = {
 
     downloadKicker: '04 · DOWNLOAD', downloadTitle: ['Now,', 'hand it to your terminal.'],
     downloadIntro: 'The one-line installer is recommended. You can also grab a package directly, or audit and extend the source.',
-    platformLabel: 'Select install platform', linux: 'Linux', windows: 'Windows', copied: 'Copied', copy: 'Copy',
+    platformLabel: 'Select install platform', linux: 'Linux', mac: 'macOS', windows: 'Windows', copied: 'Copied', copy: 'Copy',
     startSteps: [['Run the installer', 'It detects your architecture and installs laintas-cli'], ['Start and sign in', 'Type laintas-cli and sign in to your Laintas account'], ['Give it a first task', 'Try “figure out how to run this project”']],
     packages: 'Packages', download: 'Download',
-    requirements: 'Linux needs a 64-bit glibc system (x86_64 / arm64). Windows needs x86_64 on Windows 10 2004+ or Windows 11 with WSL 2 enabled.',
+    requirements: 'Linux needs a 64-bit glibc system. Mac supports Apple Silicon and Intel without Helpwo Kernel. Windows needs x86_64 on Windows 10 2004+ or Windows 11 with WSL 2 enabled.',
   },
 };
 
@@ -271,6 +274,7 @@ export default function DownloadSection() {
 
   useEffect(() => {
     if (/Windows/i.test(window.navigator.userAgent)) setInstallPlatform('windows');
+    else if (/Macintosh|Mac OS X/i.test(window.navigator.userAgent)) setInstallPlatform('mac');
     fetch(RELEASE_API)
       .then((response) => response.ok ? response.json() : Promise.reject(new Error('release lookup failed')))
       .then((data) => { if (data.tag_name) setRelease(data.tag_name); })
@@ -423,7 +427,7 @@ export default function DownloadSection() {
             <ChapterHead kicker={c.downloadKicker} title={c.downloadTitle} intro={c.downloadIntro} />
             <div className="st-install">
               <div className="st-install-tabs" role="group" aria-label={c.platformLabel}>
-                {['linux', 'windows'].map((platform) => (
+                {['linux', 'mac', 'windows'].map((platform) => (
                   <button type="button" key={platform} className={installPlatform === platform ? 'active' : ''} onClick={() => setInstallPlatform(platform)} aria-pressed={installPlatform === platform}>{c[platform]}</button>
                 ))}
               </div>

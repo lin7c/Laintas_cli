@@ -54,3 +54,12 @@ def test_mac_frozen_update_requests_mac_archive():
 
         assert requested[-1].endswith("laintas-cli_darwin_arm64.tar.gz")
         assert target.read_bytes() == b"old"
+
+
+def test_mac_updates_use_site_mirror_and_custom_tag():
+    with mock.patch.object(updater.sys, "platform", "darwin"), \
+            mock.patch.dict(updater.os.environ, {}, clear=True):
+        assert updater._asset_url("latest", "manifest.json") == (
+            "https://cli.laintas.com/releases/latest/manifest.json")
+        assert updater._asset_url("laintas-cli-beta-v1", "manifest.json") == (
+            "https://cli.laintas.com/releases/laintas-cli-beta-v1/manifest.json")

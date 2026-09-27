@@ -4,9 +4,8 @@ set -euo pipefail
 # Where this script is served from — the Windows hand-off below fetches its
 # sibling from here.
 BASE_URL="https://cli.laintas.com"
-# Where the packages are. The site's own self-hosted release path is retired:
-# its "latest" pointer 404s, which broke this installer on every platform
-# after the move to GitHub Releases.
+# Linux and Windows keep using GitHub's latest assets; macOS uses the site's
+# verified /releases/latest mirror below.
 RELEASE_BASE="https://github.com/lin7c/Laintas_cli/releases/latest/download"
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -74,16 +73,16 @@ elif [ "$INSTALL_MODE" = "mac" ]; then
         arm64) ARCH="arm64" ;;
         *) echo "Unsupported Mac architecture: $(uname -m)"; exit 1 ;;
     esac
-    # LAINTAS_INSTALL_TAG optionally pins an exact release; by default macOS
-    # follows the same latest release as Linux.
+    # LAINTAS_INSTALL_TAG optionally pins an exact release. Mac packages and
+    # checksums are served from the cli.laintas.com release mirror.
     RELEASE_TAG="${LAINTAS_INSTALL_TAG:-}"
     if [ -n "$RELEASE_TAG" ]; then
         case "$RELEASE_TAG" in
             *[!a-zA-Z0-9._-]*) echo "Invalid release tag"; exit 1 ;;
         esac
-        TAG_BASE="https://github.com/lin7c/Laintas_cli/releases/download/$RELEASE_TAG"
+        TAG_BASE="$BASE_URL/releases/$RELEASE_TAG"
     else
-        TAG_BASE="$RELEASE_BASE"
+        TAG_BASE="$BASE_URL/releases/latest"
     fi
     ASSET="laintas-cli_darwin_${ARCH}.tar.gz"
     curl --fail --location --show-error --progress-bar \

@@ -6,18 +6,15 @@
 
 Update source
 -------------
-Release assets come from **GitHub Releases**, which is where CI publishes and
-where ``install.sh``/``install.ps1`` download from::
+CI publishes the originals to GitHub Releases. Linux and Windows update from
+GitHub; macOS updates from the verified ``cli.laintas.com`` mirror::
 
     https://github.com/lin7c/Laintas_cli/releases/latest/download/<asset>
-    https://github.com/lin7c/Laintas_cli/releases/download/vX.Y.Z/<asset>
+    https://cli.laintas.com/releases/latest/<asset>
 
-The site used to self-host these under ``cli.laintas.com/releases/<channel>/``,
-populated by ``scripts/build_release_assets.py`` during a manual release. Once
-releasing moved into CI nothing repopulated that directory, and every ``/v``
-update against it 404'd. ``LAINTAS_DOWNLOAD_BASE`` still points at a mirror
-laid out that flat way, which is what makes a local static server usable for
-testing.
+``scripts/build_release_assets.py`` populates the site mirror after each
+release. ``LAINTAS_DOWNLOAD_BASE`` can point to another mirror with the same
+flat ``/releases/<channel>/<asset>`` layout.
 
 Each channel carries a ``manifest.json`` asset::
 
@@ -86,11 +83,11 @@ try:
 except Exception:  # pragma: no cover
     LOCAL_VERSION = "0.0.0"
 
-# GitHub Releases is the distribution channel — the one place CI publishes
-# manifest.json, src_manifest.zip, the checksums and the binaries. Override
-# LAINTAS_DOWNLOAD_BASE to point at a mirror or a local static server, which is
-# read with the flat /releases/<channel>/<asset> layout.
+# GitHub Releases holds the originals. macOS uses the verified
+# cli.laintas.com mirror by default; LAINTAS_DOWNLOAD_BASE can override either
+# platform for testing or private mirrors.
 DEFAULT_DOWNLOAD_BASE = "https://github.com/lin7c/Laintas_cli"
+MAC_DOWNLOAD_BASE = "https://cli.laintas.com"
 _TIMEOUT = 30
 
 
@@ -98,7 +95,8 @@ _TIMEOUT = 30
 
 def download_base() -> str:
     """Root URL the updater fetches from (override for testing/staging)."""
-    return os.environ.get("LAINTAS_DOWNLOAD_BASE", DEFAULT_DOWNLOAD_BASE).rstrip("/")
+    default = MAC_DOWNLOAD_BASE if sys.platform == "darwin" else DEFAULT_DOWNLOAD_BASE
+    return os.environ.get("LAINTAS_DOWNLOAD_BASE", default).rstrip("/")
 
 
 def update_channel() -> str:
@@ -115,7 +113,7 @@ def _channel_dir(channel: str) -> str:
     """
     if channel in ("", "latest"):
         return "latest"
-    return channel if channel.startswith("v") else f"v{channel}"
+    return f"v{channel}" if re.fullmatch(r"\d+\.\d+\.\d+.*", channel) else channel
 
 
 def _asset_url(channel: str, asset: str) -> str:

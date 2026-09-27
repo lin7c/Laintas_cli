@@ -56,7 +56,10 @@ curl -fsSL https://cli.laintas.com/install.sh | bash
 
 To pin this release, set `LAINTAS_INSTALL_TAG=laintas-cli-beta-v1` for the
 installer or `LAINTAS_UPDATE_CHANNEL=laintas-cli-beta-v1` for `/v update`.
-The installer verifies the archive against the release's `SHA256SUMS.txt`.
+The installer downloads Mac archives and `SHA256SUMS.txt` from
+`https://cli.laintas.com/releases/latest/` and verifies the archive. The
+download page links both Apple Silicon and Intel archives directly from the
+same mirror. The frozen Mac `/v update` uses that mirror as well.
 Sync the site mirror with
 `LAINTAS_RELEASE_TAG=laintas-cli-beta-v1 python3 scripts/build_release_assets.py`.
 It writes both `dist/releases/latest/` and
@@ -143,29 +146,26 @@ Releasing a new version means updating:
 - the version shown in the page's compatibility section
 
 For a prerelease, keep the page's stable `RELEASE_FALLBACK` and its
-`/releases/latest/download` links on the last stable release. Use the pinned
-beta URL and install command in the macOS beta section above; GitHub
-prereleases do not advance the stable `latest` pointer.
+`/releases/latest/` links on the last ordinary release. GitHub prereleases
+do not advance the `latest` pointer. `laintas-cli-beta-v1` is an ordinary
+release, despite its name.
 
-`RELEASE_BASE` does not move between releases: it is the release channel's
-rolling `latest/download` pointer, and the cards build their filenames from
-the tag the page looked up.
+`RELEASE_BASE` is the site's rolling `https://cli.laintas.com/releases/latest`
+mirror. The download cards link directly to its files.
 
 Then build the download page:
 
 ```bash
 cd laintas_cli_download
-npm run build
+npm run build -- --outDir /tmp/laintas-cli-site-build
+cp -a /tmp/laintas-cli-site-build/. dist/
+rm -r /tmp/laintas-cli-site-build
 cd ..
 ```
 
-The page links straight at the GitHub release, so the build needs nothing
-preserved across it. Release binaries are never committed to this repository
-either — `laintas_cli_download/public/releases/` is ignored, because `public/`
-is copied into `dist/` wholesale and every sub-agent worktree is a full
-checkout, which turned two committed tarballs into gigabytes of duplicates.
-Only if you run the optional mirror in section 3 does `dist/releases` hold
-anything worth keeping, and that section says what to do about it.
+Build outside `dist/` and copy the result in so the existing
+`dist/releases/latest/` mirror survives. Release binaries are never committed
+to this repository: `laintas_cli_download/public/releases/` is ignored.
 
 ## 2. Create the GitHub release
 

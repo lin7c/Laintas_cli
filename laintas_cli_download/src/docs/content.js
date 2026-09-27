@@ -70,13 +70,15 @@ export const GROUPS = [
             rows: L([
               ['Linux x86_64', '64 位，glibc', '独立二进制，无需 Python'],
               ['Linux aarch64', '64 位 ARM，glibc', '独立二进制，无需 Python'],
+              ['macOS Apple Silicon / Intel', 'arm64 / x86_64', '原生终端二进制，无需 Python'],
               ['Windows', 'Windows 10 2004+ 或 Windows 11，64 位', '单文件安装程序（自带私有 WSL 2 发行版）'],
-              ['其他（Alpine/musl、32 位、macOS 等）', 'Python 3.10+', '源码包'],
+              ['其他（Alpine/musl、32 位等）', 'Python 3.10+', '源码包'],
             ], [
               ['Linux x86_64', '64-bit, glibc', 'Standalone binary, no Python needed'],
               ['Linux aarch64', '64-bit ARM, glibc', 'Standalone binary, no Python needed'],
+              ['macOS Apple Silicon / Intel', 'arm64 / x86_64', 'Native terminal binary, no Python needed'],
               ['Windows', 'Windows 10 2004+ or Windows 11, 64-bit', 'Single-file installer (ships a private WSL 2 distribution)'],
-              ['Anything else (Alpine/musl, 32-bit, macOS …)', 'Python 3.10+', 'Source package'],
+              ['Anything else (Alpine/musl, 32-bit …)', 'Python 3.10+', 'Source package'],
             ]),
           },
           { t: 'h', ...L('Linux', 'Linux') },
@@ -88,6 +90,14 @@ export const GROUPS = [
             t: 'p', ...L('不确定机器是否兼容时，先检查架构、位数和 glibc 版本：', 'If you are unsure the machine is compatible, check the architecture, word size and glibc version first:'),
           },
           { t: 'code', label: 'bash', code: 'uname -m\ngetconf LONG_BIT\nldd --version' },
+          { t: 'h', ...L('macOS', 'macOS') },
+          { t: 'code', label: 'bash', code: 'curl -fsSL https://cli.laintas.com/install.sh | bash\nlaintas-cli' },
+          {
+            t: 'p', ...L(
+              '安装脚本会选择 Apple Silicon 或 Intel 安装包，校验 SHA-256 后安装到 `~/.local/bin`。Mac 版不包含 Helpwo Kernel。',
+              'The installer chooses the Apple Silicon or Intel archive, verifies its SHA-256 checksum and installs to `~/.local/bin`. The Mac build does not include Helpwo Kernel.',
+            ),
+          },
           { t: 'h', ...L('Windows', 'Windows') },
           { t: 'code', label: 'PowerShell', code: 'irm https://cli.laintas.com/install.ps1 | iex\nlaintas-cli' },
           {
@@ -108,8 +118,8 @@ export const GROUPS = [
           { t: 'code', label: 'bash', code: 'unzip laintas-cli_source.zip\ncd laintas-cli-source\npython3 -m pip install -r requirements.txt\npython3 laintas_cli.py' },
           {
             t: 'p', ...L(
-              '所有安装包——Linux amd64/arm64 压缩包、Debian 包、Windows 安装程序、源码包以及 SHA-256 校验文件——都发布在 [GitHub Releases](https://github.com/lin7c/Laintas_cli/releases)，[下载页](/#download) 也列出了每个文件的直链。',
-              'Every artifact — Linux amd64/arm64 archives, the Debian package, the Windows installer, the source package and SHA-256 checksums — is published on [GitHub Releases](https://github.com/lin7c/Laintas_cli/releases); the [download section](/#download) links each one directly.',
+              'Linux 和 macOS 双架构安装包、Debian 包、Windows 安装程序、源码包以及 SHA-256 校验文件都发布在 [GitHub Releases](https://github.com/lin7c/Laintas_cli/releases)，并同步到 `cli.laintas.com/releases/latest/`；[下载页](/#download) 列出了直链。',
+              'Linux and macOS archives for both architectures, the Debian package, Windows installer, source package and SHA-256 checksums are published on [GitHub Releases](https://github.com/lin7c/Laintas_cli/releases) and mirrored at `cli.laintas.com/releases/latest/`; the [download section](/#download) links to the files.',
             ),
           },
         ],

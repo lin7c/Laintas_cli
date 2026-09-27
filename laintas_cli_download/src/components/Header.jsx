@@ -19,7 +19,7 @@ export default function Header() {
   const { data: session, isPending } = auth.useSession();
   const [userOpen, setUserOpen] = useState(false);
   const [balance, setBalance] = useState(null);
-  const [version, setVersion] = useState('v1.26.0');
+  const [version, setVersion] = useState('laintas-cli-beta-v1');
   const menuRef = useRef(null);
 
   useEffect(() => {

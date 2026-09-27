@@ -422,13 +422,14 @@ class UpdateChannelTests(unittest.TestCase):
                 / "laintas_cli_download/src/components/DownloadSection.jsx"
                 ).read_text(encoding="utf-8")
         self.assertIn(
-            "https://github.com/lin7c/Laintas_cli/releases/latest/download",
+            "https://cli.laintas.com/releases/latest",
             page)
-        self.assertNotIn("cli.laintas.com/releases/", page)
-        # The two files the page links directly; Linux goes through the
-        # installer script, which picks its own architecture.
+        # Linux uses the installer script; direct package cards include both
+        # native Mac architectures and the other downloadable installers.
         for asset in ("laintas-cli_windows_amd64_setup.exe",
-                      "laintas-cli_source.zip"):
+                      "laintas-cli_source.zip",
+                      "laintas-cli_darwin_amd64.tar.gz",
+                      "laintas-cli_darwin_arm64.tar.gz"):
             self.assertIn(asset, page)
 
 
