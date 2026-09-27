@@ -59,7 +59,9 @@ installer or `LAINTAS_UPDATE_CHANNEL=laintas-cli-beta-v1` for `/v update`.
 The installer downloads Mac archives and `SHA256SUMS.txt` from
 `https://cli.laintas.com/releases/latest/` and verifies the archive. The
 download page links both Apple Silicon and Intel archives directly from the
-same mirror. The frozen Mac `/v update` uses that mirror as well.
+same mirror. New Mac builds use this mirror for `/v update`; the already
+published `laintas-cli-beta v1` binary was built before that updater change
+and still uses GitHub Releases for `/v update`.
 Sync the site mirror with
 `LAINTAS_RELEASE_TAG=laintas-cli-beta-v1 python3 scripts/build_release_assets.py`.
 It writes both `dist/releases/latest/` and

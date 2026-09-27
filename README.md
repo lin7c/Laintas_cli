@@ -56,8 +56,8 @@ laintas-cli
 ```
 
 The Mac installer writes to `~/.local/bin`; add that directory to `PATH` if
-your shell does not already use it. The installer and `/v update` use the
-verified packages mirrored at `cli.laintas.com/releases/latest/`. See [the release guide](build/RELEASE.md)
+your shell does not already use it. The installer downloads and verifies the
+Mac package from `cli.laintas.com/releases/latest/`. See [the release guide](build/RELEASE.md)
 for the Mac build and verification steps.
 
 Manage the Windows helper from `/windows` (alias `/kernel`). The full-screen
