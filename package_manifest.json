@@ -4,10 +4,17 @@
   "modules": [
     "laintas_cli",
     "agent_loop",
+    "append_input",
+    "account_store",
+    "account_tasks",
+    "task_handoff",
+    "file_lock",
     "background_compaction",
     "agent_ui_events",
     "agent_router",
     "station_service",
+    "terminal_link",
+    "terminal_link_runtime",
     "station_ui",
     "detail_trace",
     "git_attribution",
@@ -119,7 +126,8 @@
     "prop_ui",
     "vision",
     "retask",
-    "retask_view"
+    "retask_view",
+    "acp_agent"
   ],
   "packages": [
     "agent_tools",

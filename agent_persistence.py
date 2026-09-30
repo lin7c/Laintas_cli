@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 import json_store
 import paths
 
-AGENTS_DIR = paths.AGENTS_DIR
+AGENTS_DIR = paths.account_path("AGENTS_DIR")
 _MAX_HISTORY_TURNS = 200  # truncate older turns to keep files manageable
 
 
@@ -70,6 +70,8 @@ def _agent_file(agent_id: str) -> Path:
 
 def save_agent_state(agent: "AgentInfo") -> bool:
     """Atomically write agent state to disk. Returns True on success."""
+    if getattr(agent, "remote_terminal", ""):
+        return True
     try:
         _ensure_dir()
     except OSError:
@@ -85,7 +87,7 @@ def save_agent_state(agent: "AgentInfo") -> bool:
         "name": agent.name,
         "role": getattr(agent, "role", "pool"),
         "depth": getattr(agent, "depth", 0),
-        "parent_id": getattr(agent, "parent_id", None),
+        "parent_id": getattr(agent, "_term_original_parent", getattr(agent, "parent_id", None)),
         "parent_terminal": getattr(agent, "parent_terminal", None),
         "deployment_terminal": getattr(agent, "deployment_terminal", None),
         "home_terminal": getattr(agent, "home_terminal", None),

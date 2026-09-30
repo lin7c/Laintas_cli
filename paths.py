@@ -5,6 +5,10 @@ All file and directory paths used by laintas_cli are defined here.
 Other modules import from this module instead of constructing paths directly.
 
 Layout:
+    Signed-in runtime files below live under accounts/<sha256(userId)>/.
+    The root keeps shared skills, instance coordination and unassigned legacy
+    data. Account selection happens before modules cache these paths.
+
     ~/.laintas/                          # Home configuration (LAINTAS_HOME env override)
     ├── config.json                      # Global settings
     ├── session.json                     # Authentication session
@@ -42,13 +46,24 @@ Layout:
 import hashlib
 import os
 import stat
+import sys
+import threading
 import uuid
 from pathlib import Path
 
 
 # ── Home Directory (global config) ───────────────────────────────────────
 
-LAINTAS_HOME = Path(os.environ.get("LAINTAS_HOME", str(Path.home() / ".laintas")))
+LAINTAS_HOME = Path(os.environ.get("LAINTAS_HOME", str(Path.home() / ".laintas"))).expanduser().absolute()
+ROOT_HOME = LAINTAS_HOME
+ACCOUNT_USER_ID = ""
+_ACCOUNT_CONFIGURED = False
+_ACCOUNT_PATHS_BOUND = False
+_account_mutex = threading.RLock()
+
+
+class AccountSelectionError(RuntimeError):
+    pass
 
 
 def _safe_instance_id(value: str) -> str:
@@ -172,6 +187,82 @@ PROMPT_FEEDBACK_LOG  = PROMPTS_DIR / "feedback.jsonl"
 PROMPT_OPT_STATE     = PROMPTS_DIR / "_state.json"
 
 
+_ACCOUNT_PATH_NAMES = (
+    "CONFIG_FILE", "SESSION_FILE", "HISTORY_FILE", "POLICY_FILE", "AUDIT_FILE",
+    "HOOKS_FILE", "PYTHON_HOOKS_FILE", "MCP_FILE", "BACKENDS_FILE",
+    "MODEL_PROVIDERS_FILE", "MODEL_KEYS_FILE", "TRUST_FILE", "TASKS_FILE",
+    "MESSAGES_READ_FILE", "INTERACTIVE_COMMANDS_FILE", "MEMORY_DIR", "MEMORY_INDEX",
+    "PLANS_DIR", "PLANS_STATE", "AGENTS_DIR", "SESSIONS_DIR", "TRAINING_DIR",
+    "TRAINING_LOCAL_DB", "PROMPTS_DIR", "PROMPT_CANDIDATES_DIR",
+    "PROMPT_FEEDBACK_LOG", "PROMPT_OPT_STATE",
+)
+_ACCOUNT_RELATIVE_PATHS = {name: globals()[name].relative_to(ROOT_HOME)
+                           for name in _ACCOUNT_PATH_NAMES}
+
+
+def require_account_selected() -> None:
+    """Require explicit initialization, allowing an explicitly anonymous run."""
+    if not _ACCOUNT_CONFIGURED:
+        raise AccountSelectionError(
+            "Account paths are not initialized. Call paths.configure_account(user_id) "
+            "before importing runtime stores, or configure_account('') for an anonymous backend.")
+
+
+def account_path(name: str) -> Path:
+    """Bind a consumer to one selected profile; later hot-swapping is refused."""
+    global _ACCOUNT_PATHS_BOUND
+    with _account_mutex:
+        require_account_selected()
+        if name != "LAINTAS_HOME" and name not in _ACCOUNT_RELATIVE_PATHS:
+            raise ValueError(f"Not an account path: {name}")
+        _ACCOUNT_PATHS_BOUND = True
+        return globals()[name]
+
+
+def assert_account_write(path) -> None:
+    """Reject uninitialized or misrouted writes to managed user stores."""
+    private = {p.parts[0] for p in _ACCOUNT_RELATIVE_PATHS.values()}
+    private.update({"run", "identities", "cookies.json", "messages.json", "models", "processes",
+                    "usage", "branches.json", "checkpoints.json", "model_windows.json",
+                    "markdown_theme.json", "search_engines.json", "extensions", "enterprise"})
+    destination = Path(os.path.abspath(Path(path).expanduser()))
+    managed = False
+    # Inspect both the lexical location and its real target: a symlink in a
+    # profile must not turn a managed write into an unchecked export.
+    for candidate, root in ((destination, Path(os.path.abspath(ROOT_HOME))),
+                            (destination.resolve(), ROOT_HOME.resolve())):
+        try:
+            relative = candidate.relative_to(root)
+        except ValueError:
+            continue
+        if relative.parts and relative.parts[0] in private | {"accounts"}:
+            managed = True
+            break
+    if not managed:
+        return  # Shared coordination, project files and caller-owned exports.
+    require_account_selected()
+    try:
+        destination.resolve().relative_to(LAINTAS_HOME.resolve())
+    except ValueError:
+        raise AccountSelectionError("User-data destination is outside the selected account profile") from None
+
+
+def configure_account(user_id: str) -> None:
+    """Select paths before consumers import/cache them; never hot-swap a run."""
+    import account_store
+    global LAINTAS_HOME, ACCOUNT_USER_ID, _ACCOUNT_CONFIGURED
+    uid = str(user_id or "").strip()
+    target = account_store.profile_dir(ROOT_HOME, uid) if uid else ROOT_HOME
+    with _account_mutex:
+        if _ACCOUNT_PATHS_BOUND and (uid != ACCOUNT_USER_ID or target != LAINTAS_HOME):
+            raise AccountSelectionError("Runtime stores already belong to another profile; restart to change accounts")
+        for name, relative in _ACCOUNT_RELATIVE_PATHS.items():
+            globals()[name] = target / relative
+        LAINTAS_HOME = target
+        ACCOUNT_USER_ID = uid
+        _ACCOUNT_CONFIGURED = True
+
+
 # ── Per-Project Directory (cwd-scoped) ───────────────────────────────────
 
 _PROJECT_SUBDIR = ".laintas"
@@ -271,6 +362,7 @@ def ensure_home() -> None:
     Safe to call multiple times (uses exist_ok=True).
     Sets 0o700 on the root directory for privacy.
     """
+    require_account_selected()
     if not _home_owner_ok():
         raise RuntimeError(
             f"LAINTAS_HOME ({LAINTAS_HOME}) resolves to a directory not "
@@ -452,3 +544,14 @@ def ensure_project_path_committable(name: str, note: str = "",
         return True
     except OSError:
         return False
+
+
+# An embedded entry may select a verified profile through the environment.
+# Bare library imports never inspect the real default profile or migrate it.
+_cli_entry = (getattr(sys, "frozen", False)
+              or Path(sys.argv[0]).stem in {"laintas-cli", "laintas", "laintas_cli"})
+if os.environ.get("LAINTAS_ACCOUNT_ID", "").strip() and not _cli_entry:
+    import account_store as _account_bootstrap
+    configure_account(_account_bootstrap.launch_account(ROOT_HOME, TERMINAL_ID, []))
+elif os.environ.get("LAINTAS_ACCOUNT_MODE") == "anonymous":
+    configure_account("")

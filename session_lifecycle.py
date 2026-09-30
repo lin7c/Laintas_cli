@@ -4,18 +4,10 @@ import hashlib
 import json
 import os
 import re
-import threading
 import uuid
 
 import paths
-
-if os.name == "nt":
-    import msvcrt
-else:
-    import fcntl
-
-_mutex = threading.RLock()
-_local = threading.local()
+import file_lock
 
 
 def _key(cwd):
@@ -34,34 +26,10 @@ def identity(blob):
 
 @contextmanager
 def guard(cwd):
-    # flock alone does not serialize threads reliably; nested saves share the
-    # outer process lock instead of opening a second descriptor and deadlocking.
-    with _mutex:
-        key = (str(paths.SESSIONS_DIR), str(cwd))
-        held = getattr(_local, "held", set())
-        if key in held:
-            yield
-            return
-        paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-        with (paths.SESSIONS_DIR / f"{_key(cwd)}_lifecycle.lock").open("a") as lock:
-            if os.name == "nt":
-                if lock.tell() == 0:
-                    lock.write(" ")
-                    lock.flush()
-                lock.seek(0)
-                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
-            else:
-                fcntl.flock(lock, fcntl.LOCK_EX)
-            _local.held = held | {key}
-            try:
-                yield
-            finally:
-                _local.held = held
-                if os.name == "nt":
-                    lock.seek(0)
-                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    fcntl.flock(lock, fcntl.LOCK_UN)
+    paths.require_account_selected()
+    with file_lock.guard(paths.SESSIONS_DIR / f"{_key(cwd)}_lifecycle.lock",
+                         rank=file_lock.SESSION):
+        yield
 
 
 # path -> ((ino, mtime_ns, size), ids). Session listing probes is_deleted

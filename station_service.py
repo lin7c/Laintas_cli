@@ -67,9 +67,10 @@ class StationService:
                     tuple(r._allowed_tool_names_for_state(
                         {"_role_name": a.profile.specialist_role}, a.id)),
                     tuple(policy.denied_tools),
-                    a.active_assignment is not None or a.deployment_pending or a.status in {"running", "waiting", "queued"},
+                    a.active_assignment is not None or a.deployment_pending or a.status in {"running", "thinking", "waiting", "queued"},
                     a.lifecycle_terminated,
-                    not deployment or bool(terminal and terminal.session and terminal.session.is_alive())))
+                    (bool(r.get_terminal(a.remote_terminal) and r.get_terminal(a.remote_terminal).session.is_alive())
+                     if a.remote_terminal else not deployment or bool(terminal and terminal.session and terminal.session.is_alive()))))
             return tuple(result)
 
     def snapshot(self):
@@ -162,6 +163,14 @@ class StationService:
         r = self.runtime
         decision = self.preview(request)
         if decision.action == "assign":
+            agent = r.get_agent(decision.agent_id)
+            if agent is not None and agent.remote_terminal:
+                import terminal_link
+                owner = r.get_agent(request.owner_id)
+                result = terminal_link.get_service().assign(agent, request,
+                    r._allowed_tool_names_for_state(owner.state, owner.id))
+                return StationResult(True, f"Assigned {agent.id} in {agent.remote_terminal}.",
+                                     agent.id, result["job_id"], "assign")
             ok, message, assignment = r.start_agent_assignment(
                 decision.agent_id, request.task, deps, session=session,
                 events_cb=events_cb, expected_parent_id=request.owner_id)
@@ -227,6 +236,14 @@ class StationService:
         return results
 
     def deploy(self, agent_id, terminal_name, *, owner_id, create_terminal):
+        remote = self.runtime.get_agent(agent_id)
+        if remote is not None and remote.remote_terminal:
+            try:
+                import terminal_link
+                terminal_link.get_service().deploy(remote, terminal_name, owner_id)
+                return StationResult(True, f"Stationed {agent_id} in {terminal_name}.", agent_id)
+            except Exception as exc:
+                return StationResult(False, str(exc))
         r = self.runtime
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", terminal_name):
             return StationResult(False, "Invalid terminal name.")
@@ -287,6 +304,8 @@ class StationService:
     def undeploy(self, agent_id, owner_id):
         r = self.runtime
         agent = r.get_agent(agent_id)
+        if agent is not None and agent.remote_terminal:
+            return StationResult(False, "Linked Agents stay in their execution terminal; use /term release.")
         if agent is None:
             return StationResult(False, "Agent has ended.")
         with agent.assignment_lock:
@@ -300,6 +319,15 @@ class StationService:
     def cancel(self, agent_id, run_id, owner_id):
         r = self.runtime
         agent = r.get_agent(agent_id)
+        if agent is not None and agent.remote_terminal:
+            if agent.parent_id != owner_id or not agent.active_assignment or agent.active_assignment.id != run_id:
+                return StationResult(False, "Task changed or belongs to another manager.")
+            try:
+                import terminal_link
+                terminal_link.get_service().cancel(agent, run_id)
+                return StationResult(True, "Remote cancellation requested.")
+            except Exception as exc:
+                return StationResult(False, str(exc))
         if agent is None:
             return StationResult(False, "Agent has ended.")
         with agent.assignment_lock:
@@ -332,6 +360,15 @@ class StationService:
         r = self.runtime
         if name == "term0":
             return StationResult(False, "The primary terminal belongs to the CLI; use /exit.")
+        import terminal_link
+        service = terminal_link._service
+        if service is not None and name in service.children:
+            child = service.children[name]
+            terminal = r.get_terminal(name)
+            if child["owner"] != owner_id or terminal is None or terminal.created_at != expected_created_at:
+                return StationResult(False, "Terminal owner or identity changed; inspect it again.")
+            service.release(name)
+            return StationResult(True, f"Released {name}; its independent CLI remains running.")
         with r._registry_lock:
             terminal = r.get_terminal(name)
             manager = r.get_agent(owner_id)

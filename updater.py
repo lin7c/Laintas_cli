@@ -6,15 +6,17 @@
 
 Update source
 -------------
-CI publishes the originals to GitHub Releases. Linux and Windows update from
-GitHub; macOS updates from the verified ``cli.laintas.com`` mirror::
+Every platform updates from the self-hosted ``cli.laintas.com`` mirror,
+which ``scripts/build_release_assets.py`` repopulates after each release
+(``scripts/release.sh`` runs it as part of publishing)::
 
-    https://github.com/lin7c/Laintas_cli/releases/latest/download/<asset>
     https://cli.laintas.com/releases/latest/<asset>
 
-``scripts/build_release_assets.py`` populates the site mirror after each
-release. ``LAINTAS_DOWNLOAD_BASE`` can point to another mirror with the same
-flat ``/releases/<channel>/<asset>`` layout.
+GitHub Releases still holds the originals — it is where CI publishes and
+where ``install.sh``/``install.ps1`` download from — so pointing
+``LAINTAS_DOWNLOAD_BASE`` at it switches ``/v`` back to GitHub. Any other
+override uses the same flat ``/releases/<channel>/<asset>`` layout, which is
+what makes a local static server usable for testing.
 
 Each channel carries a ``manifest.json`` asset::
 
@@ -83,11 +85,11 @@ try:
 except Exception:  # pragma: no cover
     LOCAL_VERSION = "0.0.0"
 
-# GitHub Releases holds the originals. macOS uses the verified
-# cli.laintas.com mirror by default; LAINTAS_DOWNLOAD_BASE can override either
-# platform for testing or private mirrors.
-DEFAULT_DOWNLOAD_BASE = "https://github.com/lin7c/Laintas_cli"
-MAC_DOWNLOAD_BASE = "https://cli.laintas.com"
+# The self-hosted cli.laintas.com mirror is the default update channel;
+# GITHUB_RELEASES_BASE is kept so LAINTAS_DOWNLOAD_BASE can switch /v back
+# to the GitHub originals (whose URL shape differs) or a private mirror.
+DEFAULT_DOWNLOAD_BASE = "https://cli.laintas.com"
+GITHUB_RELEASES_BASE = "https://github.com/lin7c/Laintas_cli"
 _TIMEOUT = 30
 
 
@@ -95,8 +97,7 @@ _TIMEOUT = 30
 
 def download_base() -> str:
     """Root URL the updater fetches from (override for testing/staging)."""
-    default = MAC_DOWNLOAD_BASE if sys.platform == "darwin" else DEFAULT_DOWNLOAD_BASE
-    return os.environ.get("LAINTAS_DOWNLOAD_BASE", default).rstrip("/")
+    return os.environ.get("LAINTAS_DOWNLOAD_BASE", DEFAULT_DOWNLOAD_BASE).rstrip("/")
 
 
 def update_channel() -> str:
@@ -119,20 +120,21 @@ def _channel_dir(channel: str) -> str:
 def _asset_url(channel: str, asset: str) -> str:
     """URL of one release asset.
 
-    GitHub spells the rolling pointer and a pinned tag differently —
-    ``/releases/latest/download/<asset>`` against
-    ``/releases/download/<tag>/<asset>`` — so the channel decides the shape,
-    not just the path segment. An overridden base keeps the flat
-    ``/releases/<channel>/<asset>`` layout so any static directory can serve
-    as a mirror.
+    The default (and any mirror-style override) uses the flat
+    ``/releases/<channel>/<asset>`` layout, so any static directory can serve
+    as a mirror. GitHub spells the rolling pointer and a pinned tag
+    differently — ``/releases/latest/download/<asset>`` against
+    ``/releases/download/<tag>/<asset>`` — so when LAINTAS_DOWNLOAD_BASE
+    points at GitHub the channel decides the shape, not just the path
+    segment; getting this wrong 404s for exactly the users who pin a channel.
     """
     base = download_base()
     directory = _channel_dir(channel)
-    if base != DEFAULT_DOWNLOAD_BASE:
-        return f"{base}/releases/{directory}/{asset}"
-    if directory == "latest":
-        return f"{base}/releases/latest/download/{asset}"
-    return f"{base}/releases/download/{directory}/{asset}"
+    if base == GITHUB_RELEASES_BASE:
+        if directory == "latest":
+            return f"{base}/releases/latest/download/{asset}"
+        return f"{base}/releases/download/{directory}/{asset}"
+    return f"{base}/releases/{directory}/{asset}"
 
 
 def _windows_host() -> bool:

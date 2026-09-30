@@ -40,7 +40,9 @@ docker run --rm \
     apt-get install -y --no-install-recommends binutils >/dev/null 2>&1
     command -v objdump >/dev/null || { echo "objdump still missing"; exit 1; }
     python -m pip install --upgrade pip >/dev/null
-    python -m pip install --prefer-binary pyinstaller requests certifi rich prompt_toolkit \
+    # Install the project so all core dependencies in package_manifest.json
+    # (including terminal parsing and credential storage) enter the binary.
+    python -m pip install --prefer-binary /src "pyinstaller>=6.16,<7" \
         websockets aiortc >/dev/null
     rm -rf /tmp/b /tmp/d
     # Use the spec file (reads package_manifest.json for datas/hiddenimports).
@@ -50,6 +52,8 @@ docker run --rm \
       /src/build/linux/laintas_cli.spec
     cp /tmp/d/laintas-cli /out/laintas-cli
     chmod 755 /out/laintas-cli
+    /out/laintas-cli --version
+    /out/laintas-cli --help >/dev/null
     echo "== done =="
   '
 

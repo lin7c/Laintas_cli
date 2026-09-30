@@ -4,7 +4,7 @@ How to publish a version to GitHub and sync it to `cli.laintas.com`, so that
 the download page, the install script and the CLI's `/v` update command all
 use the same set of release assets.
 
-## `laintas-cli-beta v1` release (`laintas-cli-beta-v1`)
+## `laintas-cli-beta v2` release (`laintas-cli-beta-v2`)
 
 The Mac build is a native terminal CLI for Intel (`amd64`) and Apple Silicon
 (`arm64`). It does **not** install, start, or depend on Helpwo Kernel. Helpwo
@@ -36,16 +36,16 @@ PyInstaller's ad-hoc signature; Developer ID signing and notarization are
 required before treating this as the general public Mac installer.
 
 Publish after both Mac jobs pass. `version.py` keeps the PEP 440 package
-version `1.32.5b1` for pip and Debian packaging, while the public release
-name is `laintas-cli-beta v1`. Commit the intended source, tag that commit
-`laintas-cli-beta-v1`, and push the tag. This tag is published as an ordinary
+version `1.32.5b2` for pip and Debian packaging, while the public release
+name is `laintas-cli-beta v2`. Commit the intended source, tag that commit
+`laintas-cli-beta-v2`, and push the tag. This tag is published as an ordinary
 GitHub Release and is marked `latest`. Check the release and both architecture
 archives:
 
 ```bash
-gh release view laintas-cli-beta-v1 --json isPrerelease,assets
-curl -fsSIL https://github.com/lin7c/Laintas_cli/releases/download/laintas-cli-beta-v1/laintas-cli_darwin_arm64.tar.gz
-curl -fsSIL https://github.com/lin7c/Laintas_cli/releases/download/laintas-cli-beta-v1/laintas-cli_darwin_amd64.tar.gz
+gh release view laintas-cli-beta-v2 --json isPrerelease,assets
+curl -fsSIL https://github.com/lin7c/Laintas_cli/releases/download/laintas-cli-beta-v2/laintas-cli_darwin_arm64.tar.gz
+curl -fsSIL https://github.com/lin7c/Laintas_cli/releases/download/laintas-cli-beta-v2/laintas-cli_darwin_amd64.tar.gz
 ```
 
 Mac users can install the current release with the same command as Linux:
@@ -54,18 +54,17 @@ Mac users can install the current release with the same command as Linux:
 curl -fsSL https://cli.laintas.com/install.sh | bash
 ```
 
-To pin this release, set `LAINTAS_INSTALL_TAG=laintas-cli-beta-v1` for the
-installer or `LAINTAS_UPDATE_CHANNEL=laintas-cli-beta-v1` for `/v update`.
-The installer downloads Mac archives and `SHA256SUMS.txt` from
-`https://cli.laintas.com/releases/latest/` and verifies the archive. The
+To pin this release, set `LAINTAS_INSTALL_TAG=laintas-cli-beta-v2` for the
+installer or `LAINTAS_UPDATE_CHANNEL=laintas-cli-beta-v2` for `/v update`.
+The installer downloads archives and `SHA256SUMS.txt` from
+`https://cli.laintas.com/releases/latest/` and verifies them. The
 download page offers a single Mac install link that selects Apple Silicon or
-Intel from the same mirror. New Mac builds use this mirror for `/v update`; the already
-published `laintas-cli-beta v1` binary was built before that updater change
-and still uses GitHub Releases for `/v update`.
+Intel from the same mirror. `/v update` on every platform reads this mirror
+(the older `laintas-cli-beta v1` binaries still use GitHub Releases for `/v update`).
 Sync the site mirror with
-`LAINTAS_RELEASE_TAG=laintas-cli-beta-v1 python3 scripts/build_release_assets.py`.
+`LAINTAS_RELEASE_TAG=laintas-cli-beta-v2 python3 scripts/build_release_assets.py`.
 It writes both `dist/releases/latest/` and
-`dist/releases/laintas-cli-beta-v1/`.
+`dist/releases/laintas-cli-beta-v2/`.
 
 Run one real smoke test on each Mac architecture before announcing the beta:
 install the archive, launch `laintas-cli --version`, execute a shell command,
@@ -265,13 +264,8 @@ Both manifests must report the version being released, e.g. `1.23.4`.
 
 ## 4. Where `/v` updates from
 
-**Target state (plan A):** `updater.py` reads cli.laintas.com:
-
-```python
-DEFAULT_DOWNLOAD_BASE = "https://cli.laintas.com"
-```
-
-so `/v` reads the mirror section 3 feeds:
+**Status:** `DEFAULT_DOWNLOAD_BASE` points at `https://cli.laintas.com` and
+`/v` reads the mirror section 3 feeds:
 
 ```text
 https://cli.laintas.com/releases/latest/manifest.json
@@ -281,12 +275,12 @@ https://cli.laintas.com/releases/latest/laintas-cli_linux_amd64.tar.gz
 https://cli.laintas.com/releases/latest/laintas-cli_linux_arm64.tar.gz
 ```
 
-**Migration status:** `DEFAULT_DOWNLOAD_BASE` still points at
-`https://github.com/lin7c/Laintas_cli` and flips to cli.laintas.com in the
-NEXT release — the same release that ships the CI sync job. Order matters:
-the mirror must be fed before the default moves, or every installed CLI
-404s on its next `/v`. Until that release, `/v` reads the GitHub release this
-workflow publishes.
+The mirror is fed by `scripts/release.sh` → `scripts/build_release_assets.py`
+as part of every release, so the earlier failure mode (CI publishes to
+GitHub, nobody repopulates the site directory, every `/v` 404s) cannot
+recur. Pointing `LAINTAS_DOWNLOAD_BASE` at `https://github.com/lin7c/Laintas_cli`
+switches `/v` back to the GitHub originals (whose URL shape differs — see
+`updater._asset_url`).
 
 History: the site used to self-host these under
 `cli.laintas.com/releases/<channel>/`, written by
@@ -353,9 +347,8 @@ Confirm that:
 - `downloads/latest.json` still resolves — the Windows build's `/windows
   install` reads it, and it is published by a different repository
 
-`/v` reads whatever its `DEFAULT_DOWNLOAD_BASE` names — GitHub until the
-plan-A release lands, cli.laintas.com after. The mirror checks above must
-pass either way.
+`/v` reads whatever its `DEFAULT_DOWNLOAD_BASE` names — now
+cli.laintas.com. The mirror checks above must pass either way.
 
 Static file updates need no nginx reload; only a configuration change does:
 

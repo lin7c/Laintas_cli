@@ -40,8 +40,8 @@ from typing import Any, Callable, Optional
 import paths
 import trust_store
 
-CONFIG_PATH = paths.HOOKS_FILE
-PYTHON_HOOKS_PATH = paths.PYTHON_HOOKS_FILE
+CONFIG_PATH = paths.account_path("HOOKS_FILE")
+PYTHON_HOOKS_PATH = paths.account_path("PYTHON_HOOKS_FILE")
 
 # ── Module-level cache ────────────────────────────────────────────────────
 _hooks_config: list[dict] | None = None

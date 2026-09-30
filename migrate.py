@@ -40,7 +40,7 @@ import paths
 def _home_migrations() -> list[tuple[Path, Path, str]]:
     """Return list of (old_path, new_path, description) for home files."""
     home = Path.home()
-    return [
+    migrations = [
         (home / ".laintas_cli_session.json", paths.SESSION_FILE, "session credentials"),
         (home / ".laintas_cli_config.json",  paths.CONFIG_FILE,  "global config"),
         (home / ".laintas_cli_history",      paths.HISTORY_FILE, "command history"),
@@ -55,6 +55,18 @@ def _home_migrations() -> list[tuple[Path, Path, str]]:
         (home / ".laintas_cli_agents",       paths.AGENTS_DIR,   "agents directory"),
         (home / ".laintas_cli_skills",       paths.SKILLS_DIR,   "skills directory"),
     ]
+    # Old files have no trustworthy account ownership. Keep their migration
+    # in the unassigned root, even when today's launch selected an account.
+    if not paths.ACCOUNT_USER_ID:
+        return migrations
+    result = []
+    for old, new, description in migrations:
+        try:
+            new = paths.ROOT_HOME / new.relative_to(paths.LAINTAS_HOME)
+        except ValueError:
+            pass  # already root-scoped (shared skills)
+        result.append((old, new, description))
+    return result
 
 
 # ── CWD migration map ────────────────────────────────────────────────────

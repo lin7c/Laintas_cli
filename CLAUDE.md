@@ -42,28 +42,27 @@ New top-level modules must be added to `package_manifest.json` — it drives set
 
 **To publish a release, use `.github/workflows/release.yml`** — it builds Linux amd64/arm64 binaries and a source package, then publishes checksums and update manifests to GitHub Releases.
 
-### After a release: announce it (release announcement)
+### After a release: post an update note (更新公告)
 
-Every release that users can install gets one official message, which reaches laintas.com's message center, Helpwo's inbox and the CLI's `L>` inbox. Only after the release workflow for the tag has **succeeded** (the assets are downloadable — announcing a 404 is worse than not announcing):
+Releases are no longer announced as official messages (inbox pushes) — do **not** run `publish-message.mjs` for a release. Each user-installable release gets one entry on https://laintas.com/updates instead. Only after the release workflow for the tag has **succeeded** (assets downloadable):
 
-1. Write `/tmp/.../release-message.json` (scratch dir, not the repo):
+1. Write `release-note.json` in a scratch dir (not the repo):
    ```json
    {
-     "slug": "cli-v1-24-0",
-     "titleZh": "[laintas-cli] v1.24.0 released",
-     "titleEn": "[laintas-cli] v1.24.0 released",
-     "bodyZh": "· One user-facing change per line\n\nRun /v update to upgrade.",
-     "bodyEn": "· One user-facing change per line\n\nRun /v update to upgrade.",
-     "actionUrl": "https://github.com/lin7c/Laintas_cli/releases/tag/v1.24.0"
+     "project": "laintas-cli",
+     "version": "1.24.0",
+     "titleZh": "laintas-cli 1.24.0",
+     "titleEn": "laintas-cli 1.24.0",
+     "bodyZh": "- 一行一条用户能感知的改动\n- ……\n\n运行 /v update 升级。",
+     "bodyEn": "- One user-facing change per line\n- ...\n\nRun /v update to upgrade."
    }
    ```
-   - `slug` is `cli-v` + version with dots as dashes. It is the dedupe key — a re-run with the same content is a no-op.
-   - Both languages are required. Write for users: what changed for them, not internal refactors, file names, commit hashes, hosts or anything security-sensitive. Plain text only (it is also rendered in a terminal); body ≤ 8000 chars.
-   - Keep `level` info and `audience` all. Do not set `popup`, `pinned` or `critical` for a routine release (the script refuses them without `--allow-loud`).
-2. Dry run and show the preview to the user: `node /root/laintas/server/publish-message.mjs <file>`.
-3. **Publish only after the user explicitly says so** — it goes to every account and cannot be recalled: `node /root/laintas/server/publish-message.mjs <file> --publish`.
+   - Allowed keys: `project, version, titleZh, titleEn, bodyZh, bodyEn`, optional `slug` (default `laintas-cli-v1-24-0`) and `publishedAt`. Unknown keys are refused; both languages are required.
+   - `project` must be a project listed on /updates: the homepage cards (`laintas-cli`, `helpwo`, `laintas-search`, `laintas-scene`, `laintas-enterprise`, `laintas-market`; short names `cli`/`search`/… work) or one added on the page. An unknown project is refused with the list of valid ids — ask the user to add it on the page rather than filing the note elsewhere.
+   - Plain text; lines starting with `- ` render as a list. Write for users — no internal refactors, file names, commit hashes, hosts or anything security-sensitive.
+2. Dry run: `node /root/laintas/server/publish-update.mjs <file>`, then publish: `node /root/laintas/server/publish-update.mjs <file> --publish` (`--draft` saves it for a human to publish from the page).
 
-A typo in an already published message is fixed on the laintas.com admin page (System → Messages, silent edit), not by re-running the script.
+Re-running with the same content is a no-op; changed content updates the note — unless someone edited it on the /updates page, which the script refuses to overwrite without `--force`. Admins and viewers edit, unpublish or delete notes on https://laintas.com/updates (「管理」).
 
 ## Architecture (read PROJECT.md for full detail)
 

@@ -69,7 +69,7 @@ def rendezvous_dir() -> Optional[Path]:
         base = winbridge.localappdata()
         return base / "Laintas" / "kernel-rendezvous" if base else None
     import paths
-    return Path(paths.LAINTAS_HOME) / "kernel-rendezvous"
+    return Path(paths.ROOT_HOME) / "kernel-rendezvous"
 
 
 def rendezvous_path() -> Optional[Path]:

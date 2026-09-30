@@ -213,7 +213,7 @@ def record_sample(name: str, arguments: dict, result: dict, returncode,
 
 # ── Inference (no-op until a model is shipped) ─────────────────────────────
 _model_state: dict = {"tried": False, "session": None, "tokenizer": None}
-_MODEL_PATH = paths.LAINTAS_HOME / "models" / "precheck.onnx"
+_MODEL_PATH = paths.account_path("LAINTAS_HOME") / "models" / "precheck.onnx"
 
 
 def _ensure_model():

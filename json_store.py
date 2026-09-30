@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Union
@@ -39,7 +40,7 @@ def load_json(path: Union[str, Path], default: Any = None) -> Any:
 
 def save_json_atomic(path: Union[str, Path], data: Any, *, indent: int = 2,
                      ensure_ascii: bool = False, mode: int = None,
-                     newline: bool = False) -> None:
+                     newline: bool = False, account_independent: bool = False) -> None:
     """Write *data* as JSON to *path* via temp-file + fsync + atomic rename.
 
     A crash or kill mid-write can never leave a truncated/corrupted target
@@ -51,6 +52,13 @@ def save_json_atomic(path: Union[str, Path], data: Any, *, indent: int = 2,
     make.
     """
     path = Path(path)
+    # Profile registration/selection explicitly owns its target account even
+    # before runtime initialization. All ordinary managed-store writes must
+    # use the selected profile; do not import paths into this bootstrap helper.
+    path_module = sys.modules.get("paths")
+    check = getattr(path_module, "assert_account_write", None)
+    if check is not None and not account_independent:
+        check(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:

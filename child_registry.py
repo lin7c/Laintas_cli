@@ -38,9 +38,9 @@ import threading
 import time
 from typing import Optional
 
-from paths import LAINTAS_HOME
+import paths
 
-RUN_DIR = LAINTAS_HOME / "run"
+RUN_DIR = paths.account_path("LAINTAS_HOME") / "run"
 
 _lock = threading.RLock()
 _groups: dict[int, dict] = {}       # pgid -> {"start": ticks, "kind": str}

@@ -60,9 +60,15 @@ class NavigationTests(unittest.TestCase):
         create.assert_called_once_with(["/term", "term2"], "registry", None)
 
     def test_nested_creation_keeps_parent_and_depth(self):
+        import terminal_link
         registry = SimpleNamespace(terminal_meta={"name": "outer"}, depth=2, agent_id=None)
+        service = mock.Mock()
+        service.prepare_created.return_value = ("term-test", {"id": "test-invitation"})
+        registered = SimpleNamespace()
         with mock.patch.object(cli, "_REPL_PROCESS_DEPTH", 2), \
-                mock.patch.object(cli, "get_terminal", return_value=None), \
+                mock.patch.object(cli, "get_terminal", side_effect=[None, registered]), \
+                mock.patch.object(cli, "get_current_agent", return_value=SimpleNamespace(id="primary")), \
+                mock.patch.object(terminal_link, "get_service", return_value=service), \
                 mock.patch.object(cli, "SubTerminalSession") as session, \
                 mock.patch.object(cli, "register_terminal") as register, \
                 mock.patch.object(cli.time, "sleep"), \
@@ -73,6 +79,9 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(command[command.index("--parent-terminal") + 1], "outer")
         self.assertFalse(session.call_args.kwargs["use_tmux"])
         self.assertEqual(register.call_args.kwargs["parent_terminal"], "term0")
+        service.prepare_created.assert_called_once_with("inner", "primary")
+        self.assertEqual(registered.link_creation_id, "test-invitation")
+        self.assertIn("LAINTAS_TERM_INVITE", session.call_args.args[0])
 
     def test_status_displays_child_identity_without_changing_shell_routing(self):
         agent = SimpleNamespace(name="primary", id="primary", base_model="")

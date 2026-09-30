@@ -18,6 +18,7 @@ python3 -m PyInstaller --noconfirm --clean build/mac/laintas_cli.spec
 binary="$repo/dist/laintas-cli"
 test -x "$binary"
 "$binary" --version
+"$binary" --help >/dev/null
 
 staging="$(mktemp -d)"
 trap 'rm -rf "$staging"' EXIT

@@ -25,6 +25,11 @@ aiortc>=1.14
 # you it's missing and how to install. Comment out if you don't need MCP.
 mcp>=1.0
 
+# Optional — enables `laintas-cli --acp` (Agent Client Protocol over stdio,
+# how ACP editors like Zed drive the CLI). Without it, --acp explains what
+# to install and exits.
+agent-client-protocol>=0.2
+
 # Optional — enables the headless-browser live-view stack (browser.* tools).
 # The CLI runs without this; browser._debug_open will report the missing dep.
 # Requires system packages: Xvfb, x11vnc, google-chrome (or chromium).

@@ -33,7 +33,7 @@ import json_store
 import paths
 import workgraph
 
-TASKS_PATH = paths.TASKS_FILE
+TASKS_PATH = paths.account_path("TASKS_FILE")
 _lock = threading.RLock()
 
 # ── Session-level tasks (in-memory, not persisted) ──────────────────────

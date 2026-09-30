@@ -44,9 +44,9 @@ from typing import Optional
 
 import paths
 
-CANDIDATES_DIR = paths.PROMPT_CANDIDATES_DIR
-FEEDBACK_LOG = paths.PROMPT_FEEDBACK_LOG
-STATE_PATH = paths.PROMPT_OPT_STATE
+CANDIDATES_DIR = paths.account_path("PROMPT_CANDIDATES_DIR")
+FEEDBACK_LOG = paths.account_path("PROMPT_FEEDBACK_LOG")
+STATE_PATH = paths.account_path("PROMPT_OPT_STATE")
 
 _lock = threading.RLock()
 

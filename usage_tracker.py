@@ -31,6 +31,8 @@ _SESSION: list[dict] = []  # records made by this process, in arrival order
 
 def _usage_dir() -> Path:
     d = paths.LAINTAS_HOME / "usage"
+    paths.require_account_selected()
+    paths.assert_account_write(d)
     d.mkdir(parents=True, exist_ok=True)
     return d
 

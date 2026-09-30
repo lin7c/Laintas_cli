@@ -77,7 +77,7 @@ except Exception as _e:
 import paths
 import trust_store
 
-CONFIG_PATH = paths.MCP_FILE
+CONFIG_PATH = paths.account_path("MCP_FILE")
 # Per tool call. MCP servers front real work — a database query, a page scrape,
 # a remote API — and 30s cut off the slow-but-fine ones as if they had hung,
 # with nothing to show for the wait. Per-server `call_timeout` in mcp.json still

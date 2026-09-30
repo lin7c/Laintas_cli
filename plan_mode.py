@@ -29,8 +29,8 @@ import paths
 import workgraph
 import symbols                # Centralized UI symbol constants
 
-PLANS_DIR = paths.PLANS_DIR
-_STATE_PATH = paths.PLANS_STATE
+PLANS_DIR = paths.account_path("PLANS_DIR")
+_STATE_PATH = paths.account_path("PLANS_STATE")
 
 _lock = threading.RLock()
 

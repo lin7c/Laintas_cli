@@ -376,9 +376,11 @@ if __name__ == "__main__":
 class UpdateChannelTests(unittest.TestCase):
     """Where `/v` fetches from.
 
-    The site's own /releases/ path stopped being populated when releasing
-    moved into CI, so every update — and every download link on the page —
-    resolved to a 404 that only showed up at the moment a user ran `/v`.
+    The default is the self-hosted cli.laintas.com mirror, repopulated by
+    scripts/release.sh via scripts/build_release_assets.py as part of every
+    release — the process that made the earlier "the site directory went
+    stale and every /v 404'd" failure impossible to repeat. GitHub still
+    holds the originals and stays reachable through LAINTAS_DOWNLOAD_BASE.
     """
 
     def _url(self, channel, asset, base=None):
@@ -388,24 +390,43 @@ class UpdateChannelTests(unittest.TestCase):
                 updater.os.environ.pop("LAINTAS_DOWNLOAD_BASE", None)
             return updater._asset_url(channel, asset)
 
-    def test_latest_uses_the_github_rolling_pointer(self):
+    def test_latest_uses_the_site_mirror_flat_layout(self):
         self.assertEqual(
             self._url("latest", "manifest.json"),
-            "https://github.com/lin7c/Laintas_cli/releases/latest/download/"
-            "manifest.json")
+            "https://cli.laintas.com/releases/latest/manifest.json")
 
     def test_a_pinned_version_uses_the_tag_form(self):
-        """GitHub spells a pinned tag differently from `latest`.
+        """A pinned channel resolves on the site mirror's flat layout.
 
-        `/releases/<tag>/<asset>` is not a URL GitHub serves; getting this
-        wrong 404s only for users who pinned a channel.
+        `/releases/vX.Y.Z/` is the immutable copy scripts/build_release_assets.py
+        publishes next to `latest/`; `1.23.2` and `v1.23.2` must both land
+        there, because LAINTAS_UPDATE_CHANNEL accepts either spelling.
         """
-        expected = ("https://github.com/lin7c/Laintas_cli/releases/download/"
-                    "v1.23.2/laintas-cli_linux_amd64.tar.gz")
+        expected = ("https://cli.laintas.com/releases/v1.23.2/"
+                    "laintas-cli_linux_amd64.tar.gz")
         self.assertEqual(
             self._url("v1.23.2", "laintas-cli_linux_amd64.tar.gz"), expected)
         self.assertEqual(
             self._url("1.23.2", "laintas-cli_linux_amd64.tar.gz"), expected)
+
+    def test_the_github_override_keeps_the_github_url_shape(self):
+        """Pointing LAINTAS_DOWNLOAD_BASE at GitHub switches /v back to it.
+
+        GitHub spells the rolling pointer and a pinned tag differently —
+        `/releases/latest/download/<asset>` against
+        `/releases/download/<tag>/<asset>` — while the site mirror (and any
+        other static mirror) is flat. Getting this wrong 404s only for users
+        who pinned a channel or overrode the base.
+        """
+        github = "https://github.com/lin7c/Laintas_cli"
+        self.assertEqual(
+            self._url("latest", "manifest.json", base=github),
+            "https://github.com/lin7c/Laintas_cli/releases/latest/download/"
+            "manifest.json")
+        self.assertEqual(
+            self._url("v1.23.2", "laintas-cli_linux_amd64.tar.gz", base=github),
+            "https://github.com/lin7c/Laintas_cli/releases/download/"
+            "v1.23.2/laintas-cli_linux_amd64.tar.gz")
 
     def test_an_overridden_base_keeps_the_flat_mirror_layout(self):
         """A static directory has to remain usable as a mirror for testing."""

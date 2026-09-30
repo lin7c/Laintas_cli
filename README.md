@@ -95,6 +95,25 @@ python3 laintas_cli.py
 
 Optional browser, MCP, WebRTC, and advanced web-fetch dependencies are documented in `requirements.txt`.
 
+### Use from an ACP editor (Zed & friends)
+
+The CLI speaks the [Agent Client Protocol](https://agentclientprotocol.com)
+over stdio, so any ACP-compatible editor can drive it:
+
+```bash
+python3 -m pip install agent-client-protocol   # once
+laintas-cli --acp
+```
+
+Point the editor's ACP/agent setting at `laintas-cli --acp` (the same
+command works on Windows: the launcher forwards it into the private WSL
+runtime). Each editor session maps to one agent conversation in that
+workspace; tool calls stream back as ACP tool-call updates, and anything
+the approval policy gates — a command, a write, a delete — becomes a
+permission request in the editor instead of a terminal dialog. Without the
+SDK installed, `--acp` prints the one-line install hint and exits; nothing
+else in the CLI depends on it.
+
 ## Architecture
 
 Laintas CLI is a modular monolith: latency-sensitive UI, policy, state, and tool dispatch remain in one local process, while model inference and optional integrations cross explicit boundaries. The public customization surfaces are configuration files, project files, skills, MCP, extensions, and hooks; internal Python modules are not all stable plugin APIs.
@@ -175,19 +194,21 @@ This separation keeps interaction behavior consistent without forcing every comm
 
 ### State layout
 
-Global state is user-scoped; project state travels with a workspace. Private directories and files are created with restrictive permissions, and executable customization rejects unsafe ownership or symlink conditions.
+Signed-in runtime state is account-scoped; project state travels with a workspace. Private directories and files are created with restrictive permissions, and executable customization rejects unsafe ownership or symlink conditions. Account directories use the SHA-256 of the verified `userId`, independent of display names.
 
 | Location | Examples | Scope |
 |---|---|---|
-| `~/.laintas/config.json` | Runtime preferences and feature settings | User |
-| `~/.laintas/session.json` | Authentication/session state | User, private |
-| `~/.laintas/policy.json` | Global tool and command policy | User |
-| `~/.laintas/backends.json` | Backend profiles and credential references | User |
-| `~/.laintas/mcp.json` | MCP process definitions | User |
-| `~/.laintas/hooks.json`, `hooks.py` | Declarative and Python lifecycle hooks | User |
+| `~/.laintas/accounts/<id-hash>/config.json` | Runtime preferences and feature settings | Account |
+| `~/.laintas/accounts/<id-hash>/session.json` | Authentication credentials | Account, private |
+| `~/.laintas/accounts/<id-hash>/policy.json` | Tool and command policy | Account |
+| `~/.laintas/accounts/<id-hash>/backends.json` | Backend profiles and credential references | Account |
+| `~/.laintas/accounts/<id-hash>/mcp.json` | MCP process definitions | Account |
+| `~/.laintas/accounts/<id-hash>/hooks.json`, `hooks.py` | Declarative and Python lifecycle hooks | Account |
 | `~/.laintas/skills/` | User-installed skills | User |
-| `~/.laintas/extensions/` | Global extensions | User |
-| `~/.laintas/memory/`, `plans/`, `agents/`, `sessions/` | Durable runtime data | User |
+| `~/.laintas/accounts/<id-hash>/extensions/` | Installed extensions | Account |
+| `~/.laintas/accounts/<id-hash>/memory/`, `plans/`, `agents/`, `sessions/` | Durable runtime data | Account |
+| `~/.laintas/instances/`, `writes/`, `session_locks/` | Instance discovery, conflict detection and account-aware session locks | Shared between accounts |
+| `~/.laintas/sessions/` | Unassigned legacy tasks | Explicit adoption required |
 | `.laintas/cli.prop` | Project system instructions | Project |
 | `.laintas/memory.json` | Project-scoped memory | Project |
 | `.laintas/rules.json` | Persistent workspace rules | Project |
@@ -459,7 +480,7 @@ Role selection and routing never broaden the parent's tool permissions.
 
 | Area | Commands | Purpose |
 |---|---|---|
-| Session | `/login`, `/fork`, `/resume`, `/told`, `/detail` | Authentication, context branching, conversation and trace inspection |
+| Session | `/account`, `/login`, `/handoff`, `/fork`, `/resume`, `/told`, `/detail` | Account profiles, task handoff, context branching, conversation and trace inspection |
 | Behavior | `/mode`, `/plan`, `/model`, `/config`, `/theme` | Working posture, planning, model override, preferences |
 | Knowledge | `/memory`, `/rule`, `/skill` | Persistent context, constraints, progressive skills |
 | Execution | `/term`, `/spawn`, `/agents`, `/task` | Terminals, delegated agents, and task tracking |
@@ -469,13 +490,94 @@ Role selection and routing never broaden the parent's tool permissions.
 | Applications | `/app` | Run a registered application in its own sub-terminal with its own agent |
 | Administration | `/policy`, `/usage`, `/training`, `/v`, `/org` | Policy, allowance, data preference, updates, Enterprise |
 
+Add another verified login with `/account add B`, name the current one with
+`/account alias A`, and inspect `/account list`. `/account switch B` saves the
+outgoing tasks and restarts into B's last open task in this terminal. It does
+not take over a task open in another terminal. Finish or pause running Agents
+before switching. A refresh of the current login keeps its task; a login as a
+different account switches environments instead of changing a running task's
+credentials. Run `laintas-cli --account A` and `laintas-cli --account B` in
+separate terminals for concurrent work. Separate Git worktrees are appropriate
+when both tasks edit code. Helpwo linking still requires the kernel and CLI to
+use the same account.
+
+Account switches validate the restart executable before saving or shutting
+down the current runtime. A preparation error cancels the switch and keeps
+the prompt usable. If restarting fails after shutdown, the previous account
+selection is restored unless another CLI has updated it; this process exits
+with a recovery message and the saved tasks can be opened with `--resume`.
+An interactive switch drops launch-only task/application arguments and resumes
+the destination account. Restarting immediately after the first login retains
+the original launch task and its arguments.
+
+Embedded Python entry points must call `paths.configure_account(user_id)`
+before importing runtime stores. For an anonymous/custom backend, explicitly
+use `paths.configure_account('')` or `LAINTAS_ACCOUNT_MODE=anonymous`. An
+embedded entry can also inherit `LAINTAS_ACCOUNT_ID` for a verified local
+profile. Uninitialized stores fail explicitly; once a store binds its paths,
+changing profiles requires a process restart. JSON writes to managed private
+stores also check the selected profile.
+
+File locks serialize callers per canonical file path. Nested acquisitions
+follow the enforced order: profile/handoff/legacy-receipt stores (`STORE`),
+session lifecycle (`SESSION`), then session lease claims (`CLAIM`). Locks of
+equal rank follow canonical path order; reacquiring a held lock is allowed.
+Inverted acquisitions raise before waiting. Lock sidecars must remain on disk
+while any process can use them.
+
+During a signed-in task, `/handoff new <title> --to B` captures its objective,
+constraints, recent conversation, native message thread and plan. `B` can be a
+saved account alias/email/userId. For a recipient not saved locally, use
+`--to-user-id <userId>` instead. The checkpoint
+excludes credentials and runtime approvals; recognized secrets in text are
+redacted. Large contexts must be compacted before exporting. Exchange the
+project's `.laintas/handoff/` through Git, or use `/handoff export <id> [file]`
+and `/handoff import <token|file>`. Sync the code and environment separately.
+The recipient runs `/handoff accept <id>`: its primary Agent opens a new owned
+session and begins verifying and continuing the remaining work. Repeating
+acceptance retains the receiving session's progress. A's original session is
+preserved. Legacy handoff envelopes without task checkpoints remain readable.
+Tokens have a corruption checksum, not an account signature; cloud `/handoff
+sync` remains scoped to one account and is not cross-account delivery.
+
+Old tasks are not assigned to whichever account happens to be logged in during
+an upgrade. Use `/account legacy` in their project and explicitly choose
+`/account adopt <session-id>`. Adoption keeps the original files, creates an
+owned receiving session, and records the chosen account to prevent a second
+account adopting the same source. Legacy configuration and memory remain at
+the old root rather than being silently attributed to an account.
+
 `/t` opens the terminal browser even when no child terminals exist. Press `n`
 to create the next available `termN`, `e` to enter the selected terminal,
 `o` to observe, or `x` twice to close it. `/term <name>` creates a named child.
+If the local pairing service is unavailable, it creates a local shell and
+reports that Agent pairing is unavailable. Ordinary terminal registration
+does not contact the kernel or gateway. An adopted executor still cannot
+create a third terminal level, including through the local-shell fallback.
 Inside a child CLI, `/back` (or `/q`) returns to its parent without stopping
 the child; `Ctrl+\\` is the force-detach shortcut. The prompt and Agents view
 show the child's name. LIVE OUTPUT reconstructs the current terminal screen
 instead of concatenating redraws, and refreshing preserves preview scrolling.
+
+Two independently running CLIs can establish the same controller/executor
+relationship through `/term`. Run `/term peers` in controller B, then
+`/term adopt <terminal-id> --name A`. In executor A, explicitly run
+`/term accept <invitation-id>`. B now hires A's persistent Agents as direct
+employees named `A/primary`, `A/scout`, etc., with A's primary stationed in A.
+Use B's `/station` to assign work; execution uses A's workspace, credentials,
+and the intersection of both sides' tool permissions. Agents in A do not
+become managers of one another. `/term A` creates a child and attaches it
+automatically, using the creator's consent.
+
+Only two terminal levels are permitted: an executor cannot acquire execution
+children, and a controller with children cannot itself become an executor.
+Local pairing permits different accounts with explicit acceptance; remote
+pairing requires the same account and updated Helpwo kernel/gateway support.
+`/term release A` in B, or `/term release` in A, revokes the relationship
+without terminating an independently started CLI. Lost contact expires the
+execution lease after 30 seconds and requests cancellation of delegated work;
+the relationship remains reserved until explicitly released. Status updates
+carry bounded result summaries; full execution history stays with A.
 
 ### Password vault: `/password`
 
@@ -618,21 +720,49 @@ The package manifest is intentionally explicit. When adding a runtime module, bu
 The download page offers one-line installers for Linux and macOS; each selects
 the matching CPU architecture. It also links to the Windows installer
 (`laintas-cli_windows_amd64_setup.exe`), both Linux archives, both Mac archives,
-the Debian package and the source zip. The Mac installer downloads the archive
-and checksum file from `cli.laintas.com/releases/latest/`. Linux installation
-and the Windows installer currently download from GitHub Releases. The already
-published `laintas-cli-beta v1` Mac binary also uses GitHub Releases for
-`/v update`; Mac binaries built from current `main` use the site mirror.
+the Debian package and the source zip. The installer and the download page
+fetch from `cli.laintas.com/releases/latest/`, as does `/v update` on every
+platform (GitHub Releases holds the originals that CI publishes; point
+`LAINTAS_DOWNLOAD_BASE` at it to switch `/v` back). The already published
+`laintas-cli-beta v1` binaries were built before this change and still use
+GitHub Releases for `/v update`.
 
-The current public release is [laintas-cli-beta v1](https://github.com/lin7c/Laintas_cli/releases/tag/laintas-cli-beta-v1)
-(tag `laintas-cli-beta-v1`). It is an ordinary GitHub Release, marked `latest`;
-its Python package version is `1.32.5b1`. The Mac package is an initial native
+The current public release is [laintas-cli-beta v2](https://github.com/lin7c/Laintas_cli/releases/tag/laintas-cli-beta-v2)
+(tag `laintas-cli-beta-v2`). It is an ordinary GitHub Release, marked `latest`;
+its Python package version is `1.32.5b2`. The Mac package is an initial native
 CLI build without Helpwo Kernel. See [the release guide](build/RELEASE.md) for
 build and verification details.
 
 ## Version History
 
 The history below is curated from the repository tags and changes, following an Added/Changed/Fixed-style release-note structure rather than reproducing raw commit messages. The tagged public history currently represented in this repository begins at v1.3.0.
+
+### [laintas-cli-beta v2](https://github.com/lin7c/Laintas_cli/releases/tag/laintas-cli-beta-v2) — 2026-09-30
+
+**Added**
+
+- Type and submit append messages while an Agent is thinking; successive
+  messages remain visible as branches of the Thinking line.
+- Account profiles with isolated sessions and settings, terminal-local account
+  selection, safe switching and explicit task handoff or legacy-task adoption.
+- Two-level terminal adoption through `/term`, exposing the executor's Agents
+  to its controller after explicit acceptance. Local pairing supports separate
+  accounts; cross-server pairing needs matching-account Kernel/Gateway support.
+- Optional ACP integration for compatible editors through `laintas-cli --acp`.
+
+**Fixed**
+
+- File locking now uses independent per-file locks and rejects nested lock-order
+  inversions instead of globally blocking unrelated lease and storage work.
+- Profile stores require explicit initialization and reject cached-profile
+  hot-swapping or writes to another profile.
+- Account switching validates restart commands before shutdown, saves tasks
+  once, restores account selection on failed restarts, and separates interactive
+  switch arguments from first-login launch arguments.
+- Snapshot ownership conflicts leave a debug diagnostic. Local `/term` creation
+  can fall back to a shell when pairing is unavailable without bypassing the
+  two-level terminal restriction.
+- Linux standalone builds install the complete declared core dependency set.
 
 ### [laintas-cli-beta v1](https://github.com/lin7c/Laintas_cli/releases/tag/laintas-cli-beta-v1) — 2026-09-27
 

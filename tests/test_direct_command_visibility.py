@@ -40,6 +40,22 @@ class PendingDirectCommandsTests(unittest.TestCase):
         history = _shell("ls", "a") + [{"role": "assistant", "content": "hi"}]
         self.assertEqual(agent_loop._pending_direct_commands(history), [])
 
+    def test_failed_and_unanswered_turns_do_not_hide_commands(self):
+        failed = {"role": "assistant", "message_kind": "turn_failed",
+                  "content": "[This turn ended without an answer: backend error.]"}
+        history = (
+            [{"role": "assistant", "content": "done"}]
+            + _shell("echo key >> ~/.ssh/authorized_keys")
+            + [{"role": "user", "content": "remove it", "input_kind": "prompt"},
+               failed,
+               {"role": "user", "content": "remove it", "input_kind": "prompt"},
+               failed,
+               {"role": "user", "content": "why?", "input_kind": "prompt"}])
+        self.assertEqual(agent_loop._pending_direct_commands(history), [
+            {"command": "echo key >> ~/.ssh/authorized_keys",
+             "returncode": None},
+        ])
+
     def test_keys_are_declared_turn_only(self):
         for key in ("_direct_commands", "_direct_commands_readable"):
             self.assertIn(key, agent_loop.STATE_KEYS_TURN_ONLY)

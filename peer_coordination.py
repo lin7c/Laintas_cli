@@ -462,7 +462,14 @@ def gc_stale_state(now: Optional[float] = None) -> dict:
                 dir_age = _age(sub)
                 for f in sub.iterdir():
                     if f.name.endswith(suffix) and f.is_file() and is_stale(f):
-                        f.unlink(missing_ok=True)
+                        if suffix == ".lock":
+                            import file_lock
+                            with file_lock.guard(paths.SESSION_LOCKS_DIR / f".{sub.name}.claim", rank=file_lock.CLAIM):
+                                if not f.exists() or not is_stale(f):
+                                    continue
+                                f.unlink(missing_ok=True)
+                        else:
+                            f.unlink(missing_ok=True)
                         key = "registrations" if suffix == ".json" else "leases"
                         removed[key] += 1
                 if dir_age > _STATE_DIR_MAX_AGE:
@@ -497,21 +504,35 @@ def acquire_session_lease(cwd: str, session_id: str) -> dict:
     dead) is broken and taken over automatically.
     """
     try:
-        return _acquire_session_lease(cwd, session_id)
-    except FileNotFoundError:
-        # gc_stale_state removed the (empty, day-old) lock directory between
-        # our mkdir and our write. Once more, from the mkdir.
-        try:
-            return _acquire_session_lease(cwd, session_id)
-        except Exception as exc:
-            return {"ok": False, "owner": None, "error": str(exc)}
+        import file_lock
+        # Serialize stale-owner replacement too; an atomic rename alone lets
+        # two contenders both replace a dead lease and both report success.
+        for attempt in range(2):
+            try:
+                with file_lock.guard(paths.SESSION_LOCKS_DIR / f".{_cwd_hash(cwd)}.claim", rank=file_lock.CLAIM):
+                    return _acquire_session_lease(cwd, session_id)
+            except FileNotFoundError:
+                if attempt:
+                    raise
     except Exception as exc:
         return {"ok": False, "owner": None, "error": str(exc)}
 
 
+def _lease_key(session_id: str, owner_user_id=None) -> str:
+    sid = _normalize_session_id(session_id)
+    uid = paths.ACCOUNT_USER_ID if owner_user_id is None else str(owner_user_id)
+    if uid and sid:
+        return hashlib.sha256(uid.encode()).hexdigest()[:16] + "__" + sid
+    return sid
+
+
+def session_lock_path(cwd: str, session_id: str, owner_user_id=None) -> Path:
+    return paths.SESSION_LOCKS_DIR / _cwd_hash(cwd) / f"{_lease_key(session_id, owner_user_id)}.lock"
+
+
 def _acquire_session_lease(cwd: str, session_id: str) -> dict:
     try:
-        sid = _normalize_session_id(session_id)
+        sid = _lease_key(session_id)
         if not sid:
             return {"ok": False, "owner": None,
                     "error": "empty session id"}
@@ -607,14 +628,16 @@ def _acquire_session_lease(cwd: str, session_id: str) -> dict:
 def release_session_lease(cwd: str, session_id: str) -> None:
     """Release ownership of a session (only if this instance owns it)."""
     try:
-        sid = _normalize_session_id(session_id)
+        sid = _lease_key(session_id)
         if not sid:
             return
         lock_path = paths.SESSION_LOCKS_DIR / _cwd_hash(cwd) / f"{sid}.lock"
-        owner = _read_lease(lock_path)
-        if owner is not None and owner.get("instance_id") == _coord_instance_id():
-            lock_path.unlink(missing_ok=True)
-        _held_leases.discard((_cwd_hash(cwd), sid))
+        import file_lock
+        with file_lock.guard(paths.SESSION_LOCKS_DIR / f".{_cwd_hash(cwd)}.claim", rank=file_lock.CLAIM):
+            owner = _read_lease(lock_path)
+            if owner is not None and owner.get("instance_id") == _coord_instance_id():
+                lock_path.unlink(missing_ok=True)
+            _held_leases.discard((_cwd_hash(cwd), sid))
     except OSError:
         pass
 
@@ -624,9 +647,11 @@ def release_all_leases() -> None:
     for cwd_hash, sid in list(_held_leases):
         try:
             lock_path = paths.SESSION_LOCKS_DIR / cwd_hash / f"{sid}.lock"
-            owner = _read_lease(lock_path)
-            if owner is not None and owner.get("instance_id") == _coord_instance_id():
-                lock_path.unlink(missing_ok=True)
+            import file_lock
+            with file_lock.guard(paths.SESSION_LOCKS_DIR / f".{cwd_hash}.claim", rank=file_lock.CLAIM):
+                owner = _read_lease(lock_path)
+                if owner is not None and owner.get("instance_id") == _coord_instance_id():
+                    lock_path.unlink(missing_ok=True)
         except OSError:
             pass
     _held_leases.clear()

@@ -658,6 +658,43 @@ class SlashRegistryTests(unittest.TestCase):
             controller_cls.call_args.kwargs["existing_session"], existing)
         controller.run.assert_called_once_with()
 
+    def test_continue_does_not_reprint_or_rerecord_streamed_replies(self):
+        # The loop streams each step's reply live and returns them joined as
+        # `msg`; /continue used to print that again and append it to history
+        # a second time.
+        state = {"shortTermMemory": ""}
+        history = [{"role": "assistant", "content": "step one\n\nsummary"}]
+        names = ("_current_live_session", "_last_agent_state",
+                 "_last_chat_history", "_last_original_input", "_last_deps",
+                 "_last_session", "_last_events_cb", "_last_existing_session")
+        saved = {n: getattr(laintas_cli.handle_meta_command, n, None)
+                 for n in names}
+        output = io.StringIO()
+        old_console = laintas_cli.console
+        laintas_cli.console = Console(file=output, force_terminal=False)
+        laintas_cli.handle_meta_command._current_live_session = None
+        laintas_cli.handle_meta_command._last_agent_state = state
+        laintas_cli.handle_meta_command._last_chat_history = history
+        laintas_cli.handle_meta_command._last_original_input = "task"
+        laintas_cli.handle_meta_command._last_deps = None
+        laintas_cli.handle_meta_command._last_events_cb = lambda _e: None
+        response = {"msg": "step one\n\nsummary", "state": state,
+                    "session": None, "_history_recorded": True}
+        try:
+            with mock.patch.object(
+                    laintas_cli, "_run_agent_loop_with_interrupt",
+                    return_value=response), \
+                    mock.patch.object(laintas_cli, "get_loop_deps",
+                                      return_value=mock.Mock()):
+                laintas_cli._cmd_continue({}, _Registry())
+        finally:
+            laintas_cli.console = old_console
+            for n, v in saved.items():
+                setattr(laintas_cli.handle_meta_command, n, v)
+
+        self.assertNotIn("summary", output.getvalue())
+        self.assertEqual(len(history), 1)
+
     def test_clear_dispatches_as_new_session_command(self):
         output = io.StringIO()
         old_console = laintas_cli.console

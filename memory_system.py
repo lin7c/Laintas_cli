@@ -33,8 +33,8 @@ try:
 except Exception:
     mem_signals = None
 
-MEMORY_DIR = paths.MEMORY_DIR
-MEMORY_INDEX = paths.MEMORY_INDEX
+MEMORY_DIR = paths.account_path("MEMORY_DIR")
+MEMORY_INDEX = paths.account_path("MEMORY_INDEX")
 LOCAL_USER_SCOPE = "local-user"
 
 #: Entries that were written but never used again are the ones worth dropping

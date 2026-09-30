@@ -547,6 +547,16 @@ def link_credentials(home: Path) -> None:
     which is the operator's (and the application's) business, not the user's.
     Nothing else from the operator's home is visible to a session.
     """
+    if paths.ACCOUNT_USER_ID:
+        import account_store
+        session = json_store.load_json(_home() / "session.json", {})
+        if session.get("userId") == paths.ACCOUNT_USER_ID:
+            account_store.remember(home, session)
+            target = account_store.profile_dir(home, paths.ACCOUNT_USER_ID)
+            backend = json_store.load_json(_home() / "backends.json", None)
+            if backend is not None:
+                json_store.save_json_atomic(target / "backends.json", backend, mode=0o600)
+        return
     for name in ("session.json", "backends.json"):
         source = _home() / name
         target = Path(home) / name

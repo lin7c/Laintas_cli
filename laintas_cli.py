@@ -11,6 +11,29 @@ Usage:
 """
 
 import sys
+import os
+from pathlib import Path
+
+# Account paths must be chosen before modules cache config/storage locations.
+# Library imports (including tests) do not inspect or mutate real profiles.
+import paths
+import account_store
+if (sys.argv[1:2] in (["--version"], ["-V"], ["--help"], ["-h"])
+        and (__name__ == "__main__" or getattr(sys, "frozen", False)
+             or Path(sys.argv[0]).name in {"laintas-cli", "laintas", "laintas_cli"})):
+    paths.configure_account("")
+if (sys.argv[1:2] not in (["--version"], ["-V"], ["--help"], ["-h"])
+        and (__name__ == "__main__" or getattr(sys, "frozen", False)
+        or Path(sys.argv[0]).name in {"laintas-cli", "laintas", "laintas_cli"})):
+    try:
+        _launch_account_id = account_store.launch_account(
+            paths.ROOT_HOME, paths.TERMINAL_ID, sys.argv[1:])
+        paths.configure_account(_launch_account_id)
+        if _launch_account_id:
+            os.environ["LAINTAS_ACCOUNT_ID"] = _launch_account_id
+    except account_store.AccountError as _account_error:
+        print(str(_account_error), file=sys.stderr)
+        raise SystemExit(2)
 
 # Run as a script (`python laintas_cli.py`, the PyInstaller entry), this file
 # is `__main__`, and the twenty-odd `import laintas_cli` calls elsewhere would
@@ -267,14 +290,14 @@ def _resolve_launch_executable() -> str:
 _LAUNCH_EXECUTABLE_PATH = _resolve_launch_executable()
 
 
-def _restart_process(executable: Optional[str] = None) -> None:
-    """Replace this process using a validated absolute restart command.
+def _restart_command(executable: Optional[str] = None, *, args: Optional[list] = None):
+    """Validate and capture the absolute restart command before teardown.
 
     Frozen installs restart the replaced binary. Source/console-script installs
     restart the module with the same Python interpreter, avoiding dependence on
     a PATH shim or on argv[0] remaining valid after a cwd change.
     """
-    args = list(sys.argv[1:])
+    args = list(sys.argv[1:] if args is None else args)
     if executable or getattr(sys, "frozen", False):
         target = os.path.realpath(os.path.abspath(
             executable or _LAUNCH_EXECUTABLE_PATH))
@@ -290,6 +313,11 @@ def _restart_process(executable: Optional[str] = None) -> None:
         raise FileNotFoundError(f"restart executable does not exist: {target}")
     if not os.access(target, os.X_OK):
         raise PermissionError(f"restart executable is not executable: {target}")
+    return target, argv
+
+
+def _restart_process(executable: Optional[str] = None, *, args: Optional[list] = None) -> None:
+    target, argv = _restart_command(executable, args=args)
     os.execv(target, argv)
 
 import pty
@@ -484,7 +512,9 @@ def _no_color_requested() -> bool:
     return "NO_COLOR" in os.environ
 
 
-console = Console(
+import append_input
+
+console = append_input.AppendConsole(
     theme=LAINTAS_THEME,
     style="foreground",
     no_color=_no_color_requested(),
@@ -1547,8 +1577,8 @@ BACKEND_URL = os.environ.get("LAINTAS_BACKEND") or "https://laintas.com"
 # redirect account cookies, passwords, or OAuth codes to another host.
 LAINTAS_BASE = "https://laintas.com"
 ACCOUNTS_BASE = "https://accounts.laintas.com"
-SESSION_FILE = paths.SESSION_FILE
-CONFIG_FILE = paths.CONFIG_FILE
+SESSION_FILE = paths.account_path("SESSION_FILE")
+CONFIG_FILE = paths.account_path("CONFIG_FILE")
 HEARTBEAT_INTERVAL = 30
 
 
@@ -3683,6 +3713,11 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "is accepted as an alias for the `text` action.")),
     CommandSpec("/login", "Re-authenticate with Laintas", "Account & Session"),
     CommandSpec(
+        "/account", "List, add or switch account profiles", "Account & Session",
+        "/account [list|add <alias>|switch <account>|alias <name>|legacy|adopt <session-id>]",
+        subcommands=("list", "add", "switch", "alias", "legacy", "adopt"),
+        help_text="Accounts keep separate tasks and credentials. Switching saves the current task and restarts into the selected account. Legacy tasks require explicit adoption."),
+    CommandSpec(
         "/password", "Open the local password vault", "Account & Session",
         "/password",
         help_text=(
@@ -3805,7 +3840,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "routing, Tab opens the Agent rail, Alt+arrow switches "
             "Agent/terminal, PageUp/PageDown scrolls, and Esc exits."
         )),
-    CommandSpec("/term", "List, create, or rename terminals", "Agents & Terminals", "/term [name|rename <old> <new>]", aliases=("/t",), subcommands=("rename",)),
+    CommandSpec("/term", "Manage terminals and two-level adoption", "Agents & Terminals", "/term [name|peers|adopt <id> --name <name>|accept <invite>|release [name]|rename <old> <new>]", aliases=("/t",), subcommands=("peers", "adopt", "accept", "release", "rename")),
     CommandSpec("/helpwo", "Share a session with Helpwo through this machine's Helpwo kernel: its own sub-terminal and agent, listed under this machine in Helpwo; /helpwo stop closes it", "Agents & Terminals", "/helpwo [stop]", subcommands=("stop",)),
     CommandSpec(
         "/app", "Run a registered application in its own sub-terminal with its own agent",
@@ -3843,14 +3878,15 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "terminal; deployment always requires an explicit target."
         )),
     CommandSpec(
-        "/handoff", "Hand the work to the next person as a file, not a chat log",
+        "/handoff", "Create a task checkpoint for the next account",
         "Agents & Terminals",
-        "/handoff [list|new <title>|show <id>|claim <id>|release <id>|note <id> <text>|close <id>|reopen <id>|sync [id]|export <id> [file]|import <token|file>|remote|fetch <remote-path>]",
+        "/handoff [list|new <title>|accept <id>|show <id>|claim <id>|release <id>|note <id> <text>|close <id>|reopen <id>|sync [id]|export <id> [file]|import <token|file>|remote|fetch <remote-path>]",
         subcommands=("list", "new", "show", "claim", "release", "note", "close",
-                     "reopen", "sync", "export", "import", "remote", "fetch"),
+                     "reopen", "sync", "export", "import", "remote", "fetch", "accept"),
         completion_descriptions=(
             ("list", "Every handoff in this workspace and what is left on it"),
             ("new", "Write one before you stop for the day"),
+            ("accept", "Create and continue this account's receiving session"),
             ("show", "Open one: baseline, what is outstanding, what not to retry"),
             ("claim", "Say you are picking it up"),
             ("release", "Put it back without closing it"),
@@ -3864,15 +3900,12 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             ("fetch", "Take a handoff somebody else created"),
         ),
         help_text=(
-            "An envelope in .laintas/handoff/, meant to be committed. It carries "
-            "where the work sits, what is still outstanding and what not to try "
-            "again \u2014 not the conversation, because a transcript cannot be "
-            "merged or verified. What is outstanding is re-checked against the "
-            "workspace every time it is opened rather than believed from the "
-            "file, so it cannot go stale. /handoff sync reconciles it with "
-            "whoever else holds it: both sides can append while apart and "
-            "neither loses anything, and two people claiming the same handoff is "
-            "reported rather than silently resolved."
+            "An envelope in .laintas/handoff/. During a signed-in task, new "
+            "captures its context and plan. --to selects a saved account; "
+            "--to-user-id names a remote recipient. Export/import crosses accounts; sync uses only "
+            "the current account's cloud storage. accept creates a separate "
+            "receiving session and continues it. Sync code and environment "
+            "separately; credentials and live processes are never transferred."
         )),
     CommandSpec(
         "/shared", "Share files with Helpwo through Laintas storage",
@@ -4401,10 +4434,15 @@ _ARG_COMPLETIONS: dict[str, tuple] = {
     "/memory": ((("show",), _cached_provider("memory", _memory_loader)),),
     "/messages": (((("read", "dismiss"),), _cached_provider("messages", _message_loader)),),
     "/handoff": (
-        ((("show", "claim", "release", "note", "close", "reopen", "sync", "export"),),
+        ((("show", "claim", "release", "note", "close", "reopen", "sync", "export", "accept"),),
          _cached_provider("handoff", _handoff_loader)),
         (("import",), _path_candidates()),
         (("export", "*"), _path_candidates()),
+    ),
+    "/account": (
+        ((("switch",),), _cached_provider("accounts", lambda: [
+            (row.get("alias") or row["userId"], row.get("email") or row["userId"])
+            for row in account_store.profiles(paths.ROOT_HOME)])),
     ),
     "/retask": (
         ((), _path_candidates((".retask",))),
@@ -7485,15 +7523,23 @@ def load_session() -> Optional[dict]:
         if not paths.ensure_private_file(SESSION_FILE):
             return None
         try:
-            return json.loads(SESSION_FILE.read_text())
+            value = json.loads(SESSION_FILE.read_text())
+            if not isinstance(value, dict):
+                return None
+            if (paths.ACCOUNT_USER_ID
+                    and str(value.get("userId") or "") != paths.ACCOUNT_USER_ID):
+                return None
+            return value
         except (json.JSONDecodeError, OSError):
             pass
     return None
 
 
 def save_session(session: dict) -> None:
-    """Save session token to ~/.laintas/session.json."""
-    _atomic_private_json(SESSION_FILE, session)
+    """Save verified credentials to their own profile, never another account."""
+    if not session.get("userId"):
+        raise account_store.AccountError("Cannot persist an unverified account")
+    account_store.remember(paths.ROOT_HOME, session)
 
 
 def clear_session() -> None:
@@ -7769,6 +7815,12 @@ def _safe_status(message, *, spinner="dots", **_ignored):
     animated spinner everywhere. Extra spinner kwargs are accepted and ignored so
     this drops in for any former ``console.status`` call verbatim.
     """
+    ui = append_input.current(console)
+    if ui is not None:
+        holder = [Text.from_markup(message) if isinstance(message, str) else message]
+        with ui.status(lambda: holder[0]):
+            yield lambda text: holder.__setitem__(0, Text.from_markup(text))
+        return
     try:
         text = Text.from_markup(message) if isinstance(message, str) else message
     except Exception:
@@ -8046,6 +8098,17 @@ def verify_session(session: dict) -> Optional[dict]:
     return user if status == "ok" else None
 
 
+def _verify_login_identity(session: dict) -> bool:
+    verified = verify_session(session)
+    if (not isinstance(verified, dict) or not verified.get("id")
+            or str(verified["id"]) != str(session.get("userId") or "")):
+        return False
+    session["userId"] = str(verified["id"])
+    session["userName"] = str(verified.get("name") or session.get("userName") or "")
+    session["userEmail"] = str(verified.get("email") or session.get("userEmail") or "")
+    return True
+
+
 def resolve_session_from_token(token: str, resp_cookies=None) -> Optional[dict]:
     """Turn a raw token (and optional response cookies) into a verified session.
 
@@ -8229,7 +8292,7 @@ def _login_via_device(
                         "userName": (data.get("user") or {}).get("name", ""),
                         "userEmail": (data.get("user") or {}).get("email", ""),
                     }
-                    if not verify_session(session):
+                    if not _verify_login_identity(session):
                         console.print("[red]The new CLI session could not be verified.[/red]")
                         return None
                     save_session(session)
@@ -8407,7 +8470,7 @@ def _login_via_browser_local() -> Optional[dict]:
                     "userName": user.get("name", ""),
                     "userEmail": user.get("email", ""),
                 }
-                if not verify_session(session):
+                if not _verify_login_identity(session):
                     console.print("[red]The new CLI session could not be verified.[/red]")
                     return None
                 save_session(session)
@@ -8442,7 +8505,11 @@ def ensure_auth() -> Optional[dict]:
         with _safe_status("[dim]Checking sign-in…[/dim]"):
             status, user_info = check_session(session)
         if status == "ok":
-            session["userId"] = user_info["id"]
+            if (paths.ACCOUNT_USER_ID
+                    and str(user_info["id"]) != paths.ACCOUNT_USER_ID):
+                console.print("[red]Saved credentials identify another account. Use /login.[/red]")
+                return None
+            session["userId"] = str(user_info["id"])
             session["userName"] = user_info.get("name", "")
             session["userEmail"] = user_info.get("email", "")
             return session
@@ -8987,7 +9054,7 @@ def _lease_id_for_blob(blob: dict) -> str:
 _LIVE_SESSION_LEASE: dict = {"cwd": "", "session_id": ""}
 
 
-def _live_session_lease_owner(cwd: str, session_id: str) -> Optional[dict]:
+def _live_session_lease_owner(cwd: str, session_id: str, owner_user_id=None) -> Optional[dict]:
     """The live peer holding `session_id` here, or None.
 
     Read-only, so it answers "may I touch this session" without taking it.
@@ -8998,8 +9065,7 @@ def _live_session_lease_owner(cwd: str, session_id: str) -> Optional[dict]:
         return None
     try:
         import peer_coordination
-        lock_path = (paths.SESSION_LOCKS_DIR / peer_coordination._cwd_hash(cwd)
-                     / f"{peer_coordination._normalize_session_id(session_id)}.lock")
+        lock_path = peer_coordination.session_lock_path(cwd, session_id, owner_user_id)
         owner = peer_coordination._read_lease(lock_path)
         if (owner and owner.get("instance_id") != paths.PROCESS_INSTANCE_ID
                 and peer_coordination._pid_alive(int(owner.get("pid") or 0))):
@@ -9140,6 +9206,9 @@ def _acquire_resume_lease(blob: dict) -> Optional[dict]:
     progress.  Returns the blob to resume on success, or None (with a
     warning printed) when another live instance currently owns it.
     """
+    if not account_store.owns(blob, paths.ACCOUNT_USER_ID):
+        console.print("[yellow]This task belongs to another account. Accept a handoff instead.[/yellow]")
+        return None
     with session_lifecycle.guard(blob.get("cwd") or os.getcwd()):
         if session_lifecycle.is_deleted(blob.get("cwd") or os.getcwd(), blob):
             console.print("[yellow]This saved session was deleted. Refresh the picker.[/yellow]")
@@ -9257,6 +9326,8 @@ def _switch_resume_session(blob, cwd, state, history, live):
 
 def _fork_resume_blob(blob: dict, cwd: str) -> Optional[dict]:
     """Branch from a saved context without acquiring or changing its owner."""
+    if not account_store.owns(blob, paths.ACCOUNT_USER_ID):
+        raise account_store.AccountError("Saved task belongs to another account")
     parent_id = _resume_effective_session_id(blob)
     lineage = normalize_fork_lineage(blob.get("fork_lineage"))
     child_id = uuid.uuid4().hex[:16]
@@ -9278,6 +9349,8 @@ def _restore_resume_blob(blob: dict, chat_history: list) -> dict:
     Codex/Claude bring back a session: the transcript, the older-turn summary
     (so long sessions don't lose early goals), and the open todo/plan list.
     """
+    if not account_store.owns(blob, paths.ACCOUNT_USER_ID):
+        raise account_store.AccountError("Saved task belongs to another account")
     chat_history.clear()
     # Prepend a digest of turns that were dropped past the resume window so the
     # early goals/instructions aren't lost on a long session.
@@ -9302,6 +9375,7 @@ def _restore_resume_blob(blob: dict, chat_history: list) -> dict:
     except Exception:
         pass
     restored_state = prepare_state_for_repl(blob.get("state") or {})
+    account_store.stamp(restored_state, paths.ACCOUNT_USER_ID)
     if restored_session_id:
         restored_state["_session_id"] = restored_session_id
     # Inject fork lineage so subsequent /fork calls chain correctly. Every
@@ -11893,7 +11967,7 @@ class AgentRegistry:
             if not isinstance(msg, dict):
                 continue
             kind = msg.get("kind")
-            control = kind in self.REMOTE_CONTROL_KINDS
+            control = kind in self.REMOTE_CONTROL_KINDS or kind == "term-rpc"
             executor = self._remote_control_executor if control else self._remote_executor
             if executor is None or not self._reserve_remote_capacity(control):
                 req_id = msg.get("reqId") or msg.get("id")
@@ -11936,7 +12010,18 @@ class AgentRegistry:
                 kind = "chat"
                 payload = {"message": msg.get("content", "")}
 
-            if kind == "exec":
+            if kind == "term-rpc":
+                import terminal_link
+                if not msg.get("_termRpc"):
+                    raise terminal_link.LinkError("Terminal RPC must originate from the authenticated gateway route")
+                if float(payload.get("deadline", 0)) < time.time():
+                    result = {"ok": False, "error": "Terminal RPC expired before dispatch"}
+                else:
+                    result = terminal_link.get_service().dispatch(payload.get("source"), payload.get("user_id"),
+                        payload.get("operation"), payload.get("args"))
+                self._kernel_hooks_host.send({"t": "cli-term-reply", "agentId": self.agent_id,
+                    "rpcId": payload.get("rpcId"), "sourceId": payload.get("sourceId"), "result": result})
+            elif kind == "exec":
                 self._handle_exec(req_id, payload)
             elif kind == "query":
                 self._handle_query(req_id, payload)
@@ -16539,7 +16624,181 @@ def _cmd_new_session_notice() -> None:
     console.print("[yellow]/new is handled by the main REPL. Type it at the prompt to start a new session.[/yellow]")
 
 
-def _cmd_login(session: dict, agent_registry: AgentRegistry) -> None:
+_ACCOUNT_RESTART = None
+
+
+def _account_idle() -> bool:
+    busy = [agent for agent in get_all_agents()
+            if agent.status in {"queued", "running", "thinking", "waiting"}
+            or (getattr(agent, "thread", None) is not None
+                and agent.thread.is_alive())]
+    if busy:
+        console.print("[yellow]Pause or finish running Agents before changing accounts or accepting a task. You can use another account in a separate CLI.[/yellow]")
+        return False
+    return True
+
+
+def _request_account_switch(user_id: str) -> bool:
+    global _ACCOUNT_RESTART
+    if _IN_SUB_TERMINAL or _agents_view_is_active():
+        console.print("[yellow]Switch accounts from the main CLI or launch a separate CLI with --account.[/yellow]")
+        return False
+    if not _account_idle():
+        return False
+    _ACCOUNT_RESTART = user_id
+    return True
+
+
+def _account_restart_args(user_id: str, *, returning=True) -> list:
+    """Interactive switches start a REPL; login restarts retain the launch task."""
+    result = []
+    values = {"--account"}
+    flags = {"--account-return"}
+    if returning:
+        values.update({"--execute", "-e", "--session-id", "--app", "--app-state",
+                       "--app-launch-id", "--app-options", "--agent-id", "--agent-name"})
+        flags.update({"--resume", "--continue", "--monitor-only", "--acp"})
+    source = sys.argv[1:]
+    index = 0
+    while index < len(source):
+        arg = source[index]
+        key = arg.split("=", 1)[0]
+        if key in values:
+            index += 1 if "=" in arg else 2
+            continue
+        if key in flags or (returning and arg.startswith("-e") and not arg.startswith("--")):
+            index += 1
+            continue
+        result.append(arg)
+        index += 1
+    result.extend(["--account", user_id])
+    if returning:
+        result.extend(["--resume", "--account-return"])
+    return result
+
+
+def _save_before_account_switch() -> None:
+    """Fail before teardown if an outgoing task cannot be saved."""
+    account_store.freeze_admissions(_account_idle)
+    try:
+        _save_account_tasks_before_switch()
+    except BaseException:
+        account_store.cancel_transition()
+        raise
+
+
+def _save_account_tasks_before_switch() -> None:
+    state = getattr(handle_meta_command, "_last_agent_state", {}) or {}
+    history = getattr(handle_meta_command, "_last_chat_history", []) or []
+    live = getattr(handle_meta_command, "_current_live_session", None)
+    cwd = str((live or {}).get("cwd") or state.get("_task_cwd") or paths.live_cwd())
+    if live:
+        session_store.sync_runtime(live, state, history, cwd=cwd,
+                                  tasks=task_manager.export_active_tasks(cwd=cwd, session_id=state.get("_session_id")))
+    saved = set()
+    for agent in get_all_agents():
+        messages = agent.chat_history if agent.chat_history else []
+        if any(m.get("role") == "user" for m in messages):
+            agent_cwd = str(agent.state.get("_task_cwd") or cwd)
+            result = save_resume_checkpoint(agent.state, messages, agent_cwd, agent_id=agent.id)
+            if result is None:
+                raise OSError(f"Could not save task for Agent {agent.id}; account switch cancelled")
+            saved.add(agent.id)
+    if get_current_agent_id() not in saved and any(m.get("role") == "user" for m in history):
+        if save_resume_checkpoint(state, history, cwd, agent_id=get_current_agent_id()) is None:
+            raise OSError("Could not save the current task; account switch cancelled")
+
+
+def _restart_into_account(user_id: str, agent_registry=None, *, returning=True,
+                          interactive_session=None) -> None:
+    # All fallible preparation happens while the old runtime is still usable.
+    args = _account_restart_args(user_id, returning=returning)
+    target, argv = _restart_command(args=args)
+    receipt = None
+    old_environment = os.environ.get("LAINTAS_ACCOUNT_ID")
+    try:
+        _save_before_account_switch()
+        receipt = account_store.select(paths.ROOT_HOME, paths.TERMINAL_ID, user_id)
+    except BaseException:
+        account_store.cancel_transition()
+        raise
+    # Everything below is owned by this CLI; persistent services are untouched.
+    try:
+        stop_trigger_scanner()
+        _terminal_agents.close()
+        close_all_agents()
+        close_all_terminals()
+        browser_mod.close_all_browser_sessions()
+        if interactive_session is not None:
+            interactive_session.close()
+        if agent_registry is not None:
+            agent_registry.unregister()
+        try:
+            _get_mcp_mod().get_manager().shutdown()
+        except Exception:
+            pass
+        import windows_host
+        windows_host.stop_host()
+        import peer_coordination
+        peer_coordination.release_all_leases()
+        peer_coordination.get_coord().unregister()
+        child_registry.kill_all()
+        terminal_arbiter.reset_to_pristine()
+        os.environ["LAINTAS_ACCOUNT_ID"] = user_id
+        _restart_process(executable=target, args=argv[1:])
+    except BaseException as exc:
+        try:
+            account_store.rollback_selection(receipt)
+        except Exception as rollback_error:
+            console.print(escape(f"Could not restore account selection: {type(rollback_error).__name__}"))
+        if old_environment is None:
+            os.environ.pop("LAINTAS_ACCOUNT_ID", None)
+        else:
+            os.environ["LAINTAS_ACCOUNT_ID"] = old_environment
+        account_store.cancel_transition()
+        console.print(escape(f"Account restart failed ({type(exc).__name__}). Tasks were saved before shutdown. "
+                             "This CLI will exit; relaunch the previous account with --resume."))
+        raise SystemExit(1) from exc
+    # execv cannot return on success; do not resume a dismantled REPL if a
+    # replacement launcher unexpectedly returns.
+    raise SystemExit(0)
+
+
+def _perform_requested_account_restart(agent_registry, interactive_session):
+    global _ACCOUNT_RESTART
+    try:
+        _restart_into_account(_ACCOUNT_RESTART, agent_registry,
+                              interactive_session=interactive_session)
+    except (OSError, ValueError, RuntimeError) as switch_error:
+        # Only preparation errors return here. Errors after teardown exit the
+        # process inside _restart_into_account instead of reopening a broken REPL.
+        account_store.cancel_transition()
+        _ACCOUNT_RESTART = None
+        console.print(escape(f"Account switch cancelled: {switch_error}"))
+
+
+def _restart_after_login(user_id: str):
+    """Retain the original launch task, restoring selection if exec fails."""
+    target, argv = _restart_command(args=_account_restart_args(user_id, returning=False))
+    old_environment = os.environ.get("LAINTAS_ACCOUNT_ID")
+    receipt = account_store.select(paths.ROOT_HOME, paths.TERMINAL_ID, user_id)
+    try:
+        os.environ["LAINTAS_ACCOUNT_ID"] = user_id
+        _restart_process(executable=target, args=argv[1:])
+    except BaseException:
+        try:
+            account_store.rollback_selection(receipt)
+        finally:
+            if old_environment is None:
+                os.environ.pop("LAINTAS_ACCOUNT_ID", None)
+            else:
+                os.environ["LAINTAS_ACCOUNT_ID"] = old_environment
+        raise
+
+
+def _cmd_login(session: dict, agent_registry: AgentRegistry, *, alias=None, activate=True) -> bool:
+    if activate and not _account_idle():
+        return False
     choice = choose_login_method()
     if choice == "remote":
         console.print(f"[dim]Starting browser login… {symbols.BULLET} Esc/Ctrl+C cancel[/dim]")
@@ -16553,6 +16812,12 @@ def _cmd_login(session: dict, agent_registry: AgentRegistry) -> None:
         new_session = None
         console.print("[dim]Login cancelled.[/dim]")
     if new_session:
+        account_store.remember(paths.ROOT_HOME, new_session, alias=alias)
+        if not activate:
+            console.print(f"[green]Added account {escape(alias or new_session['userId'])}. Use /account switch to select it.[/green]")
+            return False
+        if str(new_session["userId"]) != paths.ACCOUNT_USER_ID:
+            return _request_account_switch(str(new_session["userId"]))
         session.clear()
         session.update(new_session)
         # Refresh the Helpwo link only if this terminal was already
@@ -16560,6 +16825,52 @@ def _cmd_login(session: dict, agent_registry: AgentRegistry) -> None:
         if agent_registry.agent_id:
             agent_registry.register(session, quiet=True)
         console.print(f"[green]Logged in as {new_session.get('userEmail') or new_session.get('userName') or new_session['userId']}[/green]")
+    return False
+
+
+def _cmd_account(parts: list, session: dict, agent_registry: AgentRegistry) -> bool:
+    sub = parts[1].lower() if len(parts) > 1 else "list"
+    args = parts[2:]
+    if sub == "list" and not args:
+        rows = account_store.profiles(paths.ROOT_HOME)
+        for row in rows:
+            marker = "*" if row["userId"] == paths.ACCOUNT_USER_ID else " "
+            console.print(f"{marker} {escape(row.get('alias') or row.get('email') or row['userId'])}  {escape(row['userId'])}")
+        if not rows:
+            console.print("[dim]No saved accounts. Use /account add <alias>.[/dim]")
+    elif sub == "add" and len(args) == 1:
+        return _cmd_login(session, agent_registry, alias=args[0], activate=False)
+    elif sub == "switch" and len(args) == 1:
+        row = account_store.resolve(paths.ROOT_HOME, args[0])
+        if row["userId"] == paths.ACCOUNT_USER_ID:
+            console.print("[dim]This account is already selected.[/dim]")
+        else:
+            return _request_account_switch(row["userId"])
+    elif sub == "alias" and len(args) == 1:
+        credentials = session if session.get("userId") else load_session() or {}
+        if not credentials.get("userId"):
+            raise account_store.AccountError("Sign in before naming this account")
+        account_store.remember(paths.ROOT_HOME, credentials, alias=args[0])
+        console.print("[green]Account alias saved.[/green]")
+    elif sub in {"legacy", "adopt"}:
+        return _cmd_account_legacy(sub, args)
+    else:
+        raise SlashCommandUsageError("Usage: /account [list|add <alias>|switch <account>|alias <name>|legacy|adopt <session-id>]")
+    return False
+
+
+def _cmd_account_legacy(sub: str, args: list) -> bool:
+    import account_tasks
+    cwd = paths.live_cwd()
+    if sub == "legacy" and not args:
+        for blob in account_tasks.legacy_tasks(cwd):
+            console.print(f"{escape(_resume_effective_session_id(blob))}  {escape(str(blob.get('title') or blob.get('objective') or 'Legacy task'))}")
+        console.print("[dim]Assign a selected task with /account adopt <session-id>.[/dim]")
+    elif sub == "adopt" and len(args) == 1:
+        account_tasks.adopt(args[0], cwd)
+    else:
+        raise SlashCommandUsageError("Usage: /account legacy | /account adopt <session-id>")
+    return False
 
 
 def _cmd_model_aux(args: list, session: dict) -> None:
@@ -17419,7 +17730,7 @@ def _handoff_actor(session: dict) -> str:
     a placeholder: in a repository, that is who the work will be attributed to
     anyway.
     """
-    name = (session.get("userName") or session.get("userEmail") or "").strip()
+    name = (paths.ACCOUNT_USER_ID or session.get("userId") or session.get("userName") or session.get("userEmail") or "").strip()
     if name:
         return name
     try:
@@ -17526,17 +17837,7 @@ def _handoff_print_list(envs: list, cwd: str) -> None:
 
 
 def _cmd_handoff(parts: list, session: dict) -> None:
-    """Hand the work to the next person as a file, not as a conversation.
-
-    A handoff envelope lives at .laintas/handoff/<id>.json and is meant to be
-    committed. It carries where the work sits, what is still outstanding (which
-    is re-checked against the workspace every time it is read, never trusted
-    from the file), and what not to try again — but never the transcript.
-
-    `sync` reconciles it through Laintas storage for people who are not sharing
-    a repository remote. That is a fetch-merge-push, so two people can both
-    append while offline and neither loses anything.
-    """
+    """Create, exchange and accept inert checkpoints of signed-in tasks."""
     import handoff
     import shared_storage as ss
 
@@ -17547,7 +17848,7 @@ def _cmd_handoff(parts: list, session: dict) -> None:
 
     if sub in ("help", "-h", "--help"):
         console.print(
-            "Usage: [bold]/handoff[/bold] [list|new <title>|show <id>|claim <id>|"
+            "Usage: [bold]/handoff[/bold] [list|new <title>|accept <id>|show <id>|claim <id>|"
             "release <id>|note <id> <text>|close <id>|reopen <id>|"
             "sync \\[id]|export <id> \\[file]|import <token|file>|remote|fetch <remote-path>]\n"
             "[dim]An envelope in .laintas/handoff/ — committable, mergeable, and "
@@ -17561,13 +17862,24 @@ def _cmd_handoff(parts: list, session: dict) -> None:
             _handoff_print_list(handoff.list_all(cwd), cwd)
             return
 
+        if sub == "accept":
+            if len(args) != 1:
+                raise handoff.HandoffError("Usage: /handoff accept <id>")
+            import account_tasks
+            account_tasks.accept(args[0], cwd)
+            return
+
         if sub == "new":
-            to, avoid, words = "", [], []
+            to, avoid, words, recipient_id = "", [], [], ""
             index = 0
             while index < len(args):
                 token = args[index]
+                if token in {"--to", "--to-user-id", "--avoid"} and index + 1 >= len(args):
+                    raise handoff.HandoffError(f"{token} needs a value")
                 if token == "--to" and index + 1 < len(args):
                     to, index = args[index + 1], index + 2
+                elif token == "--to-user-id" and index + 1 < len(args):
+                    recipient_id, index = args[index + 1], index + 2
                 elif token == "--avoid" and index + 1 < len(args):
                     avoid.append(args[index + 1])
                     index += 2
@@ -17578,12 +17890,35 @@ def _cmd_handoff(parts: list, session: dict) -> None:
             if not title:
                 console.print("[yellow]Give it a title: /handoff new <what this is>[/yellow]")
                 return
-            env = handoff.create(title, actor, to=to, avoid=avoid, cwd=cwd)
+            checkpoint, target = None, ""
+            if to and recipient_id:
+                raise handoff.HandoffError("Use either --to <saved-account> or --to-user-id <userId>")
+            current_state = getattr(handle_meta_command, "_last_agent_state", None)
+            current_history = getattr(handle_meta_command, "_last_chat_history", None)
+            if (current_history and current_state and paths.ACCOUNT_USER_ID
+                    and any(m.get("role") == "user" for m in current_history)):
+                if not _account_idle():
+                    return
+                import task_handoff
+                import agent_loop
+                target = (account_store.resolve(paths.ROOT_HOME, to)["userId"] if to else recipient_id)
+                snapshot = agent_loop._build_resume_payload(
+                    current_state, current_history, cwd, "checkpoint", agent_id=get_current_agent_id())
+                checkpoint = task_handoff.capture(
+                    snapshot["state"], snapshot["chat_history"], snapshot["tasks"], paths.ACCOUNT_USER_ID,
+                    older_summary=snapshot.get("older_summary", ""), rules=snapshot.get("durable_rules") or [])
+            env = handoff.create(title, actor, to=to or recipient_id, avoid=avoid, cwd=cwd,
+                                 checkpoint=checkpoint, target_user_id=target)
             console.print(f"[green]Created {escape(env['id'])}.[/green]")
             _handoff_print_one(env, cwd)
+            if checkpoint is None:
+                console.print("[dim]This handoff contains notes only. Create one during a task to capture a resumable checkpoint.[/dim]")
+                return
             console.print(
                 "\n[dim]Commit .laintas/handoff/ so it reaches them through the repo, "
-                "or run /handoff sync to put it in Laintas storage.[/dim]")
+                "or use export/import across accounts. sync uses this account's "
+                "storage. Sync project files separately; the receiver runs "
+                "/handoff accept <id>.[/dim]")
             return
 
         if not args and sub in ("show", "claim", "release", "note", "close", "reopen", "fetch"):
@@ -17695,7 +18030,7 @@ def _cmd_handoff(parts: list, session: dict) -> None:
 
         console.print(f"[yellow]Unknown subcommand: {escape(sub)}[/yellow] — run /handoff help")
 
-    except handoff.HandoffError as exc:
+    except (handoff.HandoffError, ValueError) as exc:
         console.print(f"[red]{escape(str(exc))}[/red]")
     except ss.SharedStorageError as exc:
         console.print(f"[red]{escape(str(exc))}[/red]")
@@ -21469,6 +21804,9 @@ def _cmd_why(parts: list) -> None:
 
 
 def _station_terminal_factory(name):
+    if name != "term0":
+        import terminal_link
+        terminal_link.check_terminal_creation()
     terminal = (InteractiveSession(DEFAULT_SHELL, timeout=0, stream_output=False,
                                    persistent=True) if name == "term0"
                 else SubTerminalSession(DEFAULT_SHELL))
@@ -21579,6 +21917,12 @@ def _cmd_terminate(parts: list) -> None:
         console.print("[red]term0 is owned by this CLI; use /exit to close it.[/red]")
     else:
         term = get_terminal(name)
+        import terminal_link
+        service = terminal_link._service
+        if service is not None and name in service.children:
+            service.release(name)
+            console.print(escape(f"Released {name}; its execution CLI remains running."))
+            return
         terminated_agents = list(term.stationed_agent_ids) if term else []
         if unregister_terminal(name):
             if terminated_agents:
@@ -21594,6 +21938,7 @@ def _cmd_terminate(parts: list) -> None:
 
 
 def _cmd_send(raw_args: str) -> bool:
+    from terminal_link_runtime import LinkedTerminal
     name, send_raw = _raw_tail_after_word(raw_args)
     if not name and sys.stdin.isatty():
         terminals = [
@@ -21632,6 +21977,9 @@ def _cmd_send(raw_args: str) -> bool:
         term = get_terminal(name)
         if term is None:
             console.print(f"[red]Terminal '{name}' not found.[/red]")
+        elif isinstance(term.session, LinkedTerminal) and term.session.underlying is None:
+            console.print(escape(f"Assign work through /station {name}/primary --task <work>. "
+                                 "This linked terminal has no local shell input stream."))
         elif term.session is None or not term.session.is_alive():
             console.print(f"[yellow]Terminal '{name}' has no active session.[/yellow]")
         else:
@@ -21665,6 +22013,10 @@ def _cmd_send(raw_args: str) -> bool:
 
 
 def _cmd_hire(parts: list, session: dict) -> bool:
+    import terminal_link
+    if not terminal_link.local_admission_allowed():
+        console.print("[yellow]This terminal is controlled; hire from its controller or /term release first.[/yellow]")
+        return False
     import agent_persistence
     hire_name, employee_profile, hire_options = _parse_hire_profile(parts[1:])
     if hire_name and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", hire_name):
@@ -22056,6 +22408,7 @@ def _submit_primary_runtime_task(agent, text: str, deps, session: dict,
     prompt and a renderer-safe dependency view; this outer runtime owns the
     lease, worker, shared state/history/session, and completion events.
     """
+    session = account_store.frozen_auth(session)
     admitted, detail = begin_primary_run(agent.id)
     if not admitted:
         return False, detail
@@ -23739,6 +24092,45 @@ def _cmd_app(parts: list, agent_registry: AgentRegistry) -> None:
 
 
 def _cmd_term(parts: list, agent_registry: AgentRegistry, interactive_session) -> bool:
+    import terminal_link
+    from terminal_link_runtime import LinkedTerminal
+    action = parts[1].lower() if len(parts) > 1 else ""
+    if action in {"peers", "adopt", "accept", "release"}:
+        try:
+            service = terminal_link.get_service()
+            if action == "peers" and len(parts) == 2:
+                console.print(escape("This terminal: " + service.transport.ref))
+                for peer in service.transport.peers(all_accounts=True):
+                    console.print(escape(f"{peer['ref']} · account {peer.get('user_id') or 'local'} · pid {peer['pid']}"))
+                if agent_registry and agent_registry.agent_id and agent_registry._kernel_hooks_host:
+                    response = agent_registry._kernel_hooks_host.request({"t": "cli-term-peers", "agentId": agent_registry.agent_id}, timeout=12)
+                    if not response.get("ok"):
+                        raise terminal_link.LinkError(response.get("error") or "Kernel does not support remote terminal discovery")
+                    for peer in response.get("peers", []):
+                        console.print(escape(f"remote:{peer['id']} · {peer.get('name', '')} · {peer.get('hostname', '')}"))
+            elif action == "adopt" and len(parts) == 5 and parts[3] == "--name":
+                owner = get_current_agent()
+                invitation = service.adopt(parts[2], parts[4], owner.id if owner else "")
+                console.print(escape(f"Invitation sent: {invitation}. Accept in the execution terminal: /term accept {invitation}"))
+            elif action == "accept" and len(parts) == 3:
+                result = service.accept(parts[2])
+                console.print(escape(f"Adopted as {result['alias']}; assign work from the controller."))
+            elif action == "release" and len(parts) in {2, 3}:
+                service.release(parts[2] if len(parts) == 3 else None)
+                console.print("Relation released; the execution CLI keeps its account and workspace.")
+            else:
+                console.print("Usage: /term peers | adopt <id> --name <name> | accept <invite> | release [name]")
+        except Exception as exc:
+            console.print(escape(str(exc)))
+        return False
+    if action == "rename":
+        try:
+            service = terminal_link.get_service()
+            if len(parts) > 2 and parts[2] in service.children:
+                console.print("Release the adopted terminal before changing its alias.")
+                return False
+        except terminal_link.LinkError:
+            pass
     if len(parts) >= 2 and parts[1].lower() == "rename":
         if len(parts) != 4:
             console.print("[yellow]Usage: /term rename <old> <new>[/yellow]")
@@ -23762,12 +24154,28 @@ def _cmd_term(parts: list, agent_registry: AgentRegistry, interactive_session) -
                 "underscore, or hyphen; term0 is reserved.[/red]")
             return False
         existing = get_terminal(name)
-        if existing and existing.session and not existing.session.is_alive():
+        if (existing and existing.session and not isinstance(existing.session, LinkedTerminal)
+                and not existing.session.is_alive()):
             unregister_terminal(name)
             existing = None
         if existing is not None:
             console.print(f"[yellow]Terminal '{name}' already exists. /t to view, /terminate {name} to remove.[/yellow]")
         else:
+            service = None
+            invitation = None
+            try:
+                terminal_link.check_terminal_creation()
+                try:
+                    service = terminal_link.get_service()
+                except terminal_link.LinkError:
+                    if terminal_link._service is not None:
+                        raise
+                if service is not None:
+                    owner = get_current_agent()
+                    instance, invitation = service.prepare_created(name, owner.id if owner else "")
+            except Exception as exc:
+                console.print(escape(str(exc)))
+                return False
             parent_identity = (
                 (agent_registry.terminal_meta or {}).get("name")
                 if agent_registry and agent_registry.depth > 0 else _LOCAL_TERMINAL_NAME
@@ -23777,30 +24185,51 @@ def _cmd_term(parts: list, agent_registry: AgentRegistry, interactive_session) -
                 agent_registry.agent_id if agent_registry else None,
                 parent_terminal=parent_identity,
                 depth=_REPL_PROCESS_DEPTH + 1,
-            )
-            sub = SubTerminalSession(lain_cmd, use_tmux=False)
-            sub.start()
-            time.sleep(0.1)
-            if not sub.is_alive():
-                console.print(f"[red]Could not start terminal '{name}'.[/red]")
-                return False
-            sub.read_output(timeout=0.1)
+                env={"LAINTAS_INSTANCE_ID": instance, "LAINTAS_TERM_INVITE": json.dumps(invitation)},
+            ) if service is not None else DEFAULT_SHELL
+            sub = None
             try:
+                sub = SubTerminalSession(lain_cmd, use_tmux=False)
+                sub.start()
+                time.sleep(0.1)
+                if not sub.is_alive():
+                    raise RuntimeError("Terminal did not start")
+                sub.read_output(timeout=0.1)
                 register_terminal(
-                    sub, "laintas-cli", 0, name=name,
+                    sub, "laintas-cli" if service is not None else DEFAULT_SHELL, 0, name=name,
                     # Registry keys are local to this CLI; parent_identity
                     # is the public name passed to the nested process.
                     parent_terminal="term0")
-            except Exception as exc:
-                sub.close()
+                if invitation is not None:
+                    get_terminal(name).link_creation_id = invitation["id"]
+            except BaseException as exc:
+                if sub is not None:
+                    sub.close()
+                if service is not None:
+                    service.release(name)
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
                 console.print(
-                    f"[red]Could not register terminal '{name}': {exc}[/red]")
+                    f"[red]Could not create terminal '{name}': {exc}[/red]")
                 return False
-            console.print(f"[green]Created sub-terminal [bold]{name}[/bold] with its own CLI agent.[/green]")
+            if service is not None:
+                console.print(f"[green]Created sub-terminal [bold]{name}[/bold] with its own CLI agent.[/green]")
+            else:
+                console.print(escape(f"Created local shell {name}. Agent pairing is unavailable in this CLI."))
     elif len(parts) > 2:
         console.print("[yellow]Usage: /term \\[name|rename <old> <new>][/yellow]")
     else:
         # /t or /term (no args) — list terminals browser
+        try:
+            service = terminal_link.get_service()
+            console.print(escape("Terminal ID: " + service.transport.ref))
+            if service.parent:
+                console.print(escape(f"Controller: {service.parent['parent']} · alias {service.parent['alias']}"))
+            for invitation in service.invitations.values():
+                if invitation['expires'] > time.time() and not service.parent:
+                    console.print(escape(f"Pending: /term accept {invitation['id']}"))
+        except terminal_link.LinkError:
+            pass
         show_terminal_manager(interactive_session, agent_registry)
 
     return False
@@ -24685,8 +25114,9 @@ def _cmd_continue(session: dict, agent_registry: AgentRegistry) -> bool:
     handle_meta_command._last_session = _prev_session
     handle_meta_command._last_events_cb = _prev_events_cb
     handle_meta_command._last_existing_session = response.get("session")
-    if response.get("msg"):
-        console.print(_prev_deps.Markdown(response["msg"]) if hasattr(_prev_deps, 'Markdown') else response["msg"])
+    # The loop already streamed every step's reply live; `msg` is those same
+    # replies joined, so printing it here showed the whole run a second time.
+    if response.get("msg") and not response.get("_history_recorded"):
         (_prev_chat if _prev_chat is not None else []).append(
             {"role": "assistant", "content": response["msg"]}
         )
@@ -26053,7 +26483,10 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
         _cmd_messages(parts)
 
     elif action == "/login":
-        _cmd_login(session, agent_registry)
+        return _cmd_login(session, agent_registry)
+
+    elif action == "/account":
+        return _cmd_account(parts, session, agent_registry)
 
     elif action == "/password":
         # Local interactive vault UI. Never takes secret arguments; all
@@ -27107,7 +27540,11 @@ def _queue_supplementary(target_queue: queue.Queue, line: str,
     if not line:
         return False
     try:
-        target_queue.put_nowait(line)
+        ui = append_input.current()
+        if ui is not None:
+            ui.submit(target_queue, line)
+        else:
+            target_queue.put_nowait(line)
     except queue.Full:
         console.print("[error]Supplementary instruction queue is full.[/error]")
         return False
@@ -27193,6 +27630,7 @@ def _bg_reader_prompt_mode(target_queue: queue.Queue,
                             raise
                     if line is None or stop.is_set():
                         continue
+                    _queue_supplementary(target_queue, line)
     except TerminalBusy:
         return
     finally:
@@ -27251,7 +27689,12 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
     reaches us, so the run's own SIGINT handler still owns that key.
     """
     stop = stop_event if stop_event is not None else _bg_reader_stop
-    buf: list[str] = []
+    ui = append_input.current()
+    buf: list[str] = list(ui.draft_text()) if ui is not None else []
+
+    def _sync_draft():
+        if ui is not None and _bg_answer_mode is None:
+            ui.set_draft(''.join(buf))
 
     def _buf_cells():
         if _bg_answer_mode == "secret":
@@ -27260,13 +27703,14 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
                    for c in buf)
 
     def _erase_line(cells: int):
-        if cells > 0:
+        if cells > 0 and ui is None:
             sys.stdout.write('\r' + ' ' * cells + '\r')
             sys.stdout.flush()
 
     def _clear_visible_line():
         _erase_line(_buf_cells())
         buf.clear()
+        _sync_draft()
 
     # Alt+A cannot open the view from inside the loop: this thread is holding
     # the terminal in CBREAK, and the view's prompt_toolkit app needs it. So
@@ -27319,7 +27763,8 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
                 break
 
             if key.name == "alt" and str(key.text or "").lower() == "a":
-                _clear_visible_line()
+                if ui is None:
+                    _clear_visible_line()
                 open_view = True
                 break
 
@@ -27357,26 +27802,46 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
                     continue
                 if buf:
                     line = ''.join(buf)
-                    sys.stdout.write('\n')
-                    sys.stdout.flush()
-                    _clear_visible_line()
-                    _queue_supplementary(target_queue, line)
+                    if ui is None:
+                        sys.stdout.write('\n')
+                        sys.stdout.flush()
+                        _clear_visible_line()
+                    if _queue_supplementary(target_queue, line):
+                        buf.clear()
+                        _sync_draft()
                 continue
 
             if key.name == "backspace":
                 if buf:
                     removed = buf.pop()
-                    if _bg_answer_mode != "secret":
+                    if _bg_answer_mode != "secret" and ui is None:
                         cells = 2 if unicodedata.east_asian_width(removed) in ('W', 'F') else 1
                         sys.stdout.write('\b \b' * cells)
                         sys.stdout.flush()
+                    _sync_draft()
+                continue
+
+            if key.name == "ctrl-u":
+                _clear_visible_line()
+                continue
+
+            if key.name == "ctrl-w":
+                if ui is None:
+                    continue
+                while buf and buf[-1].isspace():
+                    buf.pop()
+                while buf and not buf[-1].isspace():
+                    buf.pop()
+                if ui is not None:
+                    _sync_draft()
                 continue
 
             if key.is_text:
-                if _bg_answer_mode != "secret":
+                if _bg_answer_mode != "secret" and ui is None:
                     sys.stdout.write(key.text)
                     sys.stdout.flush()
                 buf.extend(key.text)
+                _sync_draft()
     except TerminalBusy:
         # The hold succeeded and was then revoked mid-read. Nothing to
         # reclaim from this thread; the run continues without a reader.
@@ -27412,6 +27877,9 @@ def _open_agents_view_from_run() -> None:
     _arrow_approval_prompt, so nothing draws over the view.
     """
     _set_run_input_state("idle")
+    ui = append_input.current()
+    if ui is not None:
+        ui.pause()
 
     def _resume() -> None:
         # Only while a turn is still running. If the run finished while the
@@ -27440,6 +27908,9 @@ def _start_bg_input_reader(target_queue: queue.Queue,
     global _bg_reader_thread, _bg_reader_stop, _bg_reader_args
     if _bg_reader_thread is not None and _bg_reader_thread.is_alive():
         return  # already running
+    ui = append_input.current()
+    if ui is not None:
+        ui.resume()
     # Remember what this reader was wired to, so the paths that pause it for
     # a prompt can put it back on the same wiring. See _restart_bg_input_reader.
     _bg_reader_args = (target_queue, interrupt_event, interrupt_hint)
@@ -27524,6 +27995,9 @@ def _stop_bg_input_reader() -> bool:
         else:
             _bg_reader_thread = None
     _set_run_input_state("idle")
+    ui = append_input.current()
+    if ui is not None:
+        ui.pause()
     return stopped
 
 
@@ -28274,6 +28748,16 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
 
     signal.signal(signal.SIGINT, _soft_interrupt)
 
+    import agent_loop as _run_status
+    run_ui = append_input.AppendInput(
+        console, lambda: (_run_status._live_status_model(),
+                         _run_status._active_mode_label()))
+    try:
+        if not (events_cb is not None and _repl_process_depth() == 0
+                and sys.stdin.isatty() and run_ui.start()):
+            run_ui = None
+    except Exception:
+        run_ui = None
     _set_run_input_state("running")
     # Background stdin reader: supplementary instructions + bare-Esc soft
     # interrupt during the run (wired straight to the interrupt event, never
@@ -28437,7 +28921,6 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
             "error": run_error,
         }
     finally:
-        repl_mirror.hub.stop_recording()
         _foreground_run_active = False
         _foreground_run_thread = None
         # Esc stops the AGENT the user was talking to. Everything that turn
@@ -28481,12 +28964,18 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
         # double-Ctrl+C force-exit path above already stops the reader
         # first; align the normal unwind with it.
         _stop_bg_input_reader()
+        if run_ui is not None:
+            parked_input = run_ui.close()
+            if parked_input:
+                global _pending_prompt_default
+                _pending_prompt_default = parked_input
+        repl_mirror.hub.stop_recording()
         signal.signal(signal.SIGINT, _old_sigint)
         _interrupt_event.clear()
         _set_run_input_state("idle")
         # STEP mode: after every foreground run that can still continue,
         # pre-fill /continue so pressing Enter advances the next iteration.
-        if response is not None:
+        if response is not None and not (run_ui is not None and parked_input):
             try:
                 _maybe_step_prefill(response)
             except Exception:
@@ -28499,7 +28988,7 @@ def run_execute_mode(task: str, session: dict, depth: int, session_id: str = Non
     if not session_id:
         return _run_execute_mode(task, session, depth, session_id)
     cwd = os.getcwd()
-    claim = {"session_id": session_id, "cwd": cwd}
+    claim = {"session_id": session_id, "cwd": cwd, "owner_user_id": paths.ACCOUNT_USER_ID}
     if _acquire_resume_lease(claim) is None:
         return 1
     try:
@@ -28631,33 +29120,24 @@ def main():
     """Entry point."""
     if sys.argv[1:2] == ["pow"]:
         raise SystemExit(_run_pow_command(sys.argv[2:]))
-    # A terminal the CLI has not run in before starts from the settings last
-    # used rather than from nothing. TERMINAL_ID is derived from the tty and
-    # POSIX session id when the emulator offers nothing better, and both
-    # change on every SSH login — so without this, every new connection asked
-    # for the model and mode again.
-    try:
-        terminal_preferences.seed_new_terminal()
-    except Exception:
-        pass
-    # Put the built-in decision tree on disk the first time, so it can be
-    # read and edited. Only when absent — never over an edited tree.
-    try:
-        import branches as _branches_boot
-        _branches_boot.write_default_tree()
-    except Exception:
-        pass
     import argparse
 
     parser = argparse.ArgumentParser(description="Laintas CLI — Autonomous AI agent")
     parser.add_argument("--version", "-V", action="version",
                         version=RELEASE_NAME)
     parser.add_argument("--name", type=str, help="Set agent name (shows in Helpwo AGNETS)")
+    parser.add_argument("--account", type=str, default=None,
+                        help="Use a saved account alias, email or userId")
+    parser.add_argument("--account-return", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--backend", type=str,
         help="Custom backend URL (enters external/unmetered mode; Laintas credentials are stripped)",
         default=None)
     parser.add_argument("--laintas", type=str, help=argparse.SUPPRESS, default=None)
+    parser.add_argument("--acp", action="store_true", default=False,
+                        help="Serve the Agent Client Protocol (ACP) over stdio "
+                             "— lets ACP editors (Zed & friends) drive this CLI. "
+                             "Optional: pip install agent-client-protocol")
     parser.add_argument("--execute", "-e", type=str, default=None,
                         help="Execute a single task non-interactively and exit")
     parser.add_argument("--session-id", type=str, default=None,
@@ -28696,6 +29176,28 @@ def main():
     parser.add_argument("--app-launch-id", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--app-options", type=str, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    # ACP owns stdout and authenticates non-interactively. Enter it before
+    # REPL startup can print diagnostics or prompt for browser/device login.
+    if args.backend:
+        os.environ["LAINTAS_BACKEND"] = args.backend
+    if args.laintas and args.laintas.rstrip("/") != LAINTAS_BASE:
+        parser.error("custom authentication origins are no longer allowed")
+    if args.acp:
+        import acp_agent
+        sys.exit(acp_agent.serve(args.depth))
+
+    # Initialize durable REPL defaults after argument parsing: --help and
+    # --version must not write user data, and ACP owns its own startup.
+    try:
+        terminal_preferences.seed_new_terminal()
+    except Exception:
+        pass
+    try:
+        import branches as _branches_boot
+        _branches_boot.write_default_tree()
+    except Exception:
+        pass
 
     # Which process this is decides who may draw on the tty (see
     # _repl_process_depth).
@@ -28756,13 +29258,6 @@ def main():
                 pass
         threading.Thread(target=_sweep_state_dirs, name="state-gc",
                          daemon=True).start()
-
-    # Apply environment overrides
-    if args.backend:
-        os.environ["LAINTAS_BACKEND"] = args.backend
-    if args.laintas:
-        if args.laintas.rstrip("/") != LAINTAS_BASE:
-            parser.error("custom authentication origins are no longer allowed")
 
     # All REPL instances use full-color console — sub-terminals are full
     # laintas-cli instances and should look identical to the main terminal.
@@ -28850,6 +29345,12 @@ def main():
     # separate trust and billing domain and must not require or receive it.
     _active_backend = get_backend_profile()
     session = (ensure_auth() or {}) if _active_backend.sends_laintas_credentials else {}
+    if session.get("userId") and session["userId"] != paths.ACCOUNT_USER_ID:
+        account_store.remember(paths.ROOT_HOME, session)
+        _restart_after_login(session["userId"])
+        return
+    if paths.ACCOUNT_USER_ID:
+        account_store.select(paths.ROOT_HOME, paths.TERMINAL_ID, paths.ACCOUNT_USER_ID)
     if args.depth == 0 and not _active_backend.sends_laintas_credentials:
         console.print(
             f"[yellow]Backend mode: {_active_backend.kind} "
@@ -29132,7 +29633,7 @@ def main():
             _startup_advisories = _close_stale_admission
 
         # Only the explicit-restore path still needs the blob up front.
-        _resume_blob = (load_resume_state(
+        _resume_blob = (_previous_live_session if args.account_return else load_resume_state(
                             _session_start_cwd,
                             agent_id=_startup_agent_id)
                         if _explicit_startup_resume else None)
@@ -29657,6 +30158,14 @@ def main():
         console.print(f"[dim yellow]term0 bash session init failed: {_e}[/dim yellow]")
         _term0_session = None
 
+    try:
+        import agent_loop as _term_runtime
+        from terminal_link_runtime import start_service as _start_terminal_link
+        _start_terminal_link(_term_runtime, session, get_loop_deps,
+            lambda message: console.print(escape(message)), agent_registry)
+    except Exception as _link_error:
+        console.print(escape(f"Terminal linking unavailable: {_link_error}"))
+
     # ── Monitor-only mode (no interactive REPL) ──
     # Runs purely as a remote executor: heartbeat + /poll loop already
     # started above when the agent registered. Here we just park the main
@@ -30134,6 +30643,11 @@ def main():
                     save_resume_state(agent_state, chat_history, _session_start_cwd,
                                    agent_id=get_current_agent_id())
             if should_exit:
+                if _ACCOUNT_RESTART:
+                    _perform_requested_account_restart(agent_registry, interactive_session)
+                    if injected_done is not None:
+                        injected_done.set()
+                    continue
                 # /q already finalized this logical session as a checkpoint.
                 # Writing a generic autosave here used to create a duplicate
                 # picker entry with the same conversation and a different id.

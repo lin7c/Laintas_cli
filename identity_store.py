@@ -38,13 +38,9 @@ from typing import Any
 
 import json_store
 
-try:
-    from paths import LAINTAS_HOME
-except Exception:  # minimal/test contexts without the paths module
-    from pathlib import Path
-    LAINTAS_HOME = Path(os.environ.get("LAINTAS_HOME", str(Path.home() / ".laintas")))
+import paths
 
-IDENTITY_DIR = LAINTAS_HOME / "identities"
+IDENTITY_DIR = paths.account_path("LAINTAS_HOME") / "identities"
 
 _LOCK = threading.RLock()
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")

@@ -10,6 +10,7 @@ import uuid
 from typing import Optional
 
 import paths
+import account_store
 import session_lifecycle
 
 _LAST_ERROR = ""
@@ -223,6 +224,7 @@ def _recover_latest_live(cwd: str,
             data = json.loads(candidate.read_text(encoding="utf-8"))
             owner = data.get("terminal_id") or data.get("instance_id")
             if (data.get("cwd") == cwd and not session_lifecycle.is_deleted(cwd, data)
+                    and account_store.owns(data, paths.ACCOUNT_USER_ID)
                     and not data.get("closed_at")
                     and owner == _terminal_id()
                     and str(data.get("agent_id") or "primary")
@@ -240,6 +242,8 @@ def is_continuable_reason(reason: str) -> bool:
 def create_session(cwd: str, state: Optional[dict] = None,
                    chat_history: Optional[list] = None,
                    agent_id: str = "primary") -> dict:
+    state = state if state is not None else {}
+    account_store.stamp(state, paths.ACCOUNT_USER_ID)
     now = time.time()
     session_id = _safe_id((state or {}).get("_session_id") or uuid.uuid4().hex[:16])
     # The runtime, autosave and lease must name the same session from its
@@ -254,6 +258,9 @@ def create_session(cwd: str, state: Optional[dict] = None,
         # namespace from it, so sync/close callers never need to pass it.
         # Legacy files without it are primary's.
         "agent_id": str(agent_id or "primary"),
+        "owner_user_id": paths.ACCOUNT_USER_ID,
+        "created_by": state.get("created_by", paths.ACCOUNT_USER_ID),
+        "handoff_from": copy.deepcopy(state.get("handoff_from")),
         "instance_id": _terminal_id(),
         "terminal_id": _terminal_id(),
         "cwd": cwd,
@@ -309,6 +316,7 @@ def load_current_session(cwd: str, agent_id: str = "primary") -> Optional[dict]:
             return None
         data = json.loads(path.read_text(encoding="utf-8"))
         if (data.get("cwd") != cwd or data.get("closed_at")
+                or not account_store.owns(data, paths.ACCOUNT_USER_ID)
                 or str(data.get("agent_id") or "primary") != str(agent_id or "primary")
                 or session_lifecycle.is_deleted(cwd, data)):
             return None
@@ -359,6 +367,8 @@ def ensure_current_session(cwd: str, state: Optional[dict] = None,
 def save_session(session: dict) -> None:
     if not session:
         return
+    if not account_store.owns(session, paths.ACCOUNT_USER_ID):
+        raise account_store.AccountError("Cannot save another account's task")
     now = time.time()
     session["updated_at"] = now
     session["timestamp"] = now
@@ -374,9 +384,13 @@ def save_session(session: dict) -> None:
         state = {}
     if isinstance(state, dict):
         state = copy.deepcopy(state)
+        account_store.stamp(state, paths.ACCOUNT_USER_ID)
         state["_session_id"] = session_id
         session["state"] = state
         session["agent_state"] = copy.deepcopy(state)
+        session["owner_user_id"] = paths.ACCOUNT_USER_ID
+        session["created_by"] = state.get("created_by", session.get("created_by", paths.ACCOUNT_USER_ID))
+        session["handoff_from"] = copy.deepcopy(state.get("handoff_from"))
     # Keep the conversation last on every rewrite, not just on the files
     # create_session made: agent_loop._read_session_header can only answer the
     # session walk from a bounded head read while all of its fields precede
@@ -428,6 +442,7 @@ def close_session(session: dict) -> dict:
 def sync_runtime(session: dict, state: dict, chat_history: list, *, cwd: str = None,
                  objective: str = None, last_user_input: str = None,
                  exit_reason: str = None, tasks: list = None) -> dict:
+    account_store.stamp(state, paths.ACCOUNT_USER_ID)
     if not session:
         session = create_session(cwd or os.getcwd(), state, chat_history)
     if cwd:

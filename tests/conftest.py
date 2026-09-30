@@ -13,10 +13,14 @@ of asking every future test to remember. Tests that patch it themselves still
 win — this only moves the default.
 """
 import tempfile
+import os
 
 import pytest
 
 import paths
+os.environ.setdefault("LAINTAS_ACCOUNT_MODE", "anonymous")
+if not paths._ACCOUNT_CONFIGURED:
+    paths.configure_account("")
 import terminal_preferences
 
 

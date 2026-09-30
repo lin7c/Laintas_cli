@@ -20,7 +20,7 @@ from tools import Tool
 import paths
 import agent_loop as _al
 
-PROC_DIR = Path(paths.LAINTAS_HOME) / "processes"
+PROC_DIR = paths.account_path("LAINTAS_HOME") / "processes"
 _WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 START_GRACE = timedelta(minutes=3)
 MAX_TOTAL_STEPS = 40

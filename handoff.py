@@ -13,12 +13,12 @@ processes, it is versioned and diffable, and — unlike a message — it is stil
 true tomorrow. It lives in the repository at ``.laintas/handoff/<id>.json`` and
 is meant to be committed.
 
-What is deliberately NOT in it
-------------------------------
-The conversation. Sharing a session hands the successor 200 turns of reasoning,
-including the branches that went nowhere, and makes them reconstruct the state
-by reading it. The envelope carries the *conclusions* instead: where the work
-is, what is left, and what not to try again.
+Versions and receiving tasks
+----------------------------
+Version 1 envelopes carry notes and contracts. Version 2 adds an immutable
+task checkpoint: context and a plan, excluding credentials and runtime grants.
+Acceptance creates a separate account-owned conversation; the original stays
+intact. Importing a file alone does not execute anything.
 
 Structure: an immutable header, an append-only log
 --------------------------------------------------
@@ -31,8 +31,9 @@ the same envelope — one on each machine, synced through Laintas storage — an
 both can append. Merging is then the union of two event lists keyed by a
 content hash, which is associative, commutative and idempotent: merge in any
 order, any number of times, and the result is the same. A mutable ``status``
-field would need a lock instead, and there is no lock that spans two machines
-and an object store.
+field would need a lock instead. Local read-modify-write operations use a
+thread/process lock. Remote fetch-merge-push is not a distributed transaction:
+merge preserves events retained in either copy, not events lost by both.
 
 Event ids are content hashes rather than random, so re-merging the same file
 cannot duplicate history. The cost is that two byte-identical events from the
@@ -74,6 +75,7 @@ from typing import Any, Optional
 import agent_contract
 import json_store
 import paths
+import file_lock
 
 HANDOFF_DIR = ".laintas/handoff"
 VERSION = 1
@@ -285,7 +287,8 @@ def _clean_events(raw: Any) -> list:
 
 def create(title: str, actor: str, *, to: str = "", avoid: Optional[list] = None,
            contract: Optional[dict] = None, expect: Optional[dict] = None,
-           note: str = "", cwd: Optional[str] = None) -> dict:
+           note: str = "", cwd: Optional[str] = None,
+           checkpoint: Optional[dict] = None, target_user_id: str = "") -> dict:
     """Write a new envelope. Raises if one with the same id already exists.
 
     ``contract`` is an ``agent_contract`` contract and is normalized here, so a
@@ -319,6 +322,11 @@ def create(title: str, actor: str, *, to: str = "", avoid: Optional[list] = None
         "avoid": [str(a).strip() for a in (avoid or []) if str(a).strip()],
         "events": [],
     }
+    if checkpoint is not None:
+        import task_handoff
+        env["checkpoint"] = task_handoff.validate(checkpoint)
+        env["target_user_id"] = str(target_user_id or "")
+        env["version"] = 2
     env["events"] = [make_event("open", env["createdBy"], note,
                                 {"to": env["to"]}, ts=env["createdAt"])]
 
@@ -332,12 +340,19 @@ def create(title: str, actor: str, *, to: str = "", avoid: Optional[list] = None
 
 def header_digest(env: dict) -> str:
     """Fingerprint of the immutable half, so a merge can prove it is the same one."""
-    return hashlib.sha256(_canonical([
+    header = [
         env.get("version"), env.get("id"), env.get("title"), env.get("to"),
         env.get("createdAt"), env.get("createdBy"), env.get("repo"),
         env.get("contractRef"), env.get("contract"), env.get("expect"),
         env.get("avoid"),
-    ]).encode("utf-8")).hexdigest()[:16]
+    ]
+    if env.get("version") == 2:
+        header.extend([env.get("checkpoint"), env.get("target_user_id")])
+    return hashlib.sha256(_canonical(header).encode("utf-8")).hexdigest()[:16]
+
+
+def guard(hid: str, cwd: Optional[str] = None):
+    return file_lock.guard(handoff_dir(cwd) / f".{valid_id(hid)}.lock")
 
 
 def _write(env: dict, cwd: Optional[str] = None) -> None:
@@ -365,12 +380,21 @@ def parse(raw: Any, source: str = "") -> dict:
         version = int(raw.get("version") or 0)
     except (TypeError, ValueError):
         version = 0
-    if version != VERSION:
+    if version not in (VERSION, 2) or (version == 2 and not raw.get("checkpoint")):
         # Refusing a newer file rather than reading it partially: a half-
         # understood handoff is worse than none, because it looks complete.
         raise HandoffError(
             f"handoff format v{version or '?'} is not v{VERSION}{where} — upgrade laintas_cli")
     env = dict(raw)
+    if version == 2:
+        import task_handoff
+        try:
+            task_handoff.validate(env.get("checkpoint"))
+        except (ValueError, TypeError) as exc:
+            raise HandoffError(str(exc)) from exc
+        env["target_user_id"] = str(env.get("target_user_id") or "")
+    elif "checkpoint" in env:
+        raise HandoffError("Task checkpoints require handoff v2 — upgrade laintas_cli")
     try:
         env["id"] = valid_id(env.get("id"))
     except HandoffError as exc:
@@ -415,17 +439,15 @@ def list_all(cwd: Optional[str] = None) -> list:
 
 def append(hid: str, kind: str, actor: str, note: str = "",
            data: Optional[dict] = None, cwd: Optional[str] = None) -> dict:
-    """Append one event and persist.
-
-    Read-modify-write with no lock. That is safe for the same reason the merge
-    is: the event carries a content-hash id, so the worst a lost update can do
-    is drop an event that the next sync puts back from the other copy. It can
-    never corrupt the header or reorder history.
-    """
-    env = load(hid, cwd)
-    env["events"] = _clean_events([*env["events"], make_event(kind, actor, note, data)])
-    _write(env, cwd)
-    return env
+    """Serialize the whole read-modify-write, including competing processes."""
+    with guard(hid, cwd):
+        env = load(hid, cwd)
+        if (kind == "claim" and env.get("target_user_id")
+                and env["target_user_id"] != actor):
+            raise HandoffError("This task is addressed to another account")
+        env["events"] = _clean_events([*env["events"], make_event(kind, actor, note, data)])
+        _write(env, cwd)
+        return env
 
 
 def merge(local: dict, remote: dict) -> tuple[dict, int]:
@@ -576,6 +598,11 @@ def _remote_exists(client, remote: str) -> bool:
 
 
 def sync(hid: str, client, cwd: Optional[str] = None) -> dict:
+    with guard(hid, cwd):
+        return _sync_locked(hid, client, cwd)
+
+
+def _sync_locked(hid: str, client, cwd: Optional[str] = None) -> dict:
     """Merge the shared copy into this one and publish the result.
 
     Returns ``{"remote", "gained", "existed"}`` — ``gained`` being how many
@@ -613,6 +640,14 @@ def sync(hid: str, client, cwd: Optional[str] = None) -> dict:
 
 
 def fetch(remote: str, client, cwd: Optional[str] = None) -> dict:
+    name = remote.rsplit("/", 1)[-1]
+    if not name.endswith(".json"):
+        raise HandoffError(f"{remote} is not a handoff envelope")
+    with guard(valid_id(name[:-5]), cwd):
+        return _fetch_locked(remote, client, cwd)
+
+
+def _fetch_locked(remote: str, client, cwd: Optional[str] = None) -> dict:
     """Bring down an envelope this machine has never seen. Returns it.
 
     Separate from :func:`sync` because it answers a different question: sync
@@ -702,11 +737,16 @@ def export_token(env: dict) -> str:
     """Render an envelope as one string to paste into any channel."""
     import gzip
 
-    payload = gzip.compress(
-        _canonical({k: v for k, v in env.items() if k != "_"}).encode("utf-8"), 9)
+    raw = _canonical({k: v for k, v in env.items() if k != "_"}).encode("utf-8")
+    if len(raw) >= MAX_DECOMPRESSED_BYTES:
+        raise HandoffError("Handoff is too large to export; compact its context first")
+    payload = gzip.compress(raw, 9)
     digest = hashlib.sha256(payload).hexdigest()[:8]
     body = base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
-    return f"{TOKEN_PREFIX}:{TOKEN_VERSION}:{digest}:{body}"
+    token = f"{TOKEN_PREFIX}:{TOKEN_VERSION}:{digest}:{body}"
+    if len(token) > MAX_TOKEN_CHARS:
+        raise HandoffError("Handoff token is too large; compact its context first")
+    return token
 
 
 def looks_like_token(text: str) -> bool:
@@ -764,9 +804,11 @@ def import_envelope(incoming: dict, cwd: Optional[str] = None) -> dict:
     a handoff you already hold is add events to it, and a header that disagrees
     is refused outright by :func:`merge`.
     """
-    if handoff_path(incoming["id"], cwd).exists():
-        incoming, _ = merge(load(incoming["id"], cwd), incoming)
-    _write(incoming, cwd)
+    incoming = parse(incoming)
+    with guard(incoming["id"], cwd):
+        if handoff_path(incoming["id"], cwd).exists():
+            incoming, _ = merge(load(incoming["id"], cwd), incoming)
+        _write(incoming, cwd)
     _ensure_gitignore_exception(cwd)
     return incoming
 

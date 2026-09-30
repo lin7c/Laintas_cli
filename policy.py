@@ -28,8 +28,8 @@ from typing import Optional
 import paths
 import json_store
 
-CONFIG_PATH = paths.POLICY_FILE
-AUDIT_PATH = paths.AUDIT_FILE
+CONFIG_PATH = paths.account_path("POLICY_FILE")
+AUDIT_PATH = paths.account_path("AUDIT_FILE")
 
 # ── Default safe policy ──────────────────────────────────────────────────
 _DEFAULT_CONFIG = {

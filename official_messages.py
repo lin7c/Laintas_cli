@@ -26,13 +26,10 @@ from pathlib import Path
 
 import startup_mail
 
-try:
-    from paths import LAINTAS_HOME
-except Exception:  # paths is unavailable in some minimal test contexts
-    LAINTAS_HOME = Path(os.environ.get("LAINTAS_HOME", str(Path.home() / ".laintas")))
+import paths
 
 #: Where the last successful fetch is kept, so an offline start is not silent.
-CACHE_FILE = LAINTAS_HOME / "messages.json"
+CACHE_FILE = paths.account_path("LAINTAS_HOME") / "messages.json"
 
 #: Session cookie names, newest first. Exported because `verify_session` in the
 #: CLI reads the same credential — two copies of this list would drift, and the

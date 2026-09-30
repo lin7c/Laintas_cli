@@ -42,11 +42,13 @@ import task_manager          # Structured task tracking (session + persisted)
 import workgraph             # Unified objective/plan/steps/workflow authority
 import retask                # Work handed to the person (.retask checklists)
 import paths                 # Centralized path management
+import account_store
 import session_lifecycle
 import json_store            # atomic small-JSON read/write
 import peer_coordination     # Cross-instance file-conflict coordination
 import skills as skills_mod   # Progressive skill metadata + context loading
 import symbols                # Centralized UI symbol constants
+import append_input           # Connected foreground status + supplementary input
 import transcript_view        # Shared live/replay conversation rendering
 import event_log              # Durable prompt admission + turn event log
 import precheck               # Tool-precheck labeled-sample capture + inference stub
@@ -480,6 +482,30 @@ _active_activity_status = None
 _activity_status_lock = threading.Lock()
 
 
+def _call_stream_live(console, renderable, invoke):
+    """Standalone stream display when no foreground append region owns it."""
+    from rich.live import Live
+    from rich.errors import LiveError
+    live = Live(renderable, console=console, refresh_per_second=10,
+                transient=True, redirect_stdout=False, redirect_stderr=False)
+    try:
+        live.__enter__()
+    except LiveError:
+        return invoke()
+    try:
+        response = invoke()
+        try:
+            live.refresh()
+        except Exception:
+            pass
+        return response
+    finally:
+        try:
+            live.__exit__(None, None, None)
+        except Exception:
+            pass
+
+
 def activity_verb(tool_name: str) -> str:
     """Present-participle verb for the status row of `tool_name`."""
     name = str(tool_name or "")
@@ -574,6 +600,13 @@ def activity_status(console, tool_name: str, detail: str = "",
     if not enabled or console is None:
         yield None
         return
+    ui = append_input.current(console)
+    if ui is not None:
+        status = _ActivityStatus(
+            console, f"{activity_verb(tool_name)}…", detail, delay=delay)
+        with ui.status(status._renderable(), label=status.label):
+            yield ui
+        return
     global _active_activity_status
     status = _ActivityStatus(
         console, f"{activity_verb(tool_name)}\u2026", detail, delay=delay)
@@ -595,6 +628,9 @@ def pause_activity_status() -> None:
     It does not resume: whoever draws next owns what is on the screen now, and
     a status row reappearing underneath a prompt would be worse than no row.
     """
+    ui = append_input.current()
+    if ui is not None:
+        ui.pause()
     with _activity_status_lock:
         status = _active_activity_status
     if status is not None:
@@ -1533,6 +1569,9 @@ def register_terminal(session, command: str, depth: int, name: str = None,
                       retain_completed: bool = False) -> str:
     """Register a terminal under one parent; names are never replaced implicitly."""
     global _terminal_registry, _terminal_counter
+    if name != "term0":
+        import terminal_link
+        terminal_link.check_terminal_creation()
     with _registry_lock:
         _terminal_counter += 1
         if name is None:
@@ -2150,6 +2189,7 @@ def save_session_snapshot(state: dict, chat_history: list, cwd: str) -> None:
     queries). Silently skips on any I/O error.
     """
     try:
+        account_store.stamp(state, paths.ACCOUNT_USER_ID)
         user_turns = [m for m in chat_history if m.get("role") == "user"]
         if len(user_turns) < 2:
             return
@@ -2169,6 +2209,7 @@ def save_session_snapshot(state: dict, chat_history: list, cwd: str) -> None:
 
         payload = {
             "cwd": cwd,
+            "owner_user_id": paths.ACCOUNT_USER_ID,
             "timestamp": time.time(),
             "session_id": _ensure_session_id(state),
             "shortTermMemory": mem,
@@ -2178,6 +2219,8 @@ def save_session_snapshot(state: dict, chat_history: list, cwd: str) -> None:
         dest = paths.SESSIONS_DIR / f"{_session_key(cwd)}.json"
         paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
         _atomic_write_json(dest, payload)
+    except account_store.AccountError:
+        _diag("session_snapshot_owner_conflict", cwd=cwd)
     except Exception:
         pass
 
@@ -2258,6 +2301,8 @@ def normalize_fork_lineage(value) -> list:
 
 def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str,
                           *, agent_id: str = "primary") -> Optional[dict]:
+    state = state if state is not None else {}
+    account_store.stamp(state, paths.ACCOUNT_USER_ID)
     all_user_turns = [
         m for m in (chat_history or []) if m.get("role") == "user"
     ]
@@ -2301,6 +2346,9 @@ def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str,
         # trusting glob patterns, and delete_resume_state re-derives the right
         # namespace from the blob itself. Legacy files without it are primary's.
         "agent_id": _resume_agent_of(agent_id),
+        "owner_user_id": paths.ACCOUNT_USER_ID,
+        "created_by": state.get("created_by", paths.ACCOUNT_USER_ID),
+        "handoff_from": copy.deepcopy(state.get("handoff_from")),
         "timestamp": time.time(),
         "title": title,
         "turn_count": len(prompt_turns),
@@ -2852,7 +2900,8 @@ def list_resume_states(cwd: str, *, agent_id: str = "primary") -> list:
                 continue
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
-                if data.get("cwd") != cwd or session_lifecycle.is_deleted(cwd, data):
+                if (data.get("cwd") != cwd or session_lifecycle.is_deleted(cwd, data)
+                        or not account_store.owns(data, paths.ACCOUNT_USER_ID)):
                     continue
                 # The blob's own agent_id is authoritative over the glob that
                 # found it: a hand-copied or renamed file must not leak into
@@ -2998,6 +3047,7 @@ def load_resume_state(cwd: str, session_id: str = None,
             if path.exists():
                 data = json.loads(path.read_text(encoding="utf-8"))
                 if (data.get("cwd") == cwd and not session_lifecycle.is_deleted(cwd, data)
+                        and account_store.owns(data, paths.ACCOUNT_USER_ID)
                         and time.time() - data.get("timestamp", 0) <= 7 * 86400
                         and _resume_agent_of(data) == _resume_agent_of(agent_id)):
                     return data
@@ -3019,6 +3069,8 @@ def delete_resume_state(cwd: str, blob: dict) -> None:
     derived from the blob's own agent_id, so deleting scout's session can
     never walk into primary's files even in the same directory.
     """
+    if not account_store.owns(blob, paths.ACCOUNT_USER_ID):
+        raise ValueError("Saved task belongs to another account")
     if blob.get("cwd") and blob["cwd"] != cwd:
         raise ValueError("Saved session belongs to a different directory")
     agent_id = _resume_agent_of(blob)
@@ -3117,8 +3169,7 @@ def delete_resume_state(cwd: str, blob: dict) -> None:
                     break
                 affected.update(children)
         for session_id in affected:
-            lock = (paths.SESSION_LOCKS_DIR / peer_coordination._cwd_hash(cwd)
-                    / f"{peer_coordination._normalize_session_id(session_id)}.lock")
+            lock = peer_coordination.session_lock_path(cwd, session_id)
             owner = peer_coordination._read_lease(lock)
             if owner and peer_coordination._pid_alive(int(owner.get("pid") or 0)):
                 raise RuntimeError(
@@ -3145,7 +3196,8 @@ def load_session_snapshot(cwd: str) -> Optional[dict]:
         if not dest.exists():
             return None
         data = json.loads(dest.read_text(encoding="utf-8"))
-        if session_lifecycle.is_deleted(cwd, data):
+        if (session_lifecycle.is_deleted(cwd, data)
+                or not account_store.owns(data, paths.ACCOUNT_USER_ID)):
             return None
         # Discard snapshots older than 7 days
         if time.time() - data.get("timestamp", 0) > 7 * 86400:
@@ -3222,6 +3274,9 @@ class AgentInfo:
     """Metadata about a logical AI agent managed by the REPL."""
     id: str
     name: str
+    remote_terminal: str = ""
+    remote_agent: str = ""
+    remote_relation: str = ""
     # Stable switching position; see TerminalInfo.index. The primary agent is
     # always 0.
     index: int = 0
@@ -3331,6 +3386,12 @@ def can_agents_communicate(caller_id: str, target_id: str) -> bool:
     """
     if not caller_id or not target_id or caller_id == target_id:
         return False
+    import terminal_link
+    service = terminal_link._service
+    if service is not None and service.parent:
+        controlled = getattr(service.adapter, "controlled", set())
+        if caller_id in controlled and target_id in controlled:
+            return False
     with _registry_lock:
         caller = _agent_registry.get(caller_id)
         target = _agent_registry.get(target_id)
@@ -3737,8 +3798,12 @@ def scheduler_status(agent_id: str) -> dict:
                 "max_concurrent": _max_concurrent}
 
 
+@account_store.admission((False, "Account switch is in progress."))
 def begin_primary_run(agent_id: str = "primary") -> tuple[bool, str]:
     """Atomically acquire the one execution lease for a primary Agent."""
+    import terminal_link
+    if not terminal_link.local_admission_allowed():
+        return False, "This terminal is controlled; assign work from its controller or /term release."
     agent = get_agent(agent_id)
     if agent is None or agent.lifecycle_terminated:
         return False, f"Agent '{agent_id}' is not available."
@@ -3767,6 +3832,9 @@ def finish_primary_run(agent_id: str = "primary", *, reply: str = "",
 
 def queue_primary_message(agent_id: str, message: str) -> tuple[bool, str]:
     """Append input to the currently running primary task."""
+    import terminal_link
+    if not terminal_link.local_admission_allowed():
+        return False, "This terminal is controlled; append instructions from its controller."
     agent = get_agent(agent_id)
     text = str(message or "").strip()
     if agent is None or agent.lifecycle_terminated:
@@ -3819,19 +3887,26 @@ def get_or_hire_pool_agent() -> AgentInfo:
         "No deployed employee is available; hire one from a live terminal first")
 
 
+@account_store.admission((False, "Account switch is in progress.", None))
 def start_agent_assignment(agent_id: str, task: str, deps,
                            session: Optional[dict] = None,
-                           events_cb=None, *, expected_parent_id: Optional[str] = None
+                           events_cb=None, *, expected_parent_id: Optional[str] = None,
+                           on_finished=None
                            ) -> tuple[bool, str, Optional[AgentAssignment]]:
     """Start one concrete background assignment for a hired employee.
 
     Employee capability/profile is persistent; state and chat history are fresh
     for every assignment.  The employee returns to idle after the runner exits.
     """
+    import terminal_link
+    if not terminal_link.local_admission_allowed():
+        return False, "This terminal is controlled; assign work from its controller.", None
     employee = get_agent(agent_id)
     task = str(task or "").strip()
     if employee is None:
         return False, f"Agent '{agent_id}' not found.", None
+    if employee.remote_terminal:
+        return False, "Linked Agents must execute through /station in their owning terminal.", None
     if employee.lifecycle_terminated:
         return False, f"Agent '{agent_id}' has been terminated.", None
     if employee.role not in {"pool", "deployed"}:
@@ -3895,7 +3970,7 @@ def start_agent_assignment(agent_id: str, task: str, deps,
         employee.abort_event.clear()
         durable_runtime_state = {
             key: value for key, value in employee.state.items()
-            if key in {"_persisted_employee", "_session_id", "_task_cwd"}
+            if key in {"_persisted_employee", "_session_id", "_task_cwd", "_tool_allowlist"}
         }
         employee.state = {
             "shortTermMemory": "",
@@ -3932,6 +4007,14 @@ def start_agent_assignment(agent_id: str, task: str, deps,
                 "error": error,
             })
             employee.assignment_history = employee.assignment_history[-100:]
+            if on_finished is not None:
+                try:
+                    # Complete state restoration before publishing the
+                    # employee as available for another assignment.
+                    on_finished(assignment)
+                except Exception as exc:
+                    _diag("assignment_finish_callback_failed",
+                          agent_id=employee.id, error=str(exc))
             if employee.active_assignment is assignment:
                 employee.active_assignment = None
             employee.status = (
@@ -4537,6 +4620,8 @@ def swap_station(old_agent_id: str, new_agent_id: str,
 def close_all_agents() -> None:
     """Clean up all agent registrations. Signals abort to running children first."""
     global _current_agent_id, _running_count, _wait_queue, _station_service
+    import terminal_link
+    terminal_link.stop_service()
     _station_service = None
     cancelled = []
     ephemeral_sessions = []
@@ -4737,6 +4822,15 @@ def abort_agent(agent_id: str) -> bool:
                 else:
                     kept.append((queued_id, start_fn))
             _wait_queue = kept
+    import terminal_link
+    service = terminal_link._service
+    if service is not None:
+        for target in targets:
+            if target.remote_terminal and target.active_assignment:
+                try:
+                    service.cancel(target, target.active_assignment.id)
+                except terminal_link.LinkError:
+                    pass
     for session in ephemeral_sessions:
         try:
             session.close()
@@ -8278,14 +8372,20 @@ def _pending_direct_commands(history: list, limit: int = 10) -> list:
             # Recorded after its command, so met first walking backwards.
             returncode = message.get("returncode")
             continue
-        if role == "user" and message.get("input_kind") == "interactive":
-            continue
         if role == "user" and message.get("input_kind") == "shell":
             command = " ".join(str(message.get("content") or "").split())
             if command:
                 commands.append({"command": command[:200],
                                  "returncode": returncode})
             returncode = None
+            continue
+        # A prompt nothing answered, and the note left by a turn that failed
+        # before the model saw it (balance, backend error), are not the agent
+        # speaking. Stopping at them hid `echo … >> authorized_keys` from the
+        # retry that asked to undo it.
+        if role == "user":
+            continue
+        if role == "assistant" and message.get("message_kind") == "turn_failed":
             continue
         break
     commands.reverse()
@@ -8370,6 +8470,9 @@ def prepare_state_for_repl(state: dict) -> dict:
         thread_messages = []
     return {
         "shortTermMemory": _trim_short_term_memory(state.get("shortTermMemory", "")),
+        "owner_user_id": str(state.get("owner_user_id") or paths.ACCOUNT_USER_ID),
+        "created_by": str(state.get("created_by", paths.ACCOUNT_USER_ID)),
+        "handoff_from": copy.deepcopy(state.get("handoff_from")),
         "_compact_background_at": state.get("_compact_background_at", 0),
         # The last measured per-request overhead. Carried so `/compact status`,
         # the pager and the first checkpoint of the next turn budget against
@@ -10854,6 +10957,14 @@ def run_agent_loop(
     message_queue: if provided, drained between iterations — supplementary
     messages from the user are injected into the conversation context.
     """
+    # Login changes must never alter the execution identity of an admitted run.
+    _proxy = get_agent(agent_id) if agent_id else None
+    if _proxy is not None and _proxy.remote_terminal:
+        raise RuntimeError("A linked Agent cannot execute locally; use /station.")
+    session = account_store.frozen_auth(session)
+    if session.get("userId") and paths.ACCOUNT_USER_ID:
+        session = account_store.frozen_auth(session, paths.ACCOUNT_USER_ID)
+    account_store.stamp(state, paths.ACCOUNT_USER_ID)
     # Child agents must not consume the primary REPL's supplementary input or
     # share its Ctrl+C event. Resolve their runtime channels from AgentInfo.
     _runtime_info = get_agent(agent_id) if agent_id else None
@@ -11252,6 +11363,10 @@ def run_agent_loop(
                 _supplementary.append(msg)
             except queue.Empty:
                 break
+        if _owns_local_render:
+            ui = append_input.current(deps.console)
+            if ui is not None:
+                ui.consume(_supplementary)
         # `/prompt [issue]` is a control command even while the main agent is
         # running. Capture the live context and launch a silent, read-only lab
         # branch; do not inject the command into the main task conversation.
@@ -12921,34 +13036,14 @@ def run_agent_loop(
                 _transient_ctx = (
                     _transient_factory()
                     if callable(_transient_factory) else nullcontext())
-                with _transient_ctx:
-                    live = Live(
-                        _LiveWrapper(), console=deps.console,
-                        refresh_per_second=10.0, auto_refresh=True,
-                        transient=True, redirect_stdout=False,
-                        redirect_stderr=False)
-                    try:
-                        live.__enter__()
-                    except LiveError:
-                        # Defensive fallback for any other terminal UI that
-                        # currently owns this Console. Live.start failed before
-                        # the backend request, so falling back cannot duplicate
-                        # a billed model call.
+                _append_ui = append_input.current(deps.console)
+                if _append_ui is not None:
+                    with _append_ui.status(_render, started=_thinking_t0):
                         response = _do_stream_call()
-                    else:
-                        try:
-                            response = _do_stream_call()
-                            try:
-                                live.refresh()
-                            except Exception:
-                                pass
-                        finally:
-                            try:
-                                live.__exit__(None, None, None)
-                            except Exception:
-                                # Rendering cleanup must never discard an
-                                # already-received model response.
-                                pass
+                else:
+                    with _transient_ctx:
+                        response = _call_stream_live(
+                            deps.console, _LiveWrapper(), _do_stream_call)
             # Live painted only a transient tail PREVIEW (cleared on exit), so
             # the full reply still must be printed once below regardless of
             # detail mode. _ui_streamed tracks whether ai_stream chunks were
@@ -14576,7 +14671,7 @@ def run_agent_loop(
             # while the provider is producing its final chunk. Give that
             # shared queue one refresh tick and continue the same run instead
             # of declaring completion with an accepted message stranded.
-            if self_info is not None and self_info.role == "primary":
+            if _owns_local_render or (self_info is not None and self_info.role == "primary"):
                 if _msg_queue.empty():
                     time.sleep(0.05)
                 if not _msg_queue.empty():

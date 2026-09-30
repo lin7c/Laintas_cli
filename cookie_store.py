@@ -26,13 +26,9 @@ from typing import Any, Iterable
 
 import json_store
 
-try:
-    from paths import LAINTAS_HOME
-except Exception:  # paths is unavailable in some minimal test contexts
-    from pathlib import Path
-    LAINTAS_HOME = Path(os.environ.get("LAINTAS_HOME", str(Path.home() / ".laintas")))
+import paths
 
-COOKIE_FILE = LAINTAS_HOME / "cookies.json"
+COOKIE_FILE = paths.account_path("LAINTAS_HOME") / "cookies.json"
 
 _LOCK = threading.RLock()
 

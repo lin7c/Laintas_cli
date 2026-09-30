@@ -7,7 +7,7 @@ import { useLanguage } from '@/contexts/LanguageContext';
 import SiteFooter from './SiteFooter';
 import TerminalReplay from './TerminalReplay';
 
-const RELEASE_FALLBACK = 'laintas-cli-beta-v1';
+const RELEASE_FALLBACK = 'laintas-cli-beta-v2';
 // The site mirrors the verified assets from the latest GitHub Release.
 const RELEASE_BASE = 'https://cli.laintas.com/releases/latest';
 const RELEASE_API = 'https://api.github.com/repos/lin7c/Laintas_cli/releases/latest';
