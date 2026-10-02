@@ -1349,9 +1349,12 @@ def _maybe_warn_bounded_mode() -> None:
         return
     _bounded_mode_user_warned = True
     try:
-        print(
-            "标准模式：子任务每轮上限 30 步，超长任务可能中途被打断。"
-            "这是防跑偏/防无限循环的安全阀。如需长任务：拆小，或 /max 解除限制（风险自负）。"
+        import sys as _sys
+        _sys.stderr.write(
+            "[standard mode] Sub-tasks are soft-capped at 30 turns per round. "
+            "Long tasks may be interrupted mid-way. This is a safety valve against "
+            "runaway loops. For long tasks: break them into smaller steps, or use "
+            "/max to lift the cap (at your own risk).\n"
         )
     except Exception:
         pass
@@ -5648,7 +5651,7 @@ def resume_subagent(agent_id: str) -> dict:
         child.chat_history.append({
             "role": "user",
             "content": (
-                "[System: 断点续跑 — your previous run finished and you are "
+                "[System: breakpoint-resume — your previous run finished and you are "
                 "being continued with prior history preserved. Treat the "
                 "next tell message as a new instruction in the same session.]"
             ),
