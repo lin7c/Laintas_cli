@@ -1300,6 +1300,66 @@ def apply_max_config() -> dict:
     return {k: get_runtime_config(k) for k in _MAX_CONFIG}
 
 
+# ── Bounded-mode soft limit (standard / non-/max mode) ──────────────────
+# In standard mode, sub-agent tasks are soft-capped at _MAX_MODE_LOOP_CEILING
+# turns per round. This is a safety valve against runaway/infinite loops.
+# /max lifts the cap (via apply_max_config); `/config reset` restores the
+# default config, which automatically re-enables the bound.
+_MAX_MODE_LOOP_CEILING = 30
+_bounded_mode_user_warned = False
+
+
+def _is_max_mode() -> bool:
+    """Return True if /max mode is active (runtime config at ceiling)."""
+    try:
+        return (int(get_runtime_config("max_loops"))
+                >= int(_MAX_CONFIG.get("max_loops", 100000)))
+    except Exception:
+        return False
+
+
+def _bounded_turn_limit() -> Optional[int]:
+    """Turn limit for sub-agent tasks in the current mode.
+
+    Returns None in /max mode (unbounded); otherwise the soft ceiling.
+    """
+    if _is_max_mode():
+        return None
+    return _MAX_MODE_LOOP_CEILING
+
+
+def _child_turn_limit_note() -> str:
+    """Prompt note injected into child tasks in bounded (standard) mode."""
+    _limit = _bounded_turn_limit()
+    if _limit is None:
+        return ""
+    return (
+        f"[Note: standard mode — this sub-task is soft-capped at {_limit} "
+        f"turns per round. If the task is long, break it into smaller steps "
+        f"or ask the user to run /max.]"
+    )
+
+
+def _maybe_warn_bounded_mode() -> None:
+    """Warn the user once (per process) about the bounded-mode soft limit."""
+    global _bounded_mode_user_warned
+    if _bounded_mode_user_warned:
+        return
+    if _is_max_mode():
+        return
+    _bounded_mode_user_warned = True
+    try:
+        import sys as _sys
+        _sys.stderr.write(
+            "[standard mode] Sub-tasks are soft-capped at 30 turns per round. "
+            "Long tasks may be interrupted mid-way. This is a safety valve against "
+            "runaway loops. For long tasks: break them into smaller steps, or use "
+            "/max to lift the cap (at your own risk).\n"
+        )
+    except Exception:
+        pass
+
+
 # ── Soft-Interrupt & Supplementary Input ──────────────────────────────
 # Ctrl+C during the agent loop sets _user_interrupt for graceful stop.
 # Users can type supplementary messages while the AI works — they're
@@ -3898,6 +3958,8 @@ def start_agent_assignment(agent_id: str, task: str, deps,
     Employee capability/profile is persistent; state and chat history are fresh
     for every assignment.  The employee returns to idle after the runner exits.
     """
+    # Bounded-mode: persistent assignments get the same soft-cap warning.
+    _maybe_warn_bounded_mode()
     import terminal_link
     if not terminal_link.local_admission_allowed():
         return False, "This terminal is controlled; assign work from its controller.", None
@@ -5080,6 +5142,8 @@ def spawn_subagent(parent_id: str, task: str, deps,
 
     Returns the child's agent_id, or None if the parent doesn't exist.
     """
+    # Bounded-mode: warn the user once per process about the soft turn cap.
+    _maybe_warn_bounded_mode()
     parent = get_agent(parent_id)
     if parent is None or parent.lifecycle_terminated or parent.abort_event.is_set():
         return None
@@ -5219,6 +5283,11 @@ def spawn_subagent(parent_id: str, task: str, deps,
 
     # Inject role into child state so run_agent_loop picks it up
     effective_task = task
+    # Bounded-mode: inject the soft turn-cap note into the child's prompt
+    # (no-op in /max mode — _child_turn_limit_note returns "").
+    _turn_note = _child_turn_limit_note()
+    if _turn_note:
+        effective_task = f"{_turn_note}\n\n{effective_task}"
     if role:
         child.state["_role_name"] = role
         role_obj = agent_roles.get_role(role)
@@ -5402,6 +5471,15 @@ def spawn_subagent(parent_id: str, task: str, deps,
                 "completion_source": (
                     str(result.get("completion_source") or "")
                     if isinstance(result, dict) else ""),
+                # Silent-failure diagnostics: when a child stops without a
+                # clear result, the parent needs these to distinguish "had
+                # nothing to say" from "failed silently". finish_reason is
+                # the loop's exit reason; completion_tokens is the
+                # provider-reported token usage for this child.
+                "finish_reason": (str(result.get("exit_reason") or "")
+                                  if isinstance(result, dict) else ""),
+                "completion_tokens": int(getattr(child, "usage_tokens", 0) or 0),
+                "silent_fail_count": int(child.state.get("_silent_fail_count", 0) or 0),
             }
             if _loop_error:
                 _execution["message"] = _loop_error
@@ -5515,11 +5593,83 @@ def spawn_subagent(parent_id: str, task: str, deps,
     t = threading.Thread(target=lambda: schedule_agent(child.id, _runner),
                          daemon=True, name=f"laintas-sched-{child.id}")
     child.thread = t
+    # Save the runner for resume_subagent(): a finished spawn child's loop
+    # can be restarted with preserved state/history via agent.tell.
+    child._resume_runner = _runner
     try:
         t.start()
     except Exception as exc:
         _runner(False, f"Could not start child thread: {exc}")
     return child.id
+
+
+def resume_subagent(agent_id: str) -> dict:
+    """Restart a finished spawn child's loop with preserved state/history.
+
+    Breakpoint-resume for spawn sub-agents: the child's `_runner` (saved at
+    spawn time) is re-driven through the scheduler with the original state
+    and chat_history intact. Used by `agent.tell` when the target is an
+    already-finished spawn child.
+
+    Returns {"ok": True, "resumed": True, ...} on success,
+    {"ok": False, "error": ...} on failure.
+    """
+    child = get_agent(agent_id)
+    if child is None:
+        return {"ok": False, "error": f"agent '{agent_id}' not found"}
+    if child.role != "subagent":
+        return {"ok": False,
+                "error": f"agent '{agent_id}' is not a spawn sub-agent "
+                         f"(role={child.role})"}
+    _runner = getattr(child, "_resume_runner", None)
+    if _runner is None:
+        return {"ok": False,
+                "error": f"agent '{agent_id}' has no saved runner "
+                         f"(not a spawn child or already cleaned up)"}
+    if child.status not in {"done", "error", "aborted"}:
+        return {"ok": False,
+                "error": f"agent '{agent_id}' is not finished "
+                         f"(status={child.status}); tell it directly instead"}
+    if child.lifecycle_terminated:
+        return {"ok": False,
+                "error": f"agent '{agent_id}' lifecycle is terminated"}
+    # Clear abort/exhausted markers so the scheduler admits the rerun.
+    # schedule_agent() refuses agents whose abort_event is set or whose
+    # status is "aborted".
+    try:
+        child.abort_event.clear()
+    except Exception:
+        pass
+    if child.status == "aborted":
+        child.status = "idle"
+    child.error = ""
+    # Breakpoint-resume note: the rerun sees the full prior history plus
+    # this marker, so it knows it is continuing rather than starting fresh.
+    # The actual tell message is delivered to the inbox separately by the
+    # caller (agent.tell) after the resume thread starts.
+    try:
+        child.chat_history.append({
+            "role": "user",
+            "content": (
+                "[System: breakpoint-resume — your previous run finished and you are "
+                "being continued with prior history preserved. Treat the "
+                "next tell message as a new instruction in the same session.]"
+            ),
+            "input_kind": "system",
+        })
+    except Exception:
+        pass
+    # Restart the original runner via the scheduler (re-acquires a slot).
+    t = threading.Thread(
+        target=lambda: schedule_agent(child.id, _runner),
+        daemon=True, name=f"laintas-resume-{child.id}")
+    child.thread = t
+    try:
+        t.start()
+    except Exception as exc:
+        return {"ok": False,
+                "error": f"could not restart child thread: {exc}"}
+    return {"ok": True, "resumed": True, "agent_id": child.id}
 
 
 def spawn_subagents_parallel(parent_id: str, tasks: list[dict], deps,
@@ -5531,6 +5681,9 @@ def spawn_subagents_parallel(parent_id: str, tasks: list[dict], deps,
              "contract": {...}}, ...]
     Returns list of child agent IDs.
     """
+    # Bounded-mode: warn once per process (spawn_subagent also warns, but
+    # the batch entry point should warn even if individual spawns are denied).
+    _maybe_warn_bounded_mode()
     child_ids = []
     # The batch's identity IS its branch: one object carrying the members, the
     # budget, the supervisor and the outcome ledger. `group_id` stays on each
@@ -10920,6 +11073,80 @@ def _observed_turn(function):
     return wrapped
 
 
+class _ExtendableRange:
+    """A range-like iterator whose budget can be refunded mid-iteration.
+
+    Drop-in replacement for ``range(max_loops)`` in the main agent loop.
+    Iterations that were pure waiting (``agent.wait`` / ``await_spawns`` —
+    the agent did no real work, it just blocked for a child) do not consume
+    the turn budget: the caller refunds them via :meth:`refund`.
+
+    The effective limit grows as refunds are granted, so ``for`` loops using
+    this class can run past the original ``max_loops`` when (and only when)
+    wait-iterations are refunded.
+    """
+
+    def __init__(self, limit: int):
+        self._limit = max(0, int(limit))
+        self._refunds = 0
+
+    def refund(self, n: int = 1) -> None:
+        """Return *n* iterations to the budget."""
+        self._refunds += max(0, int(n))
+
+    @property
+    def effective_limit(self) -> int:
+        """Current budget ceiling including granted refunds."""
+        return self._limit + self._refunds
+
+    def __iter__(self):
+        i = 0
+        # Re-read the limit each step: refunds granted during the loop
+        # extend the iteration.
+        while i < self._limit + self._refunds:
+            yield i
+            i += 1
+
+
+# Tool names whose *exclusive* presence in a turn marks it as pure waiting.
+# A turn that only blocked for children did no work and should not consume
+# the main-loop turn budget.
+_WAIT_ONLY_TOOLS = frozenset({"agent.wait", "await_spawns"})
+
+
+def _is_pure_wait_turn(new_messages: list) -> bool:
+    """Return True if the turn added only wait-tool calls.
+
+    Inspects OpenAI-format chat_history messages appended during one loop
+    iteration. Returns True when at least one wait-tool call is present and
+    no other tool was called. Text-only turns (no tool calls at all) are
+    NOT pure-wait — the model did think/respond.
+    """
+    seen_wait = False
+    try:
+        for msg in new_messages or []:
+            if not isinstance(msg, dict):
+                continue
+            for call in (msg.get("tool_calls") or []):
+                if not isinstance(call, dict):
+                    continue
+                fname = ""
+                _fn = call.get("function") or {}
+                if isinstance(_fn, dict):
+                    fname = str(_fn.get("name") or "")
+                if not fname:
+                    fname = str(call.get("name") or "")
+                if not fname:
+                    continue
+                if fname in _WAIT_ONLY_TOOLS:
+                    seen_wait = True
+                else:
+                    return False
+    except Exception:
+        return False
+    return seen_wait
+
+
 @background_compaction.scoped
 @_observed_turn
 def run_agent_loop(
@@ -11292,7 +11519,23 @@ def run_agent_loop(
     # the "up to 2 escalating compactions" budget per overflow episode, not per
     # task lifetime.
     state["_overflow_retry"] = 0
-    for loop in range(max_loops):
+    # Extendable turn budget: pure-wait iterations (agent.wait / await_spawns)
+    # are refunded so blocking for children does not consume the task's
+    # turn budget. See _ExtendableRange.
+    _loop_budget = _ExtendableRange(max_loops)
+    _prev_history_len = len(chat_history or [])
+    for loop in _loop_budget:
+        # Refund the previous iteration if it was pure waiting. Checked here
+        # (start of iteration N evaluates iteration N-1) because the wait
+        # tools block inside the iteration and only return at its end.
+        if loop > 0:
+            try:
+                _new_msgs = (chat_history or [])[_prev_history_len:]
+                if _is_pure_wait_turn(_new_msgs):
+                    _loop_budget.refund(1)
+            except Exception:
+                pass
+        _prev_history_len = len(chat_history or [])
         # The working directory can vanish mid-task — the agent itself may
         # have removed it (a worktree, a build tree, a scratch dir). On Linux
         # the process is then holding an unlinked inode and every path call
@@ -11316,7 +11559,12 @@ def run_agent_loop(
         # call we would have to discard. Turns the common "ran out of loop
         # budget mid-action" ending into a usable summary. Unbounded runs
         # (/max) never reach the cap, so the flag simply never fires there.
-        _final_turn = max_loops > 1 and loop == max_loops - 1
+        # Note: uses the extendable budget's effective limit, since pure-wait
+        # refunds can push the last iteration past the original max_loops.
+        _final_turn = (
+            _loop_budget.effective_limit > 1
+            and loop == _loop_budget.effective_limit - 1
+        )
         _loop_id = next_debug_loop()
         history_context = _history_without_current_turn(chat_history, original_input)
         if "_direct_commands" not in state:
@@ -11492,9 +11740,10 @@ def run_agent_loop(
                 "\n".join(filter(None, (
                     _routing_query, str(state["_dynamic_context_query"])))),
                 state, _authorized_tool_names), state)
+            from rich.markup import escape as _esc
             deps.console.print(
-                f"\n[accent.dim]↳[/accent.dim] [muted]Applied instruction: "
-                f"{supp_text}[/muted]")
+                f"\n[accent]│[/accent] [success]›[/success] "
+                f"{_esc(supp_text)}")
             supp_message = f"[Supplementary instruction from user]: {supp_text}"
             chat_history.append({
                 "role": "user", "content": supp_message,
@@ -12416,7 +12665,7 @@ def run_agent_loop(
             # reads in context (no re-read amnesia) while bounding the thread size.
             # (`lang` is assigned later in the loop, so derive it here.)
             _live_state = fit_live_state(_build_user_message(
-                original_input, state, memory_entries, history_context, loop, max_loops,
+                original_input, state, memory_entries, history_context, loop, _loop_budget.effective_limit,
                 thread_mode=True, first_turn=False, volatile=_volatile_context,
                 terminals_snapshot=terminals_snapshot,
             ), state)
@@ -12463,7 +12712,7 @@ def run_agent_loop(
         else:
             _live_state = None
             user_input = fit_live_state(_build_user_message(
-                original_input, state, memory_entries, history_context, loop, max_loops,
+                original_input, state, memory_entries, history_context, loop, _loop_budget.effective_limit,
                 volatile=_volatile_context,
                 terminals_snapshot=terminals_snapshot,
             ), state)
@@ -14744,7 +14993,9 @@ def run_agent_loop(
             stale_count = 0  # reset on any output (tool call or conversational reply)
 
         # 11. Delay between steps (interruptible)
-        if loop < max_loops - 1:
+        # Note: compares against the extendable budget's effective limit,
+        # since pure-wait refunds can extend the run past max_loops.
+        if loop < _loop_budget.effective_limit - 1:
             # Use interrupt event.wait() instead of time.sleep() so we can
             # wake up immediately on Ctrl+C rather than waiting for sleep to end.
             # The tools just ran, and one of them may have removed the
@@ -14773,7 +15024,7 @@ def run_agent_loop(
         memory_entries = _read_memory(deps)  # re-read in case AI wrote memory
         history_context = _history_without_current_turn(chat_history, original_input)
         user_input = _build_user_message(
-            original_input, state, memory_entries, history_context, loop, max_loops,
+            original_input, state, memory_entries, history_context, loop, _loop_budget.effective_limit,
             volatile=_volatile_context,
             # This iteration's snapshot, not a fresh take: the next iteration
             # renders its own, and consuming it twice inside one iteration is
