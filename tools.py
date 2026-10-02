@@ -5069,7 +5069,9 @@ def _bi_agent_hire(params: dict, ctx: ToolCtx) -> dict:
     role_name = (params.get("profile") or "").strip() or None
     role = _roles.get_role(role_name) if role_name else None
     if role_name and role is None:
-        return {"ok": False, "error": f"unknown employee profile '{role_name}'"}
+        valid_profiles = sorted(_roles.list_roles() if hasattr(_roles, 'list_roles') else [])
+        hint = f" Valid profiles: {', '.join(valid_profiles)}" if valid_profiles else ""
+        return {"ok": False, "error": f"unknown employee profile '{role_name}'.{hint}"}
     requested_tools = params.get("tools")
     if requested_tools is not None:
         if not isinstance(requested_tools, list):
@@ -5077,7 +5079,11 @@ def _bi_agent_hire(params: dict, ctx: ToolCtx) -> dict:
         known = {tool.name for tool in get_registry().list()}
         unknown = sorted(set(requested_tools) - known)
         if unknown:
-            return {"ok": False, "error": f"unknown tools: {', '.join(unknown)}"}
+            valid_tools = sorted(known)
+            hint = f" Valid tools: {', '.join(valid_tools[:20])}" if valid_tools else ""
+            if len(valid_tools) > 20:
+                hint += f" (and {len(valid_tools) - 20} more)"
+            return {"ok": False, "error": f"unknown tools: {', '.join(unknown)}.{hint}"}
         allowed_tools = [str(item) for item in requested_tools]
     elif role and role.allowed_tools:
         allowed_tools = list(role.allowed_tools)
@@ -5211,16 +5217,83 @@ def _bi_agent_list(params: dict, ctx: ToolCtx) -> dict:
 
 
 def _bi_agent_rename(params: dict, ctx: ToolCtx) -> dict:
-    """Rename the current agent."""
+    """Rename the current agent (non-primary agents can only rename themselves)."""
     new_name = (params.get("name") or "").strip()
     if not new_name:
         return {"ok": False, "error": "missing 'name'"}
     if ctx.rename_agent is None or ctx.get_agent is None or not ctx.agent_id:
         return {"ok": False, "error": "rename not available"}
+    import agent_loop as _al
     current = ctx.get_agent(ctx.agent_id)
-    if current and ctx.rename_agent(current.id, new_name):
+    if current is None:
+        return {"ok": False, "error": "no current agent to rename"}
+    # Primary agent cannot be renamed; non-primary agents can only rename themselves
+    is_primary = (current.parent_id is None) or (ctx.agent_id == "primary")
+    if is_primary:
+        return {"ok": False, "error": "the primary agent cannot be renamed"}
+    if ctx.rename_agent(current.id, new_name):
         return {"ok": True, "result": f"Renamed to {new_name}"}
-    return {"ok": False, "error": "no current agent to rename"}
+    return {"ok": False, "error": "rename failed"}
+
+
+def _bi_agent_remove(params: dict, ctx: ToolCtx) -> dict:
+    """Permanently remove an agent and free its ID for reuse.
+
+    Only the parent agent can remove its direct children, or an agent can
+    remove itself. The primary agent cannot be removed.
+    """
+    target_id = (params.get("agent_id") or "").strip()
+    if not target_id:
+        return {"ok": False, "error": "missing 'agent_id'"}
+    if ctx.get_agent is None or not ctx.agent_id:
+        return {"ok": False, "error": "remove not available"}
+    import agent_loop as _al
+
+    # Cannot remove the primary agent
+    if target_id == "primary":
+        return {"ok": False, "error": "the primary agent cannot be removed"}
+
+    target = ctx.get_agent(target_id)
+    if target is None:
+        return {"ok": False, "error": f"agent '{target_id}' not found"}
+
+    caller = ctx.get_agent(ctx.agent_id)
+    if caller is None:
+        return {"ok": False, "error": "caller agent not found"}
+
+    # Permission check: caller must be the parent of target, or the target itself
+    is_parent = (getattr(target, 'parent_id', None) == ctx.agent_id)
+    is_self = (target_id == ctx.agent_id)
+    is_primary_caller = (caller.parent_id is None) or (ctx.agent_id == "primary")
+    # Primary can remove any agent; others can only remove their children or themselves
+    if not (is_parent or is_self or is_primary_caller):
+        return {"ok": False, "error": "you can only remove your own child agents or yourself"}
+
+    # Abort if still running
+    try:
+        _al.abort_agent(target_id)
+    except Exception:
+        pass
+
+    # Remove from registry and free the ID
+    try:
+        if hasattr(_al, 'remove_agent'):
+            _al.remove_agent(target_id)
+        elif hasattr(ctx, 'remove_agent_fn') and ctx.remove_agent_fn:
+            ctx.remove_agent_fn(target_id)
+        else:
+            return {"ok": False, "error": "remove not supported by this runtime"}
+    except Exception as exc:
+        return {"ok": False, "error": f"remove failed: {exc}"}
+
+    # Clean up persistence if it's a persistent agent
+    try:
+        import agent_persistence as _ap
+        _ap.delete_agent(target_id)
+    except Exception:
+        pass
+
+    return {"ok": True, "result": f"Agent '{target_id}' removed; its ID is now free for reuse"}
 
 
 # ── Account usage and recent failures ──────────────────────────────────
@@ -10785,7 +10858,9 @@ def register_builtin_tools() -> None:
                 "Hire a persistent employee with an independent base model, prompt, "
                 "and tool policy. It stays undeployed unless a different explicit "
                 "terminal is supplied; work while undeployed uses a private temporary "
-                "terminal. This does not start an assignment."),
+                "terminal. This does not start an assignment. "
+                "For one-off parallel tasks, use spawn_parallel instead — hire is for "
+                "long-lived employees, spawn_parallel is for temporary task workers."),
             schema={
                 "type": "object",
                 "properties": {
@@ -10815,7 +10890,7 @@ def register_builtin_tools() -> None:
         ),
         Tool(
             name="agent.rename",
-            description="Rename the current agent.",
+            description="Rename the current agent. Only non-primary agents can rename themselves; the primary agent cannot be renamed.",
             schema={
                 "type": "object",
                 "properties": {
@@ -10824,6 +10899,20 @@ def register_builtin_tools() -> None:
                 "required": ["name"],
             },
             invoke=_bi_agent_rename,
+        ),
+        Tool(
+            name="agent.remove",
+            description=("Permanently remove an agent and free its ID for reuse. "
+                         "The primary agent cannot be removed. A parent can remove its "
+                         "direct children; an agent can remove itself."),
+            schema={
+                "type": "object",
+                "properties": {
+                    "agent_id": {"type": "string", "description": "Agent ID to remove"},
+                },
+                "required": ["agent_id"],
+            },
+            invoke=_bi_agent_remove,
         ),
         Tool(
             name="account.usage",
@@ -11060,11 +11149,13 @@ def register_builtin_tools() -> None:
         Tool(
             name="spawn_parallel",
             description=(
-                "NON-BLOCKING by default. Spawn multiple sub-agents in PARALLEL: returns "
+                "NON-BLOCKING by default. Spawn multiple TEMPORARY sub-agents in PARALLEL for "
+                "one-off tasks: returns "
                 "batch_id and child_ids "
                 "immediately while results continue to arrive through your "
                 "inbox, so continue useful independent work — whichever child finishes "
                 "first reaches you first, without waiting for the slowest. "
+                "For persistent long-lived employees, use agent.hire instead. "
                 "Set wait=true only for a "
                 "real barrier that requires ALL results before the next action; that "
                 "BLOCKING mode returns a combined structured report. Max 6 agents "

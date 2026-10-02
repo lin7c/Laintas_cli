@@ -183,7 +183,7 @@ _STYLE_BASE = {
     "rail.count": "#6e7681",
     "rail.card.selected": "bg:#161b22",
     "rail.card.hover": "bg:#10151c",
-    "rail.bar": "#3fb950",
+    "rail.bar": "#484f58",
     "rail.name": "#c9d1d9",
     "rail.name.selected": "bold #f0f6fc",
     "rail.task": "#6e7681",
@@ -194,14 +194,14 @@ _STYLE_BASE = {
     "key": "#8b949e bold",
     "stream": "#6e7681",
     "running": "bold #3fb950",
-    "thinking": "bold #d29922",
+    "thinking": "bold #3fb950",
     "queued": "#8b949e",
-    "waiting": "#d29922",
-    "done": "#3fb950",
+    "waiting": "#8b949e",
+    "done": "#6e7681",
     "error": "bold #f85149",
     "idle": "#6e7681",
     "separator": "#262c36",
-    "agent": "bold #a78bfa",
+    "agent": "bold #e6edf3",
     "user": "bold #f0f6fc",
     "input": "bold #4ade80",
     "input.caret": "bold #3fb950",
@@ -236,7 +236,7 @@ _STYLE_BASE = {
     "hint": "italic #6e7681",
     "message": "#a78bfa",
     "message.bar": "#a78bfa",
-    "message.name": "bold #d2a8ff",
+    "message.name": "bold #e6edf3",
     "tool.row": "bg:#11161d",
     "tool.meta": "#6e7681",
     "tool.toggle": "#484f58",
@@ -605,6 +605,10 @@ class AgentsModeController:
         self._raw: dict[str, bool] = defaultdict(bool)
         # None = decide by width; True/False = the person toggled it.
         self._profile_pinned: Optional[bool] = None
+        # Narrow mode (< RAIL_MIN_COLUMNS): list-first navigation. True shows
+        # the agent list full-screen; False shows the selected agent's
+        # conversation. Defaults to list since /agents is a dashboard.
+        self._narrow_list_mode: bool = True
         # Mouse state: what a press started, what the pointer is over, and
         # the transcript selection as (agent_id, (row, col), (row, col)).
         self._drag: Optional[tuple] = None
@@ -717,6 +721,11 @@ class AgentsModeController:
         width, _height = self._terminal_size()
         return RAIL_WIDTH if width >= self.RAIL_MIN_COLUMNS else 0
 
+    def _is_narrow(self) -> bool:
+        """Below the rail threshold: single-column, list-first layout."""
+        width, _height = self._terminal_size()
+        return width < self.RAIL_MIN_COLUMNS
+
     def _profile_visible(self) -> bool:
         width, _height = self._terminal_size()
         if self._profile_pinned is not None:
@@ -735,12 +744,12 @@ class AgentsModeController:
 
     def _rail_page_size(self) -> int:
         _width, height = self._terminal_size()
-        # Three header rows; each card is three rows and a gap. When the
+        # Two header rows; each card is two rows and a gap. When the
         # roster does not fit, the "↑/↓ N more" rows need room as well.
-        fits = max(1, (height - 3) // 4)
+        fits = max(1, (height - 2) // 3)
         if len(self._last_agents) <= fits:
             return fits
-        return max(1, (height - 5) // 4)
+        return max(1, (height - 4) // 3)
 
     def _right_width(self) -> int:
         width, _height = self._terminal_size()
@@ -956,26 +965,27 @@ class AgentsModeController:
         working = sum(statuses[a.id] in WORKING for a in agents)
         attention = sum(self.unread(a.id) > 0 for a in agents)
 
-        # Header: the terminal (switchable when there is more than one) and
-        # a census a person acts on — who is working, who wants them.
-        terminals = [row.name for row in agent_loop.get_all_terminals()]
-        head = [("class:rail.term", f" {self.terminal_label(self.terminal_name)}")]
-        if len(terminals) > 1:
-            left, right = "‹", "›"
-            head = [("class:rail.arrow", f" {left} "),
-                    ("class:rail.term", self.terminal_label(self.terminal_name)),
-                    ("class:rail.arrow", f" {right}")]
-            hits[0] = ("terminal",)
-        count = f"{len(agents)} agent{'s' if len(agents) != 1 else ''} "
-        lines.append(self._spread(head, [("class:rail.count", count)], width))
-        census: list = []
+        # Header: compact census. "term0 · 2 · ●1" — _fit truncates if needed.
+        term_label = self.terminal_label(self.terminal_name)
+        parts = [f" {term_label}", f"{len(agents)}"]
         if working:
-            census.append(("class:running", f" {symbols.DOT} {working} working"))
+            parts.append(f"{symbols.DOT}{working}")
         if attention:
-            census.append(("class:approval", f"  {symbols.DOT_HALF} {attention} for you"))
-        if not census:
-            census = [("class:rail.count", " all idle")]
-        lines.append(_fit(census, width))
+            parts.append(f"{symbols.DOT_HALF}{attention}")
+        if not working and not attention:
+            parts.append("idle")
+        header_text = f" {f' {symbols.BULLET} '.join(parts)}"
+        # Color: urgent status colors the whole header.
+        if attention:
+            hstyle = "class:approval"
+        elif working:
+            hstyle = "class:running"
+        else:
+            hstyle = "class:rail.count"
+        header_line = [(hstyle, header_text)]
+        if len([row.name for row in agent_loop.get_all_terminals()]) > 1:
+            hits[0] = ("terminal",)
+        lines.append(_fit(header_line, width))
         lines.append(_fit([("class:separator", "─" * width)], width))
 
         page = self._rail_page_size()
@@ -987,7 +997,7 @@ class AgentsModeController:
         while count > 1:
             above = 1 if self.rail_offset else 0
             below = 1 if self.rail_offset + count < len(agents) else 0
-            if 3 + above + below + 4 * count <= height:
+            if 2 + above + below + 3 * count <= height:
                 break
             count -= 1
         visible = agents[self.rail_offset:self.rail_offset + count]
@@ -1029,13 +1039,7 @@ class AgentsModeController:
                 row1 = [("", "   "), ("class:rail.task", _crop_cells(
                     self._rail_subtitle(agent, status, profile), inner - 4))]
 
-            deploy_glyph = symbols.DOT if profile["deployed"] else symbols.DOT_OPEN
-            meta = profile["model"] or "default model"
-            row2 = [("", "   "),
-                    ("class:deploy.on" if profile["deployed"] else "class:rail.meta",
-                     deploy_glyph + " "),
-                    ("class:rail.meta", _crop_cells(meta, inner - 6))]
-            for row in (row0, row1, row2):
+            for row in (row0, row1):
                 hits[len(lines)] = ("agent", agent.id)
                 lines.append([bar] + [(f"{s} {bg}".strip(), t)
                                       for s, t, *_ in _fit(row, inner)])
@@ -1651,23 +1655,9 @@ class AgentsModeController:
         offset = self.focus_scroll[agent.id]
         if offset:
             chips += [("class:muted", f"{symbols.ARROW_U} {offset}"), ("", "  ")]
-        buttons = self._title_buttons(agent)
-        spans = []                   # (offset within chips, width, name)
-        for name, label in buttons:
-            text = f" {label} "
-            spans.append((cell_width("".join(t for _s, t in chips)) + 2,
-                          cell_width(text), name))
-            chips += [(self._title_button_style(name, profile), text),
-                      ("", " ")]
-        if buttons:
-            chips.append(("", " "))
-        if profile["deployed"]:
-            chips += [("class:deploy.on", f"{symbols.DOT} "),
-                      ("class:title.role", self.terminal_label(
-                          agent_loop.agent_deployment_terminal(agent)))]
-        else:
-            chips += [("class:deploy.off", f"{symbols.DOT_OPEN} "),
-                      ("class:title.role", "not deployed")]
+        # Title bar keeps only identity (name + role). Model and deployment
+        # live in the profile panel; they are debug info, not conversation
+        # context.
         chips = [("", "  ")] + chips + [("", " ")]
         chips_w = cell_width("".join(t for _s, t in chips))
         left = [("", " "), ("class:title.name", profile["name"])]
@@ -1675,14 +1665,10 @@ class AgentsModeController:
             left += [("class:dim", f"  {symbols.BULLET}  "),
                      ("class:title.role", profile["title"])]
         if chips_w + 12 > width:
-            chips, spans = [], []
+            chips = []
             chips_w = 0
         line = self._spread(left, chips, width)
-        # _spread right-aligns the chips; the leading "  " is in `chips`, and
-        # each span offset above already counts it.
-        start = width - chips_w
-        self._title_hits = [(start + offset, start + offset + w, name)
-                            for offset, w, name in spans]
+        self._title_hits = []
         return [line]
 
     def _title_buttons(self, agent) -> list:
@@ -1854,6 +1840,14 @@ class AgentsModeController:
         elif self.overlay:
             keys = [("alt+" + symbols.ARROW_U + symbols.ARROW_D, "pick"),
                     ("tab", "close"), ("esc", "back")]
+        elif self._is_narrow() and self._narrow_list_mode:
+            # Narrow list-first: Enter dives in, arrows move.
+            keys = [("enter", "open"),
+                    ("alt+" + symbols.ARROW_U + symbols.ARROW_D, "agent"),
+                    ("esc", "back")]
+        elif self._is_narrow():
+            # Narrow conversation: Esc returns to the list.
+            keys = [("esc", "agent list")]
         else:
             agent = agent_loop.get_agent(self.selected_id)
             keys = [("enter", self._input_action(agent)),
@@ -1954,32 +1948,23 @@ class AgentsModeController:
         if profile["tags"]:
             text(" ".join(f"#{tag}" for tag in profile["tags"][:6]), "class:message")
 
-        section("MODEL")
-        text(profile["model"] or "backend default")
+        # Identity block: model + deployment merged, one compact section.
+        section("SETUP")
+        model_line = profile["model"] or "backend default"
         availability = profile["model_available"]
-        status_row = []
-        if availability is True:
-            status_row = [("class:done", f"{symbols.OK} available")]
-        elif availability is False:
-            status_row = [("class:toast.warn", f"{symbols.WARN} not offered by backend")]
+        if availability is False:
+            model_line += f" {symbols.WARN} not offered"
         elif availability == "checking":
-            status_row = [("class:muted", "checking availability…")]
-        if profile["model_source"] and profile["model"]:
-            status_row += ([("class:dim", f" {symbols.BULLET} ")] if status_row else []) + [
-                ("class:muted", profile["model_source"])]
-        if status_row:
-            rows.extend(agents_transcript.wrap(status_row, inner,
-                                               [("", "  ")], [("", "  ")]))
-
-        section("DEPLOYMENT")
-        rows.extend(agents_transcript.wrap(
-            [("class:deploy.on" if profile["deployed"] else "class:deploy.off",
-              (symbols.DOT if profile["deployed"] else symbols.DOT_OPEN) + " "),
-             ("class:profile.value", profile["deployment"])],
-            inner, [("", "  ")], [("", "    ")]))
-
-        section("TOOLS")
-        text(profile["tools"])
+            model_line += " (checking…)"
+        text(f"model  {model_line}")
+        deploy_icon = symbols.DOT if profile["deployed"] else symbols.DOT_OPEN
+        deploy_style = "class:deploy.on" if profile["deployed"] else "class:deploy.off"
+        # profile['deployment'] is like "not deployed · home term0";
+        # compact it to "○ not deployed · term0".
+        where = profile['deployment'].replace("home ", "")
+        deploy_text = f"{deploy_icon} {where}"
+        rows.append(_fit([(deploy_style, f"  {deploy_text}")], inner))
+        text(f"tools  {profile['tools']}")
 
         _revision, events = agent_ui_events.hub.agent_events_snapshot(
             agent.id, limit=300)
@@ -2007,10 +1992,6 @@ class AgentsModeController:
                 [("class:profile.value", value)], inner,
                 [("", "  "), ("class:profile.label", label.ljust(8))],
                 [("", " " * 10)]))
-        if agent.role != "subagent":
-            section("CONTINUE IN THE CLI")
-            rows.append([("", "  "), ("class:key", f"/agent {agent.id}")])
-            rows.append([("", "  "), ("class:muted", "then /resume for history")])
         return rows
 
     def inspector_fragments(self):
@@ -2476,6 +2457,15 @@ class AgentsModeController:
             self.overlay = not self.overlay
             self.invalidate()
 
+        @kb.add("enter", filter=Condition(
+            lambda: self._is_narrow() and self._narrow_list_mode))
+        def _narrow_enter(_event):
+            # Narrow list-first: Enter dives into the selected agent's
+            # conversation.
+            if self.selected_id:
+                self._narrow_list_mode = False
+                self.invalidate()
+
         @kb.add("escape")
         def _escape(event):
             if self._selection:
@@ -2483,6 +2473,10 @@ class AgentsModeController:
                 self.invalidate()
             elif self.overlay:
                 self.overlay = False
+                self.invalidate()
+            elif self._is_narrow() and not self._narrow_list_mode:
+                # Narrow conversation: Esc goes back to the agent list.
+                self._narrow_list_mode = True
                 self.invalidate()
             else:
                 input_buffer.text = ""
@@ -2610,13 +2604,13 @@ class AgentsModeController:
             return bool(agent) and str(getattr(agent, "status", "")) in WORKING
 
         def border_style() -> str:
-            # The prompt's frame breathes while the Agent in focus works:
-            # the one place the eye rests is also where "busy" is visible.
+            # The prompt's frame signals "busy" while the Agent in focus works.
+            # A static style: the previous time-based pulse redrew the box
+            # twice a second and could tear mid-frame on slow terminals.
             if self.pending_approval() is not None:
                 return "class:box"
             if working_selected():
-                return ("class:box.active" if int(time.monotonic() / 0.8) % 2 == 0
-                        else "class:box.pulse")
+                return "class:box.active"
             return "class:box"
 
         def prompt_prefix():
@@ -2650,8 +2644,15 @@ class AgentsModeController:
                 ConditionalProcessor(AfterInput(placeholder),
                                      filter=Condition(lambda: not input_buffer.text)),
             ])
+        def _input_height() -> Dimension:
+            # Lock to 1 row while the placeholder shows: a height that
+            # flickers between 1 and 5 during background refreshes tears
+            # the box borders. Grow only when the user types past one line.
+            if not input_buffer.text:
+                return Dimension.exact(1)
+            return Dimension(min=1, max=5)
         input_window = Window(input_control, wrap_lines=True,
-                              height=Dimension(min=1, max=5),
+                              height=_input_height,
                               dont_extend_height=True)
         prompt_box = HSplit([
             VSplit([Window(width=1, height=1, char="╭", style=border_style),
@@ -2677,7 +2678,20 @@ class AgentsModeController:
             prompt_box,
             Window(_PaneControl(self.footer_lines), height=1),
         ])
-        root = VSplit([rail, right], style="class:root")
+        # Narrow mode: list-first. The agent list takes the full screen;
+        # Enter dives into the conversation, Esc comes back.
+        narrow_list_filter = Condition(
+            lambda: self._is_narrow() and self._narrow_list_mode)
+        narrow_list_view = HSplit([
+            Window(_PaneControl(self.rail_lines, self._rail_mouse),
+                   style="class:rail.bg"),
+            Window(_PaneControl(self.footer_lines), height=1),
+        ])
+        normal_view = VSplit([rail, right], style="class:root")
+        root = HSplit([
+            ConditionalContainer(narrow_list_view, filter=narrow_list_filter),
+            ConditionalContainer(normal_view, filter=~narrow_list_filter),
+        ])
         self.app = Application(
             layout=Layout(root, focused_element=input_window),
             key_bindings=kb, style=STYLE, full_screen=True,
