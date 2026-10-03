@@ -737,8 +737,35 @@ def _ptk_fragments(pairs):
     return out
 
 
+# Cached terminal size: shutil.get_terminal_size() is an ioctl syscall.
+# Refresh on SIGWINCH via _refresh_term_size().
+_TERM_SIZE_CACHE = [0, 0]  # [columns, rows]
+_TERM_SIZE_INIT = [False]
+
+
+def _get_term_size() -> tuple[int, int]:
+    """Cached terminal size; refreshes on SIGWINCH."""
+    if not _TERM_SIZE_INIT[0]:
+        import shutil, signal
+        def _on_winch(signum, frame):
+            # Invalidate the cache; the handler stays registered.
+            _TERM_SIZE_CACHE[0] = 0
+        try:
+            signal.signal(signal.SIGWINCH, _on_winch)
+        except (OSError, ValueError):
+            pass
+        _TERM_SIZE_INIT[0] = True
+    if _TERM_SIZE_CACHE[0] == 0:
+        import shutil
+        _sz = shutil.get_terminal_size()
+        _TERM_SIZE_CACHE[0] = _sz.columns
+        _TERM_SIZE_CACHE[1] = _sz.lines
+    return (_TERM_SIZE_CACHE[0], _TERM_SIZE_CACHE[1])
+
+
 def _apply_marquee(row_text: str, sel_idx: int,
-                   last_sel: list, start_time: list) -> str:
+                   last_sel: list, start_time: list,
+                   fixed_chars: int = 0) -> str:
     """Scroll a long selected row horizontally (marquee / focus-follow effect).
 
     When the focused row's plain-text length exceeds the terminal width, the
@@ -748,12 +775,24 @@ def _apply_marquee(row_text: str, sel_idx: int,
 
     The marquee cycle: pause 1 s at start -> scroll 1 char / 0.2 s -> pause 2 s
     at end -> wrap back to start.
+
+    ``fixed_chars`` keeps that many leading visible characters pinned at the
+    left while the remainder scrolls.  Used by tree pickers (e.g. /resume)
+    whose leading branch prefix and node dot are structural and must not
+    scroll away with the content.
     """
-    import shutil
-    term_w = shutil.get_terminal_size().columns
+    term_w = _get_term_size()[0]
     plain = re.sub(r"\[/?[^\]]+\]", "", row_text)
     avail = term_w - 1  # leave 1-char right margin
-    if len(plain) <= avail:
+    # The fixed prefix is never scrolled; only the content after it marquees.
+    fixed_chars = max(0, min(fixed_chars, len(plain)))
+    fixed_part = plain[:fixed_chars]
+    scrollable = plain[fixed_chars:]
+    scroll_avail = avail - fixed_chars
+    if scroll_avail < 1:
+        # Terminal too narrow to show anything beyond the fixed prefix.
+        return fixed_part[:avail - 1] + "…"
+    if len(scrollable) <= scroll_avail:
         return row_text
     now = time.monotonic()
     if last_sel[0] != sel_idx:
@@ -762,7 +801,7 @@ def _apply_marquee(row_text: str, sel_idx: int,
     elapsed = now - start_time[0]
     pause_start = 1.0
     scroll_speed = 0.2          # seconds per character
-    max_offset = len(plain) - avail + 2
+    max_offset = len(scrollable) - scroll_avail + 2
     raw = max(0.0, elapsed - pause_start) / scroll_speed
     # Wrap: after scrolling to the end, pause 2 s, then reset.
     wrap_at = max_offset + 2.0 / scroll_speed
@@ -770,10 +809,10 @@ def _apply_marquee(row_text: str, sel_idx: int,
         start_time[0] = now
         raw = 0.0
     offset = int(min(raw, max_offset))
-    visible = plain[offset:offset + avail - 1]
+    visible = scrollable[offset:offset + scroll_avail - 1]
     if offset < max_offset:
         visible += "…"
-    return visible
+    return fixed_part + visible
 
 
 # ── Reusable selection dialog ──────────────────────────────────────────
@@ -945,6 +984,7 @@ def select_dialog(
     on_action=None,
     enter_action: str = "",
     letter_shortcuts: bool = False,
+    marquee_fixed=None,
     refresh_interval: float = 0.05,
     auto_confirm_seconds: Optional[float] = None,
     auto_confirm_index: Optional[int] = None,
@@ -985,6 +1025,11 @@ def select_dialog(
         ``(enter_action, idx)`` instead of the raw item.  Useful for pickers
         where Enter triggers an action (e.g. "resume", "toggle") rather than
         returning a value.
+    marquee_fixed : int | list[int] | dict[int, int] | None
+        Leading visible characters to pin during the marquee scroll of a long
+        selected row.  An int applies to every row; a list/dict gives the
+        per-item (original index) fixed width.  Used by tree pickers whose
+        branch prefix must stay visible while the content scrolls.
     on_action : callable | None
         Optional in-place action handler(action, index). Return a dictionary
         with items, selected_index and hint to refresh without closing the
@@ -1034,6 +1079,17 @@ def select_dialog(
         else:
             norm.append((str(it), ""))
 
+    # Precompute plain-text labels once: _visible() runs on every frame
+    # (20fps) and used to re-strip Rich markup from every label each time.
+    _plain_norm: list[str] = [
+        re.sub(r"\[/?[^\]]+\]", "", lab).lower() for lab, _ in norm
+    ]
+
+    def _refresh_plain_norm():
+        _plain_norm[:] = [
+            re.sub(r"\[/?[^\]]+\]", "", lab).lower() for lab, _ in norm
+        ]
+
     sel = [max(0, min(selected_index, len(norm) - 1))]
     _auto_seconds = (float(auto_confirm_seconds)
                      if auto_confirm_seconds is not None else None)
@@ -1060,8 +1116,7 @@ def select_dialog(
             return unfiltered
         out = []
         for oi, (lab, _desc) in enumerate(norm):
-            plain = re.sub(r"\[/?[^\]]+\]", "", lab).lower()
-            if _fuzzy_match(plain, f):
+            if _fuzzy_match(_plain_norm[oi], f):
                 out.append((oi, lab, _desc))
         return out
 
@@ -1096,7 +1151,7 @@ def select_dialog(
         start, end = 0, len(vis)
         if full_screen and vis:
             import shutil
-            term_h = shutil.get_terminal_size().lines
+            term_h = _get_term_size()[1]
             # Reserve lines for title, search, header/footer hints
             reserve = (3 if title else 0) + (3 if search else 0) + 3
             list_h = max(4, term_h - reserve)
@@ -1126,8 +1181,22 @@ def select_dialog(
             if desc:
                 row_text += f"  [dim]{desc}[/dim]"
             if is_sel:
+                _fixed = 0
+                if marquee_fixed is not None:
+                    if isinstance(marquee_fixed, int):
+                        _fixed = marquee_fixed
+                    elif isinstance(marquee_fixed, dict):
+                        _fixed = marquee_fixed.get(oi, 0)
+                    elif isinstance(marquee_fixed, (list, tuple)):
+                        _fixed = (marquee_fixed[oi]
+                                  if 0 <= oi < len(marquee_fixed) else 0)
+                # The selection indicator (" › ") is prepended to every row
+                # by select_dialog itself, so it counts toward the pinned
+                # width on top of the caller's per-item fixed prefix.
+                _fixed += 3
                 row_text = _apply_marquee(
-                    row_text, oi, _marquee_last_sel, _marquee_start)
+                    row_text, oi, _marquee_last_sel, _marquee_start,
+                    fixed_chars=_fixed)
             style = "class:selected" if is_sel else ""
             _line_targets[_line_no()] = ("item", oi)
             lines.append((style, row_text + "\n"))
@@ -1263,6 +1332,7 @@ def select_dialog(
                         if isinstance(it, (tuple, list)) else (str(it), "")
                         for it in items
                     ]
+                    _refresh_plain_norm()
                     sel[0] = max(0, min(update.get("selected_index", sel[0]),
                                         len(norm) - 1))
                     hint = update.get("hint", hint)
@@ -9640,8 +9710,15 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
     # a session are grouped below its latest tip; child sessions nest by id.
     tree_rows = _build_fork_tree_rows(choices)
 
+    # Per-row pinned widths for the marquee: the tree prefix + node dot are
+    # structural and must stay visible while a long selected row scrolls.
+    # select_dialog reads this list live, so _build_labels() refreshes it in
+    # place whenever the rows are rebuilt (e.g. after a delete).
+    _marquee_fixed: list[int] = []
+
     def _build_labels():
         labels = []
+        _marquee_fixed.clear()
         for item, tree_prefix in tree_rows:
             kind = item.get("kind", "session")
             branch_name = str(item.get("_tree_branch_name")
@@ -9666,6 +9743,9 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
             meta = f"[dim]{ago} {symbols.BULLET} {turns} turn(s)[/dim]"
             labels.append(
                 f"{prefix_str}{badge} {kind_label}  {meta}  [bold]{title}[/bold]")
+            # Visible width of the pinned prefix: tree connector + dot + space.
+            # symbols.DOT / DOT_OPEN are single visible chars.
+            _marquee_fixed.append(len(tree_prefix) + 1 + 1)
         return labels
 
     sel_idx = 0
@@ -9697,6 +9777,7 @@ def show_resume_picker(cwd: str) -> Optional[dict]:
             on_action=_on_action,
             enter_action="resume",
             hint=hint,
+            marquee_fixed=_marquee_fixed,
         )
         if result is None:
             return None

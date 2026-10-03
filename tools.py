@@ -354,12 +354,31 @@ def _rewrite_tool_refs(text: str, wire_of: dict) -> str:
     """
     if not text or not wire_of:
         return text
-    for internal in sorted(wire_of, key=len, reverse=True):
-        wire = wire_of[internal]
-        if wire == internal:
-            continue
-        text = re.sub(rf"(?<![\w.]){re.escape(internal)}(?!\w)(?!\.\w)", wire, text)
+    # Cache compiled patterns per (internal -> wire) mapping. The mapping
+    # changes only when the registry version bumps, so cache on the mapping
+    # content itself.
+    _cache_key = tuple(sorted(wire_of.items()))
+    _patterns = _rewrite_tool_refs._cache.get(_cache_key)
+    if _patterns is None:
+        _patterns = []
+        for internal in sorted(wire_of, key=len, reverse=True):
+            wire = wire_of[internal]
+            if wire == internal:
+                continue
+            _patterns.append(
+                (re.compile(rf"(?<![\w.]){re.escape(internal)}(?!\w)(?!\.\w)"),
+                 wire))
+        _rewrite_tool_refs._cache[_cache_key] = _patterns
+        # Bound the cache: mappings are few (per registry version).
+        if len(_rewrite_tool_refs._cache) > 32:
+            _rewrite_tool_refs._cache.pop(
+                next(iter(_rewrite_tool_refs._cache)))
+    for _rx, _wire in _patterns:
+        text = _rx.sub(_wire, text)
     return text
+
+
+_rewrite_tool_refs._cache = {}
 
 
 class ToolRegistry:
@@ -367,6 +386,11 @@ class ToolRegistry:
         self._tools: dict[str, Tool] = {}
         self._builtin_names: set[str] = set()
         self._lock = threading.RLock()
+        # Version bumped on every register/unregister; used to invalidate
+        # the to_openai_tools() cache below.
+        self._version = 0
+        # Cache: (unified, frozenset(allowed_names), version) -> (tools, name_map)
+        self._openai_cache: dict = {}
 
     def register(self, tool: Tool, overwrite: bool = True) -> bool:
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", tool.name or ""):
@@ -386,11 +410,17 @@ class ToolRegistry:
                 tool.trust_level = "builtin"
                 self._builtin_names.add(tool.name)
             self._tools[tool.name] = tool
+            self._version += 1
+            self._openai_cache.clear()
             return True
 
     def unregister(self, name: str) -> bool:
         with self._lock:
-            return self._tools.pop(name, None) is not None
+            _removed = self._tools.pop(name, None) is not None
+            if _removed:
+                self._version += 1
+                self._openai_cache.clear()
+            return _removed
 
     def unregister_source(self, source: str) -> int:
         """Drop every tool whose source equals `source`. Returns count removed."""
@@ -398,6 +428,9 @@ class ToolRegistry:
             victims = [n for n, t in self._tools.items() if t.source == source]
             for n in victims:
                 del self._tools[n]
+            if victims:
+                self._version += 1
+                self._openai_cache.clear()
             return len(victims)
 
     def get(self, name: str) -> Optional[Tool]:
@@ -585,6 +618,21 @@ class ToolRegistry:
         ``allowed_names`` filters by internal registry name before aliases are
         applied, so provider visibility matches runtime authorization.
         """
+        # Cache hit: the registry version bumps on every register/unregister,
+        # so a cached entry is guaranteed to reflect the current toolset.
+        # NOTE: None and empty set are different filters (all vs none), so
+        # the key must distinguish them.
+        _cache_key = (unified,
+                      None if allowed_names is None
+                      else frozenset(allowed_names),
+                      self._version)
+        _cached = self._openai_cache.get(_cache_key)
+        if _cached is not None:
+            # Return copies: callers may stuff the list into request
+            # payloads; mutating the cached objects would corrupt
+            # later hits.
+            _ct, _cm = _cached
+            return list(_ct), dict(_cm)
         _canon = None
         if unified:
             try:
@@ -641,7 +689,9 @@ class ToolRegistry:
                     "parameters": params,
                 },
             })
-        return tools, name_map
+        _result = (tools, name_map)
+        self._openai_cache[_cache_key] = _result
+        return list(tools), dict(name_map)
 
 
 # Module-level singleton — every consumer hits this.
