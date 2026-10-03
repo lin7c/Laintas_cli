@@ -3,7 +3,7 @@
   "tokenize": [
     {"line": "file_exists .env", "tokens": ["file_exists", ".env"]},
     {"line": "contains .env \"WECHAT_MCH_ID=\"", "tokens": ["contains", ".env", "WECHAT_MCH_ID="]},
-    {"line": "review \"截图显示 \\\"已保存\\\"\"", "tokens": ["review", "截图显示 \"已保存\""]},
+    {"line": "review \"\u622a\u56fe\u663e\u793a \\\"\u5df2\u4fdd\u5b58\\\"\"", "tokens": ["review", "\u622a\u56fe\u663e\u793a \"\u5df2\u4fdd\u5b58\""]},
     {"line": "matches a.md \"a\\\\d+\"", "tokens": ["matches", "a.md", "a\\d+"]},
     {"line": "  min_length   answers/q1.md   200 ", "tokens": ["min_length", "answers/q1.md", "200"]},
     {"line": "contains x \"\"", "tokens": ["contains", "x", ""]}
@@ -11,18 +11,18 @@
   "parse": [
     {
       "name": "full",
-      "text": "retask 1\ntitle: 接入微信支付\ngoal: 沙箱跑通一笔支付\n\n## [x] t1 注册商户号\ncheck: contains .env \"WECHAT_MCH_ID=\"\nnote: 2026-09-14 10:02 passed: .env ok\n\n在 pay.weixin.qq.com 注册。\n\n第二段。\n\n## [>] t2 拿到密钥\nafter: t1\ncheck: contains .env \"WECHAT_API_V3_KEY=\"\ncheck: review \"后台显示密钥已设置\"\n\n登录后台。\n",
+      "text": "retask 1\ntitle: \u63a5\u5165\u5fae\u4fe1\u652f\u4ed8\ngoal: \u6c99\u7bb1\u8dd1\u901a\u4e00\u7b14\u652f\u4ed8\n\n## [x] t1 \u6ce8\u518c\u5546\u6237\u53f7\ncheck: contains .env \"WECHAT_MCH_ID=\"\nnote: 2026-09-14 10:02 passed: .env ok\n\n\u5728 pay.weixin.qq.com \u6ce8\u518c。\n\n\u7b2c\u4e8c\u6bb5。\n\n## [>] t2 \u62ff\u5230\u5bc6\u94a5\nafter: t1\ncheck: contains .env \"WECHAT_API_V3_KEY=\"\ncheck: review \"\u540e\u53f0\u663e\u793a\u5bc6\u94a5\u5df2\u8bbe\u7f6e\"\n\n\u767b\u5f55\u540e\u53f0。\n",
       "expect": {
-        "title": "接入微信支付",
-        "goal": "沙箱跑通一笔支付",
+        "title": "\u63a5\u5165\u5fae\u4fe1\u652f\u4ed8",
+        "goal": "\u6c99\u7bb1\u8dd1\u901a\u4e00\u7b14\u652f\u4ed8",
         "tasks": [
-          {"id": "t1", "title": "注册商户号", "status": "done", "after": [],
+          {"id": "t1", "title": "\u6ce8\u518c\u5546\u6237\u53f7", "status": "done", "after": [],
            "checks": ["contains .env \"WECHAT_MCH_ID=\""],
            "notes": ["2026-09-14 10:02 passed: .env ok"],
-           "description": "在 pay.weixin.qq.com 注册。\n\n第二段。"},
-          {"id": "t2", "title": "拿到密钥", "status": "doing", "after": ["t1"],
-           "checks": ["contains .env \"WECHAT_API_V3_KEY=\"", "review \"后台显示密钥已设置\""],
-           "notes": [], "description": "登录后台。"}
+           "description": "\u5728 pay.weixin.qq.com \u6ce8\u518c。\n\n\u7b2c\u4e8c\u6bb5。"},
+          {"id": "t2", "title": "\u62ff\u5230\u5bc6\u94a5", "status": "doing", "after": ["t1"],
+           "checks": ["contains .env \"WECHAT_API_V3_KEY=\"", "review \"\u540e\u53f0\u663e\u793a\u5bc6\u94a5\u5df2\u8bbe\u7f6e\""],
+           "notes": [], "description": "\u767b\u5f55\u540e\u53f0。"}
         ],
         "current": "t2",
         "progress": [1, 2]

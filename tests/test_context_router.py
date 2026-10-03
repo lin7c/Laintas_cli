@@ -100,7 +100,7 @@ class CompletedTaskSkillTests(unittest.TestCase):
 
     def test_skill_save_is_visible_whatever_the_request_says(self):
         tools = [_tool("fs.read"), _tool("skill.save")]
-        for query in ("修复登录页的构建错误", "rename the helper"):
+        for query in ('\u4fee\u590d\u767b\u5f55\u9875\u7684\u6784\u5efa\u9519\u8bef', "rename the helper"):
             self.assertIn("skill.save",
                           context_router.select_tool_names(query, tools))
 

@@ -38,12 +38,12 @@ class AppendInputTests(unittest.TestCase):
 
     def test_connected_rows_hide_preview_execution_and_logs(self):
         with self.ui.status(lambda: Text('reply preview\nexecuting shell command')):
-            self.ui.set_draft('只分析，不要修改')
+            self.ui.set_draft('Analyze only; do not edit')
             self.console.print('tool output must wait')
             rows = self.screen()
         self.assertEqual(len(rows), 2, rows)
         self.assertRegex(rows[0], r'L[·›»] ─╮ Thinking… .*glm-5.3-flash · AUTO')
-        self.assertEqual(rows[1], '    ╰─ append 只分析，不要修改')
+        self.assertEqual(rows[1], '    ╰─ append Analyze only; do not edit')
         self.assertEqual(rows[0].index('╮'), rows[1].index('╰'))
         self.assertNotIn('tool output must wait', self.output.getvalue())
         self.ui.set_draft('')
@@ -51,15 +51,15 @@ class AppendInputTests(unittest.TestCase):
 
     def test_consumed_append_keeps_branch_and_preserves_next_draft(self):
         target = queue.Queue()
-        self.ui.set_draft('追加第一条')
-        self.ui.submit(target, '追加第一条')
-        self.ui.set_draft('第二条草稿')
+        self.ui.set_draft('first instruction')
+        self.ui.submit(target, 'first instruction')
+        self.ui.set_draft('second draft')
         self.console.print('deferred execution')
         self.ui.consume([target.get_nowait()])
-        self.assertEqual(self.ui.draft_text(), '第二条草稿')
+        self.assertEqual(self.ui.draft_text(), 'second draft')
         rows = self.screen()
-        self.assertEqual(rows[1:], ['    ├─ append 追加第一条',
-                                   '    ╰─ append 第二条草稿'])
+        self.assertEqual(rows[1:], ['    ├─ append first instruction',
+                                   '    ╰─ append second draft'])
         self.assertEqual(self.ui.pending, [])
         self.assertNotIn('deferred execution', self.output.getvalue())
         self.ui.set_draft('')
@@ -69,35 +69,35 @@ class AppendInputTests(unittest.TestCase):
 
     def test_each_submission_adds_branch_and_last_branch_changes_to_junction(self):
         target = queue.Queue()
-        for text in ['内容1', '内容2', '内容3']:
+        for text in ['content1', 'content2', 'content3']:
             self.ui.set_draft(text)
             self.ui.submit(target, text)
         self.assertEqual(self.screen()[1:], [
-            '    ├─ append 内容1', '    ├─ append 内容2', '    ╰─ append 内容3'])
-        self.ui.set_draft('内容4')
+            '    ├─ append content1', '    ├─ append content2', '    ╰─ append content3'])
+        self.ui.set_draft('content4')
         self.console.print('execution must stay hidden')
         rows = self.screen()
         self.assertEqual(rows[1:], [
-            '    ├─ append 内容1', '    ├─ append 内容2',
-            '    ├─ append 内容3', '    ╰─ append 内容4'])
+            '    ├─ append content1', '    ├─ append content2',
+            '    ├─ append content3', '    ╰─ append content4'])
         for row in rows[1:]:
             self.assertEqual(row.index('─'), rows[0].index('╮') + 1)
         self.assertNotIn('execution must stay hidden', self.output.getvalue())
         self.assertEqual([target.get_nowait() for _ in range(3)],
-                         ['内容1', '内容2', '内容3'])
-        self.ui.consume(['内容1', '内容2', '内容3'])
-        self.assertEqual(self.ui.close(), '内容4')
+                         ['content1', 'content2', 'content3'])
+        self.ui.consume(['content1', 'content2', 'content3'])
+        self.assertEqual(self.ui.close(), 'content4')
 
     def test_tall_tree_keeps_newest_input_and_bottom_connector_visible(self):
         target = queue.Queue()
         for number in range(30):
-            self.ui.submit(target, f'内容{number}')
-        self.ui.set_draft('最新草稿')
+            self.ui.submit(target, f'content{number}')
+        self.ui.set_draft('latest draft')
         rows = self.screen()
         self.assertLessEqual(len(rows), 23)
         self.assertIn('earlier append', rows[1])
-        self.assertEqual(rows[-1], '    ╰─ append 最新草稿')
-        self.assertEqual(rows[-2], '    ├─ append 内容29')
+        self.assertEqual(rows[-1], '    ╰─ append latest draft')
+        self.assertEqual(rows[-2], '    ├─ append content29')
 
     def test_full_queue_keeps_draft(self):
         target = queue.Queue(maxsize=1)
@@ -109,7 +109,7 @@ class AppendInputTests(unittest.TestCase):
         self.assertEqual(self.ui.pending, [])
 
     def test_tool_status_cannot_break_append_connector(self):
-        self.ui.set_draft('继续检查')
+        self.ui.set_draft('continue checking')
         with agent_loop.activity_status(self.console, 'shell.run', 'npm test', delay=0):
             rows = self.screen()
         self.assertEqual(len(rows), 2)
@@ -139,7 +139,7 @@ class AppendInputTests(unittest.TestCase):
 
     def test_paste_is_two_rows_and_crop_respects_terminal_width(self):
         self.console.width = 38
-        self.ui.set_draft('第一行\n第二行\t' + '中文' * 40)
+        self.ui.set_draft('first line\nsecond line\t' + '\u4e2d\u6587' * 40)
         rows = self.screen()
         self.assertEqual(len(rows), 2, rows)
         self.assertTrue(rows[1].startswith('    ╰─ append '))
@@ -160,8 +160,8 @@ class AppendInputTests(unittest.TestCase):
     def test_reader_resumes_draft_and_submits_paste_without_raw_echo(self):
         stop = threading.Event()
         target = queue.Queue()
-        self.ui.set_draft('保留')
-        feed = [terminal_arbiter.Key('paste', '追加\n内容'),
+        self.ui.set_draft('keep ')
+        feed = [terminal_arbiter.Key('paste', 'append \ncontent'),
                 terminal_arbiter.Key('enter')]
 
         class Term:
@@ -178,8 +178,8 @@ class AppendInputTests(unittest.TestCase):
                 mock.patch.object(laintas_cli, 'console', self.console), \
                 mock.patch.object(laintas_cli.sys.stdout, 'write') as raw:
             laintas_cli._bg_reader_cbreak_mode(target, threading.Event(), stop)
-        self.assertEqual(target.get_nowait(), '保留追加\n内容')
-        self.assertEqual(self.ui.pending, ['保留追加\n内容'])
+        self.assertEqual(target.get_nowait(), 'keep append \ncontent')
+        self.assertEqual(self.ui.pending, ['keep append \ncontent'])
         self.assertEqual(self.ui.draft_text(), '')
         raw.assert_not_called()
 
@@ -215,8 +215,8 @@ class AppendInputTests(unittest.TestCase):
             with mock.patch.object(laintas_cli.terminal_arbiter, 'hold', arbiter.hold), \
                     mock.patch.object(laintas_cli, 'console', self.console):
                 reader.start()
-                os.write(master, '中文 append\r'.encode())
-                self.assertEqual(target.get(timeout=3), '中文 append')
+                os.write(master, '\u4e2d\u6587 append\r'.encode())
+                self.assertEqual(target.get(timeout=3), '\u4e2d\u6587 append')
                 self.assertFalse(interrupt.is_set())
                 stop.set()
                 reader.join(timeout=2)
@@ -242,8 +242,8 @@ class AppendInputTests(unittest.TestCase):
             ui = append_input.current()
             self.assertIsNotNone(ui)
             seen['worker'] = ui._live._refresh_thread
-            ui.submit(kwargs['message_queue'], '未消费的追加')
-            ui.set_draft('未提交的草稿')
+            ui.submit(kwargs['message_queue'], 'unconsumed append')
+            ui.set_draft('unsubmitted draft')
             return {'success': True, 'msg': '', 'state': {}}
 
         with mock.patch.object(laintas_cli, 'console', self.console), \
@@ -259,7 +259,7 @@ class AppendInputTests(unittest.TestCase):
                 SimpleNamespace(console=self.console), 'task', {}, {}, [],
                 events_cb=lambda events: None)
             self.assertEqual(laintas_cli._pending_prompt_default,
-                             '未消费的追加\n未提交的草稿')
+                             'unconsumed append\nunsubmitted draft')
         self.assertFalse(seen['worker'].is_alive())
         self.assertIsNone(append_input.current())
 

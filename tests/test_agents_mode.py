@@ -785,7 +785,7 @@ class AgentsModeTests(unittest.TestCase):
         agent.status = "thinking"
         agent_ui_events.hub.emit(
             "ai", agent_id=agent.id, terminal_name="term0",
-            detail="latest " + ("界" * 80) + " ENDLATEST")
+            detail="latest " + ('\u754c' * 80) + " ENDLATEST")
         controller = agents_mode.AgentsModeController("term0", object(), {})
         controller.selected_id = agent.id
         with mock.patch.object(agents_mode.time, "monotonic", return_value=0):
@@ -809,7 +809,7 @@ class AgentsModeTests(unittest.TestCase):
         for index in range(40):
             agent_ui_events.hub.emit(
                 "ai", agent_id=agent.id, terminal_name="term0",
-                detail=f"**reply** {index} " + "界" * (index % 7))
+                detail=f"**reply** {index} " + '\u754c' * (index % 7))
         controller = agents_mode.AgentsModeController("term0", object(), {})
         controller.selected_id = agent.id
         for render, width in ((controller.transcript_lines, 57),

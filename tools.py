@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import private_files
 import re
 import shlex
 import hashlib
@@ -161,6 +162,15 @@ _TRUE_STRINGS = {"true", "yes", "on", "1"}
 _FALSE_STRINGS = {"false", "no", "off", "0"}
 
 
+def _any_of_types(rule: dict) -> list:
+    """Branch types of an `anyOf` union — the spelling Gemini accepts for what
+    used to be `"type": [a, b]` (a list-valued type is a 400 there)."""
+    branches = rule.get("anyOf")
+    if not isinstance(branches, list):
+        return []
+    return [b["type"] for b in branches if isinstance(b, dict) and isinstance(b.get("type"), str)]
+
+
 def _coerce_params(params: dict, schema: dict) -> dict:
     """Return *params* with JSON-ish scalars converted to the schema's types.
 
@@ -188,7 +198,7 @@ def _coerce_params(params: dict, schema: dict) -> dict:
         return params
 
     def _types(rule: dict) -> list:
-        declared = rule.get("type")
+        declared = rule.get("type") or _any_of_types(rule)
         if isinstance(declared, list):
             return [t for t in declared if t]
         return [declared] if declared else []
@@ -282,7 +292,7 @@ def _validate_params(params: dict, schema: dict) -> Optional[str]:
     def _check(value, rule: dict, path: str) -> Optional[str]:
         if not isinstance(rule, dict):
             return None
-        expected = rule.get("type")
+        expected = rule.get("type") or _any_of_types(rule)
         expected_types = expected if isinstance(expected, list) else [expected]
         expected_types = [item for item in expected_types if item]
         if expected_types and not any(_matches_type(value, item) for item in expected_types):
@@ -473,6 +483,7 @@ class ToolRegistry:
             if _vErr:
                 return {"ok": False, "tool": name, "error": _vErr, "_validation_error": True}
         try:
+            private_files.check_tool(name, params or {}, ctx.cwd, external=tool.source != "builtin")
             invoke_ctx = ctx
             if tool.source != "builtin":
                 # Never hand authentication state or control-plane callbacks to
@@ -893,6 +904,10 @@ def _resolve_evidence(raw, ctx: ToolCtx):
             span = (int(start), int(end))
         abs_path = (spec if os.path.isabs(spec)
                     else os.path.abspath(os.path.join(base, spec)))
+        try:
+            private_files.check(abs_path, 'read')
+        except private_files.PrivateFileError as error:
+            return None, str(error)
         if not os.path.isfile(abs_path):
             return None, f"evidence file not found: {spec}"
         built.append(_me.evidence_for(abs_path,
@@ -1215,6 +1230,7 @@ def unknown_result_flags(result: dict) -> list:
                   if key.startswith("_") and key not in RESULT_FLAGS)
 
 
+@private_files.guard("fs.read")
 def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
     """Read a file as UTF-8 with optional line range and cat-style numbering.
 
@@ -1488,6 +1504,10 @@ def _check_file_write_policy(abs_path: str, ctx: ToolCtx, diff_preview: str) -> 
     without one (headless/automated contexts with no human to ask), it proceeds —
     the decision is still audited, it just can't be confirmed live.
     """
+    try:
+        private_files.check(abs_path, 'write')
+    except private_files.PrivateFileError as error:
+        return {'ok': False, 'error': str(error), 'status': 'private_file_denied'}
     # The contract's own boundary comes first: it is narrower than policy, it
     # is per-agent, and unlike policy it is what this particular child agreed
     # to when it was spawned.
@@ -1634,6 +1654,7 @@ def _describe_delete_target(abs_path: str) -> tuple[dict, Optional[str]]:
     }, None
 
 
+@private_files.guard("fs.delete")
 def _bi_fs_delete(params: dict, ctx: ToolCtx) -> dict:
     """Delete one file, symlink, or directory after explicit policy approval."""
     path = params.get("path")
@@ -1707,6 +1728,7 @@ def _bi_fs_delete(params: dict, ctx: ToolCtx) -> dict:
     return result
 
 
+@private_files.guard("fs.write")
 def _bi_fs_write(params: dict, ctx: ToolCtx) -> dict:
     path = params.get("path")
     content = params.get("content", "")
@@ -1863,6 +1885,7 @@ def _take_within_budget(entries, budget: int, *, skip: int = 0, limit=None):
     return taken, None
 
 
+@private_files.guard("fs.ls")
 def _bi_fs_ls(params: dict, ctx: ToolCtx) -> dict:
     path = params.get("path", ".")
     abs_path = os.path.abspath(os.path.join(ctx.cwd or os.getcwd(), path)) \
@@ -1874,7 +1897,7 @@ def _bi_fs_ls(params: dict, ctx: ToolCtx) -> dict:
     except (TypeError, ValueError):
         return {"ok": False, "error": "offset and limit must be integers"}
     try:
-        names = sorted(os.listdir(abs_path))
+        names = sorted(name for name in os.listdir(abs_path) if private_files.allowed(os.path.join(abs_path, name)))
 
         def _described(chosen):
             for name in chosen:
@@ -2367,6 +2390,7 @@ def _bi_evolve_lab_draft(params: dict, ctx: ToolCtx) -> dict:
     }
 
 
+@private_files.guard("fs.edit")
 def _bi_fs_edit(params: dict, ctx: ToolCtx) -> dict:
     """Exact string replacement in a file.
 
@@ -2556,6 +2580,7 @@ def _edit_anchor_hint(content: str, old: str, limit: int = 160) -> str:
     return hint
 
 
+@private_files.guard("fs.multi_edit")
 def _bi_fs_multi_edit(params: dict, ctx: ToolCtx) -> dict:
     """Apply multiple sequential exact-string edits to one file atomically.
 
@@ -2694,6 +2719,7 @@ def _bi_fs_multi_edit(params: dict, ctx: ToolCtx) -> dict:
             "changed": content != working, "diff": diff or "(no differences)"}, abs_path)
 
 
+@private_files.guard("fs.diff")
 def _bi_fs_diff(params: dict, ctx: ToolCtx) -> dict:
     """Compute a unified diff between two files or between a file and a string.
 
@@ -2892,6 +2918,8 @@ def _walk_files(root: str, limit: "_WalkLimit", *, max_depth: int = _FS_MAX_DEPT
                     if limit.entries > limit.budget:
                         limit.reason = "entries"
                         return
+                    if not private_files.allowed(entry.path):
+                        continue
                     try:
                         is_dir = entry.is_dir(follow_symlinks=False)
                     except OSError:
@@ -2900,7 +2928,7 @@ def _walk_files(root: str, limit: "_WalkLimit", *, max_depth: int = _FS_MAX_DEPT
                         if entry.name in _FS_PRUNE_DIRS:
                             continue
                         yield entry.path, True
-                        if depth + 1 <= max_depth:
+                        if depth + 1 <= max_depth and private_files.allowed(entry.path, "read"):
                             children.append((entry.path, depth + 1))
                     else:
                         yield entry.path, False
@@ -2927,6 +2955,7 @@ def _fs_active_excludes(search_root: str) -> list[str]:
 _GREP_MAX_FILE_SIZE = 8 * 1024 * 1024
 
 
+@private_files.guard("fs.grep")
 def _bi_fs_grep(params: dict, ctx: ToolCtx) -> dict:
     """Search for a regex pattern in files under a directory.
 
@@ -3028,6 +3057,8 @@ def _bi_fs_grep(params: dict, ctx: ToolCtx) -> dict:
     def _matches():
         nonlocal files_scanned
         for filepath in files:
+            if not private_files.allowed(filepath, "read"):
+                continue
             yield from _file_matches(filepath)
 
     def _file_matches(filepath):
@@ -3176,6 +3207,7 @@ def _common_literal_prefix(patterns: list) -> str:
     return "/".join(shared)
 
 
+@private_files.guard("fs.glob")
 def _bi_fs_glob(params: dict, ctx: ToolCtx) -> dict:
     """Find files matching a glob pattern.
 
@@ -5643,6 +5675,7 @@ def _bi_storage_get(params: dict, ctx: ToolCtx) -> dict:
     return _storage_call(ctx, work)
 
 
+@private_files.guard('storage.put')
 def _bi_storage_put(params: dict, ctx: ToolCtx) -> dict:
     """Upload one local file to the shared storage."""
     local = str(params.get("local_path") or "").strip()
@@ -5724,6 +5757,7 @@ def _bi_storage_delete(params: dict, ctx: ToolCtx) -> dict:
     return _storage_call(ctx, work)
 
 
+@private_files.guard("file_push")
 def _bi_file_push(params: dict, ctx: ToolCtx) -> dict:
     """Push files from the local filesystem to Laintas shared storage (R2).
 
@@ -5840,6 +5874,7 @@ def _bi_file_push(params: dict, ctx: ToolCtx) -> dict:
     return {"ok": True, "result": result, "files": uploaded}
 
 
+@private_files.guard("terminal.send")
 def _bi_terminal_send(params: dict, ctx: ToolCtx) -> dict:
     """Send interactive input to a terminal and return only newly read output.
 
@@ -5896,6 +5931,7 @@ def _bi_terminal_send(params: dict, ctx: ToolCtx) -> dict:
     }
 
 
+@private_files.guard("terminal.read")
 def _bi_terminal_read(params: dict, ctx: ToolCtx) -> dict:
     """Read output added since this agent's previous terminal cursor."""
     target = (params.get("name") or "").strip()
@@ -6014,6 +6050,7 @@ def _terminal_output_len(term: Any) -> int:
         return 0
 
 
+@private_files.guard("terminal.scroll")
 def _bi_terminal_scroll(params: dict, ctx: ToolCtx) -> dict:
     """Scroll a named terminal's viewport within its scrollable history.
 
@@ -6108,6 +6145,7 @@ def _bi_terminal_scroll(params: dict, ctx: ToolCtx) -> dict:
     return result
 
 
+@private_files.guard("terminal.wait")
 def _bi_terminal_wait(params: dict, ctx: ToolCtx) -> dict:
     """Wait for a background terminal to finish, then return its final delta."""
     target = (params.get("name") or "").strip()
@@ -6160,6 +6198,7 @@ def _bi_terminal_wait(params: dict, ctx: ToolCtx) -> dict:
     return result
 
 
+@private_files.guard("terminal.terminate")
 def _bi_terminal_terminate(params: dict, ctx: ToolCtx) -> dict:
     """Terminate a named terminal."""
     target = (params.get("name") or "").strip()
@@ -6345,6 +6384,7 @@ def _bi_app_trust_revoke(params: dict, ctx: ToolCtx) -> dict:
     return {"ok": True, "revoked": app_host.revoke(name)}
 
 
+@private_files.guard("terminal.create")
 def _bi_terminal_create(params: dict, ctx: ToolCtx) -> dict:
     """Create a new named sub-terminal (no agent stationed)."""
     name = (params.get("name") or "").strip()
@@ -6395,6 +6435,7 @@ def _bi_terminal_create(params: dict, ctx: ToolCtx) -> dict:
     return {"ok": True, "result": f"Created sub-terminal {name}", "terminal": name}
 
 
+@private_files.guard("terminal.list")
 def _bi_terminal_list(params: dict, ctx: ToolCtx) -> dict:
     """List all named terminals."""
     if ctx.get_all_terminals is None:
@@ -6427,6 +6468,7 @@ def _bi_terminal_list(params: dict, ctx: ToolCtx) -> dict:
     return {"ok": True, "result": "\n".join(lines)}
 
 
+@private_files.guard("terminal.exec")
 def _bi_terminal_exec(params: dict, ctx: ToolCtx) -> dict:
     """Run an arbitrary command in a background sub-terminal, optionally with a trigger."""
     import sys as _sys
@@ -6490,6 +6532,7 @@ def _bi_terminal_exec(params: dict, ctx: ToolCtx) -> dict:
     return result
 
 
+@private_files.guard("terminal.watch")
 def _bi_terminal_watch(params: dict, ctx: ToolCtx) -> dict:
     """Set or clear a trigger on an existing terminal.
 
@@ -7784,12 +7827,14 @@ def _classify_shell_result(command: str, result: dict) -> dict:
     return result
 
 
+@private_files.guard("shell.exec")
 def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
     """Execute a shell command, then classify a search's empty exit 1."""
     return _classify_shell_result(str(params.get("command") or ""),
                                   _bi_shell_exec_raw(params, ctx))
 
 
+@private_files.guard("shell.exec")
 def _bi_shell_exec_raw(params: dict, ctx: ToolCtx) -> dict:
     """Execute a shell command.
 
@@ -7810,25 +7855,6 @@ def _bi_shell_exec_raw(params: dict, ctx: ToolCtx) -> dict:
         command = command[len("shell.exec "):].strip()
     elif command == "shell.exec":
         return {"ok": False, "error": "missing shell command after 'shell.exec'"}
-
-    # A PowerShell payload in double quotes is a bash string first. Caught here
-    # rather than left to run: bash's substitution produces a script PowerShell
-    # accepts and misinterprets, so the command "succeeds" with exit 0 and
-    # prints cmdlet-not-found noise about a name nobody wrote. One rejection
-    # naming the variable costs a retry; the alternative cost a whole session.
-    import command_parse
-    _ps_conflict = command_parse.powershell_expansion_conflict(command)
-    if _ps_conflict:
-        return {
-            "ok": False,
-            "returncode": -1,
-            "error": (
-                f"bash will expand {_ps_conflict} before PowerShell ever sees "
-                f"it. Put the PowerShell payload in single quotes "
-                f"(-Command '...'), escape the dollar sign (\\{_ps_conflict}), "
-                f"or write the script to a .ps1 file and run it with -File."
-            ),
-        }
 
     # Commits the agent makes carry it as co-author. No-op for everything that
     # is not a git commit, and for users who switched attribution off.
@@ -8458,6 +8484,7 @@ def _image_tool_path(params: dict, ctx: ToolCtx) -> str:
     return raw if os.path.isabs(raw) else os.path.join(ctx.cwd or os.getcwd(), raw)
 
 
+@private_files.guard("image.describe")
 def _bi_image_describe(params: dict, ctx: ToolCtx) -> dict:
     """Ask a vision model a question about an image file."""
     import vision
@@ -8478,6 +8505,7 @@ def _bi_image_describe(params: dict, ctx: ToolCtx) -> dict:
             "model": out["model"], "cached": out.get("cached", False)}
 
 
+@private_files.guard("image.to_text")
 def _bi_image_to_text(params: dict, ctx: ToolCtx) -> dict:
     """Reproduce a document or image as text, via OCR."""
     import vision
@@ -10381,7 +10409,12 @@ def register_builtin_tools() -> None:
                     "notes": {"type": "string",
                               "description": "Append a progress note (timestamped)"},
                     "addSubtask": {
-                        "type": ["string", "object"],
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "object", "properties": {
+                                "subject": {"type": "string"},
+                                "description": {"type": "string"}}},
+                        ],
                         "description": "Create a child task linked to this one. "
                                        "String = subject, or {subject, description}",
                     },
@@ -11987,7 +12020,7 @@ def register_builtin_tools() -> None:
                 "type": "object",
                 "properties": {
                     "selector": {"type": "string", "description": "CSS selector for the element to click"},
-                    "ref": {"type": ["integer", "string"], "description": "interactive element ref number from browser.snapshot"},
+                    "ref": {"anyOf": [{"type": "integer"}, {"type": "string"}], "description": "interactive element ref number from browser.snapshot"},
                     "session": {"type": "string", "description": "session name (uses most recent if omitted)"},
                     "timeout": {"type": "integer", "default": 10, "description": "wait timeout in seconds"},
                 },
@@ -12002,7 +12035,7 @@ def register_builtin_tools() -> None:
                 "type": "object",
                 "properties": {
                     "selector": {"type": "string", "description": "CSS selector for the input element"},
-                    "ref": {"type": ["integer", "string"], "description": "interactive element ref number from browser.snapshot"},
+                    "ref": {"anyOf": [{"type": "integer"}, {"type": "string"}], "description": "interactive element ref number from browser.snapshot"},
                     "text": {"type": "string", "description": "text to type"},
                     "session": {"type": "string", "description": "session name (uses most recent if omitted)"},
                     "delay": {"type": "integer", "default": 0, "description": "delay between keystrokes (ms)"},
@@ -12146,7 +12179,7 @@ def register_builtin_tools() -> None:
                 "type": "object",
                 "properties": {
                     "selector": {"type": "string", "description": "CSS selector for the <select> element"},
-                    "ref": {"type": ["integer", "string"], "description": "interactive element ref number from browser.snapshot"},
+                    "ref": {"anyOf": [{"type": "integer"}, {"type": "string"}], "description": "interactive element ref number from browser.snapshot"},
                     "value": {"type": "string", "description": "option value to select"},
                     "label": {"type": "string", "description": "option label to select (use if no value)"},
                     "session": {"type": "string", "description": "session name (uses most recent if omitted)"},

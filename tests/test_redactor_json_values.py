@@ -44,9 +44,9 @@ class JsonQuotedValueTests(unittest.TestCase):
         self.assertIn('"n": 1', out)
 
     def test_normal_json_values_not_flagged(self):
-        for text in ('{"name": "张三", "city": "北京"}',
+        for text in ('{"name": "\u5f20\u4e09", "city": "\u5317\u4eac"}',
                      '{"title": "The Password Manager Guide"}',
-                     '正常的中文文本不应误伤'):
+                     '\u6b63\u5e38\u7684\u4e2d\u6587\u6587\u672c\u4e0d\u5e94\u8bef\u4f24'):
             spans = redactor.scan_text(text)
             self.assertFalse(spans, f"false positive on {text!r}")
 

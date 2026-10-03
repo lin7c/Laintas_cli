@@ -23,6 +23,8 @@ dist/
 # laintas_cli_download (React/Vite)
 laintas_cli_download/node_modules/
 laintas_cli_download/dist/
+laintas_cli_download/dist
+laintas_cli_download/dist-*/
 laintas_cli_download/**/*_amd64.deb
 
 # Generated architecture visualization (optional to commit)
@@ -34,6 +36,7 @@ concepts-zh.html
 # worktree is a full checkout — 31 of them multiplied that into 3.3 GB.
 laintas_cli_download/public/releases/
 
-# The pinned Windows Terminal download, cached between builds. Fetched by
-# build_windows_package.sh and verified against a hash; never committed.
-build/windows/.cache/
+# Independent desktop release artifacts are mirrored here, never committed.
+laintas_cli_download/public/windows/
+
+*.egg-info/

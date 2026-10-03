@@ -356,9 +356,9 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(ws._extract_readable(payload, "application/json"), payload)
 
     def test_missing_charset_does_not_mangle_cjk(self):
-        body = "<html><body><article>中文正文内容测试</article></body></html>".encode("utf-8")
+        body = '<html><body><article>\u4e2d\u6587\u6b63\u6587\u5185\u5bb9\u6d4b\u8bd5</article></body></html>'.encode("utf-8")
         decoded = ws._decode_body(body, "text/html", "utf-8")
-        self.assertIn("中文正文内容测试", decoded)
+        self.assertIn('\u4e2d\u6587\u6b63\u6587\u5185\u5bb9\u6d4b\u8bd5', decoded)
 
 
 class ProxyRoutingTests(unittest.TestCase):

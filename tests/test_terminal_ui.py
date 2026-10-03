@@ -332,7 +332,7 @@ class ResponsiveTerminalChromeTests(unittest.TestCase):
         self.assertTrue(hint("max", 20.0, False, width=5))
 
     def test_cell_crop_handles_cjk_and_preserves_budget(self):
-        cropped = agent_loop._crop_cells("目录/非常长的文件名.py", 12, middle=True)
+        cropped = agent_loop._crop_cells('\u76ee\u5f55/\u975e\u5e38\u957f\u7684\u6587\u4ef6\u540d.py', 12, middle=True)
         self.assertLessEqual(agent_loop._cell_len(cropped), 12)
         self.assertIn("…", cropped)
 

@@ -22,8 +22,8 @@ def _message(**overrides):
         "id": 1,
         "slug": "maintenance",
         "level": "notice",
-        "title": "计划维护",
-        "body": "周日 02:00 UTC 起约三十分钟。",
+        "title": "Scheduled maintenance",
+        "body": "About thirty minutes from Sunday at 02:00 UTC.",
         "actionUrl": "/settings#messages",
         "digest": "abc123",
         "read": False,
@@ -41,7 +41,7 @@ class PostTests(unittest.TestCase):
         self.assertEqual(official_messages.post([_message()]), 1)
         item = startup_mail.get("official:maintenance")
         self.assertIsNotNone(item)
-        self.assertEqual(item.title, "计划维护")
+        self.assertEqual(item.title, "Scheduled maintenance")
         # Site levels map onto the four styles the mail list knows.
         self.assertEqual(item.level, "warn")
         # A site path is shown with the host, since a terminal cannot resolve it.
@@ -72,7 +72,7 @@ class PostTests(unittest.TestCase):
 
         # Edited on the site: a new digest, so it is new information again.
         startup_mail.clear()
-        official_messages.post([_message(digest="def456", body="改期到周一。")])
+        official_messages.post([_message(digest="def456", body="Rescheduled to Monday.")])
         self.assertFalse(startup_mail.get(key).read)
 
     def test_malformed_entries_are_skipped_rather_than_raising(self):

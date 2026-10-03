@@ -31,12 +31,12 @@ class PessimisticWidthTests(unittest.TestCase):
             laintas_cli._pessimistic_width(f"ACT {symbols.BULLET} act"), 10)
 
     def test_wide_and_narrow_characters(self):
-        self.assertEqual(laintas_cli._pessimistic_width("中文"), 4)
+        self.assertEqual(laintas_cli._pessimistic_width('\u4e2d\u6587'), 4)
         self.assertEqual(laintas_cli._pessimistic_width("abc"), 3)
 
     def test_never_underestimates_prompt_toolkit(self):
         from prompt_toolkit.utils import get_cwidth
-        for sample in ("primary · ACT · glm-5.2", "ACT", "中文 · ACT",
+        for sample in ("primary · ACT · glm-5.2", "ACT", '\u4e2d\u6587 \xb7 ACT',
                        f"a{symbols.BULLET}b", "primary@term0"):
             self.assertGreaterEqual(laintas_cli._pessimistic_width(sample),
                                     get_cwidth(sample), sample)
@@ -65,7 +65,7 @@ class RpromptFitTests(unittest.TestCase):
             (100, "~/a-very-long-working-directory-name-goes-here"),
             # A wide-character path: two cells per glyph, so a
             # character-counting shortener would leave the row too long.
-            (90, "~/中文目录/项目"),
+            (90, '~/\u4e2d\u6587\u76ee\u5f55/\u9879\u76ee'),
         ]
         for width, path in cases:
             with self.subTest(width=width, path=path):

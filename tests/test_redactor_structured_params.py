@@ -48,7 +48,7 @@ class StructuredParamScrubTests(unittest.TestCase):
 
     def test_ordinary_values_untouched(self):
         msgs = [{"role": "assistant", "content": [
-            {"type": "text", "text": "正常"},
+            {"type": "text", "text": '\u6b63\u5e38'},
             {"type": "tool_use", "name": "fs_read",
              "input": {"path": "/tmp/x.py", "mode": "r"}}
         ]}]

@@ -77,7 +77,7 @@ def _tokens(text: str) -> set:
         "\u63a8\u8350": {"recommend"}, "\u516c\u8ba4": {"recommend", "popular"},
         "\u8bba\u6587": {"paper", "research", "writing"},
         "\u6587\u6863": {"docs", "documentation"},
-        # Operating the user's own computer (the windows-machine skill).
+        # Browser and application task vocabulary.
         "\u6d4f\u89c8\u5668": {"browser"},
         "\u6253\u5f00": {"open"},
         "\u8f6f\u4ef6": {"app"},

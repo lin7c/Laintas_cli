@@ -138,8 +138,7 @@ def gateway_path() -> Path:
 
 def _legacy_executable() -> Path:
     """The pre-extension frozen binary, kept only so it can be removed."""
-    suffix = ".exe" if os.name == "nt" else ""
-    return paths.LAINTAS_HOME / "enterprise" / "bin" / f"laintas-enterprise{suffix}"
+    return paths.LAINTAS_HOME / "enterprise" / "bin" / "laintas-enterprise"
 
 
 # ── download + verify + install ────────────────────────────────────────────

@@ -641,7 +641,7 @@ class CommandTests(_Home):
             laintas_cli._cmd_helpwo("--port 9000", ["/helpwo", "--port", "9000"], registry, {})
         launch.assert_not_called()
         start.assert_not_called()
-        self.assertIn("kernel", out.text)
+        self.assertIn("Usage: /helpwo", out.text)
 
     def test_helpwo_inside_a_sub_terminal_serves_in_place(self):
         registry = mock.Mock(agent_id=None, workspace_path=None)
@@ -787,45 +787,6 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class HelpwoEnvironmentRegistrationTests(unittest.TestCase):
-    """The Helpwo app sub-terminal goes online as a runtime environment.
-
-    Helpwo files every agent that carries `terminal` under the terminal dock
-    and keeps it out of the runtime-environment picker, so the sub-terminal
-    behind the main terminal's /helpwo --remote must register the way a
-    kernel does: a workspace, no terminal identity, no parent.
-    """
-
-    def _payload(self, as_environment: bool) -> dict:
-        import laintas_cli
-        registry = laintas_cli.AgentRegistry()
-        registry.depth = 1
-        registry.parent_remote_id = "parent-agent"
-        registry.terminal_meta = {"name": "helpwo", "command": "laintas-cli",
-                                  "createdAt": 0, "createdBy": "term0"}
-        registry.as_environment = as_environment
-        registry.workspace_path = "/srv/project"
-        link = mock.Mock(connected=True)
-        link.supports.return_value = True
-        link.request.return_value = {"ok": True, "agentId": "a1"}
-        try:
-            with mock.patch("windows_host.get_host", return_value=link):
-                self.assertTrue(registry.register({"userId": "u1"}, quiet=True))
-            return link.request.call_args.args[0]["payload"]
-        finally:
-            registry._remote_executor.shutdown(wait=False, cancel_futures=True)
-            registry._remote_control_executor.shutdown(wait=False, cancel_futures=True)
-
-    def test_environment_registers_without_terminal_identity(self):
-        payload = self._payload(as_environment=True)
-        self.assertNotIn("terminal", payload)
-        self.assertNotIn("parentId", payload)
-        self.assertEqual(payload["workspacePath"], "/srv/project")
-
-    def test_ordinary_sub_terminal_still_registers_as_terminal(self):
-        payload = self._payload(as_environment=False)
-        self.assertEqual(payload["terminal"]["name"], "helpwo")
-        self.assertEqual(payload["parentId"], "parent-agent")
 
 
 class SubterminalGracefulExitTests(unittest.TestCase):

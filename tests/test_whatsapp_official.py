@@ -50,7 +50,7 @@ class ManifestTests(unittest.TestCase):
                     or path.suffix not in {".py", ".json", ".md", ".mjs"}):
                 continue
             self.assertNotRegex(path.read_text(encoding="utf-8"),
-                                r"[一-鿿]", str(path))
+                                '[\u4e00-\u9fff]', str(path))
 
 
 class TaskRunnerContractTests(unittest.TestCase):
@@ -208,7 +208,7 @@ class SecretaryRoutingTests(unittest.TestCase):
 
     def test_execute_reaches_the_agent_with_the_rewritten_task(self):
         self.decision = '{"action":"execute","task":"check disk usage"}'
-        self.module._handle_job(self._job("磁盘"))
+        self.module._handle_job(self._job("disk"))
         self.assertEqual(self.tasks.ran, ["check disk usage"])
         self.assertIn("reported", self.sent[-1])
 

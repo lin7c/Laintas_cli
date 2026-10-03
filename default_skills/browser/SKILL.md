@@ -19,10 +19,10 @@ triggers:
 `browser.*` drives a real Chrome running on the user's machine (Xvfb + Chrome +
 x11vnc, one stack per session, streamed to the user's live view over WebRTC).
 
-On the Windows build that "machine" is the WSL side: this Chrome is not the
-browser on the user's desktop and has none of their logins. When a Helpwo
-kernel is connected (`win.*` tools present) and the user asks to open or use
-*their* browser, that is the `windows-machine` skill, not this one.
+This browser is a dedicated agent session, separate from an existing browser
+profile. Windows desktop automation belongs to the independent
+`laintas-Helpwo-cli-for-windows` application.
+
 It is heavier and slower than fetching a page, and every action happens for
 real on the open internet under the user's own IP.
 

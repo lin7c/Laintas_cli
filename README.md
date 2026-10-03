@@ -34,17 +34,11 @@ curl -fsSL https://cli.laintas.com/install.sh | bash
 laintas-cli
 ```
 
-On 64-bit Windows 10 2004+ or Windows 11, the single-file Windows installer imports a
-private `Laintas-CLI` WSL 2 distribution and installs a native
-`laintas-cli.exe` launcher. Normal startup calls `wslapi.dll` directly, does
-not run `wsl.exe`, and does not change the user's default WSL distribution.
-The installer lets the user choose the local installation drive and offers
-to start Laintas CLI on its final page:
-
-```powershell
-irm https://cli.laintas.com/install.ps1 | iex
-laintas-cli
-```
+Windows uses the independent **laintas-Helpwo-cli-for-windows** desktop app.
+Download [LaintasSetup.exe](https://cli.laintas.com/windows/LaintasSetup.exe),
+install it and open Laintas Windows from the Start menu. It reuses Helpwo's
+chat UI and runs the agent and kernel locally on Windows. The CLI repository
+builds Linux and macOS terminal packages only.
 
 The macOS build is a native terminal CLI for Apple Silicon (`arm64`) and Intel
 (`x86_64`). The installer detects the architecture automatically and verifies
@@ -60,21 +54,6 @@ The Mac installer writes to `~/.local/bin`; add that directory to `PATH` if
 your shell does not already use it. The installer downloads and verifies the
 Mac package from `cli.laintas.com/releases/latest/`. See [the release guide](build/RELEASE.md)
 for the Mac build and verification steps.
-
-On Windows, manage the Helpwo helper from `/windows` (alias `/kernel`). The full-screen
-manager shows its status and offers the same operations as these shortcuts:
-
-| Command | Result |
-|---|---|
-| `/windows start` | Install if missing, then start with workspace-only access |
-| `/windows start read` / `/windows start write` | Start with desktop read-only access or desktop control |
-| `/windows update` | Update only when needed; restore a connected kernel's current access |
-| `/windows stop` | Disconnect and stop, keeping the installation |
-| `/windows uninstall` | Stop and uninstall, removing its saved sign-in while keeping workspace files |
-| `/windows check` / `/windows status` | Check for updates / inspect local status |
-
-`/windows restart` reuses connected access (otherwise workspace only).
-`/windows install --force` repairs an installation without starting it.
 
 On Linux, check the host architecture and glibc before installing:
 
@@ -93,7 +72,7 @@ python3 -m pip install -r requirements.txt
 python3 laintas_cli.py
 ```
 
-Optional browser, MCP, WebRTC, and advanced web-fetch dependencies are documented in `requirements.txt`.
+Optional browser, MCP, and advanced web-fetch dependencies are documented in `requirements.txt`.
 
 ### Use from an ACP editor (Zed & friends)
 
@@ -105,9 +84,8 @@ python3 -m pip install agent-client-protocol   # once
 laintas-cli --acp
 ```
 
-Point the editor's ACP/agent setting at `laintas-cli --acp` (the same
-command works on Windows: the launcher forwards it into the private WSL
-runtime). Each editor session maps to one agent conversation in that
+Point the editor's ACP/agent setting at `laintas-cli --acp` on Linux or
+macOS. Each editor session maps to one agent conversation in that
 workspace; tool calls stream back as ACP tool-call updates, and anything
 the approval policy gates — a command, a write, a delete — becomes a
 permission request in the editor instead of a terminal dialog. Without the
@@ -178,7 +156,7 @@ The runtime policy—not the prompt—is the security boundary. Prompt instructi
 | Plugin systems | `skills.py`, `skill_router.py`, `mcp_client.py`, `extension_runtime.py`, `extension_manager.py`, `evolution_lab.py`, `evolution_runner.py` | Discovery, trust, lifecycle, registration, cleanup, experimental activation | `SKILL.md`, `skill.py`, `mcp.json`, extension packages |
 | Backend boundary | `backend_profiles.py` | Origin classification, credential isolation, backend selection | Backend profiles and environment references |
 | Web and browser | `browser_session.py`, `web_search.py`, `cookie_store.py`, `identity_store.py` | CDP browser control, search/fetch chain, explicit browsing identity | `/web`, `/identity`, proxy and browser config |
-| Remote integrations | `windows_host.py`, `helpwo_server.py`, `shared_storage.py` | Link to this machine's Helpwo kernel (sessions reach Helpwo through it), hosted-app bridge, file sharing | Helpwo and account configuration |
+| Application integrations | `runtime_host.py`, `helpwo_server.py`, `shared_storage.py` | Generic host adapter, local application bridge and file sharing | Application and account configuration |
 | Distribution | `updater.py`, `release.py`, `enterprise.py`, `enterprise_installer.py`, `migrate.py` | Updates, signed packages, Enterprise add-ons, migrations | Release channel and signed extensions |
 
 ### UI architecture
@@ -599,27 +577,10 @@ closes that view. Protected browser autofill remains unavailable.
 
 ### Hosted applications: `/helpwo` and `/app`
 
-Helpwo machine sharing requires Helpwo Kernel. The macOS build does not include
-that kernel, so the `/helpwo` sharing workflow below is unavailable on Mac.
-The `/app` application bridge is separate from Helpwo machine sharing.
-
-laintas_cli never talks to Helpwo itself. Helpwo reaches a machine through the
-**Helpwo kernel** running on it, and a CLI session reaches Helpwo through that
-same kernel: the kernel registers the session with its own sign-in, relays what
-Helpwo sends, and carries the session's browser screen over its own peer
-connection. Each session publishes a rendezvous file (`kernel-rendezvous/` under
-the laintas home, or under `%LOCALAPPDATA%\Laintas` on the Windows build) and
-the kernel dials it; nothing is exposed to the network.
-
-`/helpwo` opens a sub-terminal named `helpwo` — a nested CLI whose agent serves
-only Helpwo, so Helpwo's conversation is never the main terminal's — and shares
-it through the kernel. It appears in Helpwo's terminal list under the machine.
-The agent id it had is kept per folder in
-`~/.laintas/app-state/helpwo/<folder-hash>/`, so a restart comes back as the same
-session. `/helpwo stop` closes the sub-terminal. Typed inside any sub-terminal,
-`/helpwo` shares that sub-terminal in place. Without a kernel it says how to
-start one (`/windows start` on the Windows build). The old `--port`, `--host`
-and `--dist` flags are gone: laintas_cli no longer serves Helpwo locally.
+The CLI no longer installs, starts or communicates with Helpwo Kernel.
+`/helpwo` retains its hosted-application entry point; remote machine sharing
+is unavailable without a separately supplied host adapter. The independent
+Windows desktop app owns its local kernel integration and chat UI.
 
 `/app` runs other applications the same way, from manifests in
 `~/.laintas/apps/*.json` or `./.laintas/apps/*.json`:
@@ -712,20 +673,17 @@ The package manifest is intentionally explicit. When adding a runtime module, bu
 - Linux arm64 standalone archive
 - macOS Intel (`amd64`) native CLI archive
 - macOS Apple Silicon (`arm64`) native CLI archive
-- Single-file Windows amd64 installer with a private WSL 2 root filesystem
 - Linux amd64 Debian package
 - Source archive
 - SHA-256 checksums and source-update manifests
 
-The download page offers one-line installers for Linux and macOS; each selects
-the matching CPU architecture. It also links to the Windows installer
-(`laintas-cli_windows_amd64_setup.exe`), both Linux archives, both Mac archives,
-the Debian package and the source zip. The installer and the download page
-fetch from `cli.laintas.com/releases/latest/`, as does `/v update` on every
-platform (GitHub Releases holds the originals that CI publishes; point
-`LAINTAS_DOWNLOAD_BASE` at it to switch `/v` back). The already published
-`laintas-cli-beta v1` binaries were built before this change and still use
-GitHub Releases for `/v update`.
+The download page offers Linux and macOS installers that select the CPU
+architecture, plus the independent `laintas-Helpwo-cli-for-windows` installer.
+CLI archives, Debian packages, source ZIPs and checksums are mirrored at
+`cli.laintas.com/releases/latest/`. Windows installers and signed updates use
+`cli.laintas.com/windows/`; CLI releases must never overwrite that channel.
+Existing historical release notes below describe the builds shipped at the
+time and are not instructions for producing new Windows CLI packages.
 
 The current public release is [laintas-cli-beta v2](https://github.com/lin7c/Laintas_cli/releases/tag/laintas-cli-beta-v2)
 (tag `laintas-cli-beta-v2`). It is an ordinary GitHub Release, marked `latest`;

@@ -323,7 +323,7 @@ class ToolTests(unittest.TestCase):
 class RoutingTests(unittest.TestCase):
     def test_chinese_and_english_wording_route_the_tools(self):
         registry = tools.get_registry().list()
-        for query in ("带我一步步接入微信支付", "give me a quiz on react hooks"):
+        for query in ('\u5e26\u6211\u4e00\u6b65\u6b65\u63a5\u5165\u5fae\u4fe1\u652f\u4ed8', "give me a quiz on react hooks"):
             names = context_router.select_tool_names(query, registry)
             self.assertIn("retask.create", names, query)
         plain = context_router.select_tool_names("fix the failing unit test", registry)

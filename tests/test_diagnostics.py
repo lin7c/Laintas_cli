@@ -127,8 +127,8 @@ class TestHWGDiagnostics(_Base):
 class TestRenderers(_Base):
     def test_cjk_caret_alignment_uses_display_width(self):
         # Caret padding must use wcwidth, not code point count: prefix
-        # `#分析# ` is 5 code points but 7 display columns.
-        path = self.write("cjk.hwo", "#分析# { -> x }\n")
+        # An agent prefix with two CJK characters is 5 code points but 7 display columns.
+        path = self.write("cjk.hwo", '#\u5206\u6790# { -> x }\n')
         source = Path(path).read_text(encoding="utf-8")
         diag = diagnostics.Diagnostic(
             code="HWO9900", severity="error", phase="parse",
@@ -138,14 +138,14 @@ class TestRenderers(_Base):
         pretty = diagnostics.render_pretty([diag], "hwo", {path: source})
         try:
             import wcwidth
-            pad = wcwidth.wcswidth("#分析# ")
+            pad = wcwidth.wcswidth('#\u5206\u6790# ')
         except ImportError:
-            pad = len("#分析# ")
+            pad = len('#\u5206\u6790# ')
         self.assertIn(f" | {' ' * pad}^", pretty)
         self.assertEqual(pad, 7)
 
     def test_pretty_block_shape_from_compile(self):
-        path = self.write("cjk.hwo", "#分析# { -> x\n")
+        path = self.write("cjk.hwo", '#\u5206\u6790# { -> x\n')
         r = hwo_runner.compile_hwo_file(path)
         pretty = r["pretty"]
         self.assertIn("--> ", pretty)

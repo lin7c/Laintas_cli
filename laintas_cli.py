@@ -132,99 +132,24 @@ from urllib.parse import urlparse, parse_qs, urlencode
 SYSTEM = platform.system()  # "Linux", "Darwin"
 
 
-# The URL reaches PowerShell through the environment, never on the command
-# line. `-Command <string>` is terminal: PowerShell appends every argument
-# after it to the command *text*, so a URL passed there is never bound to
-# $args — v1.23.1 shipped `Start-Process -FilePath $args[0]` with the URL
-# after it, which resolves to a null path and opens nothing. It would also
-# paste a crafted URL straight into the script.
-#
-# The try/catch is what makes the exit code mean anything: Windows PowerShell
-# 5.1 exits 0 after a cmdlet error unless the script says otherwise, and a
-# silent success is precisely how the broken version reported opening a
-# browser it had not opened.
-_WINDOWS_OPEN_URL_COMMAND = (
-    "try { Start-Process -FilePath $env:LAINTAS_OPEN_URL -ErrorAction Stop } "
-    "catch { exit 1 }"
-)
-
-
-def _windows_open_url_environment(url: str) -> dict:
-    """Environment that carries ``url`` across the WSL/Win32 boundary.
-
-    A Win32 process launched from WSL inherits only the variables named in
-    WSLENV, so the name has to be added there as well as set. ``/w`` marks it
-    as travelling this direction only.
-    """
-    environment = dict(os.environ)
-    environment["LAINTAS_OPEN_URL"] = url
-    shared = [part for part in environment.get("WSLENV", "").split(":")
-              if part and part.split("/")[0] != "LAINTAS_OPEN_URL"]
-    shared.append("LAINTAS_OPEN_URL/w")
-    environment["WSLENV"] = ":".join(shared)
-    return environment
-
-
 def _open_external_url(url: str) -> bool:
-    """Open a URL on the desktop hosting this CLI.
-
-    A private WSL distribution normally has no Linux browser registered.
-    Ask Windows PowerShell to resolve the URL through the user's default HTTP
-    handler. Passing a URL to explorer.exe is not equivalent: on some Windows
-    builds it opens File Explorer and treats the URL as a path.
-    """
-    if os.environ.get("WSL_INTEROP") or os.environ.get("WSL_DISTRO_NAME"):
-        powershell = shutil.which("powershell.exe")
-        if powershell:
-            try:
-                completed = subprocess.run(
-                    [powershell, "-NoLogo", "-NoProfile", "-NonInteractive",
-                     "-Command", _WINDOWS_OPEN_URL_COMMAND],
-                    env=_windows_open_url_environment(url),
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    timeout=20)
-            except (OSError, subprocess.SubprocessError):
-                pass
-            else:
-                # Start-Process returns as soon as the handler is launched, so
-                # a non-zero code means no browser opened. Fall through to the
-                # Linux path rather than claim a window the user cannot see.
-                if completed.returncode == 0:
-                    return True
+    """Open a URL using the operating system's browser integration."""
+    import webbrowser
     try:
         return bool(webbrowser.open(url))
     except Exception:
         return False
 
 
-def is_windows_host() -> bool:
-    """True when this process is the Windows product, not a Linux install.
-
-    The Windows build is this same Linux CLI running inside a private WSL 2
-    distribution, so ``platform.system()`` says "Linux" and every host-shaped
-    decision below would otherwise be made for the wrong machine. The launcher
-    states what it is through LAINTAS_HOST; the distribution name is only a
-    fallback for a launcher older than that variable, and it is settable
-    through LAINTAS_WSL_DISTRO, so a user who renamed their distribution would
-    otherwise lose everything keyed off this.
-    """
-    return (os.environ.get("LAINTAS_HOST") == "windows"
-            or os.environ.get("WSL_DISTRO_NAME") == "Laintas-CLI")
 
 
 def host_label() -> str:
-    """What to call this machine when showing it to the user.
-
-    ``platform.system()`` answers "Linux" on the Windows product, which is
-    true of the shell and wrong about the computer: the user is sitting at a
-    Windows PC, their files are on the Windows disks, and a banner claiming
-    Linux tells them the installer put something else on their machine.
-    """
-    return "Windows (WSL 2)" if is_windows_host() else SYSTEM
+    """Return the terminal host's operating system."""
+    return SYSTEM
 
 
 def _device_name() -> str:
-    """This machine as a short label, e.g. "lin7c-pc (Windows (WSL 2))".
+    """This machine as a short label, e.g. "workstation (Linux)".
 
     Sent with each chat request so the gateway's experience can say which
     device a piece of work happened on. Never raises: a missing hostname just
@@ -237,19 +162,8 @@ def _device_name() -> str:
 
 
 def _initial_ui_preferences_for_host(preferences: dict) -> dict:
-    """Apply host-specific UI defaults without overriding a user choice.
-
-    Mouse reporting remains opt-in on ordinary Linux terminals because it
-    takes over drag-to-select. The private Windows distribution is launched
-    inside a modern Windows terminal where clickable UI is expected, so turn
-    it on there unless the user explicitly saved ``enable_mouse = false``.
-
-    What counts as that distribution is `is_windows_host`.
-    """
-    result = dict(preferences)
-    if "enable_mouse" not in result and is_windows_host():
-        result["enable_mouse"] = True
-    return result
+    """Preserve the user's terminal preferences."""
+    return dict(preferences)
 
 # Capture restart identity before os.chdir() or an in-place update can alter
 # what argv[0] resolves to.  A PATH launch commonly has argv[0] ==
@@ -1604,7 +1518,6 @@ import hooks as hooks_mod        # trusted Python hooks + argv hooks
 import backend_profiles          # backend trust domains + credential isolation
 import model_route               # /model route: backend-served vs. direct provider key
 import trust_store               # workspace trust for executable customization
-import winbridge                 # facts about the Windows side of WSL (no-op elsewhere)
 import usage_tracker             # local AI token/cost accounting (/usage)
 import training_local            # /training local: on-machine interaction capture
 import agent_ui_events           # observable events for full-screen Agents Mode
@@ -2771,85 +2684,11 @@ def _build_connected_subterminal_cmd(terminal_name: str,
     return command
 
 
-def connect_terminal_to_helpwo(agent_registry: "AgentRegistry", session: dict,
-                               quiet: bool = False, name: str = None,
-                               workspace: str = None) -> bool:
-    """CLI side of the two-end handshake with Helpwo.
-
-    Works in BOTH terminals: at depth 0 it links the primary CLI itself
-    (Helpwo needs the linked primary before it can create sub-terminals from
-    its UI); at depth ≥ 1 it hands this sub-terminal over. `name` optionally
-    sets a custom display/terminal name (kept for internal/sub-terminal callers;
-    the user-facing custom name now lives in /name). `workspace` is the absolute
-    folder to SHARE as Helpwo's remote workspace — callers that pass None
-    link without sharing anything; Helpwo only goes remote once a folder is set.
-    Starts heartbeat + message poll so Helpwo can chat / term-new / term-close.
-    """
-    if (get_backend_profile().sends_laintas_credentials
-            and not session.get("userId")):
-        if not quiet:
-            console.print("[red]/helpwo requires login. Run /login first.[/red]")
-        return False
-    is_sub = agent_registry.depth > 0 and not agent_registry.as_environment
-    meta = agent_registry.terminal_meta if is_sub else None
-    current = (meta or {}).get("name") if is_sub else agent_registry.agent_name
-
-    if agent_registry.agent_id:
-        name_same = (not name or name == current)
-        workspace_changed = workspace is not None and workspace != agent_registry.workspace_path
-        if name_same and not workspace_changed:
-            if not quiet:
-                console.print(Panel(
-                    f"[green]Already shared with Helpwo[/green]\n"
-                    f"{'Terminal' if is_sub else 'Session'}: [bold]{current}[/bold]\n"
-                    f"Agent ID: {agent_registry.agent_id}\n\n"
-                    f"[dim]/name renames; /helpwo stop stops sharing.[/dim]",
-                    title="Connected", border_style="green",
-                ))
-            return True
-        # Name or shared workspace changed — reconnect to carry the new values
-        # (previousAgentId resurrects the same agentId, so Helpwo tabs survive).
-        agent_registry.unregister()
-        agent_registry.agent_id = None
-        agent_registry.agent_secret = ""
-
+def connect_terminal_to_helpwo(agent_registry, session: dict, quiet=False, name=None, workspace=None) -> bool:
+    """Bind the session to the local application API."""
     if workspace is not None:
         agent_registry.workspace_path = workspace
-    if name and is_sub and meta is not None:
-        meta["name"] = name
-    reg_name = name or ((meta or {}).get("name") if is_sub else None)
-    ok = agent_registry.register(session, name=reg_name, quiet=True,
-                                 explain=not quiet)
-    if not ok:
-        return False
-    agent_registry.start_heartbeat()
-    agent_registry.start_message_poll(
-        agent_registry._state_cb or (lambda: {}),
-        agent_registry._chat_cb or (lambda: []),
-    )
-    if not quiet:
-        if is_sub:
-            console.print(Panel(
-                f"[green]Sub-terminal handed over to Helpwo[/green]\n"
-                f"Terminal: [bold]{(meta or {}).get('name', agent_registry.agent_name)}[/bold]\n"
-                f"Created by: {(meta or {}).get('createdBy', 'term0')}\n"
-                f"Agent ID: {agent_registry.agent_id}\n"
-                f"Remote terminal: [bold green]available in Helpwo[/bold green]\n\n"
-                f"[dim]Helpwo can now read this terminal, send it input, and close it.\n"
-                f"Run /helpwo stop to withdraw it.[/dim]",
-                title="Connected", border_style="green",
-            ))
-        else:
-            console.print(Panel(
-                f"[green]Shared with Helpwo through this machine's Helpwo kernel[/green]\n"
-                f"Name: [bold]{agent_registry.agent_name}[/bold]\n"
-                f"Agent ID: {agent_registry.agent_id}\n"
-                f"[dim]→ listed in Helpwo's terminals under this machine. The machine's "
-                f"files, terminal and preview come from the kernel.[/dim]\n\n"
-                f"[dim]/helpwo stop stops sharing.[/dim]",
-                title="Connected", border_style="green",
-            ))
-    return True
+    return agent_registry.register(session, name=name, quiet=quiet)
 
 
 def _helpwo_web_app_url() -> Optional[str]:
@@ -3787,6 +3626,9 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         "/account [list|add <alias>|switch <account>|alias <name>|legacy|adopt <session-id>]",
         subcommands=("list", "add", "switch", "alias", "legacy", "adopt"),
         help_text="Accounts keep separate tasks and credentials. Switching saves the current task and restarts into the selected account. Legacy tasks require explicit adoption."),
+    CommandSpec("/private", "Manage private file permissions", "Account & Session",
+        "/private [list|set <path> hidden|no-read|no-write [...]|remove <path>]",
+        subcommands=("list", "set", "remove")),
     CommandSpec(
         "/password", "Open the local password vault", "Account & Session",
         "/password",
@@ -3911,7 +3753,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "Agent/terminal, PageUp/PageDown scrolls, and Esc exits."
         )),
     CommandSpec("/term", "Manage terminals and two-level adoption", "Agents & Terminals", "/term [name|peers|adopt <id> --name <name>|accept <invite>|release [name]|rename <old> <new>]", aliases=("/t",), subcommands=("peers", "adopt", "accept", "release", "rename")),
-    CommandSpec("/helpwo", "Share a session with Helpwo through this machine's Helpwo kernel: its own sub-terminal and agent, listed under this machine in Helpwo; /helpwo stop closes it", "Agents & Terminals", "/helpwo [stop]", subcommands=("stop",)),
+    CommandSpec("/helpwo", "Start the local Helpwo companion in its own sub-terminal; /helpwo stop closes it", "Agents & Terminals", "/helpwo [stop]", subcommands=("stop",)),
     CommandSpec(
         "/app", "Run a registered application in its own sub-terminal with its own agent",
         "Agents & Terminals", "/app [list|start <name>|stop <name>|trust <name>|revoke <name>]",
@@ -4072,20 +3914,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
                 subcommands=("list", "check", "capture", "delete")),
     CommandSpec("/policy", "Show or set security policy", "Config & Tools", "/policy [audit|enforce|disabled [--yes]|reset]", subcommands=("audit", "enforce", "disabled", "reset")),
     CommandSpec("/trust", "Review or change workspace trust", "Config & Tools", "/trust [status|allow|revoke]", subcommands=("status", "allow", "revoke")),
-    CommandSpec(
-        "/windows", "Helpwo Kernel manager: install, update, start and uninstall",
-        "Config & Tools",
-        "/windows [status|check|install [--force]|update [--force]|start [workspace|read|write]|restart [workspace|read|write]|stop|uninstall]",
-        aliases=("/kernel",),
-        subcommands=("status", "check", "install", "update", "start", "restart", "stop", "uninstall", "help"),
-        help_text=(
-            "Open the full-screen Helpwo Kernel manager on Windows / WSL. "
-            "start installs if needed; choose workspace (default), read or write access. "
-            "update checks the latest release, verifies the download, and restores the "
-            "connected session's existing access. If already current, nothing changes. "
-            "install only installs. uninstall stops the kernel and uses its official "
-            "uninstaller, keeping your workspace files. /kernel is an alias."
-        )),
     CommandSpec("/hooks", "Manage executable hooks", "Config & Tools", "/hooks [status|trust|revoke|reload]", subcommands=("status", "trust", "revoke", "reload")),
     CommandSpec("/backend", "Manage backend trust profiles", "Config & Tools", "/backend [status|list|use <name>|config]", subcommands=("status", "list", "use", "config")),
     CommandSpec("/max", "Lift runtime limits for this process", "Config & Tools"),
@@ -4482,13 +4310,6 @@ _ARG_COMPLETIONS: dict[str, tuple] = {
     "/policy": ((("disabled",), _YES_FLAG),),
     "/trust": ((("allow",), _YES_FLAG),),
     "/hooks": ((("trust",), _YES_FLAG),),
-    "/windows": (
-        ((("start", "restart"),), _static_candidates(
-            ("workspace", "Only the kernel workspace"),
-            ("read", "Also see every window and the screen"),
-            ("write", "Also drive applications, keyboard and mouse"))),
-        ((("install", "update"),), _FORCE_FLAG),
-    ),
     "/skill": (
         ((("trust", "revoke"),), _cached_provider("skills", _skill_loader())),
         (("load",), _cached_provider("skills:unloaded", _skill_loader(False))),
@@ -4786,11 +4607,9 @@ class MetaCompleter(Completer):
         Single-flight: one thread scans; the others keep the current list, or
         wait for the first one when there is no list yet.
 
-        On the Windows product the PATH ends with /mnt/<drive> directories
-        whose readdir goes over DrvFs; the menu list is display candidates,
-        not routing, so the interval is widened there.
+        A short cache prevents repeated directory scans for display candidates.
         """
-        _ttl = 300.0 if is_windows_host() else 5.0
+        _ttl = 5.0
         if time.time() - self._cmd_mtime < _ttl and self._cmd_completer is not None:
             return
         if not self._refresh_lock.acquire(blocking=self._cmd_completer is None):
@@ -4808,8 +4627,7 @@ class MetaCompleter(Completer):
 
         The while-typing probe gate asked it on every keystroke: resolve the
         cwd, read the trust file and sha256 the project's executable
-        customizations — on /mnt/<drive> (the Windows product's usual cwd)
-        that is DrvFs I/O per key.
+        customizations, which otherwise adds filesystem I/O per key.
         """
         cwd = os.getcwd()
         now = time.monotonic()
@@ -5245,11 +5063,9 @@ class MetaCompleter(Completer):
             # workspace. An explicit Tab always probes.
             _may_probe = _is_cmd and (_shell_menu_on or _tab)
             if _may_probe and not _tab:
-                # Windows product: no while-typing probe. Each new word forks
-                # a bash that sources bash_completion inside the WSL VM, and
-                # those forks kept running behind the user's own commands.
+                # While-typing shell probes require a trusted workspace.
                 # An explicit Tab still probes.
-                _may_probe = (not is_windows_host()) and self._project_trusted()
+                _may_probe = self._project_trusted()
             _sub = _probe_shell_subcommands(_context) if _may_probe else []
             if _sub:
                 _matching = [w for w in _sub
@@ -7145,7 +6961,8 @@ def _carries_model_key(text: str) -> bool:
 
 def _is_private_command(text: str) -> bool:
     """Lines that must never be written to the history file or debug record."""
-    return _is_password_command(text) or _carries_model_key(text)
+    words = (text or "").split(maxsplit=1)
+    return _is_password_command(text) or bool(words and words[0].lower() == "/private") or _carries_model_key(text)
 
 
 class _PrivateCommandHistory(FileHistory):
@@ -7363,11 +7180,7 @@ import re
 
 # ── Routing lookup cache ────────────────────────────────────────────────
 # shutil.which() and os.path.exists() are the hot path of every input line
-# (routing decision + prose detection + completion menu). On the Windows
-# product the WSL distribution's PATH ends with the Windows directories
-# under /mnt/<drive>, where DrvFs directory scans are an order of magnitude
-# slower than native Linux: a miss (a word that is not a Linux command)
-# walked every Windows PATH dir on every keystroke/line. A short TTL cache
+# (routing decision + prose detection + completion menu). A short TTL cache
 # keeps "newly-installed binaries are picked up" behaviour (seconds, not
 # session lifetime) while making repeated lookups free.
 _LOOKUP_CACHE_TTL = 10.0
@@ -7554,11 +7367,8 @@ def _is_user_facing_command_name(c: str) -> bool:
 def list_path_commands() -> list:
     """Enumerate user-facing commands currently on PATH (for /scan display).
 
-    Names are filtered BEFORE anything is stat'ed. On the Windows product the
-    PATH ends with /mnt/<drive>/... directories where every entry is
-    `foo.exe`/`foo.dll` — all dropped by the "." rule — and a per-entry
-    is_file()+access() over DrvFs cost seconds per scan for nothing. scandir
-    also answers is_file() from d_type without an extra stat where it can.
+    Names are filtered before filesystem metadata checks. scandir can
+    answer is_file() from d_type without an extra stat.
     """
     commands = set()
     for path_dir in os.environ.get("PATH", "").split(os.pathsep):
@@ -8900,28 +8710,8 @@ def generate_cli_prop_template() -> str:
     existing project templates carrying them keep working.
     """
     shell_info = SHELL_NAME
-    # The Windows product is this same Linux CLI inside a private WSL 2
-    # distribution, so the OS line alone tells the model the opposite of what
-    # it needs to know: it reads "Linux" and then works in the user's Windows
-    # home with Win32 binaries on PATH. This block is the standing half of
-    # that correction -- procedure lives in the `wsl-windows` skill. It is
-    # host-constant, so it belongs in the cached prefix rather than the
-    # live-state tail.
-    # Not host_label(): the model needs to be told the shell is Linux, and
-    # the parenthetical does the correcting. The banner is the other way
-    # round -- the user needs to be told the machine is Windows.
     os_line = SYSTEM
     host_note = ""
-    if is_windows_host():
-        os_line = f"{SYSTEM} (private WSL 2 distribution on a Windows host)"
-        host_note = """
-- This shell is real Linux, but the machine is a Windows PC and the user thinks in Windows terms. The working directory normally starts in their Windows home, mounted at `/mnt/<drive>/...`.
-- Paths under `/mnt` are the user's real documents on the Windows disk. Writes there are worth a confirmation, DrvFs is an order of magnitude slower than the Linux filesystem, and inotify never fires -- watch-mode builds and dev-server hot reload silently do not reload there.
-- The distribution holds bash, git, curl, ssh, ripgrep and the standard coreutils, and nothing else: no node, no python, no compilers. `sudo apt-get install` needs no password, persists, and is invisible to Windows and to the user's other distributions.
-- The Windows PATH is appended, so `python`, `node`, `npm` and `git` may resolve to a Windows `.exe`. A Win32 program cannot open a `/mnt/...` path: convert it with `wslpath -w` first, or use the Linux tool instead.
-- `powershell.exe`, `cmd.exe /c`, `wsl.exe` and the Windows management binaries are approval-gated, as are writes outside the working directory. The runtime raises that prompt when you make the call; make it. Routing around the gate is a misuse, and so is stopping in front of it.
-- Opening a URL in the user's browser is handled by the runtime. Do not shell out to PowerShell for it.
-- Load the `wsl-windows` skill before installing a toolchain, running a dev server, moving a project between filesystems, or handing a path to a Windows program."""
 
     return f"""<!-- laintas-managed-prompt:v3 -->
 <role>
@@ -11444,7 +11234,7 @@ class AgentRegistry:
         self.terminal_meta: Optional[dict] = None
         # A nested CLI that exists to BE a runtime environment (the Helpwo
         # app sub-terminal behind /helpwo --remote) rather than a terminal
-        # handed to Helpwo. It registers like a Windows kernel does — a
+        # exposed to the local companion application as a runtime.
         # workspace, no terminal identity, no parent — because Helpwo files
         # anything carrying `terminal` under the terminal dock and keeps it
         # out of the runtime-environment picker.
@@ -11504,22 +11294,6 @@ class AgentRegistry:
         self._pending_approvals: dict[str, tuple[threading.Event, dict]] = {}
         self._active_req_lock = threading.RLock()
 
-        # ── Transport: this machine's Helpwo kernel ─────────────────────
-        # The CLI no longer talks to Helpwo or the gateway's agent API
-        # itself. The kernel registers this session on our behalf, relays
-        # what Helpwo sends, and posts our events back (kernel/clirelay.py);
-        # its own peer connection carries the machine's files, terminal and
-        # this session's browser screen. `_shared` is the user's intent —
-        # it survives the kernel restarting, so the session comes back.
-        self._shared = False
-        # Hooks belong to a particular WindowsHost. /windows stop discards
-        # that host, and /windows start creates another in this same process.
-        self._kernel_hooks_host = None
-        self._kernel_hooks_lock = threading.Lock()
-        # The browser screens last announced to the kernel; None = say again.
-        self._announced_screens: Optional[list] = None
-        self._screens_thread: Optional[threading.Thread] = None
-
     def _new_remote_executor(self):
         return ThreadPoolExecutor(
             max_workers=self.REMOTE_EXECUTOR_THREADS,
@@ -11571,454 +11345,23 @@ class AgentRegistry:
                 self._remote_accepted[group] -= 1
                 self._remote_capacity_lock.notify_all()
 
-    # ── kernel transport ────────────────────────────────────────────────
-
-    #: How long `register` waits for the kernel to dial this session. It
-    #: finds a new session's rendezvous file within about two seconds.
-    KERNEL_WAIT_SECONDS = 8.0
-    #: How long to keep trying to come back after the kernel reconnects.
-    KERNEL_RELINK_SECONDS = 120.0
-
-    @staticmethod
-    def _kernel_link(wait: float = 0.0):
-        """The connected kernel that relays sessions, or None."""
-        if sys.platform == "darwin":
-            return None  # The native Mac beta has no Helpwo Kernel.
-        import windows_host
-        deadline = time.time() + wait
-        while True:
-            host = windows_host.get_host()
-            if host is None and wait:
-                host = windows_host.start_host(primary=_REPL_PROCESS_DEPTH == 0)
-            if host is not None and host.supports("cli-relay"):
-                return host
-            if time.time() >= deadline:
-                return None
-            time.sleep(0.1)
-
-    @staticmethod
-    def _kernel_missing_hint() -> str:
-        if sys.platform == "darwin":
-            return "Helpwo machine sharing is not included in the macOS beta."
-        import windows_host
-        host = windows_host.get_host()
-        if host is not None and host.connected:
-            return ("This machine's Helpwo kernel is too old to share a session. "
-                    "Update it: " + ("/windows update" if winbridge.in_wsl()
-                                     else "re-run the Linux installer from "
-                                          "helpwo.laintas.com → Settings → Runtime "
-                                          "environments") + ".")
-        if winbridge.in_wsl():
-            return "Start it with /windows start, then run /helpwo again."
-        return ("Install and run it (helpwo.laintas.com → Settings → Runtime "
-                "environments → Helpwo Kernel), then run /helpwo again.")
-
-    def _install_kernel_hooks(self, host) -> None:
-        with self._kernel_hooks_lock:
-            if self._kernel_hooks_host is host:
-                return
-            host.set_handler("cli-inputs", self._on_kernel_inputs)
-            host.set_handler("cli-agent", self._on_kernel_agent)
-            host.set_handler("cli-vnc", self._on_kernel_vnc)
-            self._kernel_hooks_host = host
-
-            def on_link(up: bool) -> None:
-                # The discarded host may still finish its disconnect callback
-                # after the replacement connects. Ignore its stale notification.
-                if self._kernel_hooks_host is host:
-                    self._on_kernel_link(up)
-
-            host.add_link_listener(on_link)
-
-    def _on_kernel_link(self, up: bool) -> None:
-        """The kernel restarted or went away: our registration went with it
-        (the kernel unregisters a departing client's sessions). Come back
-        under the same id when it returns, if the user still wants to share."""
-        if not self._shared:
-            return
-        if not up:
-            console.print("[dim]Helpwo kernel disconnected; this session is "
-                          "offline in Helpwo until it returns.[/dim]")
-            return
-        # Own thread: this runs on the link's greeting, and on the Windows
-        # build the machine tools are probed right after it — a registration
-        # retried for up to two minutes must not hold them back.
-        threading.Thread(target=self._relink, name="kernel-relink",
-                         daemon=True).start()
-
-    def _relink(self) -> None:
-        if self._session is None or not self._registration_lock.acquire(blocking=False):
-            return
-        try:
-            # Retried, not tried once: a restarting kernel dials running CLIs
-            # before its own registration is done, and a single refusal then
-            # left this session out of Helpwo for good.
-            delay = 1.0
-            deadline = time.time() + self.KERNEL_RELINK_SECONDS
-            while self._shared and time.time() < deadline:
-                link = self._kernel_link()
-                if link is None:
-                    return   # gone again; the next connection retries
-                if self.register(self._session, self.agent_name or None, quiet=True):
-                    console.print("[dim]Shared with Helpwo again (kernel reconnected).[/dim]")
-                    self.start_heartbeat()
-                    return
-                time.sleep(delay)
-                delay = min(delay * 2, 15.0)
-        finally:
-            self._registration_lock.release()
-
-    def _on_kernel_inputs(self, frame: dict) -> None:
-        if not self.agent_id or str(frame.get("agentId") or "") != self.agent_id:
-            return
-        inputs = frame.get("inputs")
-        if isinstance(inputs, list):
-            self._dispatch_inputs(inputs, self._state_cb, self._chat_cb)
-
-    def _on_kernel_agent(self, frame: dict) -> None:
-        if str(frame.get("previousAgentId") or "") == self.agent_id:
-            self.agent_id = str(frame.get("agentId") or self.agent_id)
-            self._last_agent_id = self.agent_id
-
-    def _on_kernel_vnc(self, frame: dict) -> None:
-        """Say where this session's browser screen is, so the kernel can
-        stream it to Helpwo over its own peer connection."""
-        reply = {"t": "cli-vnc-res", "id": frame.get("id"), "ok": False}
-        name = str(frame.get("name") or "default")
-        try:
-            import browser_session as _bs
-            sess = _bs.get_browser_session(name)
-            if sess is None:
-                # The live-view button always asks for "default" while
-                # browser.open names sessions browser1, browser2, ...
-                sess = _bs.get_latest_browser_session()
-            port = int(getattr(sess, "rfb_port", 0) or 0) if sess is not None else 0
-            if port:
-                reply.update(ok=True, host="127.0.0.1", port=port)
-            else:
-                reply["error"] = f"no browser session '{name}' is showing a screen"
-        except Exception as e:
-            reply["error"] = f"browser registry: {e}"
-        import windows_host
-        host = windows_host.get_host()
-        if host is not None:
-            try:
-                host.send(reply)
-            except Exception:
-                pass
-
-    #: How often the browser screens are looked at while shared.
-    SCREENS_POLL_SECONDS = 2.0
-
-    def _start_screens_watch(self) -> None:
-        """Tell the kernel whenever this session's browser screens change,
-        so Helpwo's screen button lights up as soon as there is one."""
-        self._announced_screens = None      # a new registration hears it all
-        if self._screens_thread is not None and self._screens_thread.is_alive():
-            return
-
-        def watch() -> None:
-            while self._shared:
-                try:
-                    import browser_session as _bs
-                    names = _bs.screen_names()
-                except Exception:
-                    names = []
-                if self.agent_id and names != self._announced_screens:
-                    if self._kernel_send({"t": "cli-screens", "agentId": self.agent_id,
-                                          "screens": names}):
-                        self._announced_screens = names
-                time.sleep(self.SCREENS_POLL_SECONDS)
-
-        self._screens_thread = threading.Thread(target=watch, name="kernel-screens",
-                                                daemon=True)
-        self._screens_thread.start()
-
-    def _kernel_send(self, frame: dict) -> bool:
-        import windows_host
-        host = windows_host.get_host()
-        if host is None:
-            return False
-        if self._shared and self._kernel_hooks_host is not host:
-            # /windows stop discards the old host. The existing heartbeat
-            # keeps running, so its next send attaches the replacement and
-            # its immediate link callback re-registers this shared session.
-            self._install_kernel_hooks(host)
-        if not host.connected:
-            return False
-        try:
-            host.send(frame)
-            return True
-        except Exception:
-            return False
-
-    def _agent_auth_headers(self) -> dict:
-        """Bearer-style CLI credential; never place this secret in a URL."""
-        return {"Authorization": f"Agent {self.agent_secret}"}
-
-    def _recover_registration(self) -> None:
-        """Re-register through the kernel after it lost our session."""
-        if (not self._session
-                or time.time() - self._last_reregister < 10):
-            return
-        if not self._registration_lock.acquire(blocking=False):
-            return
-        try:
-            if time.time() - self._last_reregister < 10:
-                return
-            self._last_reregister = time.time()
-            if self.register(self._session, self.agent_name or None, quiet=True):
-                console.print("[green]Remote agent credentials refreshed.[/green]")
-        finally:
-            self._registration_lock.release()
-
-    def register(self, session: dict, name: str = None, quiet: bool = False,
-                 explain: Optional[bool] = None) -> bool:
-        """Register this CLI as a remote agent with Helpwo backend."""
-        # A disconnect shuts down the old pool; allow a later /helpwo to
-        # create a fresh one on the same registry instance.
-        if self._remote_executor is None:
-            self._remote_executor = self._new_remote_executor()
-        if self._remote_control_executor is None:
-            self._remote_control_executor = ThreadPoolExecutor(
-                max_workers=self.REMOTE_CONTROL_EXECUTOR_THREADS,
-                thread_name_prefix="laintas-remote-control",
-            )
-        self._remote_stopping.clear()
+    def register(self, session: dict, name=None, quiet=False, explain=None) -> bool:
+        """Assign a local identity; no remote registration or discovery."""
         self._session = session
-        hostname = socket.gethostname()
-        cwd = os.getcwd()
-
-        config = load_config()
-        if name:
-            self.agent_name = name
-        else:
-            self.agent_name = config.get("agentName", hostname)
-
-        user_email = session.get("userEmail", "")
-        user_name = session.get("userName", "")
-
-        profile = get_backend_profile()
-        payload = {
-            "name": self.agent_name,
-            "instanceId": self.instance_id,
-            "hostname": hostname,
-            "os": host_label(),
-            "shell": SHELL_NAME,
-            "cwd": cwd,
-            "goal": f"CLI agent '{self.agent_name}' on {hostname} ({host_label()})",
-        }
-        if profile.sends_laintas_credentials:
-            payload["userEmail"] = user_email
-            payload["userName"] = user_name
-        if self.parent_remote_id and not self.as_environment:
-            payload["parentId"] = self.parent_remote_id
-        if self.workspace_path:
-            # The one folder the user opted to share; Helpwo mounts this as the
-            # remote workspace root (file bytes ride P2P, off this server).
-            payload["workspacePath"] = self.workspace_path
-        if self._last_agent_id:
-            # Ask the gateway to resurrect the same agentId so Helpwo tabs
-            # and sub-terminal parent links survive re-registration.
-            payload["previousAgentId"] = self._last_agent_id
-        if self.terminal_meta and not self.as_environment:
-            payload["terminal"] = self.terminal_meta
-            payload["goal"] = (f"Sub-terminal '{self.terminal_meta.get('name', '')}'"
-                               f" on {hostname}")
-
-        # Through this machine's Helpwo kernel, never to the gateway
-        # directly: the kernel registers the session with its own sign-in,
-        # relays Helpwo's messages to us and our events back.
-        # `explain`: say why sharing failed even when success stays quiet —
-        # "not connected" without the reason is what nobody can act on.
-        explain = (not quiet) if explain is None else explain
-        waiting = self._kernel_link() is None
-        if waiting and explain:
-            console.print("[dim]Waiting for this machine's Helpwo kernel…[/dim]")
-        host = self._kernel_link(wait=self.KERNEL_WAIT_SECONDS)
-        if host is None:
-            if explain:
-                console.print(Panel(
-                    "Helpwo reaches this CLI through the Helpwo kernel running on "
-                    "this machine, and none is connected.\n\n"
-                    + self._kernel_missing_hint(),
-                    title="[yellow]Not shared with Helpwo[/yellow]",
-                    border_style="yellow",
-                ))
-            return False
-        self._install_kernel_hooks(host)
-        try:
-            reply = host.request({"t": "cli-register", "payload": payload,
-                                  "userId": str(session.get("userId") or "")},
-                                 timeout=30)
-        except Exception as e:
-            reply = {"ok": False, "error": str(e)}
-        if not reply.get("ok"):
-            if explain:
-                console.print(Panel(
-                    f"{reply.get('error') or 'the kernel refused'}",
-                    title="[yellow]Not shared with Helpwo[/yellow]",
-                    border_style="yellow",
-                ))
-            return False
-        self.agent_id = str(reply.get("agentId") or "")
-        # The gateway credential stays inside the kernel.
+        self.agent_name = name or load_config().get("agentName") or socket.gethostname()
+        self.agent_id = self.agent_id or "local-" + self.instance_id
         self.agent_secret = ""
         self._last_agent_id = self.agent_id
-        self._shared = True
-        try:
-            import contract_notify
-            contract_notify.set_registry(self)
-        except Exception:
-            pass
-        self._start_screens_watch()
-        if not quiet:
-            console.print(Panel(
-                f"[green]Shared with Helpwo through this machine's Helpwo kernel[/green]\n"
-                f"Name: [bold]{self.agent_name}[/bold]\n"
-                f"ID: {self.agent_id}\n"
-                f"Kernel: {reply.get('hostAgentId') or '—'}",
-                title="Agent Registered",
-                border_style="green",
-            ))
         return True
 
     def start_heartbeat(self):
-        """Start heartbeat thread."""
-        if not self.agent_id:
-            return
-        self._running = True
-        if self._heartbeat_thread is None or not self._heartbeat_thread.is_alive():
-            self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
-            self._heartbeat_thread.start()
-        # Start the async event sender alongside heartbeat — _push_events
-        # becomes non-blocking only once this thread is alive.
-        self._start_event_sender()
+        """Local application requests require no network heartbeat."""
+        return None
 
-    def _start_event_sender(self):
-        """Start the background event-sender thread if not already running."""
-        if self._sender_thread is not None and self._sender_thread.is_alive():
-            return
-        self._sender_stop.clear()
-        self._sender_thread = threading.Thread(
-            target=self._event_sender_loop, daemon=True,
-            name="laintas-event-sender",
-        )
-        self._sender_thread.start()
 
-    def _event_sender_loop(self):
-        """Drain _event_q, coalesce up to 50 batches within 200ms, POST once.
 
-        Runs until _sender_stop is set AND the queue is empty, so a graceful
-        shutdown can request the loop drain remaining events before exiting.
-        """
-        while True:
-            try:
-                first = self._event_q.get(timeout=0.5)
-            except queue.Empty:
-                if self._sender_stop.is_set():
-                    return
-                continue
 
-            batch = list(first)
-            deadline = time.time() + 0.1
-            while len(batch) < 50:
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    break
-                try:
-                    more = self._event_q.get(timeout=remaining)
-                    batch.extend(more)
-                except queue.Empty:
-                    break
 
-            try:
-                self._do_post_events(batch)
-            except Exception:
-                # Never let a POST exception kill the sender — that would
-                # silently break every subsequent _push_events call.
-                pass
-
-    def _do_post_events(self, events: list):
-        """Synchronous POST. Called only from the sender thread."""
-        if not self.agent_id or not events:
-            return
-        self._kernel_send({
-            "t": "cli-events",
-            "agentId": self.agent_id,
-            "body": {
-                "events": events,
-                "instanceId": self.instance_id,
-                "state": {
-                    "cwd": os.getcwd(),
-                    "status": "running",
-                    "instanceId": self.instance_id,
-                },
-            },
-        })
-
-    def _flush_events(self, timeout: float = 2.0):
-        """Block until the sender drains _event_q, capped at timeout seconds."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if self._event_q.empty():
-                return
-            time.sleep(0.05)
-
-    def _heartbeat_loop(self):
-        """Send heartbeat every HEARTBEAT_INTERVAL seconds with extended state."""
-        # Try to import psutil for metrics (optional dependency)
-        try:
-            import psutil as _psutil_mod
-            _has_psutil = True
-        except ImportError:
-            _has_psutil = False
-
-        while self._running and self.agent_id:
-            try:
-                payload = {
-                    "agentId": self.agent_id,
-                    "instanceId": self.instance_id,
-                    "cwd": os.getcwd(),
-                    "shell": SHELL_NAME,
-                }
-
-                # Running terminals snapshot
-                terminals = get_all_terminals()
-                running_terms = []
-                for t in terminals:
-                    running_terms.append({
-                        "name": t.name,
-                        "alive": bool(t.session.is_alive()) if t.session else False,
-                        "cmd": t.command[:120],
-                    })
-                payload["runningTerminals"] = running_terms
-
-                # System metrics
-                if _has_psutil:
-                    try:
-                        load = _psutil_mod.getloadavg()
-                        mem = _psutil_mod.virtual_memory()
-                        disk = _psutil_mod.disk_usage(os.getcwd())
-                        payload["metrics"] = {
-                            "loadAvg": [round(load[0], 2), round(load[1], 2), round(load[2], 2)],
-                            "memFreeMB": round(mem.available / (1024 * 1024), 1),
-                            "memTotalMB": round(mem.total / (1024 * 1024), 1),
-                            "diskFreeGB": round(disk.free / (1024**3), 1),
-                        }
-                    except Exception:
-                        pass
-
-                beat_ok = self._kernel_send({"t": "cli-heartbeat",
-                                             "agentId": self.agent_id,
-                                             "payload": payload})
-            except Exception:
-                beat_ok = False  # heartbeat failures are silent
-
-            # A failed beat retries quickly so one transient error can't
-            # open a heartbeat gap big enough to look offline to Helpwo.
-            time.sleep(5.0 if not beat_ok
-                       else float(get_runtime_config("heartbeat_interval")))
 
     def start_message_poll(self, agent_state_cb, chat_history_cb):
         """Start background thread to poll for incoming messages from Helpwo UI.
@@ -12029,8 +11372,7 @@ class AgentRegistry:
         """
         if not self.agent_id:
             return
-        # The kernel pushes Helpwo's messages to us (cli-inputs); there is
-        # nothing to poll. Keep the callbacks for the dispatcher.
+        # The local companion submits messages through its authenticated API.
         self._state_cb = agent_state_cb
         self._chat_cb = chat_history_cb
         if not self._listening:
@@ -12091,18 +11433,7 @@ class AgentRegistry:
                 kind = "chat"
                 payload = {"message": msg.get("content", "")}
 
-            if kind == "term-rpc":
-                import terminal_link
-                if not msg.get("_termRpc"):
-                    raise terminal_link.LinkError("Terminal RPC must originate from the authenticated gateway route")
-                if float(payload.get("deadline", 0)) < time.time():
-                    result = {"ok": False, "error": "Terminal RPC expired before dispatch"}
-                else:
-                    result = terminal_link.get_service().dispatch(payload.get("source"), payload.get("user_id"),
-                        payload.get("operation"), payload.get("args"))
-                self._kernel_hooks_host.send({"t": "cli-term-reply", "agentId": self.agent_id,
-                    "rpcId": payload.get("rpcId"), "sourceId": payload.get("sourceId"), "result": result})
-            elif kind == "exec":
+            if kind == "exec":
                 self._handle_exec(req_id, payload)
             elif kind == "query":
                 self._handle_query(req_id, payload)
@@ -12132,16 +11463,6 @@ class AgentRegistry:
                 self._handle_abort(req_id, payload)
             elif kind == "approval-response":
                 self._handle_approval_response(req_id, payload)
-            elif kind == "rtc-offer":
-                # This session is not a peer-to-peer host any more: the
-                # machine's kernel is, and it carries this session's screen
-                # too. Answer rather than ignore, so the browser does not wait
-                # out a timeout on a connection nobody will make.
-                self._push(req_id, "rtc-error", "", {
-                    "error": "this laintas_cli session is reached through its "
-                             "machine's Helpwo kernel; connect to the kernel"})
-            elif kind in ("rtc-ice", "rtc-close"):
-                pass
             else:
                 self._push_final(req_id, "fail", f"unknown kind '{kind}'")
         except Exception as e:
@@ -12831,12 +12152,7 @@ class AgentRegistry:
         policy approval paths.
         """
         if not self.agent_secret:
-            # Shared through the kernel: the gateway credential this relay
-            # would dial with stays inside the kernel, and the kernel's own
-            # terminal is how Helpwo opens a shell on this machine.
-            self._push_final(req_id, "fail",
-                             "open a terminal on this machine through its Helpwo "
-                             "kernel (Runtime environments)")
+            self._push_final(req_id, "fail", "Remote terminal relay is unavailable in local companion mode")
             return
         if get_runtime_config("disable_remote_terminal"):
             console.print("[yellow]Remote terminal request ignored (disable_remote_terminal is set).[/yellow]")
@@ -13323,36 +12639,9 @@ class AgentRegistry:
         return response_dict.get("decision", "reject")
 
 
-    def _push_events(self, events: list, req_id: str = None):
-        """Enqueue events for the background sender to POST.
-
-        Non-blocking: returns immediately after enqueueing. The background
-        _event_sender_loop coalesces batches and does the actual HTTP. If
-        the queue is full (>10000 batches buffered), drop the oldest batch.
-
-        If req_id is given, every event missing 'reqId' gets it injected,
-        and every event missing 'meta' gets an empty dict. Events that
-        already carry their own reqId/meta are left alone.
-        """
-        if not self.agent_id or not events:
-            return
-        if req_id:
-            for ev in events:
-                ev.setdefault("reqId", req_id)
-                ev.setdefault("meta", {})
-        try:
-            self._event_q.put_nowait(events)
-        except queue.Full:
-            # Drop oldest to make room — recovering connectivity matters more
-            # than preserving stale telemetry.
-            try:
-                self._event_q.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                self._event_q.put_nowait(events)
-            except queue.Full:
-                pass
+    def _push_events(self, req_id: str, events: list):
+        """The local application server installs its event sink on this method."""
+        return None
 
     # ── Per-request push helpers (HelpwoAI protocol) ─────────────────────
     def _push(self, req_id: str, type_: str, content: str = "", meta: dict = None):
@@ -13376,46 +12665,25 @@ class AgentRegistry:
         )
 
     def unregister(self):
-        """Unregister agent on exit. Drains the event queue first so in-flight
-        finals/outputs make it to the backend before the process exits.
-        """
+        """Cancel local requests and close this registry's owned executors."""
         self._running = False
         self._listening = False
         self._remote_stopping.set()
+        with self._active_req_lock:
+            for abort in self._active_requests.values():
+                abort.set()
+            for event, decision in self._pending_approvals.values():
+                decision["decision"] = "deny"
+                event.set()
         with self._remote_capacity_lock:
             self._remote_capacity_lock.notify_all()
-        if self._remote_executor is not None:
-            self._remote_executor.shutdown(wait=False, cancel_futures=True)
-            self._remote_executor = None
-        if self._remote_control_executor is not None:
-            self._remote_control_executor.shutdown(wait=False, cancel_futures=True)
-            self._remote_control_executor = None
         self._close_remote_terminals()
-
-        # Flush queued events (≤2s) then stop the sender thread so the
-        # final unregister POST is the last thing we do.
-        if self._sender_thread is not None and self._sender_thread.is_alive():
-            self._flush_events(timeout=2.0)
-            self._sender_stop.set()
-            try:
-                self._sender_thread.join(timeout=1.0)
-            except RuntimeError:
-                pass
-
-        self._shared = False
-        if not self.agent_id:
-            return
-
-        import windows_host
-        host = windows_host.get_host()
-        if host is not None and host.connected:
-            try:
-                host.request({"t": "cli-unregister", "agentId": self.agent_id},
-                             timeout=5)
-            except Exception:
-                pass
+        for name in ("_remote_executor", "_remote_control_executor"):
+            pool = getattr(self, name, None)
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
+                setattr(self, name, None)
         self.agent_id = None
-        self.agent_secret = ""
 
 
 # ── Debug Display ───────────────────────────────────────────────────────
@@ -14243,6 +13511,9 @@ _EXTRA_CMD_FAILED = object()
 def _load_extra_commands():
     """Load .laintas/commands.py and return handle_extra_command() if defined."""
     global _extra_cmd_handler_cache, _extra_cmd_mtime_cache
+    import private_files
+    if private_files.execution_error():
+        return None
     path = paths.project_file(paths.CWD_COMMANDS)
     try:
         mtime = path.stat().st_mtime
@@ -14475,7 +13746,7 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
         (name,): _arg_rule(0, name)
         for name in (
             "/cwd", "/fg", "/scan", "/login", "/max",
-            "/tools", "/snapshots", "/continue", "/password",
+            "/tools", "/snapshots", "/continue", "/password", "/private",
         )
     },
     # /prop takes `sys` and/or a conversation number; prop_ui.parse_target
@@ -14522,7 +13793,7 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     # its rule is deliberately looser than its siblings'.
     ("/training", "local"): _arg_rule(
         3, "/training local [status|on|off|purge|export <file>]"),
-    ("/helpwo",): _arg_rule(1, "/helpwo [stop]"),
+    ("/helpwo",): _arg_rule(1, "/helpwo [stop]", flag_start=0, allowed_flags=("stop",)),
     ("/helpwo", "stop"): _arg_rule(1, "/helpwo stop"),
     ("/app",): _arg_rule(2, "/app [list|start <name>|stop <name>|trust <name>|revoke <name>]"),
     ("/app", "list"): _arg_rule(1, "/app list"),
@@ -14549,19 +13820,6 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/shared", "rename"): _arg_rule(3, "/shared mv <from> <to>"),
     ("/shared", "copy"): _arg_rule(3, "/shared cp <from> <to>"),
     ("/shared", "help"): _arg_rule(1, "/shared help"),
-    ("/windows", "status"): _arg_rule(1, "/windows status"),
-    ("/windows", "stop"): _arg_rule(1, "/windows stop"),
-    ("/windows", "start"): _arg_rule(2, "/windows start [workspace|read|write]"),
-    ("/windows", "restart"): _arg_rule(2, "/windows restart [workspace|read|write]"),
-    ("/windows", "check"): _arg_rule(1, "/windows check"),
-    ("/windows", "uninstall"): _arg_rule(1, "/windows uninstall"),
-    ("/windows", "help"): _arg_rule(1, "/windows help"),
-    ("/windows", "update"): _arg_rule(
-        2, "/windows update [--force]", flag_start=1,
-        allowed_flags=("--force", "-f")),
-    ("/windows", "install"): _arg_rule(
-        2, "/windows install [--force]", flag_start=1,
-        allowed_flags=("--force", "-f")),
     ("/web", "status"): _arg_rule(1, "/web status"),
     ("/web", "engines"): _arg_rule(2, "/web engines [init]"),
     ("/web", "test"): _arg_rule(2, "/web test [engine]"),
@@ -15018,6 +14276,11 @@ _PROP_REQUIRED_SECTIONS = ("role", "environment", "tools", "workflow", "safety")
 
 def _load_project_memory_entries() -> tuple[list[dict], list[str], str]:
     path = paths.project_file(paths.CWD_MEMORY)
+    import private_files
+    try:
+        private_files.check(path, 'read')
+    except private_files.PrivateFileError:
+        return [], [], ''
     raw = read_file(str(path)) or ""
     if not raw.strip():
         return [], [], raw
@@ -15188,6 +14451,7 @@ def _legacy_prompt_opt_section() -> str:
 def _render_prop_effective(prop: str, redact: bool = True,
                            prompt_section: Optional[str] = None) -> str:
     import durable_rules
+    import private_files
     import memory_system
     import plan_mode
     import workflow_engine
@@ -15218,7 +14482,7 @@ def _render_prop_effective(prop: str, redact: bool = True,
                       if prompt_section is None else prompt_section),
         "agentName": current.name if current else "Laintas CLI",
         "agentId": current.id if current else "unknown",
-        "currentPath": os.getcwd(),
+        "currentPath": private_files.public_path(os.getcwd()),
         "activeFile": "None",
         "depth": str(current.depth if current else 0),
         "nextDepth": str((current.depth if current else 0) + 1),
@@ -16818,8 +16082,6 @@ def _restart_into_account(user_id: str, agent_registry=None, *, returning=True,
             _get_mcp_mod().get_manager().shutdown()
         except Exception:
             pass
-        import windows_host
-        windows_host.stop_host()
         import peer_coordination
         peer_coordination.release_all_leases()
         peer_coordination.get_coord().unregister()
@@ -18694,210 +17956,16 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
     return False
 
 
-def _kernel_status_text(state: dict) -> str:
-    if not state["wsl"]:
-        return "Helpwo Kernel here manages the Windows helper. Use it from Windows / WSL."
-    connected = state.get("connected")
-    running = state.get("processRunning")
-    state_label = ("Connected" if connected else "Running · waiting for connection"
-                   if running else "Stopped" if state.get("installed") else "Not installed")
-    tiers = state.get("tiers") or {}
-    access = ("Desktop control" if tiers.get("machineWrite") else
-              "Desktop read-only" if tiers.get("machineRead") else "Workspace only")
-    lines = [f"Status     {state_label}",
-             f"Version    {state.get('version') or '—'}",
-             f"Access     {access if connected else 'Not connected'}"]
-    if state.get("path"):
-        lines.append(f"Installed  {state['path']}")
-    if connected:
-        lines.append(f"Tools      {len(state.get('tools') or [])} available")
-    elif running:
-        lines += ["", "Finish signing in in the kernel window, then refresh here."]
-    else:
-        lines += ["", "Start: /windows start · /windows start read · /windows start write"]
-    lines += ["", "Update: /windows update     Remove: /windows uninstall"]
-    return "\n".join(lines)
 
 
-def _kernel_progress(done: int, total: int) -> None:
-    # Called through the throttled wrapper in _kernel_action.
-    label = f"{done * 100 // total}%" if total else f"{done // 1048576} MB"
-    console.print(Text(f"Downloading Helpwo Kernel… {label}", style="dim"))
 
 
-def _kernel_action(sub: str, args: list) -> str:
-    """Run one deliberate operation; returns feedback shared by CLI and manager."""
-    import windows_kernel as kernel
-    import windows_host
-    import windows_tools
-
-    last = [-1]
-    def progress(done, total):
-        step = done * 10 // total if total else done // (5 * 1048576)
-        if step > last[0]:
-            last[0] = step
-            _kernel_progress(done, total)
-
-    if sub == "check":
-        console.print("[dim]Checking for a kernel update…[/dim]")
-        release = kernel.latest()
-        have = kernel.installed_version()
-        if not have:
-            return f"Latest: v{release.version}. Run /windows update to install."
-        if tuple(map(int, have.split('.'))) >= tuple(map(int, release.version.split('.'))):
-            return f"Installed v{have}; latest v{release.version}. No update needed."
-        return f"Update available: v{have} → v{release.version}. Run /windows update."
-    if sub in ("install", "update"):
-        console.print("[dim]Checking for a kernel update…[/dim]")
-        action = kernel.update if sub == "update" else kernel.install
-        result = action(progress=progress, force=bool(args))
-        if result["action"] == "kept":
-            return f"Already up to date (v{result['version']}). Nothing changed."
-        message = f"{result['action'].title()} Helpwo Kernel v{result['version']}."
-        if result.get("restarted"):
-            message += f" Restarted with the same {result['tier']} access; reconnecting."
-        elif result.get("restartNeeded"):
-            message += " It is stopped. Choose access with /windows start [read|write]."
-        else:
-            message += " Ready to start: /windows start [read|write]."
-        if result.get("warning"):
-            message += "\n" + result["warning"]
-        return message
-    if sub in ("start", "restart"):
-        tier = (args[0].lower() if args else
-                (kernel._connected_tier() or "workspace") if sub == "restart" else "workspace")
-        tier = {"--read": "read", "-r": "read", "--write": "write", "-w": "write"}.get(tier, tier)
-        console.print("[dim]Preparing Helpwo Kernel…[/dim]")
-        result = kernel.ensure_started(tier, restart=sub == "restart", progress=progress)
-        if result["action"] == "running":
-            return f"Already connected with {tier} access."
-        return (f"Started with {tier} access in its own Windows window.\n"
-                "Finish signing in there if asked; connection is automatic. "
-                "Closing that window stops access.")
-    if sub == "stop":
-        stopped = kernel.stop()
-        windows_host.stop_host()
-        windows_tools.unregister()
-        return "Stopped. Start again with /windows start." if stopped else "Already stopped."
-    if sub == "uninstall":
-        console.print("[dim]Stopping and uninstalling Helpwo Kernel…[/dim]")
-        result = kernel.uninstall()
-        return ("Already uninstalled." if result["action"] == "absent" else
-                "Helpwo Kernel uninstalled. Your workspace files were kept. "
-                "Use /windows start to install and start again.")
-    raise kernel.KernelInstallError(f"Unknown action: {sub}. Run /windows help.")
 
 
-class _KernelBrowser(resource_ui.ResourceBrowser):
-    def __init__(self, *, feedback="", **kwargs):
-        self.feedback = feedback
-        super().__init__(**kwargs)
-
-    def _pre_run(self):
-        super()._pre_run()
-        self.status = self.feedback or self.status
-
-    def _move_selection(self, delta):
-        self.status = ""
-        super()._move_selection(delta)
 
 
-def _kernel_manager() -> None:
-    """Shared full-screen UI: actions on the left, state and effects on the right."""
-    import windows_kernel as kernel
-    feedback = ""
-    selected = "start"
-    while True:
-        state = kernel.status()
-        summary = _kernel_status_text(state)
-        entries = [
-            ("start", "Start · workspace only", "Install if needed; access only the kernel workspace.", ["start"]),
-            ("read", "Start · desktop read-only", "See Windows applications and the screen; no keyboard or mouse control.", ["start", "read"]),
-            ("write", "Start · desktop control", "Control Windows applications, keyboard and mouse.", ["start", "write"]),
-            ("update", "Update" if state["installed"] else "Install", "Download only when needed. Updates restore connected access; a fresh install stays stopped.", ["update"]),
-            ("check", "Check for updates", "Show the latest version without installing anything.", ["check"]),
-        ]
-        if state["installed"]:
-            entries += [
-                ("restart", "Restart", "Restart with the connected access level; otherwise workspace only.", ["restart"]),
-                ("stop", "Stop", "Disconnect and close the kernel. Keep it installed.", ["stop"]),
-                ("uninstall", "Uninstall", "Stop and remove the kernel and its saved sign-in. Keep workspace files.", ["uninstall"]),
-            ]
-        items = [resource_ui.UIItem(
-            key=key, title=title, subtitle=description, payload=command,
-            badge="REMOVE" if key == "uninstall" else "")
-            for key, title, description, command in entries]
-        def detail(item):
-            return resource_ui.UIDetail.text(
-                item.title, summary + "\n\n" + item.subtitle + "\n\n"
-                + "Command: /windows " + " ".join(item.payload)
-                + ("\n\n" + feedback if feedback else ""))
-        label = ("Connected" if state["connected"] else "Connecting" if state["processRunning"]
-                 else "Stopped" if state["installed"] else "Not installed")
-        browser = _KernelBrowser(
-            title=f"Helpwo Kernel · {label} · {state.get('version') or '—'}",
-            feedback=feedback, load_items=lambda: items, load_detail=detail,
-            primary_action="execute", primary_label="Run", searchable=False,
-            initial_key=selected, pane_labels=("ACTIONS", "STATUS & DETAILS"),
-            actions=[resource_ui.UIAction("r", "refresh", "Refresh", allow_empty=True),
-                     resource_ui.UIAction("i", "info", "Details", lambda item:
-                                          resource_ui.UIActionResult(detail=detail(item)))],
-            refresh_interval=0)
-        outcome = browser.run()
-        if outcome.action == "cancel":
-            return
-        if outcome.action == "refresh":
-            continue
-        if outcome.action != "execute" or outcome.item is None:
-            continue
-        selected = outcome.item.key
-        command = outcome.item.payload
-        try:
-            feedback = _kernel_action(command[0], command[1:])
-        except kernel.KernelInstallError as exc:
-            feedback = str(exc)
-        console.print(Text(feedback))
 
 
-def _cmd_windows(parts: list) -> None:
-    """/windows manages the Helpwo Kernel; /kernel is an alias."""
-    import windows_kernel as kernel
-    sub = parts[1].lower() if len(parts) > 1 else ""
-    args = parts[2:]
-    usage = ("/windows — open the manager\n"
-             "/windows start [workspace|read|write] — install if needed and start\n"
-             "/windows update [--force] — update and restore connected access\n"
-             "/windows uninstall — stop and remove; keep workspace files\n"
-             "/windows restart [workspace|read|write] · stop · status · check\n"
-             "/windows install [--force] — install without starting\n"
-             "/kernel is an alias of /windows.")
-    if sub in ("help", "--help", "-h"):
-        console.print(Text(usage))
-        return
-    valid = {"", "status", "check", "install", "update", "start", "restart", "stop", "uninstall"}
-    if sub not in valid or (args and sub not in {"install", "update", "start", "restart"}):
-        console.print(Text(usage, style="yellow"))
-        return
-    if sub in {"install", "update"} and (len(args) > 1 or any(a not in {"--force", "-f"} for a in args)):
-        console.print(Text(usage, style="yellow"))
-        return
-    if sub in {"start", "restart"} and (len(args) > 1 or any(a.lower() not in {"workspace", "read", "write", "--read", "-r", "--write", "-w"} for a in args)):
-        console.print(Text(usage, style="yellow"))
-        return
-    if not winbridge.in_wsl():
-        console.print(Text("Helpwo Kernel management here requires Windows / WSL."))
-        return
-    try:
-        if not sub and sys.stdin.isatty():
-            _kernel_manager()
-        elif sub in ("", "status"):
-            console.print(Text(_kernel_status_text(kernel.status())))
-        else:
-            console.print(Text(_kernel_action(sub, args)))
-    except kernel.KernelInstallError as exc:
-        console.print(Text(f"Kernel: {exc}", style="red"))
-    except (OSError, subprocess.SubprocessError) as exc:
-        console.print(Text(f"Kernel operation failed: {exc}. Run /windows status.", style="red"))
 
 
 def _cmd_trust(parts: list) -> None:
@@ -23379,83 +22447,28 @@ def _hosts_helpwo_here() -> bool:
     return _REPL_PROCESS_DEPTH > 0 or _HOSTED_APP.get("name") == app_host.HELPWO_APP
 
 
-def _parse_helpwo_flags(parts: list) -> Optional[dict]:
-    """/helpwo flags → options, or None after saying what was wrong.
-
-    laintas_cli no longer serves Helpwo itself or registers with it: Helpwo
-    reaches this machine through its Helpwo kernel, and /helpwo shares a
-    session through that kernel. The local-server flags are refused with the
-    reason rather than as unknown, since people have them in muscle memory;
-    `--remote` is what /helpwo now always does, so it is accepted and ignored.
-    """
-    opts = {"remote": True}
-    for arg in parts[1:]:
-        if arg == "--remote":
-            continue
-        if arg in ("--port", "--host", "--dist"):
-            console.print(
-                f"[yellow]{escape(arg)} is gone: laintas_cli no longer serves "
-                f"Helpwo locally. Helpwo reaches this machine through its Helpwo "
-                f"kernel, and /helpwo shares a session through it.[/yellow]")
-            return None
-        if arg.startswith("--"):
-            console.print(f"[red]Unknown option: {escape(arg)}[/red]")
-        else:
-            # Refused rather than ignored: "/helpwo stpo" used to start the
-            # gateway it was meant to stop.
-            console.print(f"[red]Unexpected argument: {escape(arg)}[/red]")
-        console.print(_HELPWO_USAGE)
+def _parse_helpwo_flags(parts: list):
+    """Parse local companion application options."""
+    if len(parts) > 1:
+        console.print("[yellow]Unexpected argument. Usage: /helpwo [stop][/yellow]")
         return None
-    return opts
+    return {"remote": False}
 
 
-def _helpwo_start_in_process(opts: dict, agent_registry: AgentRegistry,
-                             session: dict, *, state: Optional[dict] = None,
-                             state_dir=None, open_browser: bool = True) -> dict:
-    """Share THIS session with Helpwo through the machine's Helpwo kernel.
-
-    This is what runs inside the Helpwo sub-terminal. The kernel registers
-    the session with its own sign-in and relays Helpwo's messages; the
-    session appears in Helpwo's terminal list under this machine. With
-    ``state`` (from app_host) the session asks for the agent id it had last
-    time, so Helpwo's tabs and conversations for it carry over.
-
-    Record: {"status": "ready"|"error", "mode", "url", "open_url", "message"}.
-    """
-    url = _helpwo_web_app_url()
-    if state and state.get("persistent") and not agent_registry.agent_id:
-        agent_registry._last_agent_id = str(state.get("remote_agent_id") or "")
-    linked = connect_terminal_to_helpwo(agent_registry, session, quiet=False)
-    if linked and state_dir is not None and state and state.get("persistent"):
-        app_host.update_state(state_dir, remote_agent_id=agent_registry.agent_id or "")
-    if not linked:
-        return {"status": "error", "mode": "kernel", "url": url, "open_url": url,
-                "linked": False,
-                "message": "not shared: this machine's Helpwo kernel is not "
-                           "connected, or refused (see the sub-terminal)"}
-    if open_browser and url:
-        console.print(f"[dim]Opening {url}[/dim]")
-        try:
-            _open_external_url(url)
-        except Exception:
-            pass
-    return {"status": "ready", "mode": "kernel", "url": url, "open_url": url,
-            "linked": True, "message": "shared through the Helpwo kernel"}
+def _helpwo_start_in_process(opts, agent_registry, session, *, state=None, state_dir=None, open_browser=True):
+    """Start the existing local companion API without a machine kernel."""
+    import helpwo_server
+    ok, message = helpwo_server.start_server(agent_registry, session=session,
+        agent_id=str((state or {}).get("local_agent_id") or "") or None)
+    url = helpwo_server.get_url(with_token=True) if ok else ""
+    if ok and open_browser:
+        _open_external_url(url)
+    return {"status": "ready" if ok else "error", "mode": "local",
+            "url": url, "open_url": url, "linked": ok, "message": message}
 
 
 def _can_open_graphical_browser() -> bool:
-    """Whether opening a URL would show a window rather than take the terminal.
-
-    Without a display, webbrowser falls back to lynx/w3m, which run in the
-    foreground of this very terminal. Called from the background thread that
-    reports an app's readiness, that browser and the REPL fight over the tty
-    and the next thing the user types is eaten by the browser.
-    """
-    if sys.platform in ("darwin", "win32"):
-        return True
-    if os.environ.get("WSL_INTEROP") or os.environ.get("WSL_DISTRO_NAME"):
-        return True
-    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    return sys.platform == "darwin" or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
 def _app_label(app: str) -> str:
@@ -24011,20 +23024,7 @@ def _app_session_start_in_process(name: str, options: dict,
 
 def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
                 session: dict) -> None:
-    """Share a session with Helpwo through this machine's Helpwo kernel.
-
-    /helpwo       - share (from the main terminal: in the Helpwo sub-terminal)
-    /helpwo stop  - stop sharing / close the Helpwo sub-terminal
-
-    From the main terminal this creates the sub-terminal ``helpwo``: a nested
-    CLI whose agent serves only Helpwo, so Helpwo's conversation is never this
-    terminal's. The agent id it had is kept per folder, so a restart comes
-    back as the same session in Helpwo.
-
-    laintas_cli never talks to Helpwo itself: the kernel registers the
-    session and relays it (kernel/clirelay.py in the kernel repository).
-    Inside a sub-terminal, /helpwo shares that sub-terminal in place.
-    """
+    """Start or stop the local Helpwo companion in its own sub-terminal."""
     import helpwo_server
 
     hosts_here = _hosts_helpwo_here()
@@ -24033,12 +23033,12 @@ def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
     if len(parts) >= 2 and parts[1].lower() == "stop":
         stopped_any = False
         if not hosts_here and _close_app_subterminal(app_host.HELPWO_APP):
-            console.print("[yellow]Helpwo sub-terminal closed (its agent and gateway "
+            console.print("[yellow]Helpwo sub-terminal closed (its agent and local API "
                           "with it).[/yellow]")
             stopped_any = True
         if helpwo_server.is_running():
             helpwo_server.stop_server()
-            console.print("[yellow]Helpwo gateway stopped.[/yellow]")
+            console.print("[yellow]Helpwo local API stopped.[/yellow]")
             stopped_any = True
         if agent_registry is not None and agent_registry.agent_id:
             _disconnect_from_helpwo(agent_registry)
@@ -24183,12 +23183,6 @@ def _cmd_term(parts: list, agent_registry: AgentRegistry, interactive_session) -
                 console.print(escape("This terminal: " + service.transport.ref))
                 for peer in service.transport.peers(all_accounts=True):
                     console.print(escape(f"{peer['ref']} · account {peer.get('user_id') or 'local'} · pid {peer['pid']}"))
-                if agent_registry and agent_registry.agent_id and agent_registry._kernel_hooks_host:
-                    response = agent_registry._kernel_hooks_host.request({"t": "cli-term-peers", "agentId": agent_registry.agent_id}, timeout=12)
-                    if not response.get("ok"):
-                        raise terminal_link.LinkError(response.get("error") or "Kernel does not support remote terminal discovery")
-                    for peer in response.get("peers", []):
-                        console.print(escape(f"remote:{peer['id']} · {peer.get('name', '')} · {peer.get('hostname', '')}"))
             elif action == "adopt" and len(parts) == 5 and parts[3] == "--name":
                 owner = get_current_agent()
                 invitation = service.adopt(parts[2], parts[4], owner.id if owner else "")
@@ -26569,6 +25563,10 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
     elif action == "/account":
         return _cmd_account(parts, session, agent_registry)
 
+    elif action == "/private":
+        import private_files
+        private_files.handle_command(parts[1:])
+
     elif action == "/password":
         # Local interactive vault UI. Never takes secret arguments; all
         # secrets are read from /dev/tty inside the UI so they cannot become
@@ -26616,9 +25614,6 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
 
     elif action == "/mode":
         return _cmd_mode(raw_args, parts)
-
-    elif action in ("/windows", "/kernel"):
-        _cmd_windows(parts)
 
     elif action == "/trust":
         _cmd_trust(parts)
@@ -29576,36 +28571,6 @@ def main():
                     action="" if _checkout else "/v update", level="good")
         except Exception:
             pass
-    # Wait for this machine's Helpwo kernel. The kernel dials us; through
-    # it this session can be shared with Helpwo (/helpwo), and on the Windows
-    # build `win.*` tools appear when it arrives and disappear when it goes.
-    # Never blocks startup and never raises.
-    if sys.platform != "darwin":
-        try:
-            import windows_host as _windows_host
-            _windows_host.start_host(primary=args.depth == 0)
-        except Exception:
-            pass
-
-    # Say once, on the Windows build, that the machine is reachable and how.
-    # Not a background download: 63 MB and an installer are a decision, and
-    # the tier it later runs with is a bigger one.
-    if args.depth == 0:
-        try:
-            import winbridge as _winbridge
-            if _winbridge.in_wsl():
-                import windows_kernel as _windows_kernel
-                if _windows_kernel.kernel_exe() is None:
-                    startup_mail.post(
-                        "windows",
-                        "This CLI can drive Windows itself",
-                        "Reading windows, clicking buttons and taking "
-                        "screenshots need a small helper on the Windows "
-                        "side. Open /windows to choose access and get started.",
-                        action="/windows", level="info")
-        except Exception:
-            pass
-
     # Register as remote agent (only if authenticated)
     agent_registry = AgentRegistry()
     _session_start_cwd = os.getcwd()
@@ -29781,8 +28746,7 @@ def main():
             # Helpwo only when the user runs /helpwo here.
             startup_mail.post(
                 "helpwo", "Not connected to Helpwo",
-                "Share a session with Helpwo through this machine's Helpwo "
-                "kernel.",
+                "Start the local Helpwo companion with /helpwo.",
                 action="/helpwo")
         else:
             startup_mail.post(
@@ -30170,12 +29134,6 @@ def main():
         browser_mod.close_all_browser_sessions()
         try:
             _get_mcp_mod().get_manager().shutdown()
-        except Exception:
-            pass
-        try:
-            mgr = getattr(agent_registry, "_webrtc", None)
-            if mgr and mgr is not False and hasattr(mgr, "close"):
-                mgr.close()
         except Exception:
             pass
         nonlocal interactive_session
@@ -30696,6 +29654,11 @@ def main():
             and os.access(_first_word, os.X_OK))
         if (_gate_stripped.startswith("/") and not _is_dialogue
                 and not _is_abs_path_cmd):
+            if _is_injected_line and _first_word.lower() == "/private":
+                console.print("[yellow]/private is only available from the local owner terminal.[/yellow]")
+                if injected_done is not None:
+                    injected_done.set()
+                continue
             if (_is_injected_line
                     and _is_password_command(user_input)):
                 console.print("[yellow]/password can only be opened from the "
@@ -31279,6 +30242,10 @@ def main():
         if injected_done is not None:
             injected_done.set()
 
+
+# Bind the generic engine to this terminal host after definitions exist.
+import runtime_host
+runtime_host.bind(sys.modules[__name__])
 
 if __name__ == "__main__":
     # Final safety net for cancellation paths that occur below an interactive

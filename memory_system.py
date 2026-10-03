@@ -27,6 +27,7 @@ from typing import Optional
 
 
 import paths
+import private_files
 
 try:
     import mem_signals   # Memory salience/recall weak-label capture (capability #4)
@@ -105,24 +106,10 @@ class _UsageLock:
 
     def __enter__(self):
         try:
-            import os as _os
             MEMORY_DIR.mkdir(parents=True, exist_ok=True)
             self._fh = open(usage_file().with_suffix(".lock"), "a+")
-            if _os.name == "nt":
-                # D5 (bughunt): `import fcntl` raises on Windows and the old
-                # handler fell through to "proceed unlocked", so the very
-                # platform the lock exists for ran with silent lost updates.
-                # msvcrt.locking on the first byte is the stdlib flock twin
-                # (same pattern as session_lifecycle.guard).
-                import msvcrt
-                self._fh.seek(0)
-                self._fh.write(" ")
-                self._fh.flush()
-                self._fh.seek(0)
-                msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+            import fcntl
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
         except Exception:
             # No lock primitive (or no directory): proceed unlocked rather
             # than lose the write entirely. Usage is a heuristic, not an
@@ -133,14 +120,8 @@ class _UsageLock:
     def __exit__(self, *exc):
         try:
             if self._fh is not None:
-                import os as _os
-                if _os.name == "nt":
-                    import msvcrt
-                    self._fh.seek(0)
-                    msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+                import fcntl
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
         except Exception:
             pass
         self._close()
@@ -307,6 +288,7 @@ def _memory_path(name: str, *, strict: bool = False) -> Path:
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
+    private_files.check(path, 'write')
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -320,7 +302,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
             pass
 
 
-# D4: same-process serializer for the shared MEMORY.md index. fcntl/msvcrt
+# D4: same-process serializer for the shared MEMORY.md index. flock
 # cross-process locking lives in _UsageLock; the index is per-CLI-process
 # here, so a module lock plus atomic replace covers both races and crashes.
 import threading as _threading
@@ -331,6 +313,7 @@ def ensure_memory_dir() -> Path:
     """Create the memory directory and index if they don't exist."""
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     if not MEMORY_INDEX.exists():
+        private_files.check(MEMORY_INDEX, 'write')
         MEMORY_INDEX.write_text(
             "# laintas_cli Memory Index\n"
             "# One line per memory entry. Lines starting with # are ignored.\n"
@@ -360,6 +343,7 @@ def migrate_legacy_scopes() -> int:
         if f.name == "MEMORY.md":
             continue
         try:
+            private_files.check(f, 'read')
             meta, body = _parse_frontmatter(f.read_text(encoding="utf-8"))
             if meta.get("scope") and meta.get("scope_id"):
                 continue
@@ -574,6 +558,8 @@ def _parse_memory_file(f) -> Optional[tuple[dict, str]]:
     cannot be read. A miss costs one read+parse; a hit costs zero IO.
     """
     try:
+        import private_files
+        private_files.check(f, "read")
         st = f.stat()
         key = (os.path.abspath(str(f)), st.st_ino, st.st_mtime_ns, st.st_size)
     except OSError:
@@ -757,6 +743,13 @@ def write_memory(name: str, mem_type: str, description: str,
     except ValueError as exc:
         return False, str(exc)
     _existed_before = f.exists()
+    try:
+        private_files.check(f, 'write')
+        private_files.check(MEMORY_INDEX, 'write')
+        if _existed_before:
+            private_files.check(f, 'read')
+    except private_files.PrivateFileError as error:
+        return False, str(error)
     if _existed_before and not overwrite:
         return False, f"Memory '{name}' already exists. Use overwrite=True."
 
@@ -839,6 +832,8 @@ def delete_memory(name: str) -> tuple[bool, str]:
     if not f.exists():
         return False, f"Memory '{name}' not found"
     try:
+        private_files.check(f, 'write')
+        private_files.check(MEMORY_INDEX, 'write')
         f.unlink()
         _forget_parsed(f)
         _remove_from_index(name)
@@ -911,6 +906,9 @@ def _rewrite_meta(name: str, updates: dict) -> tuple[bool, str]:
     if not f.exists():
         return False, f"Memory '{name}' not found"
     try:
+        private_files.check(f, 'read')
+        private_files.check(f, 'write')
+        private_files.check(MEMORY_INDEX, 'write')
         meta, body = _parse_frontmatter(f.read_text(encoding="utf-8"))
     except OSError as exc:
         return False, str(exc)
@@ -1045,6 +1043,10 @@ def archive_memory(name: str, reason: str = "") -> tuple[bool, str]:
         return False, f"Memory '{name}' not found"
     try:
         target_dir = archive_dir()
+        private_files.check(f, 'read')
+        private_files.check(f, 'write')
+        private_files.check(target_dir / f.name, 'write')
+        private_files.check(MEMORY_INDEX, 'write')
         target_dir.mkdir(parents=True, exist_ok=True)
         meta, body = _parse_frontmatter(f.read_text(encoding="utf-8"))
         meta["archived_at"] = round(time.time(), 3)

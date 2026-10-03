@@ -34,12 +34,9 @@ _LOCK = threading.RLock()
 
 # D6 (bughunt): a cross-process guard for the shared cookie jar. merge() is
 # a read-modify-write of the whole file; two processes (or an unlocked pair
-# of threads) silently dropped each other's cookies. fcntl/msvcrt on a
+# of threads) silently dropped each other's cookies. flock on a
 # sidecar lock file, the same pattern as workflow_state._store_lock.
-if os.name == "nt":
-    import msvcrt as _msvcrt
-else:
-    import fcntl as _fcntl
+import fcntl as _fcntl
 
 
 class _FileLock:
@@ -51,14 +48,7 @@ class _FileLock:
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             self._fh = open(str(self._path) + ".lock", "a+")
-            if os.name == "nt":
-                if self._fh.tell() == 0:
-                    self._fh.write(" ")
-                    self._fh.flush()
-                self._fh.seek(0)
-                _msvcrt.locking(self._fh.fileno(), _msvcrt.LK_LOCK, 1)
-            else:
-                _fcntl.flock(self._fh.fileno(), _fcntl.LOCK_EX)
+            _fcntl.flock(self._fh.fileno(), _fcntl.LOCK_EX)
         except Exception:
             # A lock failure must not break cookie persistence; the thread
             # lock above still serialises same-process writers.
@@ -68,11 +58,7 @@ class _FileLock:
     def __exit__(self, *exc):
         try:
             if self._fh is not None:
-                if os.name == "nt":
-                    self._fh.seek(0)
-                    _msvcrt.locking(self._fh.fileno(), _msvcrt.LK_UNLCK, 1)
-                else:
-                    _fcntl.flock(self._fh.fileno(), _fcntl.LOCK_UN)
+                _fcntl.flock(self._fh.fileno(), _fcntl.LOCK_UN)
         except Exception:
             pass
         self._close()

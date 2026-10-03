@@ -20,7 +20,7 @@ class WrapTests(unittest.TestCase):
         self.assertIn("focus_scroll", " ".join(T._plain(row) for row in rows))
 
     def test_wide_characters_are_measured_in_cells(self):
-        for row in T.wrap([("", "界" * 25)], 10):
+        for row in T.wrap([("", '\u754c' * 25)], 10):
             self.assertLessEqual(T.cell_width(T._plain(row)), 10)
 
 

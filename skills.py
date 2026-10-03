@@ -83,6 +83,7 @@ from tools import Tool, get_registry, infer_capabilities
 import paths
 import backend_profiles
 import json_store
+import private_files
 import trust_store
 
 SKILLS_DIR = paths.SKILLS_DIR
@@ -365,8 +366,7 @@ def ensure_bundled_skills_installed() -> list[str]:
 
     The user copy shadows the bundled one, which is what lets people customise
     a skill. But it used to be copied once and never again, so every
-    improvement to a bundled skill reached new installs only — the Windows
-    guidance a connected kernel depends on included. Now a copy is upgraded
+    improvement to a bundled skill reached new installs only. Now a copy is upgraded
     when, and only when, it is byte-identical to a version we shipped: an
     edited copy is the user's and is never touched.
     """
@@ -438,7 +438,7 @@ class SkillMetadata:
     trigger_patterns: list[str] = field(default_factory=list)
     #: A tool that must be registered right now for this skill to be worth
     #: offering. Capabilities that come and go with a piece of hardware or a
-    #: second process — the Windows kernel is the first — otherwise sit in
+    #: second process would otherwise sit in
     #: every prompt on every machine describing something that is not there.
     #: Empty means unconditional, which is almost every skill.
     requires_tool: str = ""
@@ -559,6 +559,7 @@ def _parse_skill_md(skill_dir: Path) -> tuple[SkillMetadata, str]:
         return SkillMetadata(name=name, dir_path=str(skill_dir)), ""
 
     try:
+        private_files.check(skill_md, "read")
         text = skill_md.read_text(encoding="utf-8")
     except Exception:
         return SkillMetadata(name=name, dir_path=str(skill_dir)), ""
@@ -752,6 +753,12 @@ def _load_skill_full(name: str) -> tuple[bool, str]:
         return False, f"skill '{name}' not found in metadata"
 
     skill_dir = Path(meta.dir_path)
+    try:
+        private_files.check(skill_dir / "SKILL.md", "read")
+        if (skill_dir / "skill.py").is_file() and private_files.execution_error():
+            return False, "Executable skills need an isolated runtime while private files are enabled."
+    except private_files.PrivateFileError:
+        return False, "Skill blocked by private file permissions."
     if not skill_dir.is_dir():
         return False, f"skill dir '{skill_dir}' not found"
 
@@ -850,7 +857,7 @@ def _load_skill_full(name: str) -> tuple[bool, str]:
             for ref_file in refs_dir.iterdir():
                 if ref_file.is_file() and ref_file.suffix in ('.md', '.txt', '.json', '.yaml'):
                     try:
-                        state.references[ref_file.name] = ref_file.read_text(encoding="utf-8")
+                        state.references[ref_file.name] = private_files.read_text(ref_file, encoding="utf-8")
                     except Exception:
                         pass
 
@@ -878,14 +885,16 @@ def load_reference(skill_name: str, ref_name: str) -> Optional[str]:
     state = _skill_states.get(skill_name)
     if state is None:
         return None
-    # Check cache first
-    if ref_name in state.references:
-        return state.references[ref_name]
-    # Try loading from disk
     meta = _skill_metadata.get(skill_name)
     if meta is None:
         return None
     ref_path = Path(meta.dir_path) / "references" / ref_name
+    try:
+        private_files.check(ref_path, 'read')
+    except private_files.PrivateFileError:
+        return None
+    if ref_name in state.references:
+        return state.references[ref_name]
     if ref_path.is_file():
         try:
             content = ref_path.read_text(encoding="utf-8")
@@ -1017,6 +1026,11 @@ def get_activated_skills_context() -> str:
     parts = []
     for name, state in _skill_states.items():
         if state.loaded and state.body:
+            try:
+                if not private_files.allowed(Path(state.metadata.dir_path) / "SKILL.md", "read"):
+                    continue
+            except private_files.PrivateFileError:
+                continue
             parts.append(f"### Skill: {name}\n{state.body}")
             try:
                 import extension_runtime
@@ -1030,11 +1044,14 @@ def get_activated_skills_context() -> str:
 def skill_is_available(meta: "SkillMetadata") -> bool:
     """Whether this skill describes something that exists right now.
 
-    A skill about driving Windows applications is instructions for tools that
-    only appear while `helpwo-kernel.exe` is connected with a machine tier on.
-    Listing it the rest of the time spends prompt on a capability the model
-    cannot reach, and — worse than the cost — invites it to plan around one.
+    Skills may require tools from an optional extension or attached service.
+    Offer them only while that capability is available to the runtime.
     """
+    try:
+        if not private_files.allowed(Path(meta.dir_path) / "SKILL.md", "read"):
+            return False
+    except private_files.PrivateFileError:
+        return False
     if not meta.requires_tool:
         return True
     try:
@@ -1215,6 +1232,13 @@ def write_learned_skill(name: str, description: str, body: str, *,
         return False, f"scope must be '{SCOPE_PROJECT}' or '{SCOPE_USER}'"
 
     skill_dir = root / name
+    try:
+        private_files.check(skill_dir, 'write')
+        private_files.check(skill_dir / 'SKILL.md', 'write')
+        if (skill_dir / 'SKILL.md').is_file():
+            private_files.check(skill_dir / 'SKILL.md', 'read')
+    except private_files.PrivateFileError as error:
+        return False, str(error)
     if skill_dir.exists() and not skill_dir.is_dir():
         return False, f"{skill_dir} exists and is not a directory"
     if (skill_dir / "skill.py").is_file():
@@ -1276,6 +1300,11 @@ def _rewrite_learned_meta(name: str, updates: dict) -> tuple[bool, str]:
         md = skill_dir / "SKILL.md"
         if not md.is_file():
             continue
+        try:
+            private_files.check(md, 'read')
+            private_files.check(md, 'write')
+        except private_files.PrivateFileError as error:
+            return False, str(error)
         if (skill_dir / "skill.py").is_file():
             return False, f"'{name}' is an executable skill; not editable here"
         if not is_learned(skill_dir):
@@ -1365,6 +1394,10 @@ def learned_skills(include_retired: bool = False) -> list[dict]:
         for child in sorted(root.iterdir()):
             md = child / "SKILL.md"
             if not child.is_dir() or not md.is_file():
+                continue
+            try:
+                private_files.check(md, 'read')
+            except private_files.PrivateFileError:
                 continue
             if not is_learned(child):
                 continue

@@ -119,7 +119,7 @@ class ProtocolTests(unittest.TestCase):
     def test_status_with_many_large_results_keeps_all_job_identities(self):
         invite, child = self.attach()
         jobs = [{"job_id": f"{n:032x}", "agent": "primary", "task": "task" * 10000,
-                 "status": "completed", "result": "\x00中文" * 50000, "error": ""}
+                 "status": "completed", "result": '\x00\u4e2d\u6587' * 50000, "error": ""}
                 for n in range(128)]
         with mock.patch.object(self.a.adapter, "jobs", return_value=jobs):
             response = self.a.dispatch("local:B", "u", "status", {"id": invite, "token": child["token"]})

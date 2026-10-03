@@ -118,37 +118,6 @@ _DEFAULT_CONFIG = {
         r"^iptables\s", r"^nft\s", r"^ufw\s", r"^firewall-cmd\s",
         r"^openssl\s", r"^gpg\s", r"^ssh-keygen\s",
         r"^curl\s+.*\|.*(?:bash|sh|python)", r"^wget\s+.*-O\s+-",
-        # ── Windows, reached through WSL interop ────────────────────────
-        # The Windows build runs this CLI inside a private WSL distribution
-        # with `[interop] enabled` and `appendWindowsPath=true`, so every
-        # Windows binary on the user's PATH is one word away and none of the
-        # rules above describe any of them. command_parse unwraps the
-        # `-Command` / `/c` payload, so these match the launcher AND anything
-        # hidden behind it.
-        r"(?i)(?:^|[;&|]\s*|\n\s*)(?:\S*[/\\])?(?:powershell|pwsh)(?:\.exe)?\s",
-        # Any cmd at all, not just `cmd /c`: it takes its run switch in forms
-        # a pattern cannot enumerate (`//c` from msys, `/s /c`, `/q/c`,
-        # `/cX`, a quoted "/c X") and runs whatever arrives on stdin.
-        r"(?i)(?:^|[;&|]\s*|\n\s*)(?:\S*[/\\])?cmd(?:\.exe)?(?=\s|$|[;&|<>)])",
-        # Windows' other ways of running a command or script by proxy.
-        r"(?i)(?:^|[;&|]\s*|\n\s*)(?:\S*[/\\])?(?:forfiles|conhost|wscript|cscript"
-        r"|pcalua|msbuild|installutil|cmstp|regasm|regsvcs|odbcconf|msxsl"
-        r"|scriptrunner)(?:\.exe)?(?=\s|$|[;&|<>)])",
-        r"(?i)(?:^|[;&|]\s*|\n\s*)(?:\S*[/\\])?wsl(?:\.exe)?\s",
-        r"(?i)\breg(?:\.exe)?\s+(?:add|delete|import|load|unload)\b",
-        r"(?i)\breg(?:istry)?::",
-        r"(?i)\b(?:sc|net|netsh|schtasks|wmic|bitsadmin|certutil|msiexec"
-        r"|winget|choco|regsvr32|rundll32|mshta|takeown|icacls|cacls|attrib)"
-        r"(?:\.exe)?\s",
-        r"(?i)\bNew-(?:Service|ScheduledTask|LocalUser)\b",
-        r"(?i)\b(?:Set|Start|Stop|Restart|Remove)-Service\b",
-        r"(?i)\bSet-ExecutionPolicy\b",
-        r"(?i)\bInvoke-(?:WebRequest|RestMethod|Expression)\b|\biex\b",
-        r"(?i)\bStart-Process\b",
-        r"(?i)\bAdd-MpPreference\b",
-        # Anything under the Windows side of the mount is the user's real
-        # machine, not the CLI's Linux workspace.
-        r"(?i)(?:^|\s)/mnt/[a-z]/(?:Windows|Program Files|ProgramData)(?:/|\s|$)",
     ],
     "deny": [
         r"^rm\s+-rf\s+/", r"^rm\s+-rf\s+~", r"^rm\s+-rf\s+\$HOME",
@@ -165,48 +134,17 @@ _DEFAULT_CONFIG = {
         r"^chmod\s+-R\s+777\s+/", r"^chmod\s+777\s+/",
         r"^chown\s+-R\s+\S+\s+/", r"^chown\s+\S+\s+/",
         r"^sudo\s+rm\s+-rf\s+/", r"^sudo\s+su\b",
-        # ── Windows: the irreversible ones ──────────────────────────────
-        # Same tier as `mkfs` and `dd of=/dev/…` on the Linux side: no
-        # approval prompt is meaningful for these because there is nothing to
-        # restore afterwards.
-        # Program position only: `docker ps --format`, `git log --format`
-        # are arguments, not the disk formatter (variants are already split
-        # into single commands, so `^` covers `cmd /c format` too).
-        r"(?i)(?:^|[;&|(]\s*|[\\/])(?:format|diskpart|bcdedit|bootrec)(?:\.exe|\.com)?\s",
-        r"(?i)\bvssadmin(?:\.exe)?\s+delete\s+shadows\b",
-        r"(?i)\bwbadmin(?:\.exe)?\s+delete\b",
-        r"(?i)\bcipher(?:\.exe)?\s+/w\b",
-        r"(?i)\bwsl(?:\.exe)?\s+--unregister\b",
-        # Turning the machine's own defences off is never a step in the user's
-        # task, and it is a signature move of a prompt-injected agent.
-        r"(?i)\bSet-MpPreference\b.*\bDisable\w*\b",
-        r"(?i)\bStop-Service\b.*\bWinDefend\b",
-        r"(?i)\bsc(?:\.exe)?\s+(?:delete|config)\s+WinDefend\b",
-        r"(?i)\breg(?:\.exe)?\s+delete\s+[\"']?HK(?:LM|EY_LOCAL_MACHINE)\\+SYSTEM\b",
-        r"(?i)\b(?:del|erase)\b[^\n;&|]*\s[a-z]:\\?\s*$",
-        r"(?i)\b(?:rd|rmdir)\b[^\n;&|]*/s[^\n;&|]*\s[a-z]:\\?\s*$",
-        r"(?i)\bRemove-Item\b[^\n;&|]*-Recurse[^\n;&|]*\s[a-z]:\\?\s*$",
-        r"(?i)(?:^|[;&|]\s*)rm\s+-rf?\s+/mnt/[a-z]/?\s*$",
     ],
     "maxCommandLength": 10000,
     "blockSudo": True,
     # ── File-write rules (fs.write / fs.edit / fs.multi_edit) ──────────
     # Sensitive paths are always blocked regardless of mode (except "disabled").
     "denyFileWrite": [
-        # Separators are written as a class so one pattern covers a POSIX
-        # path, the same file seen through /mnt/c, and a native Windows path.
+        # Protect credential paths whether quoted or passed directly.
         r"\.env(?:\.\w+)?$", r"[/\\]\.ssh[/\\]", r"(?:^|[/\\])id_rsa(?:\.pub)?$",
         r"(?:^|[/\\])id_ed25519(?:\.pub)?$", r"\.pem$", r"\.key$",
         r"(?:^|[/\\])credentials\.json$", r"[/\\]\.git[/\\]config$", r"\.netrc$",
         r"[/\\]\.aws[/\\]credentials$",
-        # Windows-side secrets and machine state. Reachable from the CLI's WSL
-        # distribution at /mnt/<drive>/… with no prompt before this.
-        r"(?i)\.(?:pfx|ppk)$",
-        r"(?i)[/\\]AppData[/\\]Roaming[/\\]Microsoft[/\\]Crypto[/\\]",
-        r"(?i)[/\\]AppData[/\\]Local[/\\]Microsoft[/\\]Credentials[/\\]",
-        r"(?i)^(?:/mnt/[a-z])?[/\\]?(?:[a-z]:)?[/\\]Windows[/\\]System32[/\\]",
-        r"(?i)[/\\]System32[/\\]drivers[/\\]etc[/\\]hosts$",
-        r"(?i)[/\\]Start Menu[/\\]Programs[/\\]Startup[/\\]",
     ],
     # ── Browser-action rules (browser.* tools) ──────────────────────────
     # Read-only browser tools (snapshot, query, get_url, get_title,
@@ -430,16 +368,13 @@ def _default_allowed_roots() -> list:
     omitted the user's actual home, so what a fresh install gated depended on
     who ran it.
 
-    The Windows side of a WSL install (`/mnt/c/…`, or a drive letter when the
-    CLI is run natively) is deliberately absent: those are the user's real
-    documents, and a write there is worth one question.
+    Mounted external documents are not implicitly added to trusted roots.
     """
     import tempfile
 
     roots: list = []
     candidates = [str(Path.home()), tempfile.gettempdir()]
-    if os.name != "nt":
-        candidates.append("/tmp")
+    candidates.append("/tmp")
     for candidate in candidates:
         candidate = str(candidate or "").strip()
         if candidate and candidate not in roots:
@@ -488,41 +423,11 @@ def _migrate_config(cfg: dict) -> dict:
         r"^php\s+(?:.+?\s)?-r\b",
         r"^bash\s+-c\b", r"^sh\s+-c\b", r"^zsh\s+-c\b",
     ]
-    # v2026-09-01: Windows. The Windows build runs this CLI inside a private
-    # WSL distribution with interop on, so `powershell.exe`, `cmd.exe /c` and
-    # every Windows binary on the user's PATH are reachable from any shell
-    # call — and none of the rules above describe a single one of them. A
-    # config saved before today has no Windows rules at all, which is the
-    # whole point of migrating them in rather than only shipping new defaults.
-    _required_approval += [
-        rule for rule in _DEFAULT_CONFIG["needs_approval"]
-        if rule.startswith("(?i)")
-    ]
-    _required_deny = [
-        rule for rule in _DEFAULT_CONFIG["deny"] if rule.startswith("(?i)")
-    ]
-    # v2026-09-17: rules replaced by a narrower form. Adding the new form alone
-    # would leave the old one in saved configs, still denying `docker ps
-    # --format` -- the false positive the replacement exists to remove.
-    _superseded_deny = [
-        r"(?i)\b(?:format|diskpart|bcdedit|bootrec)(?:\.exe)?\s",
-    ]
-    for rule in _superseded_deny:
-        if rule in deny_list:
-            deny_list = [r for r in deny_list if r != rule]
-            changed = True
     for rule in _required_approval:
         if rule not in approval_list:
             approval_list.append(rule)
             changed = True
-    for rule in _required_deny:
-        if rule not in deny_list:
-            deny_list.append(rule)
-            changed = True
-    # Same reasoning for the file-write denylist: a config saved before today
-    # protects `~/.ssh/` but not the same keys reached at
-    # `/mnt/c/Users/<name>/.ssh/`, which is the only place they live on a
-    # Windows install.
+    # Refresh the file-write denylist for previously saved configurations.
     write_deny_list = cfg.get("denyFileWrite", [])
     for rule in _DEFAULT_CONFIG["denyFileWrite"]:
         if rule not in write_deny_list:
@@ -857,17 +762,6 @@ def is_delete_command(command: str) -> bool:
         r"\bxargs\s+(?:\S*/)?(?:rm|rmdir|unlink|shred)(?:\s|$)",
         r"(?:^|[;&|]\s*|\n\s*)find(?:\s|$)[^\n;&|]*\s-delete(?:\s|$)",
         r"(?:^|[;&|]\s*|\n\s*)find(?:\s|$)[^\n;&|]*\s-exec(?:dir)?\s+(?:\S*/)?(?:rm|rmdir|unlink|shred)(?:\s|$)",
-        # Windows deletes reach the same disks through WSL interop, and the
-        # always-ask tier is the whole reason `rm` cannot be waved through by a
-        # session-wide "approve all". Without these, `cmd.exe /c del /s /q …`
-        # and `Remove-Item -Recurse` were the way around it. command_parse
-        # unwraps the launcher, so both the wrapper line and its payload are
-        # tested here.
-        r"(?i)(?:^|[;&|]\s*|\n\s*)(?:\S*[/\\])?(?:del|erase)(?:\.exe)?\s",
-        r"(?i)(?:^|[;&|]\s*|\n\s*)(?:\S*[/\\])?(?:rd|rmdir)(?:\.exe)?\s+[^\n;&|]*/s\b",
-        r"(?i)\bRemove-Item\b",
-        r"(?i)\bClear-RecycleBin\b",
-        r"(?i)\bRemove-(?:ItemProperty|Item)\s",
     )
     return any(re.search(pattern, stripped) for pattern in patterns)
 
@@ -906,12 +800,8 @@ def is_unsafe_shared_temp_cleanup(command: str) -> bool:
 # `cat ~/.ssh/id_rsa`, and `cat "…/User Data/Default/Network/Cookies"`, ran
 # with no prompt at all on either platform.
 #
-# The Windows build is what made that urgent rather than theoretical. Its
-# working directory is the user's real Windows home, the Helpwo kernel's
-# `ai-exec` runs a bash that can read the whole profile, and that profile is
-# where Chrome keeps its cookie database, where DPAPI keeps its master keys,
-# and where the credential manager lives. The workspace boundary the user is
-# shown does not apply to a shell command.
+# Shell commands can read credential stores outside the workspace. Apply
+# credential policy to the command itself, independently of fs.* tools.
 #
 # The tier is *ask*, not *deny* — where Claude Code, Codex CLI and Copilot CLI
 # have all settled. Reading a `.env` is ordinary work in half of all
@@ -935,32 +825,9 @@ _CREDENTIAL_PATTERNS_POSIX = (
     r"/etc/shadow\b", r"/\.local/share/keyrings/",
 )
 
-#: Windows credential stores, in the msys spelling the bundled bash uses
-#: (`/c/Users/...`) and the Win32 one a wrapper payload would carry. Browser
-#: profiles come first: a cookie database is a live session for every site the
-#: user is signed in to, which is a broader credential than most private keys.
-_CREDENTIAL_PATTERNS_WINDOWS = (
-    r"(?i)[/\\]User Data[/\\][^/\\]*[/\\](?:Network[/\\])?Cookies\b",
-    r"(?i)[/\\](?:Login Data|Web Data|Local State)\b",
-    r"(?i)(?:cookies|logins|key[34]|cert9|places)\.(?:sqlite|json|db)\b",
-    r"(?i)[/\\]AppData[/\\]Roaming[/\\]Microsoft[/\\](?:Credentials|Protect|Crypto)\b",
-    r"(?i)[/\\]AppData[/\\]Local[/\\]Microsoft[/\\](?:Credentials|Vault)\b",
-    r"(?i)[/\\]NTUSER\.DAT\b",
-    r"(?i)[/\\]_netrc\b",
-    r"(?i)[/\\]AppData[/\\]Roaming[/\\]gh[/\\]hosts\.yml\b",
-    r"(?i)[/\\]\.ssh[/\\]",
-    # Windows' own ways of reading a secret out, which name no path at all.
-    r"(?i)\bcmdkey(?:\.exe)?\s+/list\b",
-    r"(?i)\bvaultcmd(?:\.exe)?\b",
-    r"(?i)\breg(?:\.exe)?\s+save\b[^\n;&|]*\bHK(?:LM|EY_LOCAL_MACHINE)\b",
-    r"(?i)\bcertutil(?:\.exe)?\s[^\n;&|]*-exportPFX\b",
-    r"(?i)\bConvertFrom-SecureString\b",
-    r"(?i)\bGet-Credential\b",
-)
-
 _CREDENTIAL_RE = tuple(
     re.compile(pattern)
-    for pattern in _CREDENTIAL_PATTERNS_POSIX + _CREDENTIAL_PATTERNS_WINDOWS
+    for pattern in _CREDENTIAL_PATTERNS_POSIX
 )
 
 #: Commands that can put bytes onto the network. Not a denial on their own —
@@ -969,9 +836,8 @@ _CREDENTIAL_RE = tuple(
 _EGRESS_RE = re.compile(
     r"(?i)(?:^|[;&|(]\s*|\n\s*|\$\(|`|\|\s*)"
     r"(?:\S*[/\\])?"
-    r"(?:curl|wget|nc|ncat|netcat|socat|scp|sftp|ftp|telnet|bitsadmin"
-    r"|Invoke-WebRequest|Invoke-RestMethod|iwr|Start-BitsTransfer)"
-    r"(?:\.exe)?(?:\s|$)"
+    r"(?:curl|wget|nc|ncat|netcat|socat|scp|sftp|ftp|telnet)"
+    r"(?:\s|$)"
 )
 
 
@@ -1010,6 +876,10 @@ def evaluate(command: str, cwd: str = None,
     that supervise untrusted/remote sources (where the audit-mode advisory
     fallthrough must NOT silently let through commands the rules flagged).
     """
+    import private_files
+    privacy_error = private_files.execution_error()
+    if privacy_error:
+        return PolicyDecision(action='deny', reason=privacy_error)
     cfg = _load_config()
     mode = cfg.get("mode", "audit")
     if strict and mode == "audit":
@@ -1072,8 +942,7 @@ def evaluate(command: str, cwd: str = None,
         # instead of showing the script.
         if command_parse_opaque(obf_risks):
             reason = ("Runs a script or encoded payload whose contents cannot "
-                      "be read from the command line (PowerShell -File / "
-                      "-EncodedCommand)")
+                      "be read from the command line")
         else:
             reason = ("Command name is produced at runtime (substitution or variable); "
                       "what will execute cannot be determined before it runs")
@@ -1102,7 +971,7 @@ def evaluate(command: str, cwd: str = None,
     # function (mode == "disabled" never matches an "enforce"/"audit"
     # branch, so it silently falls through to allow).
     # Across variants, not just the typed string: the delete may be the payload
-    # of a wrapper (`bash -c "rm -rf x"`, `cmd.exe /c del /s /q …`), where the
+    # of a wrapper (`bash -c "rm -rf x"`), where the
     # boundary anchors in is_delete_command cannot see it. The destructive-git
     # check below has always done this; the delete tier had not, which left the
     # always-ask guarantee one quote away from being optional.
@@ -1126,7 +995,7 @@ def evaluate(command: str, cwd: str = None,
     # ── Credential material: deny the exfiltration shape, ask about the rest ─
     # Checked across variants for the same reason the delete tier is: the read
     # may be the payload of a wrapper (`bash -c "cat ~/.ssh/id_rsa"`,
-    # `powershell -EncodedCommand …`), where matching the typed line alone
+    # another shell wrapper), where matching the typed line alone
     # sees nothing. Placed after the delete and git tiers so a command that is
     # both keeps the more specific prompt.
     if mode != "disabled" and any(is_credential_exfiltration(v) for v in variants):
@@ -1203,12 +1072,6 @@ def evaluate(command: str, cwd: str = None,
     return PolicyDecision("allow")
 
 
-def _case_insensitive_pair(path: Path, root: Path) -> bool:
-    """Whether these two live on a filesystem that ignores case."""
-    if os.name == "nt":
-        return True
-    return bool(_MOUNTED_DRIVE_RE.match(str(path))
-                and _MOUNTED_DRIVE_RE.match(str(root)))
 
 
 def _check_paths(command: str, cwd: str | None,
@@ -1228,16 +1091,6 @@ def _check_paths(command: str, cwd: str | None,
     # Extract paths from the command
     paths = _extract_paths(command)
     for p in paths:
-        # `C:\Users\me` is not a name in this directory. On a POSIX host
-        # (which the Windows build is, inside its WSL distribution) joining it
-        # to cwd produced a path that sat happily inside an allowed root — the
-        # one case where a Windows target must NOT be waved through, since it
-        # is the user's real machine.
-        if os.name != "nt" and _WINDOWS_PATH_RE.match(p):
-            return PolicyDecision(
-                "needs_approval", "",
-                f"Path '{p}' is on the Windows side of this machine, outside "
-                f"allowedRoots")
         try:
             resolved = (cwd_path / p).resolve()
         except (ValueError, OSError):
@@ -1251,17 +1104,6 @@ def _check_paths(command: str, cwd: str | None,
                 break
             except ValueError:
                 pass
-            # Windows filesystems do not distinguish case, and neither does
-            # the DrvFs mount a WSL install sees at /mnt/<drive>. Comparing
-            # them case-sensitively reports an escape that is not one.
-            if _case_insensitive_pair(resolved, root):
-                try:
-                    Path(str(resolved).casefold()).relative_to(
-                        Path(str(root).casefold()))
-                    ok = True
-                    break
-                except ValueError:
-                    pass
         if not ok:
             return PolicyDecision(
                 "needs_approval",
@@ -1269,19 +1111,6 @@ def _check_paths(command: str, cwd: str | None,
                 f"Path '{p}' resolves to '{resolved}' outside allowedRoots",
             )
     return None
-
-
-#: `/s`, `/q`, `/MIR`, `/E:ON` — a cmd.exe switch, not a POSIX absolute path.
-_CMD_SWITCH_RE = re.compile(r"^/[A-Za-z]$|^/[A-Za-z][A-Za-z-]{0,8}(?::\S*)?$")
-
-#: `/mnt/c/...` — a Windows drive as WSL mounts it.
-_MOUNTED_DRIVE_RE = re.compile(r"^/mnt/[A-Za-z](?:/|$)")
-
-#: A line that mentions a drive-letter or UNC path anywhere in it.
-_WINDOWS_PATH_HINT_RE = re.compile(r"(?:^|[\s\"'=])(?:[A-Za-z]:[\\/]|\\\\[^\\/\s])")
-
-#: `C:\Users\me`, `c:/temp`, `\\server\share\file`.
-_WINDOWS_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/])")
 
 
 def _extract_paths(command: str) -> list:
@@ -1293,36 +1122,20 @@ def _extract_paths(command: str) -> list:
     """
     import shlex as _shlex
     paths = []
-    # POSIX splitting treats `\` as an escape, so `C:\Users\me` arrives as
-    # `C:Usersme` — still outside every allowed root, but unrecognisable in the
-    # reason the user is shown. Split Windows-flavoured lines the Windows way.
-    posix = not _WINDOWS_PATH_HINT_RE.search(command or "")
     try:
-        tokens = _shlex.split(command, posix=posix)
+        tokens = _shlex.split(command)
     except ValueError:
         tokens = command.split()
-    if not posix:
-        tokens = [tok.strip('"') for tok in tokens]
 
     write_cmds = {"rm", "mv", "cp", "touch", "mkdir", "rmdir",
                   "chmod", "chown", "chgrp", "ln", "dd",
                   "tee", "zip", "gzip", "bzip2",
-                  "install", "rsync", "scp",
-                  # Windows, reachable through WSL interop. Their arguments are
-                  # paths for exactly the same reason `rm`'s are.
-                  "del", "erase", "rd", "move", "copy", "xcopy", "robocopy",
-                  "remove-item", "ri", "copy-item", "move-item", "new-item",
-                  "set-content", "add-content", "out-file"}
+                  "install", "rsync", "scp"}
+
 
     for i, tok in enumerate(tokens):
         # Flag arguments (don't treat as paths)
         if tok.startswith("-"):
-            continue
-        # cmd.exe switches: /s, /q, /f, and long ones like /MIR or /E — never
-        # paths, but `/S` reads as an absolute POSIX path and used to be
-        # reported as one, which put a spurious "outside allowedRoots" on every
-        # Windows delete.
-        if _CMD_SWITCH_RE.match(tok):
             continue
         # Redirect: >file or >>file (handled as separate token by shlex)
         if tok in (">", ">>", "2>", "&>"):
@@ -1332,11 +1145,6 @@ def _extract_paths(command: str) -> list:
 
         # POSIX path: starts with / and looks like a real path (not a flag)
         if tok.startswith("/") and ("/" in tok[1:] or len(tok) > 2):
-            is_path = True
-        # Windows: a drive-letter path or a UNC share. Both name the user's
-        # real machine from inside the WSL distribution and neither is under
-        # any allowedRoot, which is the answer we want them to get.
-        elif _WINDOWS_PATH_RE.match(tok):
             is_path = True
 
         if is_path and not tok.startswith("$"):

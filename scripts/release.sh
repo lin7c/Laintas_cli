@@ -9,9 +9,9 @@
 #   3. Commit + tag + push to main (triggers .github/workflows/release.yml).
 #   4. Watch the CI run and print the GitHub Release URL when done.
 #
-# CI then builds Linux amd64/arm64, the single-file Windows amd64 installer
-# (private WSL runtime), and source artifacts, publishes them to a GitHub
-# Release, and uploads the self-update src/ manifest.
+# CI builds Linux amd64/arm64, macOS Intel/Apple Silicon, Debian and source
+# artifacts, publishes them to a GitHub Release, and uploads the self-update
+# src/ manifest. Windows desktop releases belong to their independent project.
 # No binaries are committed to the repo — they live in the Release assets.
 set -euo pipefail
 

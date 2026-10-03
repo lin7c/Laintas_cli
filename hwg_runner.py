@@ -7,6 +7,8 @@ runtime semantics: durable run state, resume, retry, timeout and cache.
 
 from __future__ import annotations
 
+import private_files
+
 import hashlib
 import json
 import os
@@ -32,26 +34,12 @@ MAX_GRAPH_STEPS = 200
 def _pid_alive(pid: int) -> bool:
     """True if a process with this pid exists.
 
-    E3 crash detection. Windows-safe: os.kill(pid, 0) on Windows actually
-    terminates the target, so probe via OpenProcess/WaitForSingleObject
-    instead. On POSIX, PermissionError means the process exists but belongs
+    On POSIX, PermissionError means the process exists but belongs
     to another user — that is "alive" for our purposes.
     """
     if pid <= 0:
         return False
     try:
-        if os.name == "nt":
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            SYNCHRONIZE = 0x00100000
-            WAIT_TIMEOUT = 0x102
-            handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
-            if not handle:
-                return False
-            try:
-                return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
-            finally:
-                kernel32.CloseHandle(handle)
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -623,14 +611,14 @@ def _read_include(path: str) -> Optional[str]:
     """Reader for @include. None means "no such file" — resolve_includes turns
     that into a named error instead of an exception."""
     try:
-        return Path(path).read_text(encoding="utf-8")
+        return private_files.read_text(Path(path), encoding="utf-8")
     except OSError:
         return None
 
 
 def _read_and_validate(path: str) -> tuple[Optional[list], Optional[str]]:
     try:
-        source = Path(path).read_text(encoding="utf-8")
+        source = private_files.read_text(Path(path), encoding="utf-8")
     except OSError as e:
         return None, f"hwg: cannot read '{path}': {e}"
     try:
@@ -1290,7 +1278,7 @@ def gantt(run_id: str) -> dict:
         try:
             import workflow_viz
             order = workflow_viz.node_order_from_source(
-                Path(source).read_text(encoding="utf-8"))
+                private_files.read_text(Path(source), encoding="utf-8"))
         except Exception:
             order = None
     try:
@@ -1325,7 +1313,7 @@ def _format_run(run: dict, one_line: bool = False, mini: bool = False) -> str:
             if source:
                 try:
                     order = workflow_viz.node_order_from_source(
-                        Path(source).read_text(encoding="utf-8"))
+                        private_files.read_text(Path(source), encoding="utf-8"))
                 except Exception:
                     order = None
             strip = workflow_viz.mini_from_run(run, order)

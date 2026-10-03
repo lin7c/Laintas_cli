@@ -4,6 +4,10 @@ How to publish a version to GitHub and sync it to `cli.laintas.com`, so that
 the download page, the install script and the CLI's `/v` update command all
 use the same set of release assets.
 
+All Laintas CLI release documentation and public announcements must be in
+English. For the website's required `titleZh` / `bodyZh` fields, repeat the
+English title and body so the announcement stays English in either locale.
+
 ## `laintas-cli-beta v2` release (`laintas-cli-beta-v2`)
 
 The Mac build is a native terminal CLI for Intel (`amd64`) and Apple Silicon
@@ -105,23 +109,20 @@ The local diagnostic modules currently registered (`event_log` / `critic` /
 serve CLI recovery and local diagnostics only; they upload nothing to the
 training pipeline.
 
-**The Windows build depends on a second channel.** `/windows install`
-downloads `helpwo-kernel.exe` from `helpwo.laintas.com/downloads/`, which is
-published by the *Helpwo* build, not this one. Nothing in a laintas_cli
-release contains the kernel, so a release cannot break it — but a Helpwo
-deploy that drops `latest.json` breaks `/windows install` for every installed
-CLI, and this is the only document that would tell you where to look. Check
-it is answering before and after a release:
+**Laintas CLI packages Linux and macOS only.** Do not build a Windows CLI,
+WSL distribution, launcher, kernel helper or Windows installer from this
+repository. Do not add Windows jobs or assets to `release.yml`,
+`scripts/build_release_assets.py` or the source-update manifest.
 
-```bash
-curl -fsSL https://helpwo.laintas.com/downloads/latest.json | python3 -m json.tool
-```
-
-It must name an `asset` that exists beside it and a 64-character `sha256`;
-the CLI refuses anything else rather than running an unverified installer.
-`Helpwo`'s `npm run build` regenerates the file from what is actually in
-`public/downloads/`, so the fix is almost always a redeploy of that site
-rather than a change here.
+**Windows desktop releases are independent.** The product is named
+`laintas-Helpwo-cli-for-windows`. The private project
+`lin7c/laintas-Helpwo-cli-agent-for-windows` owns its installer and signed
+`https://cli.laintas.com/windows/latest.json` update channel. This Unix release
+workflow must not build, publish or overwrite Windows assets. The download
+page links to `https://cli.laintas.com/windows/LaintasSetup.exe`; rebuilding
+the Unix website must preserve `public/windows/` and `public/releases/`.
+`scripts/build_release_assets.py` writes both the durable `public/releases/`
+copy and the live `dist/releases/` copy after verifying the downloaded assets.
 
 Set the single version number in [version.py](../version.py):
 
@@ -186,7 +187,6 @@ git push origin v1.23.4
 - `laintas-cli_linux_arm64.tar.gz`
 - `laintas-cli_darwin_amd64.tar.gz`
 - `laintas-cli_darwin_arm64.tar.gz`
-- `laintas-cli_windows_amd64_setup.exe`
 - `laintas-cli_source.zip`
 - `laintas-cli_<version>_amd64.deb`
 - `manifest.json`
@@ -301,9 +301,7 @@ already match the release. `--overwrite-local` does keep one, under
 the replaced file may be the only copy of an edit.
 
 A frozen install downloads the archive for its host: macOS uses `darwin`,
-Linux uses `linux`, and the Windows product also uses `linux` because its CLI
-runs inside the private WSL distribution. `laintas-cli.exe` and the WSL
-distribution are replaced by re-running the Windows installer, not by `/v`.
+Linux uses `linux`. Windows desktop updates are handled by its own updater.
 
 To pin a version:
 
@@ -329,7 +327,6 @@ curl -fsSL "$base/manifest.json" | python3 -m json.tool
 curl -fsSL "$mirror/manifest.json" | python3 -m json.tool
 curl -fsSIL "$base/laintas-cli_linux_amd64.tar.gz"
 curl -fsSIL "$mirror/laintas-cli_linux_amd64.tar.gz"
-curl -fsSIL "$mirror/laintas-cli_windows_amd64_setup.exe"
 curl -fsSIL https://cli.laintas.com/install.sh
 curl -fsSIL https://cli.laintas.com/install.ps1
 curl -fsSIL https://helpwo.laintas.com/downloads/latest.json
@@ -339,13 +336,11 @@ Confirm that:
 
 - BOTH manifests report the new version — the mirror's is the one `/v` reads
   after the plan-A release lands
-- amd64, arm64, the source bundle, the Windows installer and the .deb all
+- amd64, arm64, the source bundle and the .deb all
   return `200` on BOTH channels
 - the download page shows the new version and its cards link at the new tag
 - `src_manifest.zip` matches the file checksums in the manifest
 - the mirror's `SHA256SUMS.txt` verifies (section 3)
-- `downloads/latest.json` still resolves — the Windows build's `/windows
-  install` reads it, and it is published by a different repository
 
 `/v` reads whatever its `DEFAULT_DOWNLOAD_BASE` names — now
 cli.laintas.com. The mirror checks above must pass either way.
@@ -383,7 +378,6 @@ Make sure `latest/` uses the architecture-suffixed filenames:
 ```text
 laintas-cli_linux_amd64.tar.gz
 laintas-cli_linux_arm64.tar.gz
-laintas-cli_windows_amd64_setup.exe
 ```
 
 ### The release assets vanish after a build

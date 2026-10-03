@@ -244,6 +244,9 @@ def trigger(hook_type: str, ctx: dict = None) -> tuple[bool, list[str]]:
     If allowed is False, pre_ hooks should block execution.
     Messages are hook outputs for logging/display.
     """
+    import private_files
+    if private_files.execution_error():
+        return True, []
     ctx = dict(ctx or {})
     ctx.setdefault("timestamp", datetime.now().isoformat())
     ctx.setdefault("cwd", os.getcwd())

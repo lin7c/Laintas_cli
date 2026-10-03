@@ -71,7 +71,7 @@ class ManifestTests(unittest.TestCase):
             if path.is_file() and path.suffix in {".py", ".json", ".md"} \
                     and "__pycache__" not in path.parts:
                 self.assertNotRegex(path.read_text(encoding="utf-8"),
-                                    r"[一-鿿]", str(path))
+                                    '[\u4e00-\u9fff]', str(path))
 
     def test_vendor_matches_independent_source_when_available(self):
         source = ROOT.parent / "ai-pow"

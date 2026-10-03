@@ -472,7 +472,7 @@ class LaintasAcpAgent(Agent):
                     s.id, tool_call=tool_call, options=options))
         except Exception:
             return False
-        return isinstance(response.outcome, AllowedOutcome)
+        return isinstance(response.outcome, AllowedOutcome) and response.outcome.option_id == "allow"
 
 
 # ── entry point ─────────────────────────────────────────────────────────

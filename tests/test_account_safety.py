@@ -20,7 +20,6 @@ import laintas_cli as cli
 import paths
 import peer_coordination
 import terminal_link
-import windows_host
 
 
 def isolated_python(tmp_path, code, *, account='', mode=''):
@@ -224,7 +223,7 @@ def test_exec_failure_rolls_back_selection_and_exits_after_saving_once(accounts)
         for module, attribute in [(cli, 'stop_trigger_scanner'), (cli, 'close_all_agents'),
                                   (cli, 'close_all_terminals'), (cli, '_get_mcp_mod'),
                                   (cli.browser_mod, 'close_all_browser_sessions'),
-                                  (cli._terminal_agents, 'close'), (windows_host, 'stop_host'),
+                                  (cli._terminal_agents, 'close'),
                                   (peer_coordination, 'release_all_leases'),
                                   (peer_coordination, 'get_coord'), (cli.child_registry, 'kill_all'),
                                   (cli.terminal_arbiter, 'reset_to_pristine')]:

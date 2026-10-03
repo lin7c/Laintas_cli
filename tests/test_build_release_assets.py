@@ -25,7 +25,7 @@ def test_manifest_covers_all_tracked_top_level_modules():
         capture_output=True, text=True, check=True)
     tracked_top = {
         line[:-3] for line in out.stdout.splitlines()
-        if "/" not in line and line.endswith(".py")
+        if "/" not in line and line.endswith(".py") and (repo / line).is_file()
     }
     # setup.py is the packaging entry point, not a shipped module.
     missing = sorted(m for m in tracked_top - modules if m != "setup")
@@ -91,7 +91,6 @@ def test_release_assets_include_source_and_versioned_deb():
         "laintas-cli_linux_arm64.tar.gz",
         "laintas-cli_darwin_amd64.tar.gz",
         "laintas-cli_darwin_arm64.tar.gz",
-        "laintas-cli_windows_amd64_setup.exe",
         "laintas-cli_source.zip",
         "laintas-cli_1.8.3_amd64.deb",
         "SHA256SUMS.txt",
@@ -119,24 +118,41 @@ def test_release_asset_verification_and_stale_cleanup(tmp_path):
     assert (tmp_path / "manifest.json").is_file()
 
 
-def test_release_doc_names_the_channel_the_windows_build_depends_on():
-    """`/windows install` reads a file published by a *different* repository.
+def test_published_unix_downloads_survive_a_website_rebuild(tmp_path, monkeypatch):
+    """Use checksum-verified fixture assets to exercise both publication copies."""
+    import shutil
+    durable = tmp_path / "public" / "releases"
+    live = tmp_path / "dist" / "releases"
+    windows = tmp_path / "public" / "windows" / "LaintasSetup.exe"
+    windows.parent.mkdir(parents=True)
+    windows.write_bytes(b"independent-windows-fixture")
+    monkeypatch.setattr(build_release_assets, "PUBLIC_RELEASES", str(durable))
+    monkeypatch.setattr(build_release_assets, "DIST_RELEASES", str(live))
+    monkeypatch.setenv("LAINTAS_RELEASE_TAG", "v9.9.9")
 
-    Nothing in a laintas_cli release contains the kernel, so a release here
-    cannot break it — which is exactly why it is easy to forget. A Helpwo
-    deploy that drops `latest.json` breaks `/windows install` for every
-    installed CLI, and build/RELEASE.md is the only place that would tell
-    somebody where to look.
-    """
-    import re
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    import windows_kernel
+    def stage_source(directory):
+        (Path(directory) / "manifest.json").write_text('{"version":"9.9.9","files":{}}')
+        return {"version": "9.9.9", "files": {}}
 
-    doc = (Path(build_release_assets.REPO) / "build/RELEASE.md").read_text(
-        encoding="utf-8")
-    host = re.sub(r"^https?://", "", windows_kernel.DOWNLOAD_ORIGIN)
-    assert host in doc, (
-        f"build/RELEASE.md does not mention {host}, which the Windows build "
-        f"downloads the kernel from")
-    assert "latest.json" in doc
+    def stage_assets(tag, version, directory):
+        names = build_release_assets._release_asset_names(version)
+        checksums = []
+        for name in names[:-1]:
+            payload = name.encode()
+            (Path(directory) / name).write_bytes(payload)
+            checksums.append(f"{hashlib.sha256(payload).hexdigest()}  {name}\n")
+        (Path(directory) / "SHA256SUMS.txt").write_text("".join(checksums))
+        return names
+
+    monkeypatch.setattr(build_release_assets, "_gen_src_out", stage_source)
+    monkeypatch.setattr(build_release_assets, "_fetch_release_assets", stage_assets)
+    assert build_release_assets.main() == 0
+    offered = {path.name: path.read_bytes() for path in (live / "latest").iterdir()}
+    assert offered == {path.name: path.read_bytes() for path in (durable / "latest").iterdir()}
+    # A static rebuild copies public resources back into an empty dist.
+    shutil.rmtree(live)
+    shutil.copytree(durable, live)
+    assert offered == {path.name: path.read_bytes() for path in (live / "latest").iterdir()}
+    assert (live / "v9.9.9" / "src_manifest.zip").is_file()
+    assert windows.read_bytes() == b"independent-windows-fixture"
+    assert not any("windows" in name.casefold() for name in offered)

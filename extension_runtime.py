@@ -472,6 +472,9 @@ class ExtensionRuntime:
 
     def emit(self, event: str, payload: dict) -> None:
         """Hand one event to every observer. Never raises."""
+        import private_files
+        if private_files.execution_error():
+            return
         handlers = self._observers.get(event)
         if not handlers:
             return
@@ -503,6 +506,10 @@ class ExtensionRuntime:
         return value
 
     def load(self, name: str) -> tuple[bool, str]:
+        import private_files
+        blocked = private_files.execution_error()
+        if blocked:
+            return False, blocked
         if not _SAFE_NAME.fullmatch(name or ""):
             return False, "invalid extension name"
         with self._lock:
@@ -654,6 +661,10 @@ class ExtensionRuntime:
         item = self._commands.get(str(action).lower())
         if item is None:
             return False, None
+        import private_files
+        blocked = private_files.execution_error()
+        if blocked:
+            raise private_files.PrivateFileError(blocked)
         handler = item[1]
         arity = item[2] if len(item) > 2 else None
         try:
@@ -684,6 +695,9 @@ class ExtensionRuntime:
         return files.get(str(subcommand or "").lower()) or files.get("") or ()
 
     def intercept_loop(self, command: str, ctx: dict) -> Optional[str]:
+        import private_files
+        if private_files.execution_error():
+            return None
         for owner in list(self._loaded):
             for handler in self._loops.get(owner, []):
                 result = handler(command, ctx)

@@ -16,10 +16,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 
-if os.name == "nt":
-    import msvcrt
-else:
-    import fcntl
+import fcntl
 
 
 RUNS_FILE = "workflow_runs.json"
@@ -87,14 +84,7 @@ def _store_lock(path: Path):
         try:
             lock_path.parent.mkdir(parents=True, exist_ok=True)
             lf = lock_path.open("a")
-            if os.name == "nt":
-                if lf.tell() == 0:
-                    lf.write(" ")
-                    lf.flush()
-                lf.seek(0)
-                msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)
-            else:
-                fcntl.flock(lf, fcntl.LOCK_EX)
+            fcntl.flock(lf, fcntl.LOCK_EX)
         except OSError:
             # A lock-file failure must not break persistence: fall back to
             # the thread lock alone (previous behaviour, minus same-process
@@ -109,11 +99,7 @@ def _store_lock(path: Path):
             _local.held = held
             if lf is not None:
                 try:
-                    if os.name == "nt":
-                        lf.seek(0)
-                        msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
-                    else:
-                        fcntl.flock(lf, fcntl.LOCK_UN)
+                    fcntl.flock(lf, fcntl.LOCK_UN)
                 except OSError:
                     pass
                 lf.close()

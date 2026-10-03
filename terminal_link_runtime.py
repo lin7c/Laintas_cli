@@ -353,20 +353,6 @@ def start_service(runtime, session, deps, notice, registry=None):
     transport = link.LocalTransport(paths.ROOT_HOME, paths.PROCESS_INSTANCE_ID, paths.ACCOUNT_USER_ID,
                                     lambda *args: service.dispatch(*args))
     service = link.Service(adapter, transport, paths.ACCOUNT_USER_ID)
-    if registry is not None:
-        def source():
-            if not registry.agent_id or not registry._kernel_hooks_host:
-                raise link.LinkError("Connect this CLI with /helpwo first")
-            return "remote:" + registry.agent_id
-        def remote_call(target, op, payload):
-            source()
-            result = registry._kernel_hooks_host.request({"t": "cli-term-request", "agentId": registry.agent_id,
-                "targetId": target[7:], "operation": op, "payload": payload,
-                "rpcId": uuid.uuid4().hex}, timeout=25)
-            if not result.get("ok"):
-                raise link.LinkError(result.get("error") or "Kernel refused terminal RPC")
-            return result.get("result", {})
-        transport.remote_call, transport.remote_source = remote_call, source
     link._service = service
     try:
         service.start()

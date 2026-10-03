@@ -50,7 +50,7 @@ class TestIds(HandoffTestCase):
         # Titles are written by people, and half this project's users write
         # Chinese. A slug that collapses to empty must not produce an id the
         # validator then rejects.
-        handoff.valid_id(handoff.new_id("交接给下一个人"))
+        handoff.valid_id(handoff.new_id('\u4ea4\u63a5\u7ed9\u4e0b\u4e00\u4e2a\u4eba'))
         handoff.valid_id(handoff.new_id("---"))
         handoff.valid_id(handoff.new_id(""))
 
@@ -404,7 +404,7 @@ class TestPortableToken(HandoffTestCase):
     """One string, any channel — and what it does when the channel damages it."""
 
     def test_round_trips_through_a_token(self):
-        env = self.make(to="bob", avoid=["别重跑 015,已经应用过了"],
+        env = self.make(to="bob", avoid=["Do not rerun 015; it has already been applied."],
                         contract={"outputs": [{"name": "m", "type": "file"}]},
                         expect={"m": "migrations/020.sql"})
         back = handoff.decode_token(handoff.export_token(env))

@@ -71,10 +71,6 @@
     "browser_session",
     "child_registry",
     "snapshot",
-    "winbridge",
-    "windows_host",
-    "windows_kernel",
-    "windows_tools",
     "json_store",
     "mode_manager",
     "event_log",
@@ -127,7 +123,9 @@
     "vision",
     "retask",
     "retask_view",
-    "acp_agent"
+    "acp_agent",
+    "private_files",
+    "runtime_host"
   ],
   "packages": [
     "agent_tools",
@@ -171,8 +169,6 @@
     "linux": [
       "websockets",
       "playwright",
-      "aiortc",
-      "av",
       "cffi",
       "cryptography",
       "pyte"
@@ -187,16 +183,12 @@
       "trafilatura>=1.8",
       "curl_cffi>=0.7"
     ],
-    "webrtc": [
-      "aiortc>=1.14"
-    ],
     "mcp": [
       "mcp>=1.0"
     ],
     "all": [
       "websockets>=12.0",
       "playwright>=1.40",
-      "aiortc>=1.14",
       "mcp>=1.0",
       "trafilatura>=1.8",
       "curl_cffi>=0.7"

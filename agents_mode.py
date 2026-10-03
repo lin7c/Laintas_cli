@@ -1841,9 +1841,9 @@ class AgentsModeController:
             keys = [("alt+" + symbols.ARROW_U + symbols.ARROW_D, "pick"),
                     ("tab", "close"), ("esc", "back")]
         elif self._is_narrow() and self._narrow_list_mode:
-            # Narrow list-first: Enter dives in, arrows move.
+            # Narrow list-first: Enter dives in, bare arrows move.
             keys = [("enter", "open"),
-                    ("alt+" + symbols.ARROW_U + symbols.ARROW_D, "agent"),
+                    (symbols.ARROW_U + symbols.ARROW_D, "agent"),
                     ("esc", "back")]
         elif self._is_narrow():
             # Narrow conversation: Esc returns to the list.
@@ -2457,14 +2457,24 @@ class AgentsModeController:
             self.overlay = not self.overlay
             self.invalidate()
 
-        @kb.add("enter", filter=Condition(
-            lambda: self._is_narrow() and self._narrow_list_mode))
+        narrow_list_filter = Condition(
+            lambda: self._is_narrow() and self._narrow_list_mode)
+
+        @kb.add("enter", filter=narrow_list_filter)
         def _narrow_enter(_event):
             # Narrow list-first: Enter dives into the selected agent's
             # conversation.
             if self.selected_id:
                 self._narrow_list_mode = False
                 self.invalidate()
+
+        @kb.add("up", filter=narrow_list_filter)
+        def _narrow_up(_event):
+            self.cycle_agent(-1)
+
+        @kb.add("down", filter=narrow_list_filter)
+        def _narrow_down(_event):
+            self.cycle_agent(1)
 
         @kb.add("escape")
         def _escape(event):
@@ -2680,8 +2690,6 @@ class AgentsModeController:
         ])
         # Narrow mode: list-first. The agent list takes the full screen;
         # Enter dives into the conversation, Esc comes back.
-        narrow_list_filter = Condition(
-            lambda: self._is_narrow() and self._narrow_list_mode)
         narrow_list_view = HSplit([
             Window(_PaneControl(self.rail_lines, self._rail_mouse),
                    style="class:rail.bg"),

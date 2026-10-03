@@ -37,74 +37,9 @@ from typing import Optional
 _SHELL_WRAPPERS = {"sh", "bash", "zsh", "dash", "ksh", "ash", "busybox"}
 _WRAPPER_STRING_FLAGS = {"-c", "--command"}
 
-# The Windows build runs this CLI inside a private WSL distribution with
-# interop on and the Windows PATH appended, so `powershell.exe -Command …` and
-# `cmd.exe /c …` are one word away at all times — and every rule in policy.py
-# was written for the Linux side of that boundary. Treating them as wrappers is
-# what makes the payload visible to those rules instead of the launcher name.
-#
-# PowerShell accepts abbreviations of a parameter name, so `-Com`, `-Comma`
-# and `-Command` are the same flag; the check below is by prefix for that
-# reason, not for convenience (see _PS_PARAMS for how the prefix is bounded).
-_WINDOWS_WRAPPERS = {"powershell.exe", "powershell", "pwsh.exe", "pwsh",
-                     "cmd.exe", "cmd", "wsl.exe", "wsl"}
-# (full parameter name, shortest prefix PowerShell accepts for it). This is
-# how pwsh's own CommandLineParameterParser resolves a switch: the token must
-# be a prefix of the full name AND at least as long as its minimal form. That
-# is what keeps `-ExecutionPolicy` (min `-ex`) out of `-EncodedCommand`
-# (min `-e`) while still resolving `-Encod` and `-Comm` — an exact-token match
-# let every abbreviation walk past the payload analysis with no risk flag.
-_PS_PARAMS = (
-    ("-command", "-c"), ("-commandwithargs", "-commandw"),
-    ("-configurationname", "-config"), ("-configurationfile", "-configurationf"),
-    ("-custompipename", "-cus"),
-    ("-encodedcommand", "-e"), ("-encodedarguments", "-encodeda"),
-    ("-executionpolicy", "-ex"), ("-file", "-f"), ("-help", "-h"),
-    ("-inputformat", "-in"), ("-interactive", "-i"), ("-login", "-l"),
-    ("-mta", "-mta"), ("-noexit", "-noe"), ("-nologo", "-nol"),
-    ("-noninteractive", "-noni"), ("-noprofile", "-nop"),
-    ("-outputformat", "-o"), ("-psconsolefile", "-psc"),
-    ("-settingsfile", "-settings"), ("-sta", "-sta"), ("-version", "-v"),
-    ("-windowstyle", "-w"), ("-workingdirectory", "-wd"),
-)
-_PS_ALIASES = {"-ec": "-encodedcommand", "-enc": "-encodedcommand",
-               "-cwa": "-commandwithargs", "-wd": "-workingdirectory"}
-_PS_ENCODED_PARAMS = {"-encodedcommand"}
-_PS_COMMAND_PARAMS = {"-command", "-commandwithargs"}
-
-
-def _ps_param_names(token: str) -> set:
-    """Every powershell.exe/pwsh parameter `token` could abbreviate."""
-    if token in _PS_ALIASES:
-        return {_PS_ALIASES[token]}
-    return {full for full, shortest in _PS_PARAMS
-            if full.startswith(token) and len(token) >= len(shortest)}
-def _cmd_switch_payload(words: list) -> str:
-    """What `cmd` will run, however the switch is spelled. "" if none.
-
-    cmd.exe looks for its run switch anywhere in its arguments and does not
-    need it to be a word of its own. Only `/c` as an exact word used to be
-    recognised, so all of these ran unseen (the kernel executes AI commands
-    in an msys bash, which rewrites `//c` to `/c` before cmd starts):
-
-        cmd //c X      msys-escaped switch
-        cmd /s /c X    another switch first     cmd /q/c X   stacked switches
-        cmd /cX        glued to its command     cmd "/c X"   one quoted word
-    """
-    for idx, word in enumerate(words):
-        if not word.startswith("/"):
-            continue
-        normalized = "/" + word.lstrip("/")        # msys `//c` -> `/c`
-        for part in normalized.split("/")[1:]:
-            if part[:1].lower() in ("c", "k", "r"):
-                head = part[1:].strip()
-                tail = words[idx + 1:]
-                return " ".join(x for x in (head, *tail) if x)
-    return ""
-
 # Commands that consume a shell script on stdin. `echo "rm -rf /" | sh` is the
 # canonical form of this trick.
-_STDIN_SHELLS = _SHELL_WRAPPERS | {"eval", "cmd", "cmd.exe"}
+_STDIN_SHELLS = _SHELL_WRAPPERS | {"eval"}
 
 # Programs whose own arguments are another command: `nohup rm -rf /` runs `rm`,
 # not `nohup`. The parser already looks inside interpreters (`sh -c …`); these are
@@ -436,137 +371,7 @@ def _program_name(word: str) -> str:
     see the other.
     """
     name = word.rsplit("/", 1)[-1]
-    # A Windows program is addressed by either separator and by any casing:
-    # `C:\\Windows\\System32\\CMD.EXE`, `cmd.exe` and `Cmd.Exe` are one program.
-    # Only `.exe` names are folded — Linux filenames are case-sensitive and
-    # `Make` is not `make`.
-    name = name.rsplit("\\", 1)[-1]
-    if name.lower().endswith(".exe"):
-        name = name.lower()
     return name
-
-
-def _windows_payload(program: str, rest: list) -> tuple:
-    """The script a Windows wrapper will run, plus what could not be resolved.
-
-    Returns ``(payload, risks)``. An encoded command is decoded when it decodes
-    cleanly — the point of the guard is to see what runs, and refusing to look
-    at base64 would leave the most deliberate form of hiding as the one that
-    works. Anything still unreadable (a `-File` script, undecodable base64) is
-    reported UNRESOLVED so policy fails closed on it.
-    """
-    import base64
-
-    name = program.lower()
-    risks: set = set()
-    words = [w for w in rest if w]
-    for idx, word in enumerate(words):
-        lowered = word.lower()
-        following = words[idx + 1] if idx + 1 < len(words) else ""
-        if name.startswith(("cmd",)):
-            return _cmd_switch_payload(words), risks
-        # powershell / pwsh / wsl
-        if name.startswith(("wsl",)):
-            # `wsl.exe -- <command>` and `wsl.exe <command>` both run a Linux
-            # command line, which every existing rule already understands.
-            if lowered == "--" and following:
-                return " ".join(words[idx + 1:]), risks
-            continue
-        # E4 (bughunt): `startswith("-e")` swallowed -ExecutionPolicy and
-        # -ErrorAction, `startswith("-c")` swallowed -ComputerName. Resolve
-        # the flag the way PowerShell does (see _PS_PARAMS) instead: prefix
-        # of the full name, no shorter than its minimal form. An ambiguous
-        # abbreviation that could be the payload flag is treated as it —
-        # looking at a payload that was not one costs nothing, missing one
-        # that was is the hole. `-flag:value` is PowerShell's inline form.
-        flag_token = lowered.split(":", 1)[0]
-        names = _ps_param_names(flag_token) if flag_token.startswith("-") else set()
-        # Base64 is case-sensitive: take the inline value from the original
-        # token, never from the lowercased one.
-        inline_value = following
-        if ":" in word:
-            inline_val = word.split(":", 1)[1]
-            if inline_val:
-                inline_value = inline_val
-        if names & _PS_ENCODED_PARAMS and inline_value:
-            try:
-                raw = base64.b64decode(inline_value, validate=True)
-                decoded = raw.decode("utf-16-le").strip()
-            except Exception:
-                decoded = ""
-            if decoded:
-                return decoded, {RISK_WRAPPER}
-            return "", {RISK_WRAPPER, RISK_UNRESOLVED, RISK_OPAQUE_PAYLOAD}
-        if names & _PS_COMMAND_PARAMS and following:
-            return " ".join(words[idx + 1:]), risks
-        if "-file" in names:
-            # The script is on disk; its contents are not knowable here. This
-            # is not a substitution and must not be reported as one: the agent
-            # that is told "the command name is produced at runtime" about
-            # `-File ./report.ps1` has been told something untrue about a
-            # command it wrote, and rewrites the wrong half of it.
-            return "", {RISK_WRAPPER, RISK_UNRESOLVED, RISK_OPAQUE_PAYLOAD}
-    return "", risks
-
-
-#: PowerShell variables that bash also expands, and always to the wrong thing.
-#: `$_` is bash's "last argument of the previous command", the rest are unset
-#: and expand to nothing. None of them is ever a deliberate bash reference in a
-#: line that invokes PowerShell.
-_PS_ONLY_VARIABLES = (
-    "$_", "$PSItem", "$env:", "$null", "$true", "$false", "$args", "$input",
-    "$Matches", "$Error", "$Host", "$LASTEXITCODE", "$PSScriptRoot",
-    "$PSCommandPath", "$Using:", "$MyInvocation",
-)
-
-_PS_INVOCATION_RE = re.compile(r"(?:^|[\s;|&(])(?:[^\s;|&]*[/\\])?"
-                               r"(?:powershell|pwsh)(?:\.exe)?(?=\s|$)",
-                               re.IGNORECASE)
-
-
-def powershell_expansion_conflict(command: str) -> str:
-    """The first PowerShell variable bash will eat, or "" if there is none.
-
-    A PowerShell payload written in double quotes is a bash string first:
-    `powershell.exe -Command "… | Where-Object { $_.DisplayName }"` reaches
-    PowerShell as `{ .DisplayName }` because bash already replaced `$_` with
-    the last argument of the previous command. Nothing errors -- PowerShell
-    receives a syntactically valid, semantically different script, and the
-    failure surfaces as unrelated cmdlet-not-found noise several lines later.
-
-    Only lines that actually invoke PowerShell are examined, and only outside
-    single quotes, which is exactly the quoting that fixes it.
-    """
-    if not command or not _PS_INVOCATION_RE.search(command):
-        return ""
-    quote = None
-    index = 0
-    length = len(command)
-    while index < length:
-        ch = command[index]
-        if quote == "'":
-            if ch == "'":
-                quote = None
-            index += 1
-            continue
-        if quote == '"':
-            if ch == "\\" and index + 1 < length:
-                index += 2
-                continue
-            if ch == '"':
-                quote = None
-                index += 1
-                continue
-        elif ch in ("'", '"'):
-            quote = ch
-            index += 1
-            continue
-        if ch == "$":
-            for name in _PS_ONLY_VARIABLES:
-                if command.startswith(name, index):
-                    return name
-        index += 1
-    return ""
 
 
 def analyze(command: str, *, _depth: int = 0) -> Analysis:
@@ -665,13 +470,7 @@ def analyze(command: str, *, _depth: int = 0) -> Analysis:
                     payloads.append(rest[idx + 1])
                     break
 
-        if program.lower() in _WINDOWS_WRAPPERS:
-            windows_payload, windows_risks = _windows_payload(program, rest)
-            if windows_payload:
-                payloads.append(windows_payload)
-            if windows_risks:
-                seg_risks |= windows_risks
-                risks |= windows_risks
+
 
         if program == "eval" and rest:
             payloads.append(" ".join(rest))

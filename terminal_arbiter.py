@@ -542,7 +542,7 @@ class TerminalArbiter:
     # holds the terminal — pristine means canonical mode with echo — and the
     # line discipline prints them, which is how a screen fills with
     # ``^[[<35;46;1M``. It stayed hidden because mouse reporting was off by
-    # default everywhere until the Windows build turned it on.
+    # default until explicitly enabled by the runtime configuration.
     _MODE_RESET = (
         "\x1b[?1000l"      # normal mouse tracking
         "\x1b[?1002l"      # button-event tracking

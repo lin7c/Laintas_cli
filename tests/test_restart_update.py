@@ -86,102 +86,18 @@ class DownloadProgressTests(unittest.TestCase):
 
 
 class RestartResolutionTests(unittest.TestCase):
-    POWERSHELL = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
     LOGIN_URL = "https://accounts.laintas.com/login?state=a&code=b"
 
-    def _run_wsl_open(self, returncode=0):
-        """Call the opener as it runs inside the private distribution."""
-        with mock.patch.dict(
-                laintas_cli.os.environ,
-                {"WSL_DISTRO_NAME": "Laintas-CLI", "WSLENV": "KEEP/p"},
-                clear=False), \
-                mock.patch.object(
-                    laintas_cli.shutil, "which", return_value=self.POWERSHELL), \
-                mock.patch.object(
-                    laintas_cli.subprocess, "run",
-                    return_value=SimpleNamespace(returncode=returncode)) as run, \
-                mock.patch.object(laintas_cli.webbrowser, "open") as browser:
-            opened = laintas_cli._open_external_url(self.LOGIN_URL)
-        return opened, run, browser
 
-    def test_wsl_browser_open_uses_windows_default_url_handler(self):
-        opened, run, browser = self._run_wsl_open()
 
-        self.assertTrue(opened)
-        browser.assert_not_called()
-        argv = run.call_args.args[0]
-        self.assertEqual(argv[:5], [
-            self.POWERSHELL, "-NoLogo", "-NoProfile", "-NonInteractive",
-            "-Command"])
-        self.assertEqual(len(argv), 6, "nothing may follow the -Command text")
 
-    def test_wsl_browser_open_never_puts_the_url_on_the_command_line(self):
-        """`-Command <text>` swallows everything after it.
 
-        v1.23.1 passed the URL as a trailing argument expecting $args[0] to
-        pick it up. PowerShell appends it to the command text instead, so
-        Start-Process got a null path, nothing opened, and — because the exit
-        code was ignored — the CLI reported success. Verified against
-        PowerShell: `-Command 'Write-Output $args.Count' x` prints 0.
-        """
-        opened, run, _ = self._run_wsl_open()
 
-        argv = run.call_args.args[0]
-        command = argv[5]
-        self.assertNotIn("$args", command)
-        self.assertNotIn(self.LOGIN_URL, argv,
-                         "the URL must not travel on the command line")
-        self.assertIn("$env:LAINTAS_OPEN_URL", command)
-        # Windows PowerShell 5.1 exits 0 after a cmdlet error unless told not
-        # to, which is what let the failure read as success.
-        self.assertIn("exit 1", command)
 
-        environment = run.call_args.kwargs["env"]
-        self.assertEqual(environment["LAINTAS_OPEN_URL"], self.LOGIN_URL)
-        # A Win32 process sees only what WSLENV names, and an existing entry
-        # belongs to something else that still needs it.
-        self.assertEqual(environment["WSLENV"], "KEEP/p:LAINTAS_OPEN_URL/w")
-        self.assertTrue(opened)
-
-    def test_wsl_browser_open_falls_back_when_windows_opened_nothing(self):
-        """A failed handler must not be reported as an opened browser."""
-        opened, _, browser = self._run_wsl_open(returncode=1)
-
-        browser.assert_called_once_with(self.LOGIN_URL)
-        self.assertIs(opened, bool(browser.return_value))
-
-    def test_private_windows_runtime_enables_mouse_by_default(self):
-        with mock.patch.dict(
-                laintas_cli.os.environ,
-                {"WSL_DISTRO_NAME": "Laintas-CLI"}, clear=False):
-            preferences = laintas_cli._initial_ui_preferences_for_host({})
-        self.assertIs(preferences["enable_mouse"], True)
-
-    def test_private_windows_runtime_respects_explicit_mouse_choice(self):
-        with mock.patch.dict(
-                laintas_cli.os.environ,
-                {"WSL_DISTRO_NAME": "Laintas-CLI"}, clear=False):
-            preferences = laintas_cli._initial_ui_preferences_for_host(
-                {"enable_mouse": False})
-        self.assertIs(preferences["enable_mouse"], False)
-
-    def test_launcher_marker_enables_mouse_whatever_the_distro_is_called(self):
-        """The launcher's own signal, not the distribution's name.
-
-        LAINTAS_WSL_DISTRO renames the distribution, so a name check loses the
-        mouse for anyone who used it — with nothing on screen connecting the
-        two facts.
-        """
-        with mock.patch.dict(
-                laintas_cli.os.environ,
-                {"LAINTAS_HOST": "windows",
-                 "WSL_DISTRO_NAME": "Laintas-Work"}, clear=False):
-            preferences = laintas_cli._initial_ui_preferences_for_host({})
-        self.assertIs(preferences["enable_mouse"], True)
 
     def test_an_ordinary_linux_terminal_leaves_the_mouse_off(self):
         environment = {k: v for k, v in laintas_cli.os.environ.items()
-                       if k not in ("LAINTAS_HOST", "WSL_DISTRO_NAME")}
+                       if k != "LAINTAS_HOST"}
         with mock.patch.dict(laintas_cli.os.environ, environment, clear=True):
             preferences = laintas_cli._initial_ui_preferences_for_host({})
         self.assertNotIn("enable_mouse", preferences)
@@ -271,13 +187,7 @@ class FrozenUpdateTests(unittest.TestCase):
             self.assertEqual(list(Path(tmp).glob(".laintas-cli-update-*")), [])
 
     def test_unwritable_install_dir_replaces_through_sudo(self):
-        """The Windows distribution's layout: root-owned dir, user session.
-
-        /usr/local/bin belongs to root because the Windows installer writes it
-        as root, while the distribution logs in as `laintas`. Without the sudo
-        path every `/v update` there aborted after downloading the whole
-        binary.
-        """
+        """A user-installed CLI can update a root-owned executable via sudo."""
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "laintas-cli"
             target.write_bytes(b"old-binary")
@@ -328,9 +238,6 @@ class FrozenUpdateTests(unittest.TestCase):
                         updater.os, "access", return_value=False), \
                     mock.patch.object(
                         updater.shutil, "which", return_value=None), \
-                    mock.patch.dict(
-                        updater.os.environ,
-                        {"LAINTAS_HOST": "windows"}, clear=False), \
                     mock.patch.object(
                         updater, "_download",
                         side_effect=AssertionError(
@@ -341,10 +248,7 @@ class FrozenUpdateTests(unittest.TestCase):
             self.assertIsNone(installed)
             self.assertEqual(target.read_bytes(), b"old-binary")
             self.assertTrue(any("No write permission" in m for m in messages))
-            # Telling a Windows user to "re-run with sudo" points at a command
-            # line the launcher never gives them.
-            self.assertTrue(any("Windows installer" in m for m in messages))
-            self.assertFalse(any("sudo" in m for m in messages))
+            self.assertTrue(any("sudo" in m for m in messages))
 
     def test_binary_replacement_rejects_checksum_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -449,8 +353,7 @@ class UpdateChannelTests(unittest.TestCase):
         # packages remain direct downloads.
         self.assertIn("id: 'mac'", page)
         self.assertIn("Apple Silicon / Intel", page)
-        for asset in ("laintas-cli_windows_amd64_setup.exe",
-                      "laintas-cli_source.zip"):
+        for asset in ("laintas-cli_source.zip",):
             self.assertIn(asset, page)
 
 

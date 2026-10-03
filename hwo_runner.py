@@ -11,6 +11,8 @@ Mirrors hwo.ts from the Helpwo project:
 
 from __future__ import annotations
 
+import private_files
+
 import queue
 import re
 import threading
@@ -521,7 +523,7 @@ def _load_prompt_file(path: str) -> str:
             or "://" in raw
         ):
             return ""
-        return (Path.cwd() / raw).read_text(encoding="utf-8")
+        return private_files.read_text((Path.cwd() / raw), encoding="utf-8")
     except OSError:
         return ""
 
@@ -1311,7 +1313,7 @@ def run_hwo_file(
         run_state = None
 
     try:
-        source = Path(path).read_text(encoding="utf-8")
+        source = private_files.read_text(Path(path), encoding="utf-8")
     except OSError as e:
         if run_state and workflow_state:
             run_state["status"] = "failed"
@@ -1396,7 +1398,7 @@ def run_hwo_file(
 def compile_hwo_file(path: str) -> dict:
     """Parse and validate a .hwo file without executing it."""
     try:
-        source = Path(path).read_text(encoding="utf-8")
+        source = private_files.read_text(Path(path), encoding="utf-8")
     except OSError as e:
         return {"ok": False, "msg": f"hwo: cannot read '{path}': {e}"}
 

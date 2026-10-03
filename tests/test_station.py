@@ -41,7 +41,7 @@ class RoutingTests(unittest.TestCase):
 
     def test_role_selection_does_not_confuse_testing_with_readonly_coverage_review(self):
         self.assertEqual(suggest_role("review the API"), "reviewer")
-        self.assertEqual(suggest_role("定位登录入口"), "explorer")
+        self.assertEqual(suggest_role('\u5b9a\u4f4d\u767b\u5f55\u5165\u53e3'), "explorer")
         self.assertEqual(suggest_role("run tests"), "")
         self.assertEqual(suggest_role("test the implementation"), "")
         self.assertEqual(suggest_role("review and fix the API"), "")

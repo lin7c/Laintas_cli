@@ -47,12 +47,14 @@ export default function ExtensionsSection({ standalone = false }) {
     return [...grouped.entries()].sort(([left], [right]) => left.localeCompare(right));
   }, [community]);
 
+  const Heading = standalone ? 'h1' : 'h2';
+
   return (
     <section id="extensions" className={`extensions-section page-shell${standalone ? ' extensions-standalone' : ''}`}>
       <div className="extensions-heading">
         <div>
           <p className="section-kicker">{standalone ? 'EXTENSIONS' : '04 / EXTENSIONS'}</p>
-          <h2>Two sources.<br />No blurred trust.</h2>
+          <Heading>Two sources.<br />No blurred trust.</Heading>
         </div>
         <p>Official packages and user-published code remain visibly and technically separate. Community code is unreviewed and receives a fresh AI-assisted source review before every installation.</p>
       </div>

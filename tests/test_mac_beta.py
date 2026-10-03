@@ -17,11 +17,6 @@ def test_mac_live_worktree_owner_is_not_reaped_without_proc():
         assert worktree_manager._owner_alive(owner)
 
 
-def test_mac_cli_does_not_start_helpwo_kernel():
-    with mock.patch.object(laintas_cli.sys, "platform", "darwin"), \
-            mock.patch("windows_host.start_host") as start_host:
-        assert laintas_cli.AgentRegistry._kernel_link(wait=1) is None
-        start_host.assert_not_called()
 
 
 def test_beta_sorts_between_previous_and_final_versions():
@@ -63,3 +58,8 @@ def test_mac_updates_use_site_mirror_and_custom_tag():
             "https://cli.laintas.com/releases/latest/manifest.json")
         assert updater._asset_url("laintas-cli-beta-v1", "manifest.json") == (
             "https://cli.laintas.com/releases/laintas-cli-beta-v1/manifest.json")
+
+
+def test_unix_cli_has_no_kernel_entry_point():
+    assert not hasattr(laintas_cli, "_cmd_windows")
+    assert not hasattr(laintas_cli.AgentRegistry, "_kernel_link")

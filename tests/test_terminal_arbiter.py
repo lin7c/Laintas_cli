@@ -84,7 +84,7 @@ class KeyParserTests(unittest.TestCase):
 
     def test_split_utf8_is_held_until_complete(self):
         self.assertEqual([], self.parser.feed(b"\xe4\xb8"))
-        self.assertEqual([Key("text", "中")], self.parser.feed(b"\xad"))
+        self.assertEqual([Key("text", '\u4e2d')], self.parser.feed(b"\xad"))
 
     def test_printable_run_is_batched(self):
         self.assertEqual([Key("text", "abc")], self.parser.feed(b"abc"))

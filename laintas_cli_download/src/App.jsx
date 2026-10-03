@@ -1,4 +1,5 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import RouteMetadata from './components/RouteMetadata';
 import { ThemeProvider, useTheme } from './contexts/ThemeContext';
 import { LanguageProvider } from './contexts/LanguageContext';
 import { AuthProvider } from './contexts/AuthContext';
@@ -16,6 +17,7 @@ function AppContent() {
 
   return (
     <BrowserRouter>
+      <RouteMetadata />
       <Routes>
         <Route path="/" element={
           <div className="relative min-h-screen">

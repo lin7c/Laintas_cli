@@ -7,18 +7,12 @@ prompt_toolkit>=3.0.0
 pyte>=0.8.2,<0.9
 pysocks>=1.7
 
-# Optional extras - install via pip install .[<extra>]  (e.g. .[browser,webrtc])
+# Optional extras - install via pip install .[<extra>]  (e.g. .[browser])
 #   [browser]  websockets, playwright  - headless-browser live-view + CDP tools
-#   [webrtc]   aiortc                  - P2P file channel (bypasses relay)
 #   [mcp]      mcp                     - MCP server tools (/mcp)
 #   [all]      all of the above
 #
 # The lines below are for `pip install -r requirements.txt` (dev convenience).
-
-# Enables the WebRTC peer-to-peer file channel (browser ↔ this host) so file
-# transfers bypass the Helpwo relay server. Optional: the CLI runs without it
-# and file ops fall back to the server-relayed base64-over-exec path.
-aiortc>=1.14
 
 # Optional — enables /mcp commands and MCP-server tools.
 # laintas-cli starts and runs without this; the /mcp command will tell

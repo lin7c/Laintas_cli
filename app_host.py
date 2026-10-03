@@ -56,7 +56,7 @@ PERSISTENCE_MODES = (PERSISTENCE_NONE, PERSISTENCE_WORKSPACE)
 SESSION_ALLOWED_KINDS = frozenset({
     "chat", "abort", "approval-response", "exec", "query", "delegate",
     "webtest", "analyze_site", "term-open", "term-new", "term-close",
-    "disconnect", "rtc-offer", "rtc-ice", "rtc-close",
+    "disconnect",
 })
 APP_ALLOWED_KINDS = SESSION_ALLOWED_KINDS | {"session-open", "session-close", "session-list"}
 

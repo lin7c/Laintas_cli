@@ -31,10 +31,10 @@ class FrontmatterSanitizeTests(unittest.TestCase):
         self.assertEqual(parsed.get("description"), "a b c")
 
     def test_normal_values_round_trip(self):
-        meta = {"name": "n", "description": "正常描述 with spaces",
+        meta = {"name": "n", "description": '\u6b63\u5e38\u63cf\u8ff0 with spaces',
                 "type": "user"}
         parsed, _ = ms._parse_frontmatter(ms._format_frontmatter(meta, "b"))
-        self.assertEqual(parsed.get("description"), "正常描述 with spaces")
+        self.assertEqual(parsed.get("description"), '\u6b63\u5e38\u63cf\u8ff0 with spaces')
 
     def test_multiline_description_is_preserved_as_text(self):
         # Legitimate multi-line content stays readable, just single-line.

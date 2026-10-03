@@ -1446,6 +1446,16 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
     # the root (symlink escapes, `..`) the same way RemoteProvider.pathOf
     # and webrtc_channel.py's _is_path_allowed do for the remote-mount path.
 
+    def _private_access(self, path: str, operation: str, *, recursive: bool = False) -> bool:
+        import private_files
+        try:
+            private_files.check(path or str(_local_root()), operation,
+                                str(_local_root()), recursive=recursive)
+            return True
+        except (OSError, ValueError):
+            self._json(403, {"error": "Access denied by private file permissions."})
+            return False
+
     def _entry_meta(self, p: Path) -> dict:
         st = p.stat()
         is_dir = p.is_dir()
@@ -1456,6 +1466,8 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
             "size": 0 if is_dir else st.st_size,
             "modifiedAt": st.st_mtime,
             "mimeType": mime,
+            "isSymlink": p.is_symlink(),
+            "symlinkTarget": os.readlink(p) if p.is_symlink() else None,
         }
 
     def _handle_local_fs_root(self) -> None:
@@ -1466,6 +1478,8 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         self._json(200, {"available": True, "root": str(root)})
 
     def _handle_local_fs_list(self, path: str) -> None:
+        if not self._private_access(path, "read"):
+            return
         p = _resolve_local_path(path)
         if p is None:
             self._json(400, {"error": "path outside local workspace root"})
@@ -1474,13 +1488,16 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not a directory"})
             return
         try:
-            entries = [self._entry_meta(child) for child in p.iterdir()]
+            import private_files
+            entries = [self._entry_meta(child) for child in p.iterdir() if private_files.allowed(child)]
         except OSError as e:
             self._json(500, {"error": str(e)})
             return
         self._json(200, {"entries": entries})
 
     def _handle_local_fs_stat(self, path: str) -> None:
+        if not self._private_access(path, "visible"):
+            return
         p = _resolve_local_path(path)
         if p is None or not p.exists():
             self._json(404, {"error": "not found"})
@@ -1488,6 +1505,8 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         self._json(200, self._entry_meta(p))
 
     def _handle_local_fs_read(self, path: str) -> None:
+        if not self._private_access(path, "read"):
+            return
         p = _resolve_local_path(path)
         if p is None or not p.is_file():
             self._json(404, {"error": "not found"})
@@ -1514,6 +1533,8 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         })
 
     def _handle_local_fs_write(self, body: dict) -> None:
+        if not self._private_access(str(body.get("path") or ""), "write", recursive=False):
+            return
         p = _resolve_local_path(str(body.get("path") or ""))
         if p is None:
             self._json(400, {"error": "path outside local workspace root"})
@@ -1540,6 +1561,8 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True})
 
     def _handle_local_fs_mkdir(self, body: dict) -> None:
+        if not self._private_access(str(body.get("path") or ""), "write", recursive=False):
+            return
         p = _resolve_local_path(str(body.get("path") or ""), follow_leaf=False)
         if p is None:
             self._json(400, {"error": "path outside local workspace root"})
@@ -1552,6 +1575,8 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True})
 
     def _handle_local_fs_delete(self, body: dict) -> None:
+        if not self._private_access(str(body.get("path") or ""), "write", recursive=True):
+            return
         p = _resolve_local_path(str(body.get("path") or ""), follow_leaf=False)
         root = _local_root()
         if p is None or root is None:
@@ -1579,6 +1604,10 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True})
 
     def _handle_local_fs_rename(self, body: dict) -> None:
+        if not self._private_access(str(body.get("path") or ""), "read", recursive=True):
+            return
+        if not self._private_access(str(body.get("path") or ""), "write", recursive=True):
+            return
         p = _resolve_local_path(str(body.get("path") or ""), follow_leaf=False)
         new_name = str(body.get("newName") or "").strip()
         if p is None or not new_name or "/" in new_name or new_name in (".", ".."):
@@ -1587,6 +1616,8 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         target = _resolve_local_path(str(Path(body.get("path") or "").parent / new_name))
         if target is None:
             self._json(400, {"error": "target path outside local workspace root"})
+            return
+        if not self._private_access(str(target), "write"):
             return
         if target.exists():
             self._json(409, {"error": "target already exists"})
@@ -1605,12 +1636,18 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True})
 
     def _handle_local_fs_move(self, body: dict) -> None:
+        if not self._private_access(str(body.get("path") or ""), "read", recursive=True):
+            return
+        if not self._private_access(str(body.get("path") or ""), "write", recursive=True):
+            return
         p = _resolve_local_path(str(body.get("path") or ""), follow_leaf=False)
         new_parent = _resolve_local_path(str(body.get("newParentPath") or ""))
         if p is None or new_parent is None or not new_parent.is_dir():
             self._json(400, {"error": "invalid source or destination"})
             return
         target = new_parent / p.name
+        if not self._private_access(str(target), "write"):
+            return
         if target.exists():
             self._json(409, {"error": "target already exists"})
             return

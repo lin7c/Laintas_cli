@@ -11,16 +11,16 @@ const RELEASE_FALLBACK = 'laintas-cli-beta-v2';
 // The site mirrors the verified assets from the latest GitHub Release.
 const RELEASE_BASE = 'https://cli.laintas.com/releases/latest';
 const RELEASE_API = 'https://api.github.com/repos/lin7c/Laintas_cli/releases/latest';
+const WINDOWS_DOWNLOAD = 'https://cli.laintas.com/windows/LaintasSetup.exe';
 const INSTALL_COMMANDS = {
   linux: 'curl -fsSL https://cli.laintas.com/install.sh | bash',
   mac: 'curl -fsSL https://cli.laintas.com/install.sh | bash',
-  windows: "irm https://cli.laintas.com/install.ps1 | iex",
 };
 
 const DOWNLOADS = [
   { id: 'linux', names: { zh: 'Linux', en: 'Linux' }, details: { zh: 'x86_64 / arm64 · 安装脚本自动识别架构', en: 'x86_64 / arm64 · installer picks the architecture' }, href: 'https://cli.laintas.com/install.sh', icon: Package },
   { id: 'mac', names: { zh: 'macOS', en: 'macOS' }, details: { zh: 'Apple Silicon / Intel · 安装脚本自动识别架构', en: 'Apple Silicon / Intel · installer picks the architecture' }, href: 'https://cli.laintas.com/install.sh', icon: Laptop },
-  { id: 'windows', names: { zh: 'Windows', en: 'Windows' }, details: { zh: 'x86_64 · 单文件安装器 · 自带独立 WSL 2', en: 'x86_64 · single installer · private WSL 2' }, file: 'laintas-cli_windows_amd64_setup.exe', icon: Monitor },
+  { id: 'windows', names: { zh: 'laintas-Helpwo-cli-for-windows', en: 'laintas-Helpwo-cli-for-windows' }, details: { zh: 'Windows x86_64 · Helpwo 聊天桌面版 · 双击安装', en: 'Windows x86_64 · Helpwo desktop chat · native installer' }, href: WINDOWS_DOWNLOAD, icon: Monitor },
   { id: 'source', names: { zh: '源码包', en: 'Source package' }, details: { zh: 'Python 3.10+ · 审计与二次开发', en: 'Python 3.10+ · audit and extend' }, file: 'laintas-cli_source.zip', icon: Code2 },
 ];
 
@@ -74,7 +74,7 @@ const COPY = {
     title: ['命令照常敲，', '其余交给 agent。'],
     lead: 'Laintas CLI 是装进 shell 的自主 agent。ls、git、vim 这类命令照旧直接在真实 PTY 里运行，不经过模型；用一句话描述的任务，交给 agent 去读代码、跑命令、改文件 —— 每一步都摆在你眼前，关键操作等你点头。',
     install: '安装 Laintas CLI', seeHow: '看它怎么工作',
-    facts: [['免费', '运行时免费使用，可下载源码审计'], ['Linux · macOS · Windows', 'x86_64 / arm64，Windows 10 2004+ / 11'], ['一个账号', '与 Helpwo、插件市场共用 Laintas 账号']],
+    facts: [['免费', '运行时免费使用，可下载源码审计'], ['Linux · macOS CLI / Windows Desktop', 'x86_64 / arm64，Windows 10 2004+ / 11'], ['一个账号', '与 Helpwo、插件市场共用 Laintas 账号']],
     realEyebrow: '真实会话录像 · v1.29.4', realTitle: '一段真实会话，逐帧回放',
     realNote: 'agent 读项目、跑 pytest、找到失败用例的根因，把补丁摆出来等你批准，落盘后再跑一遍测试。只剪掉了等待模型的空白，画面一个字没改。',
 
@@ -127,7 +127,7 @@ const COPY = {
     platformLabel: '选择安装平台', linux: 'Linux', mac: 'macOS', windows: 'Windows', copied: '已复制', copy: '复制',
     startSteps: [['运行安装命令', '自动识别架构并完成安装'], ['启动并登录', '输入 laintas-cli，按提示登录 Laintas 账号'], ['说出第一个任务', '比如“看看这个项目怎么跑起来”']],
     packages: '安装包', download: '下载',
-    requirements: 'Linux 需 64 位 glibc 系统；Mac 支持 Apple Silicon 和 Intel，暂不包含 Helpwo Kernel；Windows 需 x86_64、Windows 10 2004+ 或 Windows 11，并启用 WSL 2。',
+    requirements: 'Linux 需 64 位 glibc 系统；Mac 支持 Apple Silicon 和 Intel，暂不包含 Helpwo Kernel；Windows 桌面版需 x86_64、Windows 10/11 和 WebView2，安装器可联网安装 WebView2。',
   },
   en: {
     chapters: ['Intro', 'Why', 'How it works', 'Pricing', 'Download'],
@@ -142,7 +142,7 @@ const COPY = {
     title: ['Your shell, as usual.', 'Plus an agent.'],
     lead: 'Laintas CLI is an autonomous agent that lives in your shell. Commands like ls, git and vim still run straight in a real PTY, never through the model. Describe a task in a sentence and the agent reads code, runs commands and edits files — every step in front of you, every risky one waiting for your yes.',
     install: 'Install Laintas CLI', seeHow: 'See how it works',
-    facts: [['Free', 'Free runtime, source you can download and audit'], ['Linux · macOS · Windows', 'x86_64 / arm64, Windows 10 2004+ / 11'], ['One account', 'Shared with Helpwo and the plugin market']],
+    facts: [['Free', 'Free runtime, source you can download and audit'], ['Linux · macOS CLI / Windows Desktop', 'x86_64 / arm64, Windows 10 2004+ / 11'], ['One account', 'Shared with Helpwo and the plugin market']],
     realEyebrow: 'RECORDED SESSION · v1.29.4', realTitle: 'A real session, replayed frame for frame',
     realNote: 'The agent reads the project, runs pytest, traces the failing case to its root cause, shows the patch and waits for approval, then re-runs the suite. Only the model pauses are cut; nothing on screen is rewritten.',
 
@@ -195,7 +195,7 @@ const COPY = {
     platformLabel: 'Select install platform', linux: 'Linux', mac: 'macOS', windows: 'Windows', copied: 'Copied', copy: 'Copy',
     startSteps: [['Run the installer', 'It detects your architecture and installs laintas-cli'], ['Start and sign in', 'Type laintas-cli and sign in to your Laintas account'], ['Give it a first task', 'Try “figure out how to run this project”']],
     packages: 'Packages', download: 'Download',
-    requirements: 'Linux needs a 64-bit glibc system. Mac supports Apple Silicon and Intel without Helpwo Kernel. Windows needs x86_64 on Windows 10 2004+ or Windows 11 with WSL 2 enabled.',
+    requirements: 'Linux needs a 64-bit glibc system. Mac supports Apple Silicon and Intel without Helpwo Kernel. Windows desktop needs Windows 10/11 x86_64 and WebView2; the installer can download WebView2.',
   },
 };
 
@@ -431,12 +431,11 @@ export default function DownloadSection() {
                 ))}
               </div>
               <div className="st-install-line">
-                <code><span aria-hidden="true">{installPlatform === 'windows' ? 'PS>' : '$'}</span>{INSTALL_COMMANDS[installPlatform]}</code>
-                <CopyButton value={INSTALL_COMMANDS[installPlatform]} labels={c} />
+                {installPlatform === 'windows' ? <a href={WINDOWS_DOWNLOAD}><ArrowDownToLine size={18} /> {lang === 'zh' ? '下载 laintas-Helpwo-cli-for-windows' : 'Download laintas-Helpwo-cli-for-windows'}</a> : <><code><span aria-hidden="true">$</span>{INSTALL_COMMANDS[installPlatform]}</code><CopyButton value={INSTALL_COMMANDS[installPlatform]} labels={c} /></>}
               </div>
             </div>
             <ol className="st-start">
-              {c.startSteps.map(([title, detail], index) => (
+              {(installPlatform === 'windows' ? (lang === 'zh' ? [['安装桌面版','下载并双击 LaintasSetup.exe'],['启动并登录','从开始菜单打开，登录或配置模型'],['开始对话','选择工作目录，给 agent 一个任务']] : [['Install the desktop app','Download and open LaintasSetup.exe'],['Launch and sign in','Open from Start; sign in or configure a model'],['Start a conversation','Choose a workspace and give the agent a task']]) : c.startSteps).map(([title, detail], index) => (
                 <li key={title}><span>0{index + 1}</span><strong>{title}</strong><p>{detail}</p></li>
               ))}
             </ol>
@@ -446,7 +445,7 @@ export default function DownloadSection() {
                 <a href={href || `${RELEASE_BASE}/${file}`} key={id}>
                   <Icon size={18} strokeWidth={1.6} />
                   <span><strong>{names[lang] || names.en}</strong><small>{details[lang] || details.en}</small></span>
-                  <code>{release}</code>
+                  <code>{id === 'windows' ? (lang === 'zh' ? '桌面版' : 'Desktop') : release}</code>
                   <em>{c.download}<ArrowDownToLine size={15} /></em>
                 </a>
               ))}

@@ -87,7 +87,7 @@ def test_log_tail_and_tool_arguments_survive_packing():
         assert f"FAILED assertion_{i}: exit 7" in source
 
 
-@pytest.mark.parametrize("text", ["word " * 10000, "禁止部署。验证失败。" * 3000])
+@pytest.mark.parametrize("text", ["word " * 10000, '\u7981\u6b62\u90e8\u7f72\u3002\u9a8c\u8bc1\u5931\u8d25\u3002' * 3000])
 def test_oversized_message_is_bounded_and_lossless(text):
     message = {"role": "user", "content": text}
     chunks = loop._summary_source_chunks([message], 4000)
@@ -235,7 +235,7 @@ def test_model_window_switch_and_smaller_real_window(monkeypatch, tmp_path):
 def test_huge_latest_user_turn_with_old_history_has_emergency_fallback():
     messages = [{'role': 'user', 'content': 'old task'},
                 {'role': 'assistant', 'content': 'old answer'},
-                {'role': 'user', 'content': '禁止部署，修复测试。' * 10000}]
+                {'role': 'user', 'content': '\u7981\u6b62\u90e8\u7f72\uff0c\u4fee\u590d\u6d4b\u8bd5\u3002' * 10000}]
     backend = mock.Mock(return_value={'reply': SUMMARY})
     with mock.patch.object(loop, 'compaction_budget', return_value={
             'window': 32000, 'usable': 4000}), \

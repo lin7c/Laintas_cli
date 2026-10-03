@@ -25,7 +25,7 @@ def _thread(*turns):
 class SimilarityTests(unittest.TestCase):
     def test_it_is_symmetric_and_bounded(self):
         for left, right in (("hello world", "hello there"),
-                            ("别用中文注释", "注释都写英文"),
+                            ('\u522b\u7528\u4e2d\u6587\u6ce8\u91ca', '\u6ce8\u91ca\u90fd\u5199\u82f1\u6587'),
                             ("", "anything"), ("x", "x")):
             score = repair_signals.similarity(left, right)
             self.assertEqual(score, repair_signals.similarity(right, left))
@@ -40,8 +40,8 @@ class SimilarityTests(unittest.TestCase):
         """The finding that shaped this module: bigram overlap cannot see a
         restatement, so the score is a candidate finder and never a decision."""
         self.assertLess(
-            repair_signals.similarity("别用中文注释", "注释都写英文"), 0.3)
-        self.assertEqual(1.0, repair_signals.similarity("同一句话", "同一句话"))
+            repair_signals.similarity('\u522b\u7528\u4e2d\u6587\u6ce8\u91ca', '\u6ce8\u91ca\u90fd\u5199\u82f1\u6587'), 0.3)
+        self.assertEqual(1.0, repair_signals.similarity('\u540c\u4e00\u53e5\u8bdd', '\u540c\u4e00\u53e5\u8bdd'))
 
 
 class ThreadReadingTests(unittest.TestCase):
@@ -82,12 +82,12 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual([], self._rows())
 
     def test_a_second_turn_is_recorded_with_both_sides(self):
-        thread = _thread(("user", "别用中文注释"),
+        thread = _thread(("user", '\u522b\u7528\u4e2d\u6587\u6ce8\u91ca'),
                          ("assistant", "done, comments are in Chinese"))
-        row = repair_signals.on_user_turn("我说的是注释都写英文", thread)
+        row = repair_signals.on_user_turn('\u6211\u8bf4\u7684\u662f\u6ce8\u91ca\u90fd\u5199\u82f1\u6587', thread)
         self.assertIsNotNone(row)
         self.assertEqual(1, row["turn_index"])
-        self.assertIn("英文", row["user"])
+        self.assertIn('\u82f1\u6587', row["user"])
         self.assertIn("Chinese", row["assistant_tail"])
         self.assertEqual([row], [{k: v for k, v in r.items()
                                   if k not in ("v", "kind", "ts")}
@@ -150,9 +150,9 @@ class CaptureTests(unittest.TestCase):
 class ClassifierTests(unittest.TestCase):
     """One auxiliary call, and it may quote but never author."""
 
-    USER = "我说的是注释都写英文，你还是写了中文"
-    PRIOR = ["别用中文注释", "先跑一下测试"]
-    ASSISTANT = "已完成，注释使用了中文以便阅读。"
+    USER = '\u6211\u8bf4\u7684\u662f\u6ce8\u91ca\u90fd\u5199\u82f1\u6587\uff0c\u4f60\u8fd8\u662f\u5199\u4e86\u4e2d\u6587'
+    PRIOR = ['\u522b\u7528\u4e2d\u6587\u6ce8\u91ca', '\u5148\u8dd1\u4e00\u4e0b\u6d4b\u8bd5']
+    ASSISTANT = '\u5df2\u5b8c\u6210\uff0c\u6ce8\u91ca\u4f7f\u7528\u4e86\u4e2d\u6587\u4ee5\u4fbf\u9605\u8bfb\u3002'
 
     def _classify(self, reply):
         return repair_signals.classify(
@@ -160,24 +160,24 @@ class ClassifierTests(unittest.TestCase):
 
     def test_a_quoted_verdict_survives(self):
         verdict = self._classify(
-            '```json\n{"kind":"restated","later_anchor":"我说的是注释都写英文",'
-            '"earlier_anchor":"别用中文注释","about":""}\n```')
+            '```json\n{"kind":"restated","later_anchor":"\u6211\u8bf4\u7684\u662f\u6ce8\u91ca\u90fd\u5199\u82f1\u6587",'
+            '"earlier_anchor":"\u522b\u7528\u4e2d\u6587\u6ce8\u91ca","about":""}\n```')
         self.assertEqual("restated", verdict["kind"])
-        self.assertEqual("别用中文注释", verdict["earlier_anchor"])
+        self.assertEqual('\u522b\u7528\u4e2d\u6587\u6ce8\u91ca', verdict["earlier_anchor"])
 
     def test_an_invented_quote_is_dropped_and_the_class_demoted(self):
         """The basis for trusting a small model here: it can point at the
         text, it cannot make text up."""
         verdict = self._classify(
-            '{"kind":"restated","later_anchor":"我从没说过这句",'
-            '"earlier_anchor":"也没说过","about":""}')
+            '{"kind":"restated","later_anchor":"\u6211\u4ece\u6ca1\u8bf4\u8fc7\u8fd9\u53e5",'
+            '"earlier_anchor":"\u4e5f\u6ca1\u8bf4\u8fc7","about":""}')
         self.assertEqual("unclear", verdict["kind"])
         self.assertEqual("", verdict["later_anchor"])
         self.assertEqual("", verdict["earlier_anchor"])
 
     def test_a_restatement_without_the_earlier_quote_is_not_a_restatement(self):
         verdict = self._classify(
-            '{"kind":"restated","later_anchor":"我说的是注释都写英文",'
+            '{"kind":"restated","later_anchor":"\u6211\u8bf4\u7684\u662f\u6ce8\u91ca\u90fd\u5199\u82f1\u6587",'
             '"earlier_anchor":"","about":""}')
         self.assertEqual("unclear", verdict["kind"])
 

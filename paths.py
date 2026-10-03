@@ -93,7 +93,7 @@ def _terminal_identity_source() -> str:
         return f"explicit:{explicit}"
 
     for name in (
-        "TERM_SESSION_ID", "WT_SESSION", "TMUX_PANE", "WEZTERM_PANE",
+        "TERM_SESSION_ID", "TMUX_PANE", "WEZTERM_PANE",
         "KITTY_WINDOW_ID",
     ):
         value = os.environ.get(name, "").strip()
@@ -102,14 +102,11 @@ def _terminal_identity_source() -> str:
 
     try:
         tty_name = os.ttyname(0)
-    except (AttributeError, OSError):
-        # os.ttyname does not exist on Windows at all, so the AttributeError
-        # matters as much as the OSError — without it this module cannot even
-        # be imported there. os.getsid below already guards both.
+    except OSError:
         tty_name = ""
     try:
         session_id = str(os.getsid(0))
-    except (AttributeError, OSError):
+    except OSError:
         session_id = ""
     if tty_name or session_id:
         return f"tty:{tty_name}|sid:{session_id}"

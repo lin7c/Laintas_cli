@@ -48,14 +48,6 @@ For **frozen (PyInstaller) installs** the individual ``.py`` files don't exist o
 disk, so the updater replaces the whole Linux binary from the matching architecture
 asset.
 
-On Windows that is still the Linux asset: the CLI runs as this same binary
-inside its private WSL distribution, and it is what ``sys.executable`` points
-at. There the binary lives in root-owned ``/usr/local/bin`` while the session
-runs as the unprivileged ``laintas`` user, so the replacement goes through the
-distribution's password-less ``sudo`` rule; that is checked before anything is
-downloaded. The Windows launcher (``laintas-cli.exe``) and the distribution
-itself are not part of an update — those are replaced by re-running the
-installer, which keeps the existing distribution and its home directory.
 """
 
 from __future__ import annotations
@@ -137,52 +129,25 @@ def _asset_url(channel: str, asset: str) -> str:
     return f"{base}/releases/{directory}/{asset}"
 
 
-def _windows_host() -> bool:
-    """True when this CLI is the Linux binary inside the Windows distribution.
-
-    The launcher states what it is through LAINTAS_HOST; the distribution
-    name is a fallback for a launcher older than that variable, and honours
-    LAINTAS_WSL_DISTRO so a renamed distribution still matches.
-    """
-    if os.environ.get("LAINTAS_HOST") == "windows":
-        return True
-    # A plain WSL session is not this: someone running the Linux build inside
-    # their own Ubuntu distribution does have a shell to type `sudo` into, so
-    # only our own distribution takes the installer wording.
-    distro = os.environ.get("WSL_DISTRO_NAME", "")
-    return bool(distro) and distro == os.environ.get(
-        "LAINTAS_WSL_DISTRO", "Laintas-CLI")
 
 
 def _sudo_prefix() -> Optional[list]:
-    """A password-less ``sudo`` prefix, or None when there is no such thing.
-
-    The Windows distribution installs the binary as root into /usr/local/bin
-    but logs the user in as ``laintas``, so an in-place update is only
-    possible through the NOPASSWD sudo rule the rootfs ships. ``sudo -n``
-    never prompts: a distribution without that rule fails the probe instead of
-    hanging the UI on a password it has no way to type.
-    """
+    """Probe noninteractive sudo without requesting a password."""
     sudo = shutil.which("sudo")
     if not sudo:
         return None
     try:
-        probe = subprocess.run(
-            [sudo, "-n", "true"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        result = subprocess.run([sudo, "-n", "true"], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return None
-    return [sudo, "-n"] if probe.returncode == 0 else None
+    return [sudo, "-n"] if result.returncode == 0 else None
 
 
 def _log_no_write_permission(directory: str, log) -> None:
-    """Explain an unwritable install directory in terms the host can act on."""
+    """Describe an unwritable installation directory."""
     log(f"[red]No write permission for {directory}.[/red]")
-    if _windows_host():
-        log("[yellow]Re-run the Windows installer to update the runtime; it "
-            "keeps this distribution and your home directory.[/yellow]")
-    else:
-        log("[yellow]Re-run with sudo to replace the binary in place.[/yellow]")
+    log("[yellow]Re-run with sudo to replace the binary in place.[/yellow]")
 
 
 def manifest_url() -> str:
@@ -765,7 +730,7 @@ def apply_frozen_update(manifest: dict, channel_dir: str, log) -> Optional[str]:
     target = os.path.abspath(sys.executable)
     target_dir = os.path.dirname(target)
     # Decide whether the binary can be replaced at all *before* pulling down
-    # tens of megabytes.  On Windows the installer writes /usr/local/bin as
+    # tens of megabytes. The target may be owned by an administrator.
     # root while the distribution logs in as `laintas`, so the direct write
     # never succeeds there and the update has to go through sudo.
     elevate = None

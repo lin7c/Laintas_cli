@@ -27,6 +27,7 @@ import urllib.request
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIST_RELEASES = os.path.join(REPO, "laintas_cli_download", "dist", "releases")
+PUBLIC_RELEASES = os.path.join(REPO, "laintas_cli_download", "public", "releases")
 
 # Binary/install assets self-hosted alongside the source-update assets. They are
 # built by CI and live on the GitHub Release; we mirror them onto cli.laintas.com
@@ -36,7 +37,6 @@ RELEASE_ASSET_TEMPLATES = (
     "laintas-cli_linux_arm64.tar.gz",
     "laintas-cli_darwin_amd64.tar.gz",
     "laintas-cli_darwin_arm64.tar.gz",
-    "laintas-cli_windows_amd64_setup.exe",
     "laintas-cli_source.zip",
     "laintas-cli_{version}_amd64.deb",
     "SHA256SUMS.txt",
@@ -113,16 +113,20 @@ def main() -> int:
         # `laintas-cli-beta-v1` is published as an ordinary release.
         channels = ((tag,) if "-beta." in tag or "-rc." in tag
                     else ("latest", tag))
-        for channel in channels:
-            outdir = os.path.join(DIST_RELEASES, channel)
-            os.makedirs(outdir, exist_ok=True)
-            _remove_stale_release_assets(outdir)
-            shutil.copy(manifest_path, os.path.join(outdir, "manifest.json"))
-            shutil.copy(zip_path, os.path.join(outdir, "src_manifest.zip"))
-            for name in release_assets:
-                shutil.copy(os.path.join(assets_dir, name), os.path.join(outdir, name))
-            print(f"  → {outdir}: manifest.json, src_manifest.zip"
-                  + ", " + ", ".join(release_assets))
+        # Vite rebuilds dist from public. Keep the durable copy current before
+        # updating the live mirror, so a website rebuild cannot restore an old
+        # CLI release or remove the Unix downloads.
+        for release_root in (PUBLIC_RELEASES, DIST_RELEASES):
+            for channel in channels:
+                outdir = os.path.join(release_root, channel)
+                os.makedirs(outdir, exist_ok=True)
+                _remove_stale_release_assets(outdir)
+                shutil.copy(manifest_path, os.path.join(outdir, "manifest.json"))
+                shutil.copy(zip_path, os.path.join(outdir, "src_manifest.zip"))
+                for name in release_assets:
+                    shutil.copy(os.path.join(assets_dir, name), os.path.join(outdir, name))
+                print(f"  → {outdir}: manifest.json, src_manifest.zip"
+                      + ", " + ", ".join(release_assets))
 
     nfiles = len(manifest["files"])
     print(f"Published {tag} assets ({nfiles} source files + "

@@ -71,13 +71,13 @@ export const GROUPS = [
               ['Linux x86_64', '64 位，glibc', '独立二进制，无需 Python'],
               ['Linux aarch64', '64 位 ARM，glibc', '独立二进制，无需 Python'],
               ['macOS Apple Silicon / Intel', 'arm64 / x86_64', '原生终端二进制，无需 Python'],
-              ['Windows', 'Windows 10 2004+ 或 Windows 11，64 位', '单文件安装程序（自带私有 WSL 2 发行版）'],
+              ['Windows', 'Windows 10 2004+ 或 Windows 11，64 位', 'laintas-Helpwo-cli-for-windows 桌面安装器'],
               ['其他（Alpine/musl、32 位等）', 'Python 3.10+', '源码包'],
             ], [
               ['Linux x86_64', '64-bit, glibc', 'Standalone binary, no Python needed'],
               ['Linux aarch64', '64-bit ARM, glibc', 'Standalone binary, no Python needed'],
               ['macOS Apple Silicon / Intel', 'arm64 / x86_64', 'Native terminal binary, no Python needed'],
-              ['Windows', 'Windows 10 2004+ or Windows 11, 64-bit', 'Single-file installer (ships a private WSL 2 distribution)'],
+              ['Windows', 'Windows 10 2004+ or Windows 11, 64-bit', 'Independent laintas-Helpwo-cli-for-windows desktop installer'],
               ['Anything else (Alpine/musl, 32-bit …)', 'Python 3.10+', 'Source package'],
             ]),
           },
@@ -99,17 +99,17 @@ export const GROUPS = [
             ),
           },
           { t: 'h', ...L('Windows', 'Windows') },
-          { t: 'code', label: 'PowerShell', code: 'irm https://cli.laintas.com/install.ps1 | iex\nlaintas-cli' },
+          { t: 'p', ...L('[下载 laintas-Helpwo-cli-for-windows](https://cli.laintas.com/windows/LaintasSetup.exe)，双击安装，然后从开始菜单启动 Laintas Windows。', '[Download laintas-Helpwo-cli-for-windows](https://cli.laintas.com/windows/LaintasSetup.exe), open the installer, then launch Laintas Windows from Start.') },
           {
             t: 'p', ...L(
-              '安装程序会导入一个名为 `Laintas-CLI` 的私有 WSL 2 发行版，并安装原生的 `laintas-cli.exe` 启动器。它不会修改你的默认 WSL 发行版，日常启动也不调用 `wsl.exe`。安装位置所在的磁盘可以在安装时选择。',
-              'The installer imports a private WSL 2 distribution named `Laintas-CLI` and installs a native `laintas-cli.exe` launcher. Your default WSL distribution is left alone, and normal startup does not run `wsl.exe`. You can choose the drive to install to.',
+              '独立桌面版复用 Helpwo 聊天 UI，agent 和 kernel 在 Windows 本机运行。需要 Windows 10/11 x86_64 和 WebView2；安装器可联网安装 WebView2。',
+              'The independent desktop app reuses Helpwo chat UI and runs its agent and kernel locally on Windows. It requires Windows 10/11 x86_64 and WebView2; the installer can download WebView2.',
             ),
           },
           {
             t: 'note', title: L('SmartScreen 提示', 'SmartScreen'),
-            ...L('安装程序暂未代码签名，首次运行时 Windows 可能提示「已保护你的电脑」。选择「更多信息 → 仍要运行」；如需确认文件来源，请对照发布页的 SHA-256 校验值。',
-              'The installer is not code-signed yet, so Windows may say it protected your PC on first run. Choose "More info → Run anyway"; to be sure the file is ours, compare it with the SHA-256 checksum on the release page.'),
+            ...L('安装程序暂未代码签名，首次运行时 Windows 可能提示「已保护你的电脑」。选择「更多信息 → 仍要运行」；如需确认文件来源，请对照 [SHA-256 校验值](https://cli.laintas.com/windows/releases/0.1.0/SHA256SUMS.txt)。',
+              'The installer is not code-signed yet, so Windows may say it protected your PC on first run. Choose "More info → Run anyway"; to be sure the file is ours, compare it with the [SHA-256 checksum](https://cli.laintas.com/windows/releases/0.1.0/SHA256SUMS.txt).'),
           },
           { t: 'h', ...L('源码包', 'Source package') },
           {
@@ -118,8 +118,8 @@ export const GROUPS = [
           { t: 'code', label: 'bash', code: 'unzip laintas-cli_source.zip\ncd laintas-cli-source\npython3 -m pip install -r requirements.txt\npython3 laintas_cli.py' },
           {
             t: 'p', ...L(
-              'Linux 和 macOS 双架构安装包、Debian 包、Windows 安装程序、源码包以及 SHA-256 校验文件都发布在 [GitHub Releases](https://github.com/lin7c/Laintas_cli/releases)，并同步到 `cli.laintas.com/releases/latest/`；[下载页](/#download) 的安装脚本会自动选择 Linux 或 Mac 架构。',
-              'Linux and macOS archives for both architectures, the Debian package, Windows installer, source package and SHA-256 checksums are published on [GitHub Releases](https://github.com/lin7c/Laintas_cli/releases) and mirrored at `cli.laintas.com/releases/latest/`; the [download section](/#download) offers an installer that picks the Linux or Mac architecture automatically.',
+              'Linux 和 macOS 双架构安装包、Debian 包、源码包以及 SHA-256 校验文件都发布在 [GitHub Releases](https://github.com/lin7c/Laintas_cli/releases)，并同步到 `cli.laintas.com/releases/latest/`；[下载页](/#download) 的安装脚本会自动选择 Linux 或 Mac 架构。',
+              'Linux and macOS archives for both architectures, the Debian package, source package and SHA-256 checksums are published on [GitHub Releases](https://github.com/lin7c/Laintas_cli/releases) and mirrored at `cli.laintas.com/releases/latest/`; the [download section](/#download) offers an installer that picks the Linux or Mac architecture automatically.',
             ),
           },
         ],
@@ -184,8 +184,8 @@ export const GROUPS = [
           },
           {
             t: 'p', ...L(
-              '更新、下载页和安装脚本都读取同一个发布渠道：GitHub Releases。Windows 上 CLI 实际运行在私有 WSL 发行版内，所以 `/v update` 更新的是其中的 Linux 程序；启动器 `laintas-cli.exe` 和发行版本身需要重新运行安装程序来更新，已有的数据会被保留。',
-              'Updates, the download page and the install scripts all read one channel: GitHub Releases. On Windows the CLI actually runs inside its private WSL distribution, so `/v update` replaces the Linux program there; the `laintas-cli.exe` launcher and the distribution itself are updated by re-running the installer, which keeps existing data.',
+              'Linux/macOS CLI 的更新读取 `cli.laintas.com/releases/latest/`。laintas-Helpwo-cli-for-windows 使用独立的签名更新渠道 `cli.laintas.com/windows/latest.json`。',
+              'Linux/macOS CLI updates use `cli.laintas.com/releases/latest/`. laintas-Helpwo-cli-for-windows uses its independent signed update channel at `cli.laintas.com/windows/latest.json`.',
             ),
           },
         ],
@@ -1019,7 +1019,6 @@ export const GROUPS = [
               ['`/policy`、`/trust`、`/hooks`、`/backend`', '安全策略、项目信任、钩子、后端'],
               ['`/web`', '联网搜索与抓取：引擎、代理、Cookie、诊断（别名 `/search`）'],
               ['`/identity`', 'Agent 可用于浏览的已保存登录身份'],
-              ['`/windows`', '访问 CLI 所在的 Windows 主机'],
               ['`/tools`、`/tool <name>`', '列出工具、直接调用某个工具'],
               ['`/skill`、`/mcp`', '技能、MCP 服务器'],
               ['`/memory`、`/prop`', '记忆、查看完整上下文'],
@@ -1030,7 +1029,6 @@ export const GROUPS = [
               ['`/policy`, `/trust`, `/hooks`, `/backend`', 'Security policy, project trust, hooks, backends'],
               ['`/web`', 'Web search and fetch: engines, proxy, cookies, diagnostics (alias `/search`)'],
               ['`/identity`', 'Saved logins the agent may browse as'],
-              ['`/windows`', 'Reach the Windows machine the CLI runs inside'],
               ['`/tools`, `/tool <name>`', 'List tools, call one directly'],
               ['`/skill`, `/mcp`', 'Skills, MCP servers'],
               ['`/memory`, `/prop`', 'Memory, inspect the full context'],
@@ -1073,11 +1071,6 @@ export const GROUPS = [
               'The command itself may be long-running — a `find` over a large tree, say. Press `Esc` and give a narrower scope.',
               'Near the context limit it compacts first; `/compact status` shows whether that is running.',
             ]),
-          },
-          { t: 'h', ...L('Windows 上找不到文件', 'Files not found on Windows') },
-          {
-            t: 'p', ...L('CLI 运行在私有 WSL 发行版中，Windows 磁盘挂载在 `/mnt/<盘符>/` 下，例如 `C:\\Users\\me\\project` 对应 `/mnt/c/Users/me/project`。',
-              'The CLI runs inside its private WSL distribution, where Windows drives are mounted under `/mnt/<drive>/` — `C:\\Users\\me\\project` is `/mnt/c/Users/me/project`.'),
           },
           { t: 'h', ...L('报告问题', 'Reporting a problem') },
           {

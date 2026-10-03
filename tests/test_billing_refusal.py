@@ -35,7 +35,7 @@ def _run(response, prompt="hello"):
             mock.patch.object(laintas_cli.time, "sleep"), \
             mock.patch.object(laintas_cli, "get_selected_model", return_value=""), \
             mock.patch.object(laintas_cli, "get_selected_provider", return_value=""):
-        lang = "CN" if any("一" <= ch <= "鿿" for ch in prompt) else "EN"
+        lang = "CN" if any('\u4e00' <= ch <= '\u9fff' for ch in prompt) else "EN"
         result = laintas_cli.call_backend_stream(
             {}, prompt, "system", "/tmp", tools_enabled=False, lang=lang)
     return result, post.call_count
@@ -86,10 +86,10 @@ class BillingRefusalTests(unittest.TestCase):
         # Product-authored refusal copy is English-only: a CN turn gets the
         # same coded refusal as an EN one. Functional CJK (intent regexes,
         # test input) stays; product prompts do not.
-        result, _ = _run(_Refusal(402, BALANCE), prompt="帮我看看这个报错")
+        result, _ = _run(_Refusal(402, BALANCE), prompt='\u5e2e\u6211\u770b\u770b\u8fd9\u4e2a\u62a5\u9519')
         self.assertTrue(result["reply"].startswith("Balance exhausted"))
         self.assertIn("https://laintas.com/settings", result["reply"])
-        result, _ = _run(_Refusal(429, ALLOWANCE), prompt="帮我看看这个报错")
+        result, _ = _run(_Refusal(429, ALLOWANCE), prompt='\u5e2e\u6211\u770b\u770b\u8fd9\u4e2a\u62a5\u9519')
         self.assertTrue(result["reply"].startswith("Membership allowance used up"))
 
 

@@ -27,8 +27,8 @@ class PreviewTests(unittest.TestCase):
         preview = TerminalPreview()
         text = "old\r\nprogress 10%\r\x1b[2Kprogress 100% [ok]"
         self.assertEqual(preview.render(text), "old\nprogress 100% [ok]")
-        text += "\x1b[2J\x1b[H新界面\x1b]777;LAINTAS_DETACH\x07"
-        self.assertEqual(preview.render(text), "新界面")
+        text += '\x1b[2J\x1b[H\u65b0\u754c\u9762\x1b]777;LAINTAS_DETACH\x07'
+        self.assertEqual(preview.render(text), '\u65b0\u754c\u9762')
 
     def test_partial_escape_and_cursor_updates_are_incremental(self):
         preview = TerminalPreview()

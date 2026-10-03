@@ -107,7 +107,7 @@ class LocalTransport:
             raise LinkError("Unsafe terminal endpoint")
         try:
             stat = path.stat()
-            if os.name != "nt" and (stat.st_uid != os.getuid() or stat.st_mode & 0o077):
+            if stat.st_uid != os.getuid() or stat.st_mode & 0o077:
                 raise LinkError("Unsafe terminal endpoint permissions")
             row = json.loads(path.read_text())
             if (not isinstance(row, dict) or row.get("ref") != ref or not re.fullmatch(r"[0-9a-f]{64}", str(row.get("secret") or ""))
@@ -232,8 +232,7 @@ class LocalTransport:
         self.root.mkdir(parents=True, exist_ok=True)
         if self.root.is_symlink():
             raise LinkError("Unsafe terminal endpoint directory")
-        if os.name != "nt":
-            self.root.chmod(0o700)
+        self.root.chmod(0o700)
         json_store.save_json_atomic(self.root / (self.ref[6:] + ".json"),
             {"ref": self.ref, "pid": os.getpid(), "user_id": self.user_id,
              "port": self.server.server_port, "secret": self.secret, "updated": time.time()}, mode=0o600)

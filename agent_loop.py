@@ -28,6 +28,7 @@ from pathlib import Path
 
 import tools as tools_mod   # ToolRegistry singleton + ToolCtx
 import policy as policy_mod  # Security policy engine
+import private_files
 import memory_system         # Cross-session persistent memory
 import hooks as hooks_mod    # Extensible hook system
 import plan_mode             # Structured planning before execution
@@ -5815,6 +5816,7 @@ class LoopDeps:
     Markdown: type  # rich.markdown.Markdown
     # Agent-private, one-off PTY sessions. These are never registered as
     # named persistent terminals and are closed with their owning agent run.
+    capability_prompt: Optional[Callable[[], str]] = None
     InteractiveSession: Optional[type] = None
     pty_passthrough: Optional[Callable[..., dict]] = None
     request_command_approval: Optional[Callable[[str, str], bool]] = None
@@ -5848,9 +5850,17 @@ def _print_markdown_safely(deps: LoopDeps, content: str) -> None:
 _MEMORY_FILE = ".laintas/memory.json"
 
 
+def _private_prompt_read(deps, path):
+    try:
+        private_files.check(path, 'read')
+    except private_files.PrivateFileError:
+        return None
+    return deps.read_file(path)
+
+
 def _read_memory(deps: LoopDeps) -> list[dict]:
     """Read and parse .laintas/memory.json as a JSON array of entries. Returns [] on failure."""
-    raw = deps.read_file(_MEMORY_FILE)
+    raw = _private_prompt_read(deps, _MEMORY_FILE)
     if not raw or not raw.strip():
         return []
     try:
@@ -5961,7 +5971,7 @@ def _skill_catalog_parts(query: str, base_catalog: str, session) -> tuple[str, s
                               and not skills_mod.skill_is_available(metadata[name]))]
             # A skill gated on a tool (`requires_tool`) documents a capability
             # that is present right now only because the user switched it on —
-            # a connected Windows kernel. Lexical ranking cannot be trusted to
+            # an available host capability. Lexical ranking cannot be trusted to
             # surface it: its text is English, and a request in another
             # language shares no token with it. Pin it while its tools exist;
             # it drops out with them.
@@ -11717,7 +11727,7 @@ def run_agent_loop(
                 _issue = "Review the latest AI behavior and identify what should improve"
             try:
                 _effective_prompt = captured_system_prompt(_session_id) or lab_prompt_fallback(
-                    deps.read_file(str(paths.project_file(paths.CWD_CLI_PROP)))
+                    _private_prompt_read(deps, str(paths.project_file(paths.CWD_CLI_PROP)))
                     or deps.generate_prompt(),
                     prompt_lab.get_prompt_lab_section())
                 _branch = prompt_lab.capture_incident(
@@ -12224,7 +12234,7 @@ def run_agent_loop(
         # 3. Read the product prompt. HWO (prompt.md) is a role overlay, never a
         # full replacement: replacing the base used to silently remove safety,
         # lifecycle, tool and completion contracts from child agents.
-        prompt_template = deps.read_file(str(paths.project_file(paths.CWD_CLI_PROP))) or ""
+        prompt_template = _private_prompt_read(deps, str(paths.project_file(paths.CWD_CLI_PROP))) or ""
         if not prompt_template:
             prompt_template = deps.generate_prompt()
         prompt_override = (state.get('_prompt_override') or "").strip()
@@ -12319,7 +12329,7 @@ def run_agent_loop(
             # The stable half (OS, shell, terminal, depth, parent) stays in the
             # cached prefix where it belongs.
             "env": {
-                "cwd": state.get("cwd") or os.getcwd(),
+                "cwd": private_files.public_path(state.get("cwd") or os.getcwd()),
                 "children": children_str,
                 "plan_mode": plan_mode.get_plan_prompt(),
             },
@@ -12358,7 +12368,7 @@ def run_agent_loop(
             .replace("{{promptOpt}}", _prompt_lab_section) \
             .replace("{{agentName}}", agent_name) \
             .replace("{{agentId}}", agent_id_str) \
-            .replace("{{currentPath}}", state.get("cwd") or os.getcwd()) \
+            .replace("{{currentPath}}", private_files.public_path(state.get("cwd") or os.getcwd())) \
             .replace("{{activeFile}}", "None") \
             .replace("{{depth}}", str(depth)) \
             .replace("{{nextDepth}}", str(depth + 1)) \
@@ -12385,15 +12395,10 @@ def run_agent_loop(
             _hosted_app_section = ""
         if _hosted_app_section:
             system_prompt = system_prompt.rstrip() + "\n\n" + _hosted_app_section
-        # A connected Windows kernel. Empty unless the win.* tools are
-        # registered, so it can never describe a surface that is not there.
-        try:
-            import windows_tools as _windows_tools
-            _machine_section = _windows_tools.render_prompt_section()
-        except Exception:
-            _machine_section = ""
-        if _machine_section:
-            system_prompt = system_prompt.rstrip() + "\n\n" + _machine_section
+        # Host capabilities are injected without depending on a platform module.
+        provider = getattr(deps, "capability_prompt", None)
+        if callable(provider):
+            system_prompt += str(provider() or "")
         if _prompt_lab_section and not _prompt_lab_has_slot:
             system_prompt = system_prompt.rstrip() + "\n\n" + _prompt_lab_section
         if not _durable_rules_has_slot:

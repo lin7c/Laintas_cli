@@ -2,6 +2,18 @@
 
 This file provides guidance for AI coding assistants when working with code in this repository.
 
+## Language
+
+Use English for CLI interfaces, source comments, tests, documentation, GitHub
+release notes and public release announcements. This applies regardless of
+the language used in a development conversation. The website's release-note
+API requires both locale fields; populate both with the same English text for
+Laintas CLI announcements.
+
+Preserve trademarks, registered company names and legal attribution exactly
+as written, including names in Chinese. Unicode regression fixtures may use
+Unicode escapes to keep their original input values and test coverage.
+
 ## Authoritative References
 
 - `PROJECT.md` — full architecture spec (components, data flow, runtime config table, file artifacts). Read this before non-trivial changes.
@@ -42,7 +54,7 @@ New top-level modules must be added to `package_manifest.json` — it drives set
 
 **To publish a release, use `.github/workflows/release.yml`** — it builds Linux amd64/arm64 binaries and a source package, then publishes checksums and update manifests to GitHub Releases.
 
-### After a release: post an update note (更新公告)
+### After a release: post an update note
 
 Releases are no longer announced as official messages (inbox pushes) — do **not** run `publish-message.mjs` for a release. Each user-installable release gets one entry on https://laintas.com/updates instead. Only after the release workflow for the tag has **succeeded** (assets downloadable):
 
@@ -53,16 +65,16 @@ Releases are no longer announced as official messages (inbox pushes) — do **no
      "version": "1.24.0",
      "titleZh": "laintas-cli 1.24.0",
      "titleEn": "laintas-cli 1.24.0",
-     "bodyZh": "- 一行一条用户能感知的改动\n- ……\n\n运行 /v update 升级。",
+     "bodyZh": "- One user-facing change per line\n- ...\n\nRun /v update to upgrade.",
      "bodyEn": "- One user-facing change per line\n- ...\n\nRun /v update to upgrade."
    }
    ```
-   - Allowed keys: `project, version, titleZh, titleEn, bodyZh, bodyEn`, optional `slug` (default `laintas-cli-v1-24-0`) and `publishedAt`. Unknown keys are refused; both languages are required.
+   - Allowed keys: `project, version, titleZh, titleEn, bodyZh, bodyEn`, optional `slug` (default `laintas-cli-v1-24-0`) and `publishedAt`. Unknown keys are refused. Both locale fields are required by the API; use identical English titles and bodies for Laintas CLI.
    - `project` must be a project listed on /updates: the homepage cards (`laintas-cli`, `helpwo`, `laintas-search`, `laintas-scene`, `laintas-enterprise`, `laintas-market`; short names `cli`/`search`/… work) or one added on the page. An unknown project is refused with the list of valid ids — ask the user to add it on the page rather than filing the note elsewhere.
    - Plain text; lines starting with `- ` render as a list. Write for users — no internal refactors, file names, commit hashes, hosts or anything security-sensitive.
 2. Dry run: `node /root/laintas/server/publish-update.mjs <file>`, then publish: `node /root/laintas/server/publish-update.mjs <file> --publish` (`--draft` saves it for a human to publish from the page).
 
-Re-running with the same content is a no-op; changed content updates the note — unless someone edited it on the /updates page, which the script refuses to overwrite without `--force`. Admins and viewers edit, unpublish or delete notes on https://laintas.com/updates (「管理」).
+Re-running with the same content is a no-op; changed content updates the note — unless someone edited it on the /updates page, which the script refuses to overwrite without `--force`. Admins and viewers edit, unpublish or delete notes on https://laintas.com/updates (Manage).
 
 ## Architecture (read PROJECT.md for full detail)
 
@@ -95,13 +107,13 @@ The project has grown from two core modules to ten, organized in layers:
   Created by `remote_browser/rb.py save <name>` after a human signs in through the temporary live-view route; `identity.check` / `web_search.probe_identity()` verify a session is still alive before a task depends on it. Manual sign-in pays off for **login walls** (sessions last weeks); it does not for anti-bot walls (exemptions are short-lived and IP-bound — measured dead within 3 days).
   - Optional deps (`pip install .[web]`): `trafilatura` for article extraction — without it the fallback keeps nav bars and footers in what the model reads — and `curl_cffi` for the fingerprint rung.
 
-**The Windows machine (Windows build only):**
-- **`winbridge.py`** — the one place that answers "am I in WSL", "where is the Windows profile", "what is this path on the other side". Always via `wslpath` / `cmd.exe`; never by assembling `/mnt/c/Users/<name>`, which silently writes to the wrong place when the profile has moved.
-- **`windows_kernel.py`** — locate / download / checksum / install / update / start / stop / uninstall `helpwo-kernel.exe`. Backs `/windows` (alias `/kernel`) and its shared full-screen manager. **`install()` has no tier argument on purpose**: `start` installs if missing but uses the access level the user explicitly chose; `update` only restores a running, connected kernel's existing tier. Installing is not permission. Uninstall uses the official uninstaller and preserves workspace files.
-- **`windows_host.py`** — the connection to the Helpwo kernel, on **every** platform (the Linux kernel too), one rendezvous file per CLI process plus the single legacy file for old kernels (primary terminal only). **The CLI listens; the kernel dials it.** The kernel's promise is that it opens no port, and Windows forwards `localhost` into WSL in that direction by default. Rendezvous file (port + one-time token) under `%LOCALAPPDATA%\Laintas\`.
-- **`windows_tools.py`** — the `win.*` tools, registered on connect **only for the tier the kernel actually granted** and unregistered when it goes. Registered as `source="builtin"` (not a source tag) because the registry refuses to invoke non-builtins and strips their context, and `win.screenshot` needs `ctx.cwd`.
-
-Everything about *which mechanism answers* — accessibility tree, window manager, or pixels — lives in the kernel, not here, so Helpwo's browser agent and this CLI cannot drift apart on it.
+**Platform boundary:**
+The CLI targets Linux and macOS. Windows desktop adapters, kernel tools,
+installer and updater belong to the independent
+`lin7c/laintas-Helpwo-cli-agent-for-windows` project (product name
+`laintas-Helpwo-cli-for-windows`). Do not reintroduce Windows modules, WSL
+launchers or kernel discovery into this repository. `runtime_host.py` is a
+generic injectable host boundary with no desktop dependencies.
 
 **Cross-cutting subsystems:**
 - **`policy.py`** (~1,770 lines) — Security policy engine: evaluates every command as allow/needs_approval/deny via regex rules. Config in `~/.laintas/policy.json` (mtime-cached, zero-restart updates). Audit log in `~/.laintas/audit.log`. Three modes: audit, enforce, disabled.
@@ -221,7 +233,11 @@ All tunable parameters are accessible via `get_runtime_config()`/`set_runtime_co
 
 `/backend use <profile>` picks the backend; who serves the chat model is chosen in `/model`. The `/model` picker lists the backend's models and then the user's own direct routes; picking a backend model (or `/model <id>`, `/model reset`, Alt+3) switches the route back to `laintas`. `/model route <route> [model] [window]|list`, `/model add`, `/model remove <route>` manage routes. `laintas` (default) = the backend; any other route is a user's own OpenAI-compatible provider key (`model_route.py`, keys in `~/.laintas/model_keys.json`). A direct route reroutes only the chat call inside `_call_backend_stream_impl` — same SSE parser, no Laintas session sent; search/OCR/images still use the backend. Policy keys `directModel: "deny"` / `directModelHosts` govern it (the Enterprise extension merges them tighten-only). Terminal-scoped (one CLI terminal, not per sub-terminal — so the picker offers routes only when `/model` targets the REPL's own terminal) and never seeded into new terminals; env `LAINTAS_MODEL_ROUTE` overrides.
 
-`AgentRegistry` is the remote-control surface, but **the CLI never talks to Helpwo or the gateway's agent API itself**: this machine's Helpwo kernel registers the session on the CLI's behalf and relays it (kernel repo `kernel/clirelay.py`, PROTOCOL.md §3). The envelopes are unchanged — `register` / `heartbeat` / `events` / `unregister` become `cli-*` frames over the `windows_host` link, and what `/poll` returned arrives pushed as `cli-inputs` — so `_handle_remote_message` and every `kind` handler are exactly what they were. The CLI is no longer a WebRTC host (`webrtc_channel.py` is gone): an `rtc-offer` is answered with `rtc-error`, and the session's browser screen reaches Helpwo through the kernel (`cli-vnc` asks for the RFB port). Without a kernel `/helpwo` explains how to start one; nothing falls back to a direct connection.
+`AgentRegistry` retains local session identity and the generic host adapter
+boundary. The default runtime does not register with a gateway or relay
+through Helpwo Kernel. `runtime_host.py` accepts an explicitly supplied host;
+without one, remote machine sharing stays unavailable. The local application
+bridge and file sharing are separate from Windows desktop integration.
 
 ### User-Configurable Files (all under `~/.laintas/`)
 

@@ -256,7 +256,7 @@ class AppRoutingTests(unittest.TestCase):
                       "app.start", "app.stop", "fs.read", "terminal.exec")]
         for query in ("host the application for my node server",
                       "app manifest for the demo",
-                      "托管应用"):
+                      '\u6258\u7ba1\u5e94\u7528'):
             selected = context_router.select_tool_names(query, catalogue)
             self.assertIn("app.list", selected, query)
             self.assertIn("app.start", selected, query)

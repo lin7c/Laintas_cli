@@ -59,23 +59,11 @@ def guard(path, *, rank=STORE):
     with mutex:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a+b") as handle:
-            if os.name == "nt":
-                import msvcrt
-                if handle.tell() == 0:
-                    handle.write(b" ")
-                    handle.flush()
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             held[key] = order
             try:
                 yield
             finally:
                 held.pop(key)
-                if os.name == "nt":
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)

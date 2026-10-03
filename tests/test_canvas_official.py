@@ -42,7 +42,7 @@ class CanvasManifestTests(unittest.TestCase):
                     or path.suffix not in {".py", ".json", ".md"}):
                 continue
             self.assertNotRegex(path.read_text(encoding="utf-8"),
-                                r"[一-鿿]", str(path))
+                                '[\u4e00-\u9fff]', str(path))
 
     def test_publication_archive_ships_only_extension_source(self):
         with tempfile.TemporaryDirectory() as tmp:

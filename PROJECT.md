@@ -204,7 +204,6 @@ cycle detection, normalized progress/status, and an append-only event history.
 | `/work [status|list|resume|history]` | Inspect unified work state |
 | `/plan enter|submit|revise|approve` | Manage versioned, reviewed plans |
 | `/task` | View or update the active WorkGraph steps |
-| `/windows` (alias `/kernel`) | Full-screen Helpwo Kernel manager on Windows / WSL. `start [workspace\|read\|write]` installs if missing; `update [--force]` updates and restores connected access; `uninstall` stops and removes the helper, keeping workspace files. Also `status`, `check`, `install`, `restart`, `stop` |
 | `/scan` | Rescan PATH for executables |
 | `/debug` | Browse AI interaction debug logs (TUI) |
 | `/cwd` | Show current working directory |
@@ -217,49 +216,22 @@ cycle detection, normalized progress/status, and an append-only event history.
 | `/clear` | Clear screen |
 | `/exit, /quit` | Exit (cascading cleanup of all terminals) |
 
-### 12.1 The Windows machine (`winbridge` / `windows_kernel` / `windows_host` / `windows_tools`)
+### 12.1 Platform separation
 
-On the Windows build this CLI is a Linux program inside a private WSL
-distribution, so the machine the user is actually sitting at — its windows,
-its applications, its screen — is on the other side of a boundary this
-process cannot cross. It is reached through `helpwo-kernel.exe`, the same
-program Helpwo uses for remote workspaces, which already owns the
-accessibility tree, screen capture and input synthesis behind its own guard.
-Nothing here reimplements any of that.
+The terminal CLI targets Linux and macOS. The independent
+`laintas-Helpwo-cli-for-windows` desktop product owns the Windows kernel,
+Helpwo chat UI, native installer and signed updater. Its private source
+repository is `lin7c/laintas-Helpwo-cli-agent-for-windows`.
 
-| Module | Role |
-|---|---|
-| `winbridge` | The only place that answers "am I in WSL", "where is the Windows profile", "what is this path called on the other side" — all through `wslpath` and `cmd.exe`, never by assembling `/mnt/c/Users/<name>` |
-| `windows_kernel` | Locate, download, checksum, install, update, start, stop and uninstall the kernel. Backs `/windows` (alias `/kernel`) |
-| `windows_host` | The connection. **The CLI listens and the kernel dials it** — the kernel's promise is that it opens no port, and Windows forwards `localhost` into WSL in that direction by default |
-| `windows_tools` | The `win.*` tools, registered when a kernel connects and **only for the tier it actually granted**, unregistered when it goes |
+The CLI contains no Windows host, kernel lifecycle commands, WSL launcher,
+machine-tool integration or Windows packaging jobs. `runtime_host.py` is a
+generic injectable capability boundary. The default host does not register
+with a gateway or discover Helpwo Kernel. Local application APIs and
+terminal pairing remain separate generic features.
 
-Three properties worth not breaking:
-
-- **Install is not permission.** `install()` has no tier argument. The
-  `--allow-machine-read` / `--allow-machine-write` flags come from a word the
-  user typed in `/windows start` or selected in the manager, never from the install step. A CLI that
-  installed the kernel and started it with write access would have made the
-  decision the tiers exist to leave with the user.
-  An explicit start also installs when missing. An update only restores the
-  access tier of a running kernel connected to this CLI; an unconnected
-  kernel's permissions are never guessed, and a stopped kernel stays stopped.
-  The replacement is downloaded and verified before the old process stops.
-  Installation success requires a zero exit status and the expected installed
-  version. Uninstall uses the official Windows uninstaller and waits for its
-  files to disappear; it removes the saved kernel sign-in, not workspace files.
-- **The kernel gets its own console window.** Its README is right that the
-  window *is* the connection and closing it is how access is revoked in a
-  hurry. A kernel hidden behind this process is one the user cannot stop.
-- **Tools are offered only when they work.** A `win.*` tool that exists and
-  always fails costs the model turns to discover, and it tends to invent a
-  cruder workaround rather than report that the capability is off.
-
-Mechanism ordering is the kernel's decision, but the tool descriptions carry
-it because the model is the one choosing: `win.snapshot` → `win.invoke` is one
-cheap round trip that never moves the pointer, while `win.screenshot` →
-`win.click` costs a vision call per look and takes the mouse from whoever is
-at the machine.
+See [build/RELEASE.md](build/RELEASE.md) for the Unix packaging contract and
+[the download page](https://cli.laintas.com/#download) for the independent
+Windows installer.
 
 ### 13. Web Search & Fetch (`web_search.py`)
 
