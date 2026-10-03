@@ -2550,6 +2550,35 @@ def _save_resume_checkpoint_locked(state: dict, chat_history: list, cwd: str,
         if payload is None:
             return None
         paths.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        # Deduplicate: if the newest checkpoint for this cwd+agent carries
+        # identical chat_history, the user quit twice without new messages.
+        # Touch its timestamp instead of creating a visual duplicate in
+        # /resume (same content showing as two different rows).
+        _new_hash = _resume_history_hash(payload.get("chat_history"))
+        if _new_hash:
+            _existing = sorted(
+                paths.SESSIONS_DIR.glob(
+                    _resume_checkpoint_pattern(cwd, agent_id)),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            for _path in _existing[:3]:  # only check the freshest few
+                try:
+                    _data = json.loads(_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if (_data.get("session_id") == payload.get("session_id")
+                        and _resume_history_hash(_data.get("chat_history"))
+                        == _new_hash):
+                    # Same conversation: refresh mtime, keep single entry.
+                    try:
+                        _now = time.time()
+                        os.utime(_path, (_now, _now))
+                    except OSError:
+                        pass
+                    _atomic_write_json(
+                        _resume_latest_path(cwd, agent_id), payload)
+                    return payload
         dest = paths.SESSIONS_DIR / (
             f"{_session_key(cwd)}{_resume_agent_ns(agent_id)}"
             f"_resume_{payload['id']}.json")
@@ -2561,6 +2590,16 @@ def _save_resume_checkpoint_locked(state: dict, chat_history: list, cwd: str,
         return payload
     except Exception:
         return None
+
+
+def _resume_history_hash(chat_history) -> str:
+    """Stable hash of a chat_history for checkpoint deduplication."""
+    try:
+        _raw = json.dumps(chat_history or [], sort_keys=True,
+                          ensure_ascii=False, default=str)
+        return hashlib.sha256(_raw.encode("utf-8")).hexdigest()
+    except (TypeError, ValueError):
+        return ""
 
 
 def save_fork_state(state: dict, chat_history: list, cwd: str,
