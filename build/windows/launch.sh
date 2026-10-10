@@ -7,6 +7,12 @@ export PATH
 self="$(cygpath -u "$0")"
 app="$(cd "$(dirname "$self")/../.." && pwd)"
 
+# An installer does not carry empty directories, and the runtime expects
+# these to exist.
+for dir in /tmp /var/tmp; do
+    [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null
+done
+
 # Account data lives in the Windows user profile, not inside the install
 # directory, so it survives upgrades and reinstalls.
 HOME="$(cygpath -u "$USERPROFILE")"
