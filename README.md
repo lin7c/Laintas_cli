@@ -717,15 +717,37 @@ CLI archives, Debian packages, source ZIPs and checksums are mirrored at
 Existing historical release notes below describe the builds shipped at the
 time and are not instructions for producing new Windows CLI packages.
 
-The current public release is [laintas-cli-beta v2](https://github.com/lin7c/Laintas_cli/releases/tag/laintas-cli-beta-v2)
-(tag `laintas-cli-beta-v2`). It is an ordinary GitHub Release, marked `latest`;
-its Python package version is `1.32.5b2`. The Mac package is an initial native
+The current public release is [laintas-cli-beta v3](https://github.com/lin7c/Laintas_cli/releases/tag/laintas-cli-beta-v3)
+(tag `laintas-cli-beta-v3`). It is an ordinary GitHub Release, marked `latest`;
+its Python package version is `1.32.5b3`. The Mac package is an initial native
 CLI build without Helpwo Kernel. See [the release guide](build/RELEASE.md) for
 build and verification details.
 
 ## Version History
 
 The history below is curated from the repository tags and changes, following an Added/Changed/Fixed-style release-note structure rather than reproducing raw commit messages. The tagged public history currently represented in this repository begins at v1.3.0.
+
+### [laintas-cli-beta v3](https://github.com/lin7c/Laintas_cli/releases/tag/laintas-cli-beta-v3) — 2026-10-10
+
+**Added**
+
+- `/theme auto|dark|light|mono`: text colors made for the terminal's own
+  background. `auto` asks the terminal once; nothing repaints the terminal.
+- Launch options that apply to one run without changing saved preferences:
+  model, route, mode, approval level, effort, loop limit, any `/config`
+  value, tool filters, MCP config, extra system instructions and `--resume`.
+  A task given on the command line opens a session with it as the first
+  message; `-` reads the task from standard input.
+- One progress display for CLI updates, extensions and the install scripts.
+
+**Changed**
+
+- `/agents` uses one color meaning per state, a shorter side panel, and a
+  list-first layout in narrow terminals.
+- `/resume` no longer adds a duplicate checkpoint when nothing changed, and
+  long rows scroll while their tree prefix stays in place.
+- With `--execute` in text mode, start-up notices go to standard error.
+- The Windows and WSL code paths were removed from the CLI package.
 
 ### [laintas-cli-beta v2](https://github.com/lin7c/Laintas_cli/releases/tag/laintas-cli-beta-v2) — 2026-09-30
 
