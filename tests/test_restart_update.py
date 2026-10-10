@@ -41,7 +41,8 @@ class DownloadProgressTests(unittest.TestCase):
         )
         r_fd, w_fd = os.pipe()
         try:
-            with mock.patch.object(updater.requests, "get", return_value=_make_response(payload)), \
+            with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}), \
+                    mock.patch.object(updater.requests, "get", return_value=_make_response(payload)), \
                     mock.patch.object(updater, "_open_tty", return_value=(w_fd, 120)):
                 downloaded = updater._download(
                     "https://example.invalid/release.tar.gz",
@@ -54,6 +55,10 @@ class DownloadProgressTests(unittest.TestCase):
         finally:
             try:
                 os.close(r_fd)
+            except OSError:
+                pass
+            try:
+                os.close(w_fd)
             except OSError:
                 pass
         # Should contain the label, 100%, and a final newline
@@ -71,7 +76,8 @@ class DownloadProgressTests(unittest.TestCase):
             file=StdoutProxy(),
             print=messages.append,
         )
-        with mock.patch.object(updater.requests, "get", return_value=_make_response(payload)), \
+        with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}), \
+                mock.patch.object(updater.requests, "get", return_value=_make_response(payload)), \
                 mock.patch.object(updater, "_open_tty", return_value=(None, 0)):
             downloaded = updater._download(
                 "https://example.invalid/release.tar.gz",

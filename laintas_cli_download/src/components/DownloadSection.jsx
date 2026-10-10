@@ -11,10 +11,15 @@ const RELEASE_FALLBACK = 'laintas-cli-beta-v2';
 // The site mirrors the verified assets from the latest GitHub Release.
 const RELEASE_BASE = 'https://cli.laintas.com/releases/latest';
 const RELEASE_API = 'https://api.github.com/repos/lin7c/Laintas_cli/releases/latest';
-const WINDOWS_DOWNLOAD = 'https://cli.laintas.com/windows/LaintasSetup.exe';
+const WINDOWS_DOWNLOAD = 'https://cli.laintas.com/windows/releases/0.4.6/LaintasSetup.exe';
+const WINDOWS_RELEASE = {
+  version: WINDOWS_DOWNLOAD.match(/\/releases\/([^/]+)\//)[1],
+  installer: WINDOWS_DOWNLOAD,
+};
 const INSTALL_COMMANDS = {
   linux: 'curl -fsSL https://cli.laintas.com/install.sh | bash',
   mac: 'curl -fsSL https://cli.laintas.com/install.sh | bash',
+  windows: 'irm https://cli.laintas.com/install.ps1 | iex',
 };
 
 const DOWNLOADS = [
@@ -32,8 +37,8 @@ const CAP_ICONS = [TerminalSquare, Waypoints, ShieldCheck, Layers3];
 // tier table and allowance comparison live on the pricing page itself.
 const PLANS = [
   { id: 'free', price: '$0', period: '/ mo', title: { zh: '按量使用', en: 'Pay as you go' }, desc: { zh: '无需订阅。用多少付多少，单价公开透明。', en: 'No subscription. Only pay for what you use.' }, features: { zh: ['新用户 100 次调用试用', '用多少付多少', '模型分档，单价透明'], en: ['100-call trial for new accounts', 'Only pay for usage', 'Transparent model tiers'] }, badge: null, highlight: false },
-  { id: 'pro', price: '$19.9', period: '/ mo', title: { zh: 'Pro', en: 'Pro' }, desc: { zh: '每月 7,000 次调用，全产品共用一个额度池。', en: '7,000 calls a month, one pooled allowance.' }, features: { zh: ['7,000 次调用 / 月', '所有产品共用同一额度', '检索/嵌入/重排各计 1 次', '超出后可继续按量'], en: ['7,000 calls / month', 'One pool across every product', 'Retrieval/embed/rerank count as 1', 'Continue pay-as-you-go after'] }, badge: { zh: '最受欢迎', en: 'Most popular' }, highlight: true },
-  { id: 'gen', price: '$49.9', period: '/ mo', title: { zh: 'Gen', en: 'Gen' }, desc: { zh: '每月 15,000 次调用，5 小时突发上限 1,500 次。', en: '15,000 calls a month, 1,500 in a 5-hour burst.' }, features: { zh: ['15,000 次调用 / 月', '突发速率提高', '全产品共用额度', '面向全职 agent 工作流'], en: ['15,000 calls / month', 'Higher burst rate', 'One pooled allowance', 'For full-time agent workflows'] }, badge: { zh: '全产品', en: 'All products' }, highlight: false },
+  { id: 'pro', price: '$19.9', period: '/ mo', title: { zh: 'Pro', en: 'Pro' }, desc: { zh: '每月一份会员积分，全产品共用。', en: 'A monthly pool of member credits, shared across every product.' }, features: { zh: ['每月会员积分', '所有产品共用同一额度', '按会员价扣积分，比按量便宜', '超出后可继续按量'], en: ['Monthly member credits', 'One pool across every product', 'Drawn at member prices, below pay-as-you-go', 'Continue pay-as-you-go after'] }, badge: { zh: '最受欢迎', en: 'Most popular' }, highlight: true },
+  { id: 'gen', price: '$49.9', period: '/ mo', title: { zh: 'Gen', en: 'Gen' }, desc: { zh: '每月更多会员积分，会员手续费更低。', en: 'A larger monthly pool of member credits, at a lower member fee.' }, features: { zh: ['每月更多会员积分', '突发速率提高', '全产品共用额度', '面向全职 agent 工作流'], en: ['More monthly member credits', 'Higher burst rate', 'One pooled allowance', 'For full-time agent workflows'] }, badge: { zh: '全产品', en: 'All products' }, highlight: false },
 ];
 
 // The presenter. One photograph per chapter, shot from one fixed camera, so
@@ -265,6 +270,7 @@ export default function DownloadSection() {
   const { lang } = useLanguage();
   const c = COPY[lang] || COPY.en;
   const [release, setRelease] = useState(RELEASE_FALLBACK);
+  const [windowsRelease, setWindowsRelease] = useState(WINDOWS_RELEASE);
   const [installPlatform, setInstallPlatform] = useState('linux');
   const chapterRefs = useRef([]);
   const layerRefs = useRef([]);
@@ -278,6 +284,17 @@ export default function DownloadSection() {
       .then((response) => response.ok ? response.json() : Promise.reject(new Error('release lookup failed')))
       .then((data) => { if (data.tag_name) setRelease(data.tag_name); })
       .catch(() => {});
+    const controller = new AbortController();
+    fetch('/windows/download.json', { cache: 'no-store', signal: controller.signal })
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error('Windows release lookup failed')))
+      .then((data) => {
+        if (typeof data.version === 'string' && data.version
+          && data.installer === `https://cli.laintas.com/windows/releases/${data.version}/LaintasSetup.exe`) {
+          setWindowsRelease({ version: data.version, installer: data.installer });
+        }
+      })
+      .catch(() => {});
+    return () => controller.abort();
   }, []);
 
   const chapter = (index) => (node) => { chapterRefs.current[index] = node; };
@@ -431,21 +448,23 @@ export default function DownloadSection() {
                 ))}
               </div>
               <div className="st-install-line">
-                {installPlatform === 'windows' ? <a href={WINDOWS_DOWNLOAD}><ArrowDownToLine size={18} /> {lang === 'zh' ? '下载 laintas-Helpwo-cli-for-windows' : 'Download laintas-Helpwo-cli-for-windows'}</a> : <><code><span aria-hidden="true">$</span>{INSTALL_COMMANDS[installPlatform]}</code><CopyButton value={INSTALL_COMMANDS[installPlatform]} labels={c} /></>}
+                <code><span aria-hidden="true">{installPlatform === 'windows' ? 'PS>' : '$'}</span>{INSTALL_COMMANDS[installPlatform]}</code>
+                <CopyButton key={installPlatform} value={INSTALL_COMMANDS[installPlatform]} labels={c} />
               </div>
             </div>
+            {installPlatform === 'windows' && <a className="st-link" href={windowsRelease.installer}><ArrowDownToLine size={16} />{lang === 'zh' ? '直接下载安装包' : 'Download the installer directly'} · v{windowsRelease.version}</a>}
             <ol className="st-start">
-              {(installPlatform === 'windows' ? (lang === 'zh' ? [['安装桌面版','下载并双击 LaintasSetup.exe'],['启动并登录','从开始菜单打开，登录或配置模型'],['开始对话','选择工作目录，给 agent 一个任务']] : [['Install the desktop app','Download and open LaintasSetup.exe'],['Launch and sign in','Open from Start; sign in or configure a model'],['Start a conversation','Choose a workspace and give the agent a task']]) : c.startSteps).map(([title, detail], index) => (
+              {(installPlatform === 'windows' ? (lang === 'zh' ? [['安装桌面版','在 PowerShell 执行指令，或直接下载安装包'],['启动并登录','从开始菜单打开，登录或配置模型'],['开始对话','在默认工作区给 agent 一个任务']] : [['Install the desktop app','Run the command in PowerShell, or download the installer'],['Launch and sign in','Open from Start; sign in or configure a model'],['Start a conversation','Give the agent a task in the default workspace']]) : c.startSteps).map(([title, detail], index) => (
                 <li key={title}><span>0{index + 1}</span><strong>{title}</strong><p>{detail}</p></li>
               ))}
             </ol>
             <p className="st-eco-title">{c.packages}</p>
             <div className="st-packages">
               {DOWNLOADS.map(({ id, names, details, file, href, icon: Icon }) => (
-                <a href={href || `${RELEASE_BASE}/${file}`} key={id}>
+                <a href={id === 'windows' ? windowsRelease.installer : href || `${RELEASE_BASE}/${file}`} key={id}>
                   <Icon size={18} strokeWidth={1.6} />
                   <span><strong>{names[lang] || names.en}</strong><small>{details[lang] || details.en}</small></span>
-                  <code>{id === 'windows' ? (lang === 'zh' ? '桌面版' : 'Desktop') : release}</code>
+                  <code>{id === 'windows' ? `v${windowsRelease.version}` : release}</code>
                   <em>{c.download}<ArrowDownToLine size={15} /></em>
                 </a>
               ))}

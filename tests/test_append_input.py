@@ -43,7 +43,7 @@ class AppendInputTests(unittest.TestCase):
             rows = self.screen()
         self.assertEqual(len(rows), 2, rows)
         self.assertRegex(rows[0], r'L[·›»] ─╮ Thinking… .*glm-5.3-flash · AUTO')
-        self.assertEqual(rows[1], '    ╰─ append Analyze only; do not edit')
+        self.assertEqual(rows[1], '    ╰─ draft Analyze only; do not edit')
         self.assertEqual(rows[0].index('╮'), rows[1].index('╰'))
         self.assertNotIn('tool output must wait', self.output.getvalue())
         self.ui.set_draft('')
@@ -59,7 +59,7 @@ class AppendInputTests(unittest.TestCase):
         self.assertEqual(self.ui.draft_text(), 'second draft')
         rows = self.screen()
         self.assertEqual(rows[1:], ['    ├─ append first instruction',
-                                   '    ╰─ append second draft'])
+                                   '    ╰─ draft second draft'])
         self.assertEqual(self.ui.pending, [])
         self.assertNotIn('deferred execution', self.output.getvalue())
         self.ui.set_draft('')
@@ -79,7 +79,7 @@ class AppendInputTests(unittest.TestCase):
         rows = self.screen()
         self.assertEqual(rows[1:], [
             '    ├─ append content1', '    ├─ append content2',
-            '    ├─ append content3', '    ╰─ append content4'])
+            '    ├─ append content3', '    ╰─ draft content4'])
         for row in rows[1:]:
             self.assertEqual(row.index('─'), rows[0].index('╮') + 1)
         self.assertNotIn('execution must stay hidden', self.output.getvalue())
@@ -96,7 +96,7 @@ class AppendInputTests(unittest.TestCase):
         rows = self.screen()
         self.assertLessEqual(len(rows), 23)
         self.assertIn('earlier append', rows[1])
-        self.assertEqual(rows[-1], '    ╰─ append latest draft')
+        self.assertEqual(rows[-1], '    ╰─ draft latest draft')
         self.assertEqual(rows[-2], '    ├─ append content29')
 
     def test_full_queue_keeps_draft(self):
@@ -131,7 +131,7 @@ class AppendInputTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.console.print('approval question')
         self.ui.resume()
-        self.assertIn('append approval draft', self.screen()[-1])
+        self.assertIn('draft approval draft', self.screen()[-1])
         worker = self.ui._live._refresh_thread
         self.assertEqual(self.ui.close(), 'approval draft')
         self.assertFalse(worker.is_alive())
@@ -142,7 +142,7 @@ class AppendInputTests(unittest.TestCase):
         self.ui.set_draft('first line\nsecond line\t' + '\u4e2d\u6587' * 40)
         rows = self.screen()
         self.assertEqual(len(rows), 2, rows)
-        self.assertTrue(rows[1].startswith('    ╰─ append '))
+        self.assertTrue(rows[1].startswith('    ╰─ draft '))
         self.assertLessEqual(agent_loop._cell_len(rows[1]), 37)
 
     def test_live_draft_never_enters_agent_history(self):

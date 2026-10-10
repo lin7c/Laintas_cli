@@ -9311,10 +9311,11 @@ def _build_fork_tree_rows(choices: list) -> list[tuple[dict, str]]:
     """Group snapshots by logical session, then render the session tree.
 
     ``session_id`` identifies a conversation branch and ``parent_session_id``
-    identifies the session it forked from. Checkpoints and autosaves belonging
-    to one session therefore render below one resumable tip instead of becoming
-    dozens of unrelated roots. ``fork_lineage`` is only a v1 compatibility
-    hint; branch names are not stable identity.
+    identifies the session it forked from. All snapshots of one session —
+    autosaves and /q checkpoints alike — collapse into that session's single
+    resumable tip row, so accumulated checkpoints never render as branches.
+    ``fork_lineage`` is only a v1 compatibility hint; branch names are not
+    stable identity.
     """
     def _ts(blob: dict) -> float:
         try:
@@ -9445,7 +9446,8 @@ def _build_fork_tree_rows(choices: list) -> list[tuple[dict, str]]:
             snapshot["_tree_session_node"] = snapshot is header
         if node["branch_name"]:
             header["_tree_branch_name"] = node["branch_name"]
-        children = [{"blob": blob, "children": []} for blob in blobs[1:]]
+        children = [{"blob": blob, "children": []}
+                    for blob in blobs[1:] if blob.get("kind") == "fork"]
         for child_key in sorted(set(node["children"]),
                                 key=_node_newest, reverse=True):
             child = _item_for(child_key, ancestry)
@@ -10559,7 +10561,14 @@ def _call_backend_stream_impl(
                 _detail = str(evt.get("details") or "").strip()
                 return {"reply": f"Server Error: {evt['error']}" + (f" — {_detail}" if _detail else ""),
                         "tool_calls": [], "done": True, "error": True,
-                        "error_code": str(evt.get("code") or "")}
+                        "error_code": str(evt.get("code") or ""),
+                        # The gateway's own word that sending the same request
+                        # again is safe, and what the dead attempt cost. A
+                        # stream that dropped during thinking or mid tool-call
+                        # arrives here — there is no prose to continue from, so
+                        # the loop's only recovery is to ask again.
+                        "error_retryable": evt.get("retryable") is True,
+                        "error_charged_credits": evt.get("credits") if evt.get("charged") else None}
             if "_budget" in evt:
                 # The gateway's answer to "how many output tokens do I actually
                 # have?" — the clamped ceiling, plus the window room left after
@@ -24473,6 +24482,46 @@ def _told_browse_history(chat: list) -> None:
         except (TypeError, ValueError):
             return str(value or "")
 
+    def event_verdict(event: dict) -> str:
+        """Return "ok", "failed" or "" for one recorded event.
+
+        Only what the event itself recorded counts: ``transcript_view.
+        build_tool_event`` stamps ``ok``/``returncode`` on every typed tool
+        call, and a turn that died before answering carries
+        ``message_kind == "turn_failed"``. Records without a verdict (legacy
+        prose, provider-only messages) stay neutral instead of being counted
+        as successes.
+        """
+        if not isinstance(event, dict):
+            return ""
+        role = str(event.get("role") or "")
+        if role in {"tool", "shell", "knowledge"}:
+            if "ok" not in event:
+                return ""
+            return "ok" if event.get("ok") else "failed"
+        if role == "assistant":
+            return "failed" if event.get("message_kind") == "turn_failed" else ""
+        return ""
+
+    def event_meta_tail(event: dict) -> str:
+        """Exit code / error cause / slow-call marker for one tool heading."""
+        extra = event.get("extra")
+        extra = extra if isinstance(extra, dict) else {}
+        parts = []
+        returncode = event.get("returncode")
+        if returncode is not None:
+            parts.append(f"exit {returncode}")
+        error = " ".join(str(extra.get("error") or "").split())
+        if error:
+            parts.append(error[:120])
+        try:
+            elapsed = float(event.get("elapsed") or 0.0)
+        except (TypeError, ValueError):
+            elapsed = 0.0
+        if elapsed >= 2.0:
+            parts.append(f"{elapsed:.1f}s")
+        return "  •  ".join(parts)
+
     session_records = []
     index = 0
     while index < len(chat):
@@ -24510,14 +24559,38 @@ def _told_browse_history(chat: list) -> None:
                        and message_text(event).strip()]
             tools = [event for event in record["events"]
                      if event.get("role") in {"tool", "shell", "knowledge"}]
+            verdicts = [event_verdict(event) for event in record["events"]]
+            tool_verdicts = [event_verdict(event) for event in tools]
+            failed_tools = tool_verdicts.count("failed")
+            ok_tools = tool_verdicts.count("ok")
+            turn_failed = any(
+                verdict == "failed" and event.get("role") == "assistant"
+                for verdict, event in zip(verdicts, record["events"]))
             subtitle = (f"{len(replies)} AI repl{'y' if len(replies) == 1 else 'ies'}"
                         f"  •  {len(tools)} tool event{'s' if len(tools) != 1 else ''}")
+            if failed_tools:
+                subtitle += (f"  •  {failed_tools} failed"
+                             f"  •  {ok_tools} ok" if ok_tools
+                             else f"  •  {failed_tools} failed")
+            problems = []
+            if failed_tools:
+                problems.append(
+                    f"{failed_tools} tool{'s' if failed_tools != 1 else ''} failed")
+            if turn_failed:
+                problems.append("turn failed")
+            if problems:
+                status, status_style = "✗ " + ", ".join(problems), "class:error"
+            elif ok_tools:
+                status, status_style = f"✓ {ok_tools} ok", "class:success"
+            else:
+                status, status_style = "", "class:muted"
             rows.append(resource_ui.UIItem(
                 key=record["key"], badge=record["source"],
                 title=prompt[:110],
                 subtitle=subtitle, payload=record,
+                status=status, status_style=status_style,
                 search_text=" ".join(
-                    [record["prompt"]]
+                    [record["prompt"], status]
                     + [message_text(event) for event in record["events"]]),
             ))
         return rows
@@ -24535,6 +24608,8 @@ def _told_browse_history(chat: list) -> None:
             content = message_text(event)
             if not content:
                 continue
+            state = event_verdict(event)
+            tail = event_meta_tail(event) if state == "failed" else ""
             if role == "ASSISTANT":
                 reply_number += 1
                 kind = str(event.get("message_kind") or "").upper()
@@ -24550,25 +24625,28 @@ def _told_browse_history(chat: list) -> None:
                              or trace.get("tool"))
                 if tool_name:
                     heading += f"  •  {tool_name}"
+                if tail:
+                    heading += f"  •  {tail}"
             else:
                 heading = role
             lines.extend([
                 resource_ui.UILine(""),
-                resource_ui.UILine(heading, "class:detail.heading"),
+                resource_ui.UILine(heading, "class:detail.heading", state=state),
             ])
             style = ("class:detail.code" if role in {"TOOL", "SHELL"}
                      else "class:detail")
-            lines.extend(resource_ui.UILine(value, style)
+            lines.extend(resource_ui.UILine(value, style, state=state)
                          for value in content.splitlines())
         return resource_ui.UIDetail(
             title=record["prompt"].splitlines()[0][:100] if record["prompt"] else "Conversation",
-            subtitle=record["source"], lines=lines, kind="timeline")
+            subtitle=record["source"], lines=lines, kind="timeline", collapsible=True)
 
     resource_ui.ResourceBrowser(
         title="Conversation History", load_items=_load_items,
         load_detail=_load_detail,
         presentation="timeline",
         pane_labels=("CONVERSATIONS", "TRANSCRIPT"),
+        collapsible_detail=True,
         empty_message="No conversations in the current session.").run()
 
 
@@ -28128,6 +28206,11 @@ def _run_execute_mode(task: str, session: dict, depth: int, session_id: str = No
     if last_output:
         result += "\n" + last_output
     print(result)
+    if not response.get("success"):
+        # Nothing printed and status 1 told an unattended caller nothing.
+        failure = str(response.get("state", {}).get("_last_error") or "").strip()
+        if failure:
+            print(failure, file=sys.stderr)
 
     return 0 if response.get("success") else 1
 

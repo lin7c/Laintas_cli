@@ -53,6 +53,22 @@ _FP_CACHE_LIMIT = 2000           # LRU cap on tracked read fingerprints
 _WRITES_RETENTION_DAYS = 3
 _WRITE_ENTRY_MAX_BYTES = 65536   # cap a single log line
 _ETAG_CONTENT_CAP = 262144       # files ≤256KB get a content hash in their etag
+_SHELL_CHANGE_LIMIT = 40         # max files one post-shell scan reports
+
+
+def _stat_triple(abs_path: str):
+    """Cheap file identity for the post-shell scan; None once the path is gone.
+
+    A scan that recomputed ``file_etag`` for every tracked file would read and
+    hash up to 2000 files after each mutating command. lstat answers "could
+    this have changed?" for ~1µs, and the content hash is then only paid for
+    the handful whose size or mtime actually moved.
+    """
+    try:
+        st = os.lstat(abs_path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
 
 
 def _cwd_hash(cwd: str) -> str:
@@ -93,6 +109,9 @@ class _PeerCoordinator:
         self._reg_file: Optional[Path] = None
         self._read_fps: dict[str, str] = {}    # (actor, realpath) -> etag
         self._fp_order: list[str] = []         # LRU order of those keys
+        # key -> (ino, size, mtime_ns) at fingerprint time. Lets a post-shell
+        # scan skip the content hash for tracked files nothing touched.
+        self._read_stats: dict[str, tuple] = {}
         self._last_scan = 0.0
         self._last_heartbeat = 0.0
         # Writers sharing this process's working directory that are NOT this
@@ -161,12 +180,14 @@ class _PeerCoordinator:
             self._enabled = False
             self._read_fps.clear()
             self._fp_order.clear()
+            self._read_stats.clear()
 
     def _forget_actor(self, actor: str) -> None:
         prefix = f"{actor}\0"
         stale = [k for k in self._read_fps if k.startswith(prefix)]
         for key in stale:
             self._read_fps.pop(key, None)
+            self._read_stats.pop(key, None)
         if stale:
             keep = set(stale)
             self._fp_order = [k for k in self._fp_order if k not in keep]
@@ -192,6 +213,7 @@ class _PeerCoordinator:
                 self._enabled = False
                 self._read_fps.clear()
                 self._fp_order.clear()
+                self._read_stats.clear()
             return False
         self._heartbeat()
         now = time.monotonic()
@@ -204,6 +226,7 @@ class _PeerCoordinator:
             if not want:
                 self._read_fps.clear()
                 self._fp_order.clear()
+                self._read_stats.clear()
         return self._enabled
 
     def enabled(self) -> bool:
@@ -299,13 +322,59 @@ class _PeerCoordinator:
                     "it) — re-read and retry")
         return None
 
+    def note_shell_change(self, command: str,
+                          limit: int = _SHELL_CHANGE_LIMIT) -> list[str]:
+        """Report tracked files a shell command in THIS process just changed.
+
+        ``git checkout -- .``, ``git apply -R``, ``sed -i`` and friends rewrite
+        the workspace without going through fs.write, so nothing here would
+        otherwise notice: the agent keeps editing against a snapshot that is no
+        longer on disk, and the write log cannot attribute the change to
+        anyone. The tracked fingerprint set is the watch list — a file nobody
+        read has no in-context copy to go stale, so scanning it is both
+        sufficient and far cheaper than walking the repo.
+
+        Changed files are logged for attribution but deliberately NOT
+        re-fingerprinted. Refreshing here would let the next fs.edit land on
+        the stale snapshot, which is the lost update this module exists to
+        prevent; the fingerprint moves when the agent actually re-reads.
+        """
+        if not self._enabled:
+            return []
+        prefix = f"{self._instance_id}\0"
+        changed: list[str] = []
+        for key, prev in list(self._read_fps.items()):
+            if not key.startswith(prefix):
+                continue                      # another actor's view, not ours
+            real = key[len(prefix):]
+            cur_stat = _stat_triple(real)
+            if cur_stat == self._read_stats.get(key):
+                continue                      # untouched: skip the content hash
+            cur = file_etag(real)
+            # Record the stat we just paid for. That is what makes a report
+            # once-per-change rather than once-per-command: the fingerprint
+            # stays stale on purpose (so the write-side CAS still refuses the
+            # edit), but the scan will not re-announce the same content on
+            # every subsequent shell call until the agent re-reads.
+            self._read_stats[key] = cur_stat
+            if prev == cur:
+                continue                      # same bytes (a formatter no-op)
+            changed.append(real)
+            self.log_write(real, f"shell:{command[:60]}")
+            if len(changed) >= limit:
+                break
+        return changed
+
     def _set_fp(self, key: str, etag: str) -> None:
         if key not in self._read_fps:
             self._fp_order.append(key)
             if len(self._fp_order) > _FP_CACHE_LIMIT:
                 old = self._fp_order.pop(0)
                 self._read_fps.pop(old, None)
+                self._read_stats.pop(old, None)
         self._read_fps[key] = etag
+        _real = key.split("\0", 1)[1] if "\0" in key else ""
+        self._read_stats[key] = _stat_triple(_real)
 
     # ── L2: write log ────────────────────────────────────────────────
     def log_write(self, abs_path: str, op: str, actor: Optional[str] = None) -> None:

@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import time
 import threading
 from datetime import datetime, timezone
@@ -793,6 +794,324 @@ def is_unsafe_shared_temp_cleanup(command: str) -> bool:
     return is_delete_command(stripped)
 
 
+# ── Runtime state protection (~/.laintas) ────────────────────────────────
+# The runtime's own state directory holds the live event stream, sessions,
+# memories, the cross-instance registry AND policy.json — the configuration
+# this very gate reads. Nothing protected it: `echo '{"mode":"disabled"}' >
+# ~/.laintas/policy.json` was an ordinary allow, so the approval gate could
+# switch itself off with one redirect, and `mv ~/.laintas/sessions …`,
+# `sed -i … events.jsonl` or `chmod -R 000 ~/.laintas` all ran with no prompt.
+#
+# Reads deliberately stay free: inspecting events.jsonl is routine work, and
+# gating it would make the guard too noisy to keep.
+
+# Utilities whose every operand is either consumed or overwritten, so any of
+# them landing inside the state dir is a mutation of it.
+_STATE_WRITE_UTIL_RE = re.compile(
+    r"(?:^|[;&|]\s*|\bdo\s+|\bthen\s+|\bxargs\s+)"
+    r"(?:[^\s/]*/)?"
+    r"(?:mv|cp|truncate|chmod|chown|chgrp|ln|install|rsync|shred)"
+    r"(?:\s|$)")
+
+# `sed -i` / `perl -i` rewrite a file in place, and plain `sed` sits on the
+# always-allow list — without the -i test this would either miss the mutation
+# or gate every read-only sed in the repo. The flag itself is tested per token
+# below: a lookahead cannot see it, because `sed\s+` has already consumed the
+# space that `\s-i\b` would need.
+_STATE_INPLACE_EDIT_RE = re.compile(
+    r"(?:^|[;&|]\s*|\bdo\s+|\bthen\s+)(?:[^\s/]*/)?(?:sed|perl)(?=\s|$)")
+
+
+def _is_inplace_flag(token: str) -> bool:
+    """True for the sed/perl flag that rewrites the file instead of stdout.
+
+    Covers ``-i``, the GNU suffix form ``-i.bak``, and the combined short-flag
+    spellings (``-ni``, ``-pi``, ``-Ei``) — while leaving ``-e``/``-n``/``-p``
+    alone, since a read-only sed is ordinary work and must not prompt.
+    """
+    if token.startswith("--"):
+        return token.split("=", 1)[0] == "--in-place"
+    if not token.startswith("-") or token == "-":
+        return False
+    letters = re.split(r"[.=]", token[1:], 1)[0]
+    return bool(letters) and letters.isalpha() and "i" in letters
+
+# Operators where only the TARGET can clobber state. Scanning operands instead
+# would catch `cat ~/.laintas/events.jsonl > /tmp/out`, an ordinary read.
+_STATE_WRITE_TARGET_RES = (
+    re.compile(r'''(?<!>)>(?:>|\||&)?\s*('[^']*'|"[^"]*"|[^\s;&|]+)'''),
+    re.compile(r"(?:^|[;&|]\s*|\bdo\s+|\bthen\s+)tee\s+(?:-\S+\s+)*(\S+)"),
+    re.compile(r"\bdd\b[^\n;&|]*\bof=(\S+)"),
+)
+
+# Shell variables this line binds, so `P=~/.laintas/policy.json; echo x > $P`
+# is caught as the overwrite it is. Without this the guard is one assignment
+# away from useless — and that assignment is the first thing an agent reaches
+# for when a literal path gets refused.
+_STATE_ASSIGN_RE = re.compile(r"(?<![\w$.-])([A-Za-z_][A-Za-z0-9_]*)=(?!=)")
+_STATE_FOR_RE = re.compile(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^;&|]*)",
+                           re.IGNORECASE)
+
+
+# Resolved roots, cached against the raw `paths` values they came from. The
+# key is what makes this safe under rebinding: account switching and the test
+# suite both reassign paths.LAINTAS_HOME, and a changed value misses the cache
+# instead of silently gating the old tree.
+_state_roots_cache: tuple = ()
+_state_roots_cache_key: tuple | None = None
+
+
+def _runtime_state_roots() -> tuple:
+    """Every directory that holds the runtime's own state, as resolved paths.
+
+    Two, because they are not the same tree once an account is selected:
+    ``ROOT_HOME`` stays ``~/.laintas`` and contains *every* account profile
+    plus the cross-instance registry, while ``LAINTAS_HOME`` is rebound to the
+    active profile inside it. Gating only the active profile would leave
+    ``rm -rf ~/.laintas`` — all accounts, all sessions — as an ordinary
+    command, and a ``~``-spelled target would resolve outside the guard.
+
+    ``resolve()`` costs ~40µs of syscalls and this runs once per operand on
+    every shell command, so the result is cached per distinct binding. A
+    symlink re-pointed underneath the state dir mid-process would go unseen;
+    doing that already needs the write access this gate exists to protect.
+    """
+    global _state_roots_cache, _state_roots_cache_key
+    key = (str(getattr(paths, "ROOT_HOME", "") or ""),
+           str(getattr(paths, "LAINTAS_HOME", "") or ""))
+    if key == _state_roots_cache_key:
+        return _state_roots_cache
+    roots: list = []
+    for value in key:
+        if not value:
+            continue
+        try:
+            resolved = Path(value).resolve(strict=False)
+        except OSError:
+            continue
+        if resolved not in roots:
+            roots.append(resolved)
+    _state_roots_cache_key = key
+    _state_roots_cache = tuple(roots)
+    return _state_roots_cache
+
+
+def _state_compare_path(abs_path: str) -> str:
+    """Normalize *abs_path* for prefix comparison, avoiding syscalls if possible.
+
+    An absolute path with no ``..`` component is already canonical for prefix
+    purposes. Only the shapes that can escape a prefix — relative paths, and
+    ``..`` traversal — pay for a real ``resolve()``.
+    """
+    if abs_path.startswith("/") and "/../" not in abs_path \
+            and not abs_path.endswith("/.."):
+        return os.path.normpath(abs_path)
+    try:
+        return str(Path(abs_path).resolve(strict=False))
+    except OSError:
+        return abs_path
+
+
+def is_runtime_state_path(abs_path: str) -> bool:
+    """True when *abs_path* is a runtime state dir or anything inside one."""
+    roots = _runtime_state_roots()
+    if not roots:
+        return False
+    target = _state_compare_path(abs_path)
+    for root in roots:
+        root_text = str(root)
+        if target == root_text or target.startswith(root_text + "/"):
+            return True
+    return False
+
+
+def is_policy_config_path(abs_path: str) -> bool:
+    """True for the policy file itself — the gate's own configuration.
+
+    Rewriting it can set ``mode: disabled`` and turn off every approval check
+    in the process, so it gets its own reason string rather than the generic
+    runtime-state one.
+    """
+    try:
+        target = Path(abs_path).resolve(strict=False)
+    except OSError:
+        return False
+    candidates = set()
+    for candidate in (CONFIG_PATH,):
+        try:
+            candidates.add(Path(candidate).resolve(strict=False))
+        except (OSError, TypeError):
+            continue
+    try:
+        candidates.add(Path(paths.account_path("POLICY_FILE")).resolve(strict=False))
+    except Exception:
+        pass
+    return target in candidates
+
+
+def _expand_state_token(token: str) -> str:
+    """Resolve one shell token that may spell the state dir via ~ or $HOME."""
+    token = token.strip().strip("'\"")
+    if not token:
+        return ""
+    bases = []
+    laintas_home = getattr(paths, "LAINTAS_HOME", None)
+    if laintas_home:
+        bases.append(("$LAINTAS_HOME", laintas_home))
+        bases.append(("${LAINTAS_HOME}", laintas_home))
+    user_home = Path.home()
+    bases += [("$HOME", user_home), ("${HOME}", user_home), ("~", user_home)]
+    for name, base in bases:
+        if token == name:
+            return str(base)
+        for sep in ("/", "\\"):
+            if token.startswith(name + sep):
+                return str(Path(base) / token[len(name) + 1:])
+    return token
+
+
+def _token_may_be_state_path(token: str, cwd: str | None = None) -> bool:
+    """Cheap pre-filter: could *token* denote a path inside the state dir?
+
+    ``is_runtime_state_path`` pays a real ``resolve()`` syscall for anything
+    that is not already absolute, and an assignment-heavy command
+    (``CC=gcc CFLAGS=-O2 LDFLAGS=-lm … make``) hands it a dozen bare words —
+    measured at ~1ms of added latency on the hot path before this filter.
+    Separators, ``~`` and ``$`` qualify directly. Bare names also qualify
+    when execution is already inside runtime state.
+    """
+    return bool(token) and ("/" in token or "~" in token or "$" in token
+                            or (cwd is not None and is_runtime_state_path(cwd)))
+
+
+def _state_operand_path(token: str, cwd: str | None) -> str:
+    target = _expand_state_token(token)
+    if target and cwd and not os.path.isabs(target):
+        target = os.path.join(cwd, target)
+    return target
+
+
+def _state_bound_vars(command: str, cwd: str | None = None) -> frozenset:
+    """Names of shell variables *command* binds to a runtime-state path.
+
+    Covers plain and ``export``ed assignments plus ``for … in`` loop variables.
+    A glob counts: ``for f in ~/.laintas/sessions/*.json`` binds *f* to files
+    that are state, and the state root is an ancestor of the glob either way.
+    """
+    bound: set = set()
+    for match in _STATE_ASSIGN_RE.finditer(command):
+        value = re.split(r"[\s;&|]", command[match.end():], 1)[0]
+        if _token_may_be_state_path(value, cwd) \
+                and is_runtime_state_path(_state_operand_path(value, cwd)):
+            bound.add(match.group(1))
+    for match in _STATE_FOR_RE.finditer(command):
+        for word in match.group(2).split():
+            if _token_may_be_state_path(word, cwd) \
+                    and is_runtime_state_path(_state_operand_path(word, cwd)):
+                bound.add(match.group(1))
+                break
+    return frozenset(bound)
+
+
+def _token_is_state(token: str, var_map: frozenset,
+                    cwd: str | None = None) -> bool:
+    """True when *token* denotes a path inside the runtime state dir.
+
+    Three spellings, because agents use all three: a literal path, a
+    ``~``/``$HOME``/``$LAINTAS_HOME`` prefix, and a variable bound earlier on
+    the same line. ``$P/sub`` counts too — it is still inside the tree.
+    """
+    token = token.strip().strip("'\"")
+    if not token:
+        return False
+    if var_map:
+        for name in re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", token):
+            if name in var_map:
+                return True
+    if not _token_may_be_state_path(token, cwd):
+        return False
+    return is_runtime_state_path(_state_operand_path(token, cwd))
+
+
+def is_runtime_state_mutation(command: str, cwd: str | None = None) -> bool:
+    """True when *command* writes, relocates or re-permissions runtime state.
+
+    Two shapes, checked separately because they need different operands:
+
+    * redirection / ``tee`` / ``dd of=`` — only the target can clobber state,
+      so ``cat ~/.laintas/events.jsonl > /tmp/out`` stays a free read;
+    * in-place or relocating utilities (``mv``, ``cp``, ``sed -i``, ``chmod``,
+      …) — every operand is consumed or overwritten, so any of them inside the
+      state dir counts. That gates ``cp`` *out* of the state dir too; it is a
+      rare operation and one prompt is cheaper than the hole.
+
+    Deletion utilities are not listed here: ``is_delete_command`` already puts
+    every ``rm``/``find -delete`` in the always-ask tier, in both modes.
+    """
+    if not _runtime_state_roots():
+        return False
+    stripped = _unwrap_parent(command)
+    stripped = re.sub(r"^sudo(?:\s+-\S+)*\s+", "", stripped)
+    # Inspect every possible literal working directory in the chain. Keeping
+    # both sides of conditional cd commands is conservative: a failed cd must
+    # not make us forget the original directory. The existing command parser
+    # also exposes cd commands inside shell wrappers.
+    from command_parse import analyze
+    directories = [str(cwd or os.getcwd())]
+    for segment in analyze(stripped).segments:
+        if segment.program != "cd":
+            continue
+        try:
+            words = shlex.split(segment.raw)[1:]
+        except ValueError:
+            continue
+        operands = [word for word in words if not word.startswith("-")]
+        target = operands[0] if operands else str(Path.home())
+        for base in list(directories):
+            if "$" in target and _token_is_state(target, _state_bound_vars(stripped, base), base):
+                for root in _runtime_state_roots():
+                    if str(root) not in directories:
+                        directories.append(str(root))
+            directory = _state_compare_path(_state_operand_path(target, base))
+            if directory not in directories:
+                directories.append(directory)
+                if len(directories) > 32:
+                    # Avoid exponential expansion of conditional relative cd
+                    # chains. A chain this ambiguous needs human review.
+                    return True
+
+    return any(_state_mutation_in_cwd(stripped, base) for base in directories)
+
+
+def _state_mutation_in_cwd(stripped: str, cwd: str) -> bool:
+    var_map = _state_bound_vars(stripped, cwd)
+
+    for pattern in _STATE_WRITE_TARGET_RES:
+        for match in pattern.finditer(stripped):
+            if _token_is_state(match.group(1), var_map, cwd):
+                return True
+
+    for pattern in (_STATE_WRITE_UTIL_RE, _STATE_INPLACE_EDIT_RE):
+        inplace_only = pattern is _STATE_INPLACE_EDIT_RE
+        for match in pattern.finditer(stripped):
+            rest = stripped[match.end():]
+            # One command's operands only; a later `;`-separated command gets
+            # its own match.
+            segment = re.split(r"[;&|]|\bdo\b|\bthen\b", rest, 1)[0]
+            try:
+                tokens = shlex.split(segment)
+            except ValueError:
+                tokens = segment.split()
+            if inplace_only and not any(_is_inplace_flag(t) for t in tokens):
+                continue          # read-only sed/perl: ordinary work, no prompt
+            for token in tokens:
+                if token.startswith("-"):
+                    continue
+                if _token_is_state(token, var_map, cwd):
+                    return True
+    return False
+
+
 # ── Credential material ───────────────────────────────────────────────────
 # The shell is the hole the file-write rules do not cover. `denyFileWrite`
 # above protects the fs.* tools, but a command line reaches the same files and
@@ -989,6 +1308,20 @@ def evaluate(command: str, cwd: str = None,
     if mode != "disabled" and any(is_destructive_git_command(v) for v in variants):
         reason = ("destructive git command always requires approval "
                   "(audit and enforce modes alike)")
+        _write_audit(_audit_entry(command, "needs_approval", reason, cwd, req_id, agent_id))
+        return PolicyDecision("needs_approval", "", reason)
+
+    # ── Runtime state mutation: same always-ask tier ────────────────────
+    # The shell counterpart of the evaluate_file_write() check above. Without
+    # it the fs.* gate is decorative: `echo '{"mode":"disabled"}' >
+    # ~/.laintas/policy.json` was an ordinary allow, so the approval gate could
+    # switch itself off with one redirect, and `mv ~/.laintas/sessions …`,
+    # `sed -i … events.jsonl` or `chmod -R 000 ~/.laintas` all ran silently.
+    # Checked across variants so a wrapper (`bash -c "…"`) cannot hide it.
+    # Reads stay free — inspecting events.jsonl is routine work.
+    if mode != "disabled" and any(is_runtime_state_mutation(v, cwd) for v in variants):
+        reason = ("command writes runtime state under ~/.laintas; always "
+                  "requires approval (audit and enforce modes alike)")
         _write_audit(_audit_entry(command, "needs_approval", reason, cwd, req_id, agent_id))
         return PolicyDecision("needs_approval", "", reason)
 
@@ -1256,6 +1589,23 @@ def evaluate_file_write(path: str, cwd: str | None = None,
                 reason = f"Matched denyFileWrite rule: {pattern}"
                 _write_audit(_audit_entry(label, "deny", reason, cwd, req_id, agent_id))
                 return PolicyDecision("deny", pattern, reason)
+
+    # ── Runtime state (~/.laintas): always-ask tier ─────────────────────
+    # Placed BEFORE the sandbox grant on purpose, mirroring the deny loop: a
+    # prefix grant exists to let disposable worktree sandboxes write freely,
+    # and must never reopen the runtime's own live state. policy.json gets its
+    # own reason string because rewriting it can set `mode: disabled` and turn
+    # off every approval check in this process — the gate must not be editable
+    # by the thing it gates.
+    if mode != "disabled" and is_runtime_state_path(abs_path):
+        if is_policy_config_path(abs_path):
+            reason = ("writing the policy file itself always requires approval "
+                      "— it configures this gate and can disable it")
+        else:
+            reason = ("writing runtime state under ~/.laintas always requires "
+                      "approval (live events, sessions, memories, registry)")
+        _write_audit(_audit_entry(label, "needs_approval", reason, cwd, req_id, agent_id))
+        return PolicyDecision("needs_approval", "", reason)
 
     # ── Runtime sandbox grant: trusted caller pre-approved this prefix ──
     # Placed after the deny loop on purpose: a grant must never reopen a

@@ -100,6 +100,7 @@
     "repair_signals",
     "stuck_signals",
     "release",
+    "download_progress",
     "skill_router",
     "terminal_arbiter",
     "term_attach",

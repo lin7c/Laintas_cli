@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import account_store
 import agent_loop
 import laintas_cli
 import paths
@@ -83,3 +84,57 @@ class ResumeForkTests(unittest.TestCase):
         with mock.patch.object(laintas_cli, "save_fork_state", return_value=None):
             self.assertIsNone(laintas_cli._fork_resume_blob(self.source, self.cwd))
         self.assertEqual(self.source, original)
+
+
+class PickerCollapsedHistoryTests(unittest.TestCase):
+    """The picker offers the session tip while preserving snapshots on disk."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cwd = tmp.name
+        for patch in (mock.patch.object(paths, "SESSIONS_DIR", Path(tmp.name) / "sessions"),
+                      mock.patch.object(agent_loop.workgraph, "db_path",
+                                        return_value=Path(tmp.name) / "wg.db")):
+            patch.start()
+            self.addCleanup(patch.stop)
+        state = {"_session_id": "sess-A"}
+        first = [{"role": "user", "content": "first"}]
+        agent_loop.save_resume_state(state, first, self.cwd)
+        self.checkpoint = agent_loop.save_resume_checkpoint(state, first, self.cwd)
+        agent_loop.save_resume_state(
+            state, first + [{"role": "assistant", "content": "then more work"}], self.cwd)
+
+    def test_picker_offers_only_the_latest_state_and_does_not_branch(self):
+        captured = []
+
+        def select(items, **kwargs):
+            captured.extend(items)
+            return ("resume", 0)
+
+        with mock.patch.object(laintas_cli, "select_dialog", side_effect=select), \
+                mock.patch.object(laintas_cli, "_fork_resume_blob") as fork:
+            chosen = laintas_cli.show_resume_picker(self.cwd)
+        fork.assert_not_called()
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(chosen["session_id"], "sess-A")
+        self.assertEqual(chosen["chat_history"][-1]["content"], "then more work")
+        self.assertTrue(chosen["_tree_session_node"])
+
+    def test_hidden_checkpoint_remains_available_for_an_explicit_fork(self):
+        tip = agent_loop.load_resume_state(self.cwd, "sess-A")
+        choices = agent_loop.list_resume_states(self.cwd)
+        self.assertEqual(len(laintas_cli._build_fork_tree_rows(choices)), 1)
+        checkpoint = next(blob for blob in choices if blob.get("kind") == "checkpoint")
+        child = laintas_cli._fork_resume_blob(checkpoint, self.cwd)
+        self.assertIsNotNone(child)
+        self.assertEqual(child["parent_session_id"], "sess-A")
+        self.assertNotEqual(child["session_id"], "sess-A")
+        self.assertEqual([m["content"] for m in child["chat_history"]], ["first"])
+        self.assertEqual(agent_loop.load_resume_state(self.cwd, "sess-A"), tip)
+
+    def test_cancelling_the_picker_preserves_all_saved_snapshots(self):
+        before = {p: p.read_bytes() for p in paths.SESSIONS_DIR.iterdir()}
+        with mock.patch.object(laintas_cli, "select_dialog", return_value=None):
+            self.assertIsNone(laintas_cli.show_resume_picker(self.cwd))
+        self.assertEqual({p: p.read_bytes() for p in before}, before)

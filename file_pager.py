@@ -473,7 +473,24 @@ def visible_ranges(state: dict, path: str) -> list:
     store = state.get("_visible_reads")
     if not isinstance(store, dict):
         return []
-    return [list(r) for r in (store.get(path) or [])]
+    ranges = [list(r) for r in (store.get(path) or [])]
+    if not ranges:
+        return []
+    # A line range describes lines of ONE version of the file. When the file is
+    # rewritten under us — a peer session, a git checkout, a codegen step — the
+    # bytes the model holds are no longer the bytes on disk, and declining the
+    # read strands it on content that does not exist any more while telling it
+    # the opposite ("re-reading them returns the same bytes"). The fingerprint
+    # travels with the read that produced the range (tools._bi_fs_read puts it
+    # on `_read_ref`), so a mismatch means "not what you hold": serve the read.
+    # No recorded fingerprint means a ref written before this existed; fall back
+    # to the range alone rather than disabling the gate for a whole session.
+    fps = state.get("_visible_reads_fp")
+    if isinstance(fps, dict):
+        recorded = fps.get(path)
+        if recorded and tuple(recorded) != fingerprint(path):
+            return []
+    return ranges
 
 
 def mark_edited(state: dict, path: str) -> None:

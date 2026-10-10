@@ -6430,6 +6430,12 @@ _OVERFLOW_RE = re.compile(
 )
 
 
+#: Stream failures the gateway marks retryable that mean "the provider's side
+#: broke", as opposed to a refusal the same request would meet again.
+_RETRYABLE_STREAM_CODES = frozenset((
+    "upstream_request_failed", "upstream_unreachable", "upstream_timeout"))
+
+
 def _is_context_overflow(error_text: str) -> bool:
     """Detect provider context-overflow errors from the response error text.
 
@@ -7018,6 +7024,7 @@ def _project_paged_reads(thread_messages: list, state: dict) -> list:
     keep: dict = {}
     seen: set = set()
     visible: dict = {}
+    visible_fp: dict = {}
     out = []
     # Walked newest-first: when one page was delivered more than once, only the
     # most recent copy can be the live one. The older copies are the same bytes
@@ -7036,7 +7043,15 @@ def _project_paged_reads(thread_messages: list, state: dict) -> list:
             # off its own transcript — unless compaction already pruned it.
             if (len(lines) == 2
                     and _PRUNED_TOOL_MARKER not in (message.get("content") or "")):
-                visible.setdefault(path, []).append([int(lines[0]), int(lines[1])])
+                _fp = ref.get("fp")
+                version = list(_fp) if _fp else None
+                if path not in visible_fp:
+                    visible_fp[path] = version
+                # Only ranges from the newest held version can share its
+                # fingerprint. A fresh partial read must not validate older
+                # windows of a different version (including legacy refs).
+                if version == visible_fp[path]:
+                    visible.setdefault(path, []).append([int(lines[0]), int(lines[1])])
             out.append(message)
 
         if page == 0:
@@ -7060,6 +7075,12 @@ def _project_paged_reads(thread_messages: list, state: dict) -> list:
     out.reverse()
     state["_visible_reads"] = {
         path: file_pager.merge_ranges(spans) for path, spans in visible.items()}
+    # The version each held range describes. `visible_ranges` refuses to block
+    # a read when this no longer matches the file on disk: the bytes in context
+    # are then not the bytes on disk, and "you already hold these lines" would
+    # be false (see file_pager.visible_ranges).
+    state["_visible_reads_fp"] = {
+        path: fp for path, fp in visible_fp.items() if fp is not None}
     return out
 
 
@@ -8643,7 +8664,8 @@ STATE_KEYS_TURN_ONLY = frozenset({
     "_persisted_employee", "_recent_failures", "_retry_count", "_role_name",
     "_snapshot_done", "_snapshot_pending", "_snapshot_sha", "_submitted_outputs",
     "_suppress_terminal_render", "_sys_prompt_churn", "_sys_prompt_digest",
-    "_thread_mode", "_visible_reads", "_read_visible_refusals", "_workflow_phase",
+    "_thread_mode", "_visible_reads", "_visible_reads_fp",
+    "_read_visible_refusals", "_workflow_phase",
     # Run-scoped identity and bookkeeping. All turn-only by current behaviour:
     # none of them appears in the copy below, so none of them crosses.
     "_assignment_id", "_assignment_task", "_evolution_lab_branch", "_max_write_lines",
@@ -13471,6 +13493,31 @@ def run_agent_loop(
                         "The upstream stream ended before the model finished.")
                     add_debug_log(debug_entry)
                     continue
+            # The provider dropped the connection before any prose arrived
+            # (during thinking, or halfway through a tool call). A drop after
+            # prose is continued from the partial as a `stream_dropped` turn;
+            # here there is nothing to continue, so the turn is asked again.
+            # Same budget as the empty-response retry above: both are "the
+            # stream died", and two failures in a row is a provider that is
+            # down rather than one that hiccuped.
+            elif (response.get("error_retryable")
+                    and response.get("error_code") in _RETRYABLE_STREAM_CODES):
+                silent_count = state.get("_silent_fail_count", 0) + 1
+                state["_silent_fail_count"] = silent_count
+                if silent_count <= 2:
+                    _spent = response.get("error_charged_credits")
+                    if events_cb is not None:
+                        deps.console.print(
+                            "[muted](connection to the model dropped — retrying "
+                            f"{silent_count}/2"
+                            + (f"; the interrupted attempt used {_spent} credits" if _spent else "")
+                            + ")[/muted]")
+                    _append_short_memory(
+                        state,
+                        f"\n  -Dropped-stream retry {silent_count}/2: "
+                        "The connection to the model provider failed before an answer arrived.")
+                    add_debug_log(debug_entry)
+                    continue
             # ── Reactive overflow recovery (opencode compactAfterOverflow) ──
             # If the provider returned a context-overflow error, force-compaction
             # the thread and retry the turn ONCE. Our cheap token estimate may
@@ -13501,6 +13548,9 @@ def run_agent_loop(
                 from rich.markup import escape as _esc
                 deps.console.print(f"[red]{_esc(_err_text)}[/red]")
             _append_short_memory(state, f"\n  -Error: {_err_text}")
+            # For callers with no console (--execute): the reason the turn
+            # ended, which is otherwise only an exit status.
+            state["_last_error"] = _err_text
             add_debug_log(debug_entry)
             _exit_reason = TRANSITION_BACKEND_ERROR
             break

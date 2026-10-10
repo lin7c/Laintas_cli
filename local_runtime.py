@@ -80,6 +80,40 @@ PROXY_TIMEOUT = 30
 MAX_PROXY_BODY = 8 * 1024 * 1024
 
 
+def _tools_mod():
+    """tools.py, or None when the agent stack is not importable from here.
+
+    Lazy on purpose: this module is the standalone local bridge and must stay
+    importable without the agent stack. ImportError is the only expected
+    failure — anything else is a real bug and should surface.
+    """
+    try:
+        import tools as _tools
+        return _tools
+    except ImportError:
+        return None
+
+
+def _buffered_exec_timeout(cmd: str, timeout: int) -> int:
+    """Extend the idle budget for a pipeline that is silent by construction.
+
+    Mirrors tools._shell_idle_budget so the same command gets the same budget
+    whichever transport carried it (see the bounds comment above). MAX_EXEC_TIMEOUT
+    still caps the result: the factor is a convenience, not a way past the ceiling.
+    """
+    _t = _tools_mod()
+    if _t is not None and _t._pipeline_buffers_output(cmd):
+        return max(1, min(int(timeout * _t.BUFFERED_PIPELINE_IDLE_FACTOR),
+                          MAX_EXEC_TIMEOUT))
+    return timeout
+
+
+def _buffered_pipeline_hint(cmd: str) -> str:
+    """The 'redirect to a file instead' guidance, when it applies."""
+    _t = _tools_mod()
+    return _t.buffered_pipeline_hint(cmd) if _t is not None else ""
+
+
 # ---------------------------------------------------------------------------
 # Pending AI-exec requests
 # ---------------------------------------------------------------------------
@@ -225,6 +259,10 @@ def run_exec(body: dict, sse: SseWriter, resolve_cwd, agent_id: Optional[str] = 
     except (TypeError, ValueError):
         timeout = DEFAULT_EXEC_TIMEOUT
     timeout = max(1, min(timeout, MAX_EXEC_TIMEOUT))
+    # `pytest | tail` cannot print one byte until pytest exits, so its silence
+    # is not evidence of being wedged — on any transport. Scale here too or the
+    # same command dies at 120s over the bridge and survives in-process.
+    timeout = _buffered_exec_timeout(cmd, timeout)
 
     resolved = resolve_cwd(str(body.get("cwd") or ""))
     if resolved is None or not resolved.is_dir():
@@ -290,7 +328,7 @@ def run_exec(body: dict, sse: SseWriter, resolve_cwd, agent_id: Optional[str] = 
             return
         req.proc = proc
         child_registry.register(proc.pid, "local-exec")
-        _stream_process(proc, req, sse, timeout)
+        _stream_process(proc, req, sse, timeout, cmd)
     finally:
         if proc is not None and proc.stdout is not None:
             try:
@@ -303,7 +341,7 @@ def run_exec(body: dict, sse: SseWriter, resolve_cwd, agent_id: Optional[str] = 
 
 
 def _stream_process(proc: subprocess.Popen, req: _ExecRequest,
-                    sse: SseWriter, timeout: int) -> None:
+                    sse: SseWriter, timeout: int, cmd: str = "") -> None:
     """Pump stdout to the client until exit, abort, timeout or a dead client."""
     # Idle budget: `timeout` bounds SILENCE, not runtime. This pump already
     # sees every byte as it arrives, so idleness is directly observable — and a
@@ -329,7 +367,8 @@ def _stream_process(proc: subprocess.Popen, req: _ExecRequest,
         if remaining <= 0:
             _kill_process_group(proc)
             sse.event({"t": "final", "status": "fail",
-                       "error": f"no output for {timeout}s; command stopped"})
+                       "error": (f"no output for {timeout}s; command stopped."
+                                 f"{_buffered_pipeline_hint(cmd)}")})
             return
         try:
             ready, _w, _x = select.select([fd], [], [], min(remaining, 1.0))

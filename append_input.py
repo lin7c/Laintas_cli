@@ -81,7 +81,8 @@ class AppendInput:
     def __rich__(self):
         with self._lock:
             entries = [*self.submitted]
-            if self.draft:
+            has_draft = bool(self.draft)
+            if has_draft:
                 entries.append(self.draft)
             renderer, label, t0 = self._renderer, self._label, self._t0
             thinking_t0 = self._thinking_t0
@@ -112,8 +113,11 @@ class AppendInput:
             rows.append(f"    ├─ … {hidden} earlier append")
             entries = entries[hidden:]
         for index, content in enumerate(entries):
-            branch = "╰" if index == len(entries) - 1 else "├"
-            prefix = f"    {branch}─ append "
+            last = index == len(entries) - 1
+            branch = "╰" if last else "├"
+            # The unsubmitted draft (no Enter yet) is always the last row.
+            word = "draft" if has_draft and last else "append"
+            prefix = f"    {branch}─ {word} "
             preview = " ".join(content.split())
             row = transcript_view.crop_cells(prefix, width)
             row += transcript_view.crop_cells(preview, max(0, width - len(prefix)), middle=True)

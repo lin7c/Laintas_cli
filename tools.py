@@ -876,8 +876,60 @@ def _bi_skill_list(params: dict, ctx: ToolCtx) -> dict:
     return {"ok": True, "result": items, "count": len(items)}
 
 
+#: Trailing line citation on an evidence spec: `path:12` or `path:12-40`.
+#: The single-line form is what agents actually write, and what every other
+#: citation surface here accepts (agent_contract._LINE_REF, the reviewer
+#: contract's "path:line for every finding"). Only `:\d+-\d+$` used to be
+#: recognised, so `laintas_cli.py:9190` fell through to the isfile() check
+#: with the line number still glued to the name and was reported as a missing
+#: file (seq 30139) — a valid citation rejected as a bogus path.
+_EVIDENCE_LINE_RE = re.compile(r":(?P<start>\d+)(?:-(?P<end>\d+))?$")
+
+#: Named in every rejection, so the error states the contract instead of
+#: leaving the caller to guess what was wrong with its input.
+_EVIDENCE_FORMAT_HINT = ("expected 'path', 'path:LINE' or 'path:START-END'")
+
+
+def _evidence_abs_path(spec: str, base: str) -> str:
+    return spec if os.path.isabs(spec) else os.path.abspath(os.path.join(base, spec))
+
+
+def _check_evidence_lines(abs_path: str, span: tuple) -> str:
+    """Error text when `span` cites lines the file does not have, else "".
+
+    Recording a citation past EOF is worse than rejecting it: the memory then
+    points at nothing, and the drift check that is supposed to notice compares
+    content hashes, not line counts, so it stays wrong silently until the file
+    itself changes. Skipped above mem_evidence.MAX_FULL_HASH_BYTES, where
+    counting lines would cost more than the fingerprint already computed.
+    """
+    start, end = span
+    if start < 1:
+        return (f"evidence line {start} is not a valid line number in "
+                f"{abs_path} ({_EVIDENCE_FORMAT_HINT})")
+    try:
+        import mem_evidence as _me
+        cap = _me.MAX_FULL_HASH_BYTES
+    except Exception:
+        cap = 8 * 1024 * 1024
+    try:
+        if os.path.getsize(abs_path) > cap:
+            return ""
+        total = 0
+        with open(abs_path, "rb") as fh:
+            for total, _line in enumerate(fh, 1):
+                if total >= end:
+                    break          # counted far enough; no need to read on
+        if total < end:
+            return (f"evidence cites line {end} but {abs_path} has only "
+                    f"{total} line(s) ({_EVIDENCE_FORMAT_HINT})")
+    except OSError:
+        return ""                  # unreadable here is the hash's problem, not ours
+    return ""
+
+
 def _resolve_evidence(raw, ctx: ToolCtx):
-    """Turn 'path' / 'path:START-END' specs into fingerprinted evidence.
+    """Turn 'path' / 'path:LINE' / 'path:START-END' specs into fingerprinted evidence.
 
     Fingerprinted HERE, at write time, so what is recorded is the content the
     agent actually read rather than whatever the file happens to hold later.
@@ -898,18 +950,38 @@ def _resolve_evidence(raw, ctx: ToolCtx):
         if not spec:
             continue
         span = None
-        if ":" in spec and re.search(r":\d+-\d+$", spec):
-            spec, _, rng = spec.rpartition(":")
-            start, _, end = rng.partition("-")
-            span = (int(start), int(end))
-        abs_path = (spec if os.path.isabs(spec)
-                    else os.path.abspath(os.path.join(base, spec)))
+        original = spec
+        match = _EVIDENCE_LINE_RE.search(spec)
+        if match:
+            bare = spec[:match.start()]
+            # A colon is legal in a POSIX filename, so `notes:2026.md` can be a
+            # real path: the spec that actually exists wins. Only when the
+            # whole thing names nothing is the tail read as a line citation —
+            # which is what `tools.py:9190` means, and what every other
+            # citation surface here accepts.
+            if bare and not os.path.isfile(_evidence_abs_path(spec, base)):
+                start = int(match.group("start"))
+                end = int(match.group("end") or start)
+                if end < start:
+                    return None, (f"evidence range {original} is reversed: START "
+                                  f"must not exceed END ({_EVIDENCE_FORMAT_HINT})")
+                spec, span = bare, (start, end)
+        abs_path = _evidence_abs_path(spec, base)
         try:
             private_files.check(abs_path, 'read')
         except private_files.PrivateFileError as error:
             return None, str(error)
         if not os.path.isfile(abs_path):
-            return None, f"evidence file not found: {spec}"
+            # Name the part that was meant, and echo what was given: the old
+            # message reported a path the caller never wrote (`tools.py` for an
+            # input of `tools.py:9190` was the lucky case; the unlucky one kept
+            # the line number glued on) and never said what form was expected.
+            return None, (f"evidence file not found: {spec} "
+                          f"(given {original!r}; {_EVIDENCE_FORMAT_HINT})")
+        if span:
+            line_error = _check_evidence_lines(abs_path, span)
+            if line_error:
+                return None, line_error
         built.append(_me.evidence_for(abs_path,
                                       start=span[0] if span else None,
                                       end=span[1] if span else None))
@@ -1401,7 +1473,8 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
             "_budget_chars": len(body) + 4_000,
             "_read_ref": {"path": abs_path, "page": _page_no,
                           "lines": [offset, offset + max(
-                              0, int(_cached["lines_returned"]) - 1)]},
+                              0, int(_cached["lines_returned"]) - 1)],
+                          "fp": list(_fingerprint_for_cache)},
         }
         if _page_notice:
             result["note"] = "; ".join(_page_notice)
@@ -1459,8 +1532,18 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
     }
     # Every read - paged or windowed - reports the lines it delivered, so the
     # loop can tell later what the model can still see (see _project_reads).
+    # The fingerprint rides along: a line range describes lines of ONE version
+    # of the file, and without it the visibility gate cannot tell "you already
+    # hold these lines" from "you hold these lines of a version that is gone".
+    try:
+        import file_pager as _fp_ref
+        _ref_fp = list(_fp_ref.fingerprint(abs_path))
+    except Exception:
+        _ref_fp = None
     result["_read_ref"] = {"path": abs_path, "page": _page_no,
                            "lines": [offset, offset + max(0, len(selected) - 1)]}
+    if _ref_fp:
+        result["_read_ref"]["fp"] = _ref_fp
     if _page_state is None and _page_notice:
         result["note"] = "; ".join(_page_notice)
     if _page_state is not None:
@@ -7637,7 +7720,8 @@ def _exec_in_deployed_shell(command: str, session: Any, timeout: int,
         _ran_for = int(time.monotonic() - _started_at)
         return {"ok": False,
                 "error": (f"Command produced no output for {_idle_for}s "
-                          f"(ran {_ran_for}s){hint}"),
+                          f"(ran {_ran_for}s){hint}."
+                          f"{buffered_pipeline_hint(command)}"),
                 "result": scrub_marker_noise(new_content).strip(), "returncode": -1,
                 "via": via, "_shell_stuck": not recovered,
                 "terminal_recovered": bool(recovered)}
@@ -7760,15 +7844,99 @@ def _read_shell_pipe(stream) -> bytes:
     return os.read(stream.fileno(), 65536)
 
 
+#: Programs that cannot emit anything until they have consumed their whole
+#: input. A pipeline ending in one of these is SILENT BY CONSTRUCTION while
+#: the stage before it runs: `pytest | tail -20` prints nothing until pytest
+#: exits, and `make | sort` nothing until make does. The idle budget's premise
+#: — silence means wedged — is simply false for them, and applying it anyway is
+#: what killed a full test suite at 60s (seq 30209, `pytest | tail`).
+_BUFFERING_TAIL_PROGRAMS = {
+    "tail", "sort", "uniq", "wc", "tac", "column", "awk", "gawk", "mawk",
+}
+
+#: How much longer such a pipeline gets. Bounded, never infinite: the stage
+#: feeding the buffer can still wedge, and Esc stays the real escape hatch.
+#: 4x keeps the 120s factory default at 8 minutes, which covers a test suite
+#: without covering a hung one forever.
+BUFFERED_PIPELINE_IDLE_FACTOR = 4.0
+
+
+def _pipeline_buffers_output(command: str) -> bool:
+    """Whether the command's LAST pipeline stage cannot print before EOF.
+
+    Only a real pipe counts. `tail -f app.log` on its own is a different
+    animal (it streams, and with -f it never ends), and `sort big.txt` reads a
+    file, so its silence is bounded by the sort rather than by another
+    program's entire runtime.
+    """
+    stripped = (command or "").strip()
+    if "|" not in stripped:
+        return False
+    # Take the final command, then its final stage: `a; b | sort` buffers on
+    # the sort, `a || b` has no pipe at all.
+    tail = re.split(r"\|\||&&|[;\n]", stripped)[-1]
+    stages = tail.split("|")
+    if len(stages) < 2:
+        return False
+    last = stages[-1].strip()
+    try:
+        words = shlex.split(last)
+    except ValueError:
+        words = last.split()
+    while words and ("=" in words[0] and not words[0].startswith("-")):
+        words = words[1:]                      # FOO=bar sort
+    if not words:
+        return False
+    return os.path.basename(words[0]) in _BUFFERING_TAIL_PROGRAMS
+
+
+def buffered_pipeline_hint(command: str) -> str:
+    """Guidance for a buffered pipeline that outlived even its extended budget.
+
+    The fix is not a bigger number: it is to stop routing the output through a
+    stage that withholds it. Naming that in the error turns a timeout the
+    model would otherwise retry identically into a different command.
+    """
+    if not _pipeline_buffers_output(command):
+        return ""
+    return (" The last stage of this pipeline withholds all output until the "
+            "stage before it exits, so silence here says nothing about "
+            "progress. Redirect to a file instead and read that "
+            "(`cmd > /tmp/out.log 2>&1`, then read/grep it), or run it with "
+            "terminal.exec, which returns immediately and can be polled.")
+
+
+def _shell_idle_ceiling() -> float:
+    """The configured ceiling for `shell_idle_timeout`, or the factory one.
+
+    The buffered-pipeline factor is a convenience, not a way past what the
+    administrator allowed: at the top of that range (24h) a 4x multiplier would
+    mean four days of silence, which no idle budget was ever meant to cover.
+    Degrades to "no effective cap" rather than to a wrong small one.
+    """
+    try:
+        import agent_loop
+        return float(agent_loop._RUNTIME_LIMITS["shell_idle_timeout"][1])
+    except Exception:
+        return SHELL_IDLE_TIMEOUT_SECONDS * BUFFERED_PIPELINE_IDLE_FACTOR
+
+
 def _shell_idle_budget(params: dict) -> float:
     """Idle budget for one command. `timeout` from the model means idle now."""
     try:
         value = params.get("timeout")
         if value is None:
-            return shell_idle_timeout()
-        return max(1.0, float(value))
+            base = shell_idle_timeout()
+        else:
+            base = max(1.0, float(value))
     except (TypeError, ValueError):
-        return shell_idle_timeout()
+        base = shell_idle_timeout()
+    if _pipeline_buffers_output(str(params.get("command") or "")):
+        # max() keeps an explicit request authoritative: a caller that already
+        # asked for more than the ceiling gets what it asked for, never less.
+        return max(base, min(base * BUFFERED_PIPELINE_IDLE_FACTOR,
+                             _shell_idle_ceiling()))
+    return base
 
 
 def _command_has_cd_prefix(command: str) -> bool:
@@ -7829,9 +7997,53 @@ def _classify_shell_result(command: str, result: dict) -> dict:
 
 @private_files.guard("shell.exec")
 def _bi_shell_exec(params: dict, ctx: ToolCtx) -> dict:
-    """Execute a shell command, then classify a search's empty exit 1."""
-    return _classify_shell_result(str(params.get("command") or ""),
-                                  _bi_shell_exec_raw(params, ctx))
+    """Execute a shell command, then classify a search's empty exit 1.
+
+    Also the single post-hook for workspace-change detection: every return
+    path of the raw executor funnels through here, which is the only place a
+    `git checkout` / `git apply -R` / `sed -i` can be caught rewriting files
+    the agent has already read.
+    """
+    command = str(params.get("command") or "")
+    return _notify_workspace_changes(
+        command, ctx,
+        _classify_shell_result(command, _bi_shell_exec_raw(params, ctx)))
+
+
+def _notify_workspace_changes(command: str, ctx: ToolCtx, result: dict) -> dict:
+    """Tell the model when its own shell command invalidated files it had read.
+
+    Inert unless a second instance shares this cwd, and then only an lstat per
+    tracked file. The point is not to block anything — the write-side CAS
+    already does that — but to say WHY: without this, the next fs.edit fails
+    with "another instance modified it" and the model goes looking for a peer
+    that never touched the file, when the real author was its own command.
+    """
+    if not isinstance(result, dict):
+        return result
+    try:
+        import peer_coordination
+        coord = peer_coordination.get_coord()
+        if not coord.enabled():
+            return result
+        changed = coord.note_shell_change(command)
+    except Exception:
+        return result
+    if not changed:
+        return result
+    shown = changed[:8]
+    base = str(getattr(ctx, "cwd", "") or os.getcwd())
+    notice = (
+        f"{len(changed)} file(s) this instance had read were changed on disk "
+        f"by that command: " + ", ".join(
+            os.path.relpath(p, base) if os.path.isabs(p) else p
+            for p in shown)
+        + (f" (+{len(changed) - len(shown)} more)" if len(changed) > len(shown) else "")
+        + ". Any snapshot of them in context is now stale — re-read before "
+          "editing, or the next write will be refused.")
+    result["workspace_changed"] = changed
+    result["note"] = (result.get("note") + "\n" if result.get("note") else "") + notice
+    return result
 
 
 @private_files.guard("shell.exec")
@@ -7860,7 +8072,13 @@ def _bi_shell_exec_raw(params: dict, ctx: ToolCtx) -> dict:
     # is not a git commit, and for users who switched attribution off.
     command = git_attribution.apply(command)
 
-    timeout = int(params.get("timeout", 60))
+    # The idle budget, resolved ONCE for every execution path below. This used
+    # to be a hardcoded `params.get("timeout", 60)`: the tool schema advertises
+    # a default of 120, `/config shell_idle_timeout` defaults to 120, and this
+    # path used 60 — so the configured value was ignored exactly where long
+    # commands run, and a whole test suite piped through `tail` was killed at
+    # 60s of silence that was never a symptom (seq 30209).
+    timeout = _shell_idle_budget(params)
     owner = (ctx.get_agent(ctx.agent_id)
              if ctx.get_agent is not None and ctx.agent_id else None)
     # Prefer the loop-injected interrupt event: it is the one Esc / single
@@ -8021,7 +8239,8 @@ def _bi_shell_exec_raw(params: dict, ctx: ToolCtx) -> dict:
                 _idle = int(time.monotonic() - _last_output)
                 return {"ok": False,
                         "error": (f"Command produced no output for {_idle}s and was "
-                                  f"stopped: {command[:120]}"),
+                                  f"stopped: {command[:120]}."
+                                  f"{buffered_pipeline_hint(command)}"),
                         "result": output, "returncode": -1, "via": "subprocess"}
             return {"ok": process.returncode == 0,
                     "result": output or "(no output)",
@@ -9794,7 +10013,8 @@ def register_builtin_tools() -> None:
                                    "description": "durable importance, default 0.5"},
                     "evidence": {"type": "array", "items": {"type": "string"},
                                  "description": "files this claim was read off, "
-                                                "as 'path' or 'path:START-END'. "
+                                                "as 'path', 'path:LINE' or "
+                                                "'path:START-END'. "
                                                 "The content is fingerprinted now, "
                                                 "and the memory is flagged stale "
                                                 "automatically when any of them "
@@ -9862,7 +10082,8 @@ def register_builtin_tools() -> None:
                                              "user = every project"},
                     "evidence": {"type": "array", "items": {"type": "string"},
                                  "description": "files this was learned from, "
-                                                "'path' or 'path:START-END'. Their "
+                                                "'path', 'path:LINE' or "
+                                                "'path:START-END'. Their "
                                                 "content is fingerprinted now and the "
                                                 "skill is flagged stale when they change"},
                     "supersedes": {"type": "string",
@@ -10166,7 +10387,11 @@ def register_builtin_tools() -> None:
                         "holds the turn indefinitely. For anything expected to take minutes "
                         "(builds, full test suites, whole-disk searches, servers) run it with "
                         "terminal.exec instead, which returns immediately, and collect it with "
-                        "terminal.read or terminal.wait. For REPLs or commands "
+                        "terminal.read or terminal.wait. A pipeline whose last stage "
+                        "buffers (`cmd | tail`, `| sort`, `| wc -l`) prints NOTHING until "
+                        "the stage before it exits, so its silence is not progress and it "
+                        "gets a proportionally longer budget; for a long one, redirect to a "
+                        "file and read that instead of piping. For REPLs or commands "
                         "that need keystrokes without a deployment terminal, start an "
                         "agent-private PTY with session.start instead.",
             schema={
@@ -10178,7 +10403,8 @@ def register_builtin_tools() -> None:
                                 "description": "seconds of NO OUTPUT before the command is "
                                                "presumed stuck and stopped. There is no limit "
                                                "on how long a command may run while it keeps "
-                                               "producing output."},
+                                               "producing output. Omit it to use the "
+                                               "configured shell_idle_timeout."},
                     "stdin": {"type": "string"},
                 },
                 "required": ["command"],

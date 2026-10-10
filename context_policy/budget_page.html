@@ -50,6 +50,23 @@ header.top{flex:none;display:flex;align-items:center;gap:12px;flex-wrap:wrap;pad
 .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
 .btn.primary:hover:not(:disabled){color:#fff;filter:brightness(1.08)}
 .btn:disabled{opacity:.45;cursor:not-allowed}
+.guide{flex:none;background:var(--panel);border-bottom:1px solid var(--line);padding:8px 16px;max-height:34vh;overflow:auto}
+.guide>summary{cursor:pointer;font-weight:650;font-size:13px}
+.guide-copy{display:flex;gap:14px;flex-wrap:wrap;align-items:baseline;margin-top:6px;font-size:12px;color:var(--dim)}
+.guide-copy p{margin:0;flex:1;min-width:240px;max-width:760px}
+.guide-numbers{font-variant-numeric:tabular-nums;color:var(--ink)}
+.guide-links{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;align-items:center}
+.guide-links .hint{margin-right:6px}
+.terms{margin-top:8px;font-size:12px;color:var(--dim)}
+.terms>summary{cursor:pointer;color:var(--accent)}
+.terms dl{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px 20px;margin:10px 0}
+.terms dt{font-weight:650;color:var(--ink)} .terms dd{margin:3px 0 0}
+.purpose{font-size:12.5px;line-height:1.65;margin:10px 0;color:var(--dim)}
+.purpose strong{color:var(--ink)}
+.param-help{font-size:11.5px;line-height:1.6;color:var(--dim);margin:0 0 4px}
+.preview-note{border-left:2px solid var(--accent);padding-left:9px;margin-top:8px;font-size:11.5px;color:var(--dim)}
+.adv input:disabled{opacity:.55;cursor:not-allowed}
+button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 /* ── three panes ──────────────────────────────────────────────────── */
 .app{flex:1;min-height:0;display:grid;grid-template-columns:250px minmax(0,1fr) 360px;position:relative}
 .app.notree{grid-template-columns:0 minmax(0,1fr) 360px}
@@ -89,7 +106,7 @@ section.stage{display:flex;flex-direction:column;min-width:0;min-height:0}
 .viewhead .s{font-size:12px;color:var(--dim)}
 .viewhead .s b{color:var(--ink)}
 /* ── the partition canvas: blocks inside blocks ──────────────────── */
-.canvas{position:relative;flex:1;min-height:320px;margin:0 16px;border-radius:12px;background:var(--panel2);border:1px solid var(--line2);overflow:hidden;user-select:none}
+.canvas{position:relative;flex:1;min-height:180px;margin:0 16px;border-radius:12px;background:var(--panel2);border:1px solid var(--line2);overflow:hidden;user-select:none}
 .band{position:absolute;left:0;right:0;overflow:hidden;cursor:pointer}
 .band>.bg{position:absolute;inset:0;background:var(--c);opacity:.10;pointer-events:none}
 .band:hover>.bg{opacity:.17}
@@ -203,13 +220,50 @@ details[open]>summary::before{content:"▾"}
   .app.notree nav.tree{display:none}
   .toolbar .hint{display:none}
 }
-@media (max-width:760px){
-  body{overflow:auto;height:auto}
-  .app,.app.notree{display:block}
-  .canvas{height:440px;flex:none}
-  aside.side{border-left:0;border-top:1px solid var(--line)}
-  nav.tree{position:fixed}
+/* Compact previews use one scrollable pane, keeping actions and controls in reach. */
+.mobile-views{display:none}
+@media (max-width:760px), (max-height:480px) and (max-width:1100px){
+  body{overflow:hidden;height:100%}
+  header.top{gap:6px;padding:8px 10px}
+  .brand{min-width:0;flex-basis:100%}
+  .brand h1{font-size:14px}
+  .brand .meta{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11px}
+  .stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));width:100%;gap:4px}
+  .stat{min-width:0;padding:3px 6px}
+  .stat .k{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px}
+  .stat .v{font-size:13px;overflow:hidden;text-overflow:ellipsis}
+  .stat .d{font-size:10px;margin-left:3px}
+  .actions{width:100%;justify-content:flex-end;gap:6px}
+  .btn,.tb,.tab,.lock,.num,.adv input,.adv select,.kid{min-height:44px}
+  .guide{padding:6px 10px}
+  .guide>summary{min-height:32px;display:flex;align-items:center}
+  .terms dl{grid-template-columns:1fr}
+  .guide-copy p{min-width:0;flex-basis:100%}
+  .mobile-views{display:flex;flex:none;gap:4px;padding:6px 10px;background:var(--panel);border-bottom:1px solid var(--line)}
+  .mobile-views button{flex:1;min-width:0;border:1px solid var(--line2);background:var(--panel2);border-radius:8px;min-height:44px;font-size:13px}
+  .mobile-views button[aria-pressed="true"]{color:var(--accent);border-color:var(--accent);background:var(--accent-soft);font-weight:650}
+  .app,.app.notree{display:flex;flex-direction:column;overflow:hidden}
+  .app nav.tree,.app.notree nav.tree,.app section.stage,.app aside.side{display:none}
+  .app[data-mobile-view="sections"] nav.tree{display:flex;position:static;width:100%;flex:1;min-height:0;visibility:visible;border:0;box-shadow:none}
+  .app[data-mobile-view="parameters"] aside.side{display:block;flex:1;width:100%;min-height:0;border-left:0}
+  .app[data-mobile-view="diagram"] section.stage{display:flex;flex:1}
+  .trow{height:44px}
+  .caret{height:44px;width:28px}
+  .toolbar{padding:6px 10px;gap:4px}
+  .viewhead{padding:0 10px 4px;gap:6px}
+  .viewhead .t{font-size:14px}
+  .canvas{height:auto;flex:1;min-height:80px;margin:0 10px}
+  .legend{padding:6px 10px;font-size:10.5px;gap:8px}
+  .sec{padding:10px}
+  #inspector{display:flex;flex-direction:column}
+  #inspector>*{order:4}
+  #inspector>.ihead{order:0}
+  #inspector>.share{order:1}
+  #inspector>.purpose{order:2}
+  #inspector>.ipath{order:3}
+  .adv{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px}
 }
+
 </style>
 </head>
 <body>
@@ -218,6 +272,8 @@ details[open]>summary::before{content:"▾"}
   <div class="stats" id="stats"></div>
   <div class="actions"><button class="btn" id="undo-all"></button><button class="btn primary" id="primary"></button></div>
 </header>
+<details class="guide" id="guide" open><summary id="guide-title"></summary><div id="guide-body"></div></details>
+<div class="mobile-views" id="mobile-views" role="group"></div>
 <div class="app" id="app">
   <nav class="tree pane" id="tree"></nav>
   <section class="stage">
@@ -242,20 +298,20 @@ const $ = (id) => document.getElementById(id);
 
 // ── Words ────────────────────────────────────────────────────────────────
 const ZH = {
-  title: "上下文预算", request: "请求", captured: "采集于", window: "窗口", model: "模型",
-  stats: {cut: "将被压缩", saved: "省略", conv: "对话实际可用"}, blocks: (n) => `${n} 个块`,
+  title: "上下文预算", request: "请求", captured: "采集于", window: "模型总容量", model: "模型",
+  stats: {cut: "预计被裁剪的分区", saved: "预计省略的 tokens", conv: "预计剩余（对话与工具）"}, blocks: (n) => `${n} 个分区`,
   apply: "应用到 Helpwo", applyNeedsHelpwo: "请在 Helpwo 设置里点「预算」打开此页，再应用", download: "下载 .config",
   undo: "撤销修改", defaults: "恢复出厂默认",
   nav: {back: "后退", up: "上一级", enter: "进入", tree: "结构树", hint: "单击选中 · 双击进入 · Backspace 返回上一级"},
   overview: "概览", root: "上下文窗口", input: "输入预算", output: "输出预留", conv: CLI ? "对话历史" : "对话与工具",
   untagged: "未标注文本", free: "空闲",
-  viewSum: (b, c) => `预算 <b>${b}</b> · 内容 <b>${c}</b>`, viewWhole: (w) => `整个窗口 <b>${w}</b> · 双击进入`,
+  viewSum: (b, c) => `分配额度 <b>${b}</b> · 原始内容 <b>${c}</b> tokens`, viewWhole: (w) => `整个窗口 <b>${w}</b> tokens · 双击进入`,
   pill: {cut: "将被压缩", contains: "子块压缩", fixed: "🔒 不压缩", absent: "本次未出现", pin: "已锁定"},
-  moreFields: "更多参数（保底 / 超出时 / 原始权重）", treeTitle: "结构树", showAbsent: "显示未出现的块", treeCols: "占父块 · tokens",
-  quota: "份额", content: "内容", sent: "预计发送", atCapture: "采集时", ofParent: (n) => `占「${n}」的比例`,
+  moreFields: "分配细节（最低额度 / 超额处理 / 分配权重）", treeTitle: "内容分区", showAbsent: "显示本次没有使用的分区", treeCols: "分配占比 · tokens",
+  quota: "分配额度", content: "原始内容量", sent: "预计保留量", atCapture: "本次实际保留", ofParent: (n) => `占「${n}」总额度的比例`,
   flexOf: (n) => `在「${n}」可分配部分中的比例`, lock: "锁定", lockTip: "锁定后，调整其它块时这个块的比例保持不变",
   lockedDrag: "这条分割线旁边有锁定的块，先解锁再拖动",
-  floor: "保底 tokens", shrink: "超出时", share: "原始权重",
+  floor: "最低额度（tokens）", shrink: "超额处理方式", share: "分配权重（share）",
   shrinkNames: {none: "不压缩", truncate: "保留开头", tail: "保留结尾", drop: "整块丢弃", narrow: "按工具裁剪", compact: "对话压缩"},
   fixedNote: "这个块按实际大小占用，不参与比例分配，也不会被压缩。",
   untaggedNote: "父块里没有被标签包住的文字，按实际大小占用，始终完整发送。",
@@ -274,8 +330,20 @@ const ZH = {
   tabNow: "按当前设置", tabSent: "采集时发送", noText: "这个块没有文字内容。", cutAt: (n) => `省略约 ${n} tokens`,
   children: "子块",
   changes: "修改", noChanges: "还没有修改。拖动分割线，或在右侧调整比例。",
-  advanced: "高级设置", hysteresis: "释放阈值", hysteresisDesc: "块被压缩后，要降到份额的这个比例以下才恢复完整，避免每轮来回切换打乱缓存。",
-  scalarNames: {assumed_window: "默认窗口", assumed_summary_window: "默认摘要窗口", chars_per_token: "每 token 字符数"},
+  advanced: "高级设置与兼容参数", hysteresis: "恢复完整内容的阈值", hysteresisDesc: "例如设为 90%：分区额度 10,000 tokens，被裁剪后需降到 9,000 或以下才恢复完整。调低会更晚恢复，调高会更早恢复，用来减少反复切换。",
+  scalarNames: {assumed_window: "备用上下文容量", assumed_summary_window: "备用摘要容量", chars_per_token: "裁剪时的字符换算系数"},
+  scalarHelp: {assumed_window:"未提供模型时使用的备用值；不改变当前采集记录的模型容量，也不能扩大模型本身的窗口。",assumed_summary_window:CLI ? "摘要模型没有容量信息时使用的备用值。" : "CLI 兼容参数。当前 Helpwo 网页运行器不读取它，修改不会影响网页对话。",chars_per_token:CLI ? "按字符裁剪时，一个 token 对应的估算字符数；不是模型的真实分词结果。" : "CLI 兼容参数。当前 Helpwo 网页运行器不读取它，修改不会影响网页裁剪。"},
+  guideTitle: "先了解：这页控制 AI 每次能看到多少内容",
+  guideIntro: "这里的预算是文字容量，不是余额或费用。Token 是模型计算文字的单位，不等于字数。先给回答留空间，再把剩下的容量分给指令、任务状态和对话。",
+  guideExample: "例如模型容量为 100,000 tokens，回答预留 25% 时会先留出 25,000，输入剩下 75,000；最低额度和模型输出上限也会影响结果。",
+  guideNumbers: (w,o,i) => `当前采集容量 ${w} → 回答预留 ${o} + 输入 ${i} tokens`,
+  mobileViews: {sections:"分区", parameters:"参数", diagram:"分配图"}, mobileViewLabel:"切换预算视图",
+  guideStart: "选择分区，查看说明与调整：", guideTerms: "参数怎么读？展开查看示例", guideEffect: CLI ? "修改先用于预估；下载 .config 后，通过 /config import 导入才生效。无需调整时保留默认即可。" : "页面上的修改先用于预估；点「应用到 Helpwo」后，下一轮请求才使用新设置。无需调整时保留默认即可。",
+  previewNote: "这是根据本次请求估算的调整结果，裁剪标记和此前的裁剪状态可能让实际发送量有所不同；「采集时发送」显示的是本次请求记录。",
+  termHelp: {share:"顶层比例占父级总容量，例如输入 75,000 × 系统 15% = 11,250。子分区先扣除完整保留内容，再按相对权重分配剩余容量；0.2 和 0.1 表示约 2∶1，不是固定占整个窗口 20% 和 10%。",min:"按比例算出的额度小于这个数时，使用最低额度。调高可能占用更多空间；它不预先填充内容，也不能扩大模型窗口。",shrink:"父分区超额后才按此方式处理子分区：保留开头、保留结尾或整块省略。「不压缩」始终完整保留；这不是对话摘要。",metrics:"原始内容量＝裁剪前大小；分配额度＝允许占用的空间；预计保留量＝按当前设置估算要发送的大小。分配额度不是已经用掉的容量。",lock:"仅锁定此页调节时的比例，防止拖动其它分区时被连带修改；不会把内容改成「不压缩」，也不会作为运行配置保存。",hysteresis:"被裁剪的分区低于这个占用比例后，才恢复完整。例如额度 10,000，阈值 90% 时，需降到 9,000 或以下。"},
+  termNames: {share:"比例与相对权重",min:"最低额度",shrink:"超额处理",metrics:"三个数量",lock:"锁定比例",hysteresis:"恢复完整的阈值"},
+  purposeTitle: "这个分区装什么", effectTitle: "调大或调小会怎样", absentHelp: "本次请求没有使用这个分区，因此没有内容可预览；它的配置仍可用于后续请求。",
+  effects: {output:"调大：给回答更多空间，能容纳的输入更少。调小：给输入更多空间，但回答可用长度减少；模型输出上限始终有效。",system:"调大：系统指令、技能说明有更多空间；调小：超额时部分说明可能被裁剪，对话与工具通常能获得更多空间。",live:"调大：当前任务、进度等状态可保留更多；调小：可裁剪的状态可能更少，但完整保留的目标等规则仍按实际大小占用。",child:"调大相对权重：父分区超额时，优先给这里更多空间，其它可分配分区可能变少。父分区未超额时，子分区仍可完整发送。",fixed:"这个分区当前设置为完整保留，按内容的实际大小占用。比例和最低额度不会把它裁短；它会先占用父级的空间。"},
   applied: (n) => `已应用到 Helpwo（${n} 项自定义），下一轮对话生效`, applyFail: "应用失败：",
   stalePage: "这个页面不是 Helpwo 最近生成的那份（可能被改过或已过期）。请在设置里点「预算」重新打开。",
   compactOrder: "对话压缩阈值需满足 目标 < 后台 < 前台 ≤ 1。",
@@ -285,11 +353,11 @@ const ZH = {
   aux: "辅助调用（摘要 / 审阅 / 记忆提取）",
   legend: ["色条：内容占份额", "红色：超出份额", "斜纹：按实际大小", "块中块：下一级分区"],
   empty: "还没有采集到请求。先进行一次对话，再打开这个页面，就能看到每个块的实际内容。",
-  names: {system:"系统提示词",platform_safety_policy:"平台安全策略",role:"角色设定",authority:"权限说明",environment:"运行环境",context:"记忆与规则",persistentMemory:"持久记忆",durableRules:"长期规则",globalMemory:"全局记忆",skills:"技能",skillContext:"已加载技能",capabilities:"能力说明",tools:"工具定义",execution:"执行模式",workflowPhase:"工作流阶段",rolePrompt:"角色提示",confidenceGuidance:"置信度指引",orchestration:"编排上下文",verification:"验证要求",completion:"完成标准",safety:"安全规则",durable_user_rules:"用户长期规则",durable_rule_protocol:"规则协议",runtime_ownership:"运行时归属",harness_reminders:"运行提醒",intent_alignment:"意图对齐",laintas_product_protocol:"产品协议",work_orchestration:"任务编排",terminal_output_style:"终端输出风格",hwo_prompt_overlay:"HWO 提示覆盖",live:"本轮状态",task:"当前任务",objective:"目标",progress:"进度",warnings:"警告",session_memory:"会话记忆",relevant_skills:"相关技能",sub_terminals:"子终端",delegated_work:"委派工作",files_seen:"已读文件",active_tasks:"进行中任务",environment_now:"当前环境",now:"当前时间",workflow_phase:"工作流阶段",behavior_diagnostics:"行为诊断",role_identity:"角色身份",thread:"对话历史",recent_tail:"最近消息",tool_result:"单条工具结果",read_page:"读取分页",web_fetch:"网页抓取",grep_line:"搜索单行",pruned_output:"裁剪后的输出",output:"输出预留",aux:"辅助调用",summary:"摘要",critic:"审阅",mem_extract:"记忆提取",margin:"余量",source:"源材料"},
+  names: {system:"系统提示词",platform_safety_policy:"平台安全策略",role:"角色设定",authority:"权限说明",environment:"运行环境",context:"记忆与规则",persistentMemory:"持久记忆",durableRules:"长期规则",globalMemory:"全局记忆",skills:"技能说明",skillContext:"已加载技能",capabilities:"能力说明",tools:"工具定义",execution:"执行模式",workflowPhase:"工作流阶段",rolePrompt:"角色提示",confidenceGuidance:"置信度指引",orchestration:"编排上下文",verification:"验证要求",completion:"完成标准",safety:"安全规则",durable_user_rules:"用户长期规则",durable_rule_protocol:"规则协议",runtime_ownership:"产品运行规则",harness_reminders:"运行提醒",intent_alignment:"用户目标与执行要求",laintas_product_protocol:"产品协议",work_orchestration:"任务编排",terminal_output_style:"终端输出风格",hwo_prompt_overlay:"HWO 提示补充",live:"本轮任务状态",task:"当前任务",objective:"目标",progress:"进度",warnings:"警告",session_memory:"会话记忆",relevant_skills:"相关技能",sub_terminals:"子终端",delegated_work:"委派工作",files_seen:"已读文件",active_tasks:"进行中任务",environment_now:"当前环境",now:"当前时间",workflow_phase:"工作流阶段",behavior_diagnostics:"行为诊断",role_identity:"角色身份",thread:"对话历史",recent_tail:"最近消息",tool_result:"单条工具结果",read_page:"读取分页",web_fetch:"网页抓取",grep_line:"搜索单行",pruned_output:"裁剪后的输出",output:"回答预留空间",aux:"辅助调用",summary:"摘要",critic:"审阅",mem_extract:"记忆提取",margin:"余量",source:"源材料"},
 };
 const EN = {
   title: "Context budget", request: "request", captured: "captured", window: "window", model: "model",
-  stats: {cut: "compressed", saved: "left out", conv: "conversation, actual"}, blocks: (n) => `${n} block${n === 1 ? "" : "s"}`,
+  stats: {cut: "Estimated clipped sections", saved: "Estimated tokens omitted", conv: "Estimated room (chat & tools)"}, blocks: (n) => `${n} section${n === 1 ? "" : "s"}`,
   apply: "Apply to Helpwo", applyNeedsHelpwo: "Open this page with Budget in Helpwo's settings to apply it", download: "Download .config",
   undo: "Undo changes", defaults: "Shipped defaults",
   nav: {back: "Back", up: "Up", enter: "Open", tree: "Tree", hint: "click selects · double-click opens · Backspace goes up"},
@@ -297,11 +365,11 @@ const EN = {
   untagged: "Untagged text", free: "free",
   viewSum: (b, c) => `budget <b>${b}</b> · content <b>${c}</b>`, viewWhole: (w) => `the whole window, <b>${w}</b> · double-click to open`,
   pill: {cut: "compressed", contains: "child compressed", fixed: "🔒 never cut", absent: "not in this request", pin: "locked"},
-  moreFields: "More (floor / when over / raw weight)", treeTitle: "Structure", showAbsent: "show absent blocks", treeCols: "of parent · tokens",
-  quota: "quota", content: "content", sent: "would send", atCapture: "at capture", ofParent: (n) => `share of “${n}”`,
+  moreFields: "Allocation details (minimum / overflow / weight)", treeTitle: "Content sections", showAbsent: "show unused sections", treeCols: "allocation · tokens",
+  quota: "Allocated space", content: "Original size", sent: "Estimated retained", atCapture: "actually retained", ofParent: (n) => `share of the total space in “${n}”`,
   flexOf: (n) => `share of what “${n}” splits`, lock: "Lock", lockTip: "Locked: keeps this share when others are adjusted",
   lockedDrag: "A block next to this divider is locked; unlock it to drag",
-  floor: "floor (tokens)", shrink: "when over", share: "raw weight",
+  floor: "Minimum space (tokens)", shrink: "Overflow handling", share: "Allocation weight (share)",
   shrinkNames: {none: "never cut", truncate: "keep the start", tail: "keep the end", drop: "drop whole", narrow: "drop tools", compact: "compaction"},
   fixedNote: "This block takes its real size; it is not split by share and never cut.",
   untaggedNote: "Text in the parent outside any tag. It takes its real size and is always sent whole.",
@@ -320,8 +388,20 @@ const EN = {
   tabNow: "These settings", tabSent: "Sent at capture", noText: "This block has no text.", cutAt: (n) => `about ${n} tokens left out`,
   children: "Children",
   changes: "Changes", noChanges: "No changes yet. Drag a divider, or adjust a share on the right.",
-  advanced: "Advanced", hysteresis: "release band", hysteresisDesc: "Once compressed, a block is released only below this fraction of its quota, so it does not flip every turn (which costs the cache).",
-  scalarNames: {assumed_window: "assumed window", assumed_summary_window: "assumed summary window", chars_per_token: "chars per token"},
+  advanced: "Advanced & compatibility settings", hysteresis: "Threshold to restore full content", hysteresisDesc: "At 90%, a clipped section with 10,000 tokens of space returns to full content at 9,000 tokens or less. Lower means later recovery; higher means earlier recovery, reducing repeated switching.",
+  scalarNames: {assumed_window: "Fallback context capacity", assumed_summary_window: "Fallback summary capacity", chars_per_token: "Characters per token when clipping"},
+  scalarHelp: {assumed_window:"Fallback when no model is provided. It does not change this captured window or enlarge the model's capacity.",assumed_summary_window:CLI ? "Fallback capacity when the summary model has no window information." : "CLI compatibility setting. Helpwo's browser runner does not read it; changing it has no effect on browser chat.",chars_per_token:CLI ? "Estimated characters per token for character-based clipping, not the model's real tokenizer." : "CLI compatibility setting. Helpwo's browser runner does not read it; changing it has no effect on browser clipping."},
+  guideTitle: "Start here: how much content the AI can see in one request",
+  guideIntro: "This budget is text capacity, not money or credits. A token is a model's unit of text, not a character count. Reserve room for the answer, then divide the rest between instructions, task state and chat.",
+  guideExample: "For a 100,000-token window, a 25% answer reserve leaves 25,000 for output and 75,000 for input. Minimum space and the model's output limit also affect the result.",
+  guideNumbers: (w,o,i) => `Captured capacity ${w} → answer reserve ${o} + input ${i} tokens`,
+  mobileViews: {sections:"Sections", parameters:"Parameters", diagram:"Diagram"}, mobileViewLabel:"Budget view",
+  guideStart: "Select a section to read and adjust its settings:", guideTerms: "How to read the parameters — examples", guideEffect: CLI ? "Edits are estimates first. Download the .config and use /config import to activate them. Keep the defaults if you do not need to tune them." : "Edits on this page are estimates first. Apply to Helpwo uses the new settings from the next request. Keep the defaults if you do not need to tune them.",
+  previewNote: "These are estimates from the captured request. Clipping markers and previous clipping state can change the actual size. “Sent at capture” shows the recorded request.",
+  termHelp: {share:"Top-level shares use the parent's total: 75,000 input × 15% system = 11,250. Child sections first subtract protected content, then split the remainder by relative weight. Weights 0.2 and 0.1 mean about 2:1, not 20% and 10% of the whole window.",min:"Used when the proportional allocation is smaller. Raising it may consume more space; it does not fill unused space or enlarge the model's window.",shrink:"Applies to children once their parent is over budget: keep the start, keep the end, or omit the section. Never cut preserves all content. This is not a chat summary.",metrics:"Original size is before clipping; allocated space is available room; estimated retained is what these settings would keep. Allocated space is not already-used space.",lock:"Keeps this share from moving when you adjust other sections on this page. It does not protect content from clipping and is not saved as a runtime setting.",hysteresis:"A clipped section returns to full content below this fraction of its space. At 90% of 10,000, it must reach 9,000 or less."},
+  termNames: {share:"Shares and relative weights",min:"Minimum space",shrink:"Overflow handling",metrics:"The three sizes",lock:"Locking a share",hysteresis:"Recovery threshold"},
+  purposeTitle: "What this section contains", effectTitle: "What a larger or smaller allocation does", absentHelp: "This request did not use this section, so there is no content to preview. Its settings can still apply to later requests.",
+  effects: {output:"Larger: more room for the answer, less for input. Smaller: more input room, less answer room. The model's maximum output still applies.",system:"Larger: more room for instructions and skill manuals. Smaller: overflowing instructions may be clipped, usually leaving more room for chat and tools.",live:"Larger: more task state can be retained. Smaller: flexible state may be clipped, while protected goals and rules still use their actual size.",child:"A larger relative weight gives this section more room when its parent is over budget; other flexible sections may get less. If the parent fits, its children can still be sent whole.",fixed:"This section is currently protected and uses its actual size. Shares and minimum space do not clip it; it takes space from its parent first."},
   applied: (n) => `Applied to Helpwo (${n} custom setting${n === 1 ? "" : "s"}); takes effect from the next turn`, applyFail: "Could not apply: ",
   stalePage: "This page is not the one Helpwo generated last (it was edited, or is out of date). Open it again with Budget in the settings.",
   compactOrder: "Compaction needs target < background < foreground ≤ 1.",
@@ -331,7 +411,26 @@ const EN = {
   aux: "Auxiliary calls (summary / critic / memory)",
   legend: ["bar: content vs quota", "red: over its share", "hatched: real size", "block in block: the next level"],
   empty: "No request has been captured yet. Run a turn first, then open this page again to see every block's real content.",
-  names: {system: "System prompt", live: "Live state", output: "Output reserve", thread: "Conversation", tools: "Tool schemas", aux: "Auxiliary calls"},
+  names: {system: "System prompt", live: "Current task state", output: "Answer reserve", thread: "Conversation", tools: "Tool schemas", aux: "Auxiliary calls",runtime_ownership:"Product runtime rules",intent_alignment:"User goal and execution requirements",hwo_prompt_overlay:"HWO prompt additions"},
+};
+// Explain every configured section; the technical path remains available below.
+const SECTION_HELP = {
+  zh: {
+    output:"模型这一次生成回答时预留的容量。",system:"告诉 AI 扮演什么角色、有哪些能力、遵循哪些规则的指令。",live:"每轮更新的任务目标、进度、当前环境等信息。",tools:"模型可调用的工具及其参数说明。",
+    platform_safety_policy:"平台注入的安全要求。",role:"你保存的系统提示词和角色设定。",authority:"可执行操作、权限边界与指令优先级。",environment:"工作区和运行环境的信息。",context:"项目记忆与长期规则的总分区。",persistentMemory:"跨轮保留的项目记忆。",durableRules:"需要长期遵守的项目规则。",globalMemory:"跨项目使用的记忆信息。",
+    skills:"技能目录与技能操作说明。",skillContext:"已加载技能的详细操作说明。",capabilities:"当前产品和工具支持哪些能力的说明。",execution:"当前模式和执行方式的要求。",workflowPhase:"当前工作流所在阶段的说明。",rolePrompt:"执行阶段使用的角色要求。",confidenceGuidance:"如何表达不确定性、核验结果的指引。",orchestration:"工作流及多个任务之间的协调信息。",verification:"交付前需要执行的检查要求。",completion:"什么条件下可以报告任务完成。",safety:"安全操作要求。",
+    durable_user_rules:"你要求长期保留的操作规则。",durable_rule_protocol:"如何读取和维护长期规则。",runtime_ownership:"Helpwo 的当前能力、运行边界与模式规则；Engine 的架构要求也在这里。",harness_reminders:"运行器补充的执行提醒。",intent_alignment:"保持执行过程符合你的实际目标的要求。",laintas_product_protocol:"Laintas 产品的使用协议与约定。",work_orchestration:"安排、协调和交接任务的说明。",terminal_output_style:"终端结果的输出格式要求。",hwo_prompt_overlay:"HWO 工作流为本次执行补充的指令。",
+    task:"本次正在执行的任务说明。",objective:"当前要实现的目标。",progress:"已经完成的工作与当前进度。",warnings:"错误、失败或需要注意的执行信息。",session_memory:"这次会话保留的工作记忆。",relevant_skills:"与当前任务相关的技能提示。",sub_terminals:"已打开的子终端及运行信息。",delegated_work:"已经交给其他智能体的任务及结果。",files_seen:"本次执行已经读取过哪些文件。",active_tasks:"当前任务列表及其状态。",environment_now:"当前目录、编辑文件等即时环境信息。",now:"本次请求的当前时间。",workflow_phase:"当前工作流的执行阶段。",behavior_diagnostics:"执行器发现的重复操作等诊断信息。",role_identity:"当前智能体的名称和角色信息。",
+    thread:"历史聊天消息与工具返回结果。",recent_tail:"优先保留的最近几条消息。",tool_result:"一条工具返回结果能占用的容量。",read_page:"一次文件分页读取的容量。",web_fetch:"一次网页抓取结果的容量。",grep_line:"搜索命中的单行结果容量。",pruned_output:"已裁剪的工具输出容量。",aux:"用于摘要、审阅和记忆整理的辅助请求。",summary:"生成摘要的辅助请求。",critic:"审阅结果的辅助请求。",mem_extract:"提取记忆的辅助请求。",margin:"为辅助请求预留的余量。",source:"辅助请求要读取的源材料。",
+  },
+  en: {
+    output:"Room reserved for the model's answer in this request.",system:"Instructions about the AI's role, abilities and rules.",live:"Task goals, progress and environment updated each turn.",tools:"Available tools and their parameter schemas.",
+    platform_safety_policy:"Safety requirements supplied by the platform.",role:"Your saved system prompt and role settings.",authority:"Permissions, allowed actions and instruction priority.",environment:"Workspace and runtime information.",context:"The parent section for project memory and lasting rules.",persistentMemory:"Project memory kept across turns.",durableRules:"Project rules that must remain in effect.",globalMemory:"Memory used across projects.",
+    skills:"The skill catalog and operating instructions.",skillContext:"Detailed instructions for loaded skills.",capabilities:"What the product and its tools currently support.",execution:"Requirements for the active mode and execution model.",workflowPhase:"The current workflow stage.",rolePrompt:"Role requirements for this execution stage.",confidenceGuidance:"Guidance for uncertainty and verification.",orchestration:"Coordination between workflows and tasks.",verification:"Checks required before delivery.",completion:"Conditions for reporting completion.",safety:"Safe operation requirements.",
+    durable_user_rules:"Operating rules you asked to keep.",durable_rule_protocol:"How to read and maintain lasting rules.",runtime_ownership:"Helpwo's current capabilities, execution boundaries and mode rules, including Engine architecture requirements.",harness_reminders:"Reminders added by the runner.",intent_alignment:"Requirements to keep execution aligned with your goal.",laintas_product_protocol:"Laintas product conventions and protocols.",work_orchestration:"Task scheduling, coordination and handoff instructions.",terminal_output_style:"Formatting requirements for terminal results.",hwo_prompt_overlay:"Instructions added by the HWO workflow for this execution.",
+    task:"The task currently being executed.",objective:"The goal to achieve.",progress:"Completed work and current progress.",warnings:"Errors, failures and execution notices.",session_memory:"Working memory for this session.",relevant_skills:"Skill suggestions relevant to this task.",sub_terminals:"Opened sub-terminals and their runtime information.",delegated_work:"Tasks assigned to other agents and their results.",files_seen:"Files already read in this run.",active_tasks:"The current task list and status.",environment_now:"Live context such as the current folder and file.",now:"The time of this request.",workflow_phase:"The current workflow execution stage.",behavior_diagnostics:"Runner diagnostics such as repeated operations.",role_identity:"The current agent's name and role.",
+    thread:"Previous messages and tool results.",recent_tail:"Recent messages kept with priority.",tool_result:"Room for a single tool result.",read_page:"Room for one page of a file read.",web_fetch:"Room for a fetched web page.",grep_line:"Room for a single search result line.",pruned_output:"Room for an already-clipped tool result.",aux:"Supporting summary, review and memory requests.",summary:"A supporting summary request.",critic:"A supporting review request.",mem_extract:"A supporting memory extraction request.",margin:"Extra room for a supporting request.",source:"Source material for a supporting request.",
+  },
 };
 function pickZh() {
   const env = window.HelpwoEnv;
@@ -616,9 +715,17 @@ function applyShare(id, frac) {
 // ── Navigation ─────────────────────────────────────────────────────────
 // `view` is the node whose children fill the canvas; `selected` is the one
 // the inspector shows. Moving between views keeps a back stack.
-let view = "@", selected = "@", navStack = [], showAbsent = false, tab = "now";
+let view = "", selected = "output", navStack = [], showAbsent = false, tab = "now";
 const expanded = new Set(["", "input"]);
+const compactView = () => matchMedia("(max-width:760px), (max-height:480px) and (max-width:1100px)").matches;
 let treeShown = window.innerWidth > 1100;
+let mobileView = "parameters", wasCompact = compactView();
+function renderMobileViews() {
+  $("app").dataset.mobileView = mobileView;
+  $("mobile-views").setAttribute("aria-label", L.mobileViewLabel);
+  $("mobile-views").innerHTML = Object.entries(L.mobileViews).map(([id,name]) =>
+    `<button data-act="mobile-${id}" aria-pressed="${mobileView === id}">${esc(name)}</button>`).join("");
+}
 function go(next, sel) {
   if (next !== view) { navStack.push(view); if (navStack.length > 50) navStack.shift(); view = next; }
   selected = sel ?? next;
@@ -641,12 +748,25 @@ function select(id) {
 }
 // Show a node wherever it is: here, or by moving to the view that holds it.
 function reveal(id) {
+  if (compactView()) mobileView = "parameters";
   const vp = vparent(id);
   if (id === view || vp === view) select(id); else go(vp === null ? "@" : vp, id);
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────
+function renderGuide() {
+  if (!renderGuide.lang) $("guide").open = !compactView();
+  $("guide-title").textContent = L.guideTitle;
+  if (renderGuide.lang !== L) {
+    $("guide-body").innerHTML = `<div class="guide-copy"><p>${esc(L.guideIntro)}</p><span class="guide-numbers" id="guide-numbers"></span></div>
+      <div class="guide-links"><span class="hint">${esc(L.guideStart)}</span>${["output","system","live"].filter((id) => id === "output" || TOPS.includes(id)).map((id) => `<button class="tb" data-reveal="${id}">${esc(nameOf(id))}</button>`).join("")}<span class="hint">${esc(L.guideEffect)}</span></div>
+      <details class="terms"><summary>${esc(L.guideTerms)}</summary><p>${esc(L.guideExample)}</p><dl>${Object.entries(L.termHelp).map(([key,text]) => `<div><dt>${esc(L.termNames[key])}</dt><dd>${esc(text)}</dd></div>`).join("")}</dl></details>`;
+    renderGuide.lang = L;
+  }
+  $("guide-numbers").textContent = L.guideNumbers(fmt(T.win), fmt(T.output), fmt(T.input));
+}
 function renderHeader() {
+  renderGuide();
   document.title = L.title + (D.request ? ` · #${D.request}` : "");
   $("title").textContent = L.title + (D.request ? ` · ${L.request} #${D.request}` : "");
   $("meta").textContent = [D.model && `${L.model} ${D.model}`, `${L.window} ${fmt(T.win)}`, D.generated && `${L.captured} ${D.generated}`].filter(Boolean).join(" · ");
@@ -656,11 +776,12 @@ function renderHeader() {
     ["cut", L.blocks(T.cutPaths.length), T.cutPaths.length ? "bad" : "good", d(T.cutPaths.length, BASE.cut, false, 1)],
     ["saved", fmt(T.saved), T.saved ? "bad" : "", d(T.saved, BASE.saved, false)],
     ["conv", fmt(T.rest), "", d(T.rest, BASE.rest, true)],
-  ].map(([k, v, c, dd]) => `<div class="stat ${c}"><span class="k">${esc(L.stats[k])}</span><span class="v">${v}${dd}</span></div>`).join("");
+  ].map(([k, v, c, dd]) => `<div class="stat ${c}"><span class="k" title="${esc(L.stats[k])}">${esc(L.stats[k])}</span><span class="v">${v}${dd}</span></div>`).join("");
   $("undo-all").textContent = L.undo;
   $("primary").textContent = CLI ? L.download : L.apply;
 }
 function renderToolbar() {
+  renderMobileViews();
   const trail = []; for (let q = view; q !== null; q = vparent(q)) trail.unshift(q);
   const crumbs = trail.map((q, i) => i === trail.length - 1 ? `<span class="here">${esc(nameOf(q))}</span>`
     : `<button data-go="${esc(q)}">${esc(nameOf(q))}</button><span class="sep">›</span>`).join("");
@@ -734,7 +855,7 @@ function treeKids(id) {
   const plan = planOf(id);
   return [...plan.flex, ...plan.fixedKids, ...(showAbsent ? plan.absent : [])];
 }
-// Every row the same two columns: its share of the parent, then its tokens.
+// Top-level share or relative child weight, followed by allocated tokens.
 function treePct(id) {
   if (id === "") return "100%";
   const hit = partIn(id);
@@ -747,7 +868,7 @@ function renderTree() {
     const absent = isBlock(id) && !B[id];
     rows.push(`<div class="trow${selected === id ? " sel" : ""}${view === id ? " viewing" : ""}${isBlock(id) && !B[id] ? " absent" : ""}" style="--ind:${ind}" data-tree="${esc(id)}">
       <button class="caret${kids.length ? "" : " none"}" data-caret="${esc(id)}">${open ? "▾" : "▸"}</button>
-      <span class="tsw" style="background:${colorOf(id)}"></span><span class="tname" title="${esc(id || nameOf(id))}">${esc(nameOf(id))}</span>
+      <span class="tsw" style="background:${colorOf(id)}"></span><span class="tname" title="${esc(nameOf(id) + ' · ' + (SECTION_HELP[L === ZH ? 'zh' : 'en'][id.split('.').pop()] || id))}">${esc(nameOf(id))}</span>
       ${st === "cut" || st === "contains" ? `<span class="tdot ${st}"></span>` : ""}
       <span class="tpct">${absent ? "—" : treePct(id)}</span><span class="ttok">${absent ? "" : fmt(quotaOf(id))}</span></div>`);
     if (open) for (const k of kids) walk(k, ind + 1);
@@ -769,9 +890,10 @@ function shareBlock(id) {
   if (!kind) return "";
   const vp = vparent(id), v = shareValue(id);
   return `<div class="share" style="--c:${colorOf(id)}"><div class="lbl">${esc(kind === "flex" ? L.flexOf(nameOf(vp)) : L.ofParent(nameOf(vp)))}</div>
-    <div class="ctl"><input type="range" id="ins-range" min="0" max="100" step="0.1" value="${(v * 100).toFixed(1)}">
-    <input class="num" id="ins-num" type="number" min="0" max="100" step="0.5" value="${(v * 100).toFixed(1)}">%
+    <div class="ctl"><input type="range" id="ins-range" aria-label="${esc(nameOf(id) + ' · ' + L.pctWord)}" min="0" max="100" step="0.1" value="${(v * 100).toFixed(1)}">
+    <input class="num" id="ins-num" aria-label="${esc(nameOf(id) + ' · ' + L.pctWord)}" type="number" min="0" max="100" step="0.5" value="${(v * 100).toFixed(1)}">%
     <button class="lock${locks.has(id) ? " on" : ""}" data-lock="${esc(id)}" title="${esc(L.lockTip)}">🔒 ${esc(L.lock)}</button></div>
+    <div class="param-help">${esc(kind === "flex" ? L.termHelp.share : L.effects[id] || L.termHelp.min)}</div>
     <div class="note warn" id="ins-note">${esc(shareNote(id))}</div></div>`;
 }
 function shareNote(id) {
@@ -843,9 +965,9 @@ function kidsSection(id) {
 function advancedFields(id) {
   const own = cfg[id] || {};
   const rows = [
-    "min" in own ? `<span>${esc(L.floor)}</span><input type="number" min="0" step="100" value="${own.min}" data-p="${esc(id)}" data-l="min">` : "",
-    "shrink" in own ? `<span>${esc(L.shrink)}</span><select data-p="${esc(id)}" data-l="shrink">${["none", "truncate", "tail", "drop", "narrow"].map((o) => `<option value="${o}"${o === own.shrink ? " selected" : ""}>${esc(L.shrinkNames[o])}</option>`).join("")}</select>` : "",
-    "share" in own && parentOf(id) ? `<span>${esc(L.share)}</span><input type="number" min="0" max="1" step="0.005" value="${own.share}" data-p="${esc(id)}" data-l="share">` : "",
+    "min" in own ? `<span>${esc(L.floor)}</span><input aria-label="${esc(L.floor)}" type="number" min="0" step="100" value="${own.min}" data-p="${esc(id)}" data-l="min"><span class="param-help full">${esc(L.termHelp.min)}</span>` : "",
+    "shrink" in own ? `<span>${esc(L.shrink)}</span><select aria-label="${esc(L.shrink)}" data-p="${esc(id)}" data-l="shrink">${["none", "truncate", "tail", "drop", "narrow"].map((o) => `<option value="${o}"${o === own.shrink ? " selected" : ""}>${esc(L.shrinkNames[o])}</option>`).join("")}</select><span class="param-help full">${esc(L.termHelp.shrink)}</span>` : "",
+    "share" in own && parentOf(id) ? `<span>${esc(L.share)}</span><input aria-label="${esc(L.share)}" type="number" min="0" max="1" step="0.005" value="${own.share}" data-p="${esc(id)}" data-l="share"><span class="param-help full">${esc(L.termHelp.share)}</span>` : "",
   ].join("");
   return rows ? `<details style="margin-top:10px"><summary class="hint">${esc(L.moreFields)}</summary><div class="adv">${rows}</div></details>` : "";
 }
@@ -870,12 +992,15 @@ function toolsSection() {
 }
 function renderInspector() {
   const id = selected, st = stateOf(id);
+  const selectionChanged = renderInspector.last !== id;
   const note = id === "@" || id === "" ? L.rootNote : id === "input" ? L.inputNote : id === "thread" ? L.convNote
     : id.endsWith("#rest") ? L.untaggedNote : id.endsWith("#free") ? L.freeNote : isBlock(id) && B[id] && shrinkOf(id) === "none" ? L.fixedNote : "";
   const scroll = $("ins-text") ? $("ins-text").scrollTop : 0;
   $("inspector").innerHTML = `<div class="ihead"><span class="sw" style="background:${colorOf(id)}"></span>${esc(nameOf(id))}${st && st !== "fixed" ? ` <span class="pill ${st}">${esc(L.pill[st])}</span>` : ""}</div>
     ${isBlock(id) ? `<div class="ipath">${esc(id)}</div>` : ""}
+    ${sectionHelpHTML(id)}
     <div class="kv" id="ins-kv">${kvHTML(id)}</div>
+    ${R[id] ? `<div class="preview-note">${esc(L.previewNote)}</div>` : ""}
     ${note ? `<div class="note">${esc(note)}</div>` : ""}
     ${id === "thread" ? `<div class="note" id="ins-conv">${esc(L.convActual(fmt(T.rest)))}</div>` : ""}
     ${shareBlock(id)}${advancedFields(id)}
@@ -883,8 +1008,17 @@ function renderInspector() {
     ${!Object.keys(B).length ? `<div class="empty">${esc(L.empty)}</div>` : ""}
     ${kidsSection(id)}${textSection(id)}`;
   if ($("ins-text") && renderInspector.last === id) $("ins-text").scrollTop = scroll;
+  if (selectionChanged) $("inspector").parentElement.scrollTop = 0;
   renderInspector.last = id;
   refreshThreadError();
+}
+function sectionHelpHTML(id) {
+  const descriptions = SECTION_HELP[L === ZH ? "zh" : "en"];
+  const purpose = descriptions[id.split(".").pop()];
+  if (!purpose) return "";
+  const fixed = isBlock(id) && shrinkOf(id) === "none";
+  const effect = fixed ? L.effects.fixed : L.effects[id] || (isBlock(id) ? L.effects.child : "");
+  return `<div class="purpose"><strong>${esc(L.purposeTitle)}</strong><br>${esc(purpose)}${effect ? `<br><strong>${esc(L.effectTitle)}</strong><br>${esc(effect)}` : ""}${isBlock(id) && !B[id] ? `<br>${esc(L.absentHelp)}` : ""}</div>`;
 }
 // After a value changed: numbers and the text map in place. The control
 // being dragged or typed into is left alone, or the drag would end.
@@ -955,8 +1089,8 @@ function renderChanges() {
 function renderAdvanced() {
   $("adv-title").textContent = L.advanced;
   const rows = Object.keys(scal).map((k) => k === "hysteresis"
-    ? `<span data-label="s:${k}">${esc(L.hysteresis)} · ${pctText(scal[k])}</span><input type="range" min="0.5" max="1" step="0.01" value="${scal[k]}" data-s="${k}"><span class="hint full">${esc(L.hysteresisDesc)}</span>`
-    : `<span>${esc(L.scalarNames[k] || k)}</span><input type="number" min="0" step="${k === "chars_per_token" ? 0.1 : 1024}" value="${scal[k]}" data-s="${k}">`).join("");
+    ? `<span data-label="s:${k}">${esc(L.hysteresis)} · ${pctText(scal[k])}</span><input aria-label="${esc(L.hysteresis)}" type="range" min="0.5" max="1" step="0.01" value="${scal[k]}" data-s="${k}"><span class="param-help full">${esc(L.hysteresisDesc)}</span>`
+    : `<span>${esc(L.scalarNames[k] || k)}</span><input aria-label="${esc(L.scalarNames[k] || k)}" type="number" min="0" step="${k === "chars_per_token" ? 0.1 : 1024}" value="${scal[k]}" data-s="${k}" ${!CLI && ["assumed_summary_window","chars_per_token"].includes(k) ? "disabled" : ""}><span class="param-help full">${esc(L.scalarHelp[k] || "")}</span>`).join("");
   const aux = CLI ? Object.keys(cfg).filter((k) => topOf(k) === "aux" && "share" in cfg[k]) : [];
   $("adv-body").innerHTML = `<div class="adv">${rows}</div>` +
     (aux.length ? `<h2 style="margin-top:14px;font-size:12.5px">${esc(L.aux)}</h2><div class="adv">${aux.map((k) => `<span data-label="${k}">${esc(k.slice(4).split(".").map((s) => L.names[s] || s).join(" · "))} · ${pctText(share(k))}</span><input type="range" min="0" max="0.5" step="0.001" value="${share(k)}" data-p="${k}" data-l="share">`).join("")}</div>` : "");
@@ -975,6 +1109,8 @@ document.addEventListener("click", (e) => {
   const act = t.closest("[data-act]");
   if (act && act.tagName !== "INPUT") {
     const a = act.dataset.act;
+    if (a.startsWith("mobile-")) { mobileView = a.slice(7); renderAll(); return; }
+    if (a === "tree" && compactView()) { mobileView = "sections"; renderAll(); return; }
     if (a === "tree") { treeShown = !treeShown; renderToolbar(); requestAnimationFrame(renderCanvas); }
     else if (a === "back") back();
     else if (a === "up") up();
@@ -996,7 +1132,7 @@ document.addEventListener("click", (e) => {
     if (el.id === "primary") return primary();
   }
   const band = t.closest(".band");
-  if (band && !t.closest("button,input,select") && !band.dataset.id.endsWith("#free")) select(band.dataset.id);
+  if (band && !t.closest("button,input,select") && !band.dataset.id.endsWith("#free")) { if (compactView()) mobileView = "parameters"; select(band.dataset.id); }
 });
 document.addEventListener("dblclick", (e) => {
   if (e.target.closest("button,input,select,[data-drag]")) return;
@@ -1112,7 +1248,12 @@ window.addEventListener("message", (e) => {
   }
 });
 let resizeT = 0;
-window.addEventListener("resize", () => { clearTimeout(resizeT); resizeT = setTimeout(() => { if (!dragging) renderCanvas(); }, 60); });
+window.addEventListener("resize", () => { clearTimeout(resizeT); resizeT = setTimeout(() => {
+  if (dragging) return;
+  const compact = compactView();
+  if (compact !== wasCompact) { wasCompact = compact; $("guide").open = !compact; renderAll(); }
+  else renderCanvas();
+}, 60); });
 
 // ── Start: the whole window as one block ────────────────────────────────
 compute();

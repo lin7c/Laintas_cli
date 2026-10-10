@@ -1,9 +1,10 @@
 """Fork-tree placement of resume snapshots.
 
-Covers the contract that every snapshot kind (named fork, /q checkpoint,
-autosave) records the branch it was taken on and is rendered under that
-branch in the /resume picker.
+One session renders as one resumable tip row: its older autosaves and /q
+checkpoints are history and never render as branch rows. Only a named fork
+point renders as a child, under the session it forked from.
 """
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -60,20 +61,18 @@ class ForkTreeRowTests(unittest.TestCase):
                    _blob("checkpoint", 20, blob_id="new")]
         self.assertEqual(_rows(choices), [("new", ""), ("old", "")])
 
-    def test_branch_snapshots_nest_under_their_named_fork(self):
+    def test_branch_renders_under_its_named_fork_without_history_rows(self):
         choices = [
             _blob("autosave", 5, blob_id="trunk"),
             _blob("fork", 10, lineage=["a"], fork_name="a", blob_id="fork-a"),
             _blob("autosave", 30, lineage=["a"], blob_id="a-auto"),
             _blob("checkpoint", 20, lineage=["a"], blob_id="a-ckpt"),
         ]
-        branch = symbols.TREE_BRANCH + " "
         last = symbols.TREE_LAST + " "
         # The newest branch state is the resumable header; its older snapshots
         # are children. Root sessions are ordered by latest activity.
         self.assertEqual(_rows(choices), [
             ("a-auto", ""),
-            ("a-ckpt", branch),
             ("fork-a", last),
             ("trunk", ""),
         ])
@@ -107,28 +106,29 @@ class ForkTreeRowTests(unittest.TestCase):
         ]
         branch = symbols.TREE_BRANCH + " "
         last = symbols.TREE_LAST + " "
-        vert = symbols.TREE_VERT + "  "
+        # b-auto is fork-b's older snapshot: it renders nowhere, leaving the
+        # fork point as the branch's resumable tip. Sub-branches follow their
+        # own newest-first order under the parent fork.
         self.assertEqual(_rows(choices), [
             ("fork-a", ""),
             ("fork-c", branch),
             ("fork-b", last),
-            ("b-auto", "   " + last),
         ])
         # A non-last sub-branch keeps a vertical line under it.
         choices.append(
             _blob("autosave", 5, lineage=["a", "c"], blob_id="c-auto"))
-        rows = dict(_rows(choices))
-        self.assertEqual(rows["c-auto"], vert + last)
+        self.assertEqual(_rows(choices), [
+            ("fork-a", ""),
+            ("fork-c", branch),
+            ("fork-b", last),
+        ])
 
-    def test_branch_without_a_fork_snapshot_is_headed_by_its_newest(self):
+    def test_branch_without_a_fork_snapshot_shows_only_its_tip(self):
         choices = [
             _blob("autosave", 10, lineage=["branch-1"], blob_id="b1-old"),
             _blob("autosave", 20, lineage=["branch-1"], blob_id="b1-new"),
         ]
-        self.assertEqual(_rows(choices), [
-            ("b1-new", ""),
-            ("b1-old", symbols.TREE_LAST + " "),
-        ])
+        self.assertEqual(_rows(choices), [("b1-new", "")])
 
     def test_deleted_intermediate_branch_collapses_instead_of_dangling(self):
         choices = [
@@ -164,14 +164,11 @@ class ForkTreeRowTests(unittest.TestCase):
                          blob_id="junk")]
         self.assertEqual(_rows(choices), [("junk", "")])
 
-    def test_same_session_checkpoints_group_under_latest_tip(self):
+    def test_same_session_checkpoints_stay_off_the_tree(self):
         tip = _blob("autosave", 30, blob_id="tip")
         checkpoint = _blob("checkpoint", 20, blob_id="checkpoint")
         tip["session_id"] = checkpoint["session_id"] = "session-a"
-        self.assertEqual(_rows([checkpoint, tip]), [
-            ("tip", ""),
-            ("checkpoint", symbols.TREE_LAST + " "),
-        ])
+        self.assertEqual(_rows([checkpoint, tip]), [("tip", "")])
 
     def test_corrupt_parent_cycle_keeps_every_record_visible(self):
         first = _blob("autosave", 20, blob_id="first")
@@ -339,6 +336,62 @@ class ForkRoundTripTests(unittest.TestCase):
         chained = agent_loop.normalize_fork_lineage(
             carried["_fork_lineage"] + ["b"])
         self.assertEqual(chained, ["a", "b"])
+
+
+class PickerCollapseTests(unittest.TestCase):
+    """One session, one row: history snapshots never render as branches."""
+
+    def _session_blob(self, kind, ts, blob_id, session_id, **extra):
+        blob = _blob(kind, ts, blob_id=blob_id, **extra)
+        blob["session_id"] = session_id
+        return blob
+
+    def test_same_session_snapshots_collapse_into_the_tip_row(self):
+        tip = self._session_blob("autosave", 30, "tip", "session-a")
+        ckpt = self._session_blob("checkpoint", 20, "ckpt", "session-a")
+        older = self._session_blob("autosave", 10, "older", "session-a")
+        self.assertEqual(_rows([older, ckpt, tip]), [("tip", "")])
+        # The delete flow still knows which snapshots are session tips.
+        self.assertTrue(tip["_tree_session_node"])
+        self.assertFalse(ckpt["_tree_session_node"])
+        self.assertFalse(older["_tree_session_node"])
+
+    def test_named_fork_point_still_renders_as_a_child_row(self):
+        tip = self._session_blob("autosave", 30, "tip", "session-a")
+        point = self._session_blob("fork", 20, "fork-a", "session-a",
+                                   lineage=["a"], fork_name="a")
+        self.assertEqual(_rows([point, tip]), [
+            ("tip", ""),
+            ("fork-a", symbols.TREE_LAST + " "),
+        ])
+
+    def test_picker_labels_show_one_row_per_session(self):
+        choices = [
+            {"kind": "autosave", "session_id": "a", "id": "a", "timestamp": 30,
+             "chat_history": [{"role": "assistant", "content": "tip work"}]},
+            {"kind": "checkpoint", "session_id": "a", "id": "a-ck",
+             "timestamp": 20,
+             "chat_history": [{"role": "assistant", "content": "old work"}]},
+            {"kind": "fork", "session_id": "b", "id": "b", "timestamp": 10,
+             "branch_name": "alt", "fork_parent_session_id": "a",
+             "chat_history": [{"role": "assistant", "content": "fork work"}]},
+        ]
+        captured = {}
+
+        def interact(items, **kwargs):
+            captured["items"] = list(items)
+            return (None, -1)
+
+        with mock.patch.object(laintas_cli, "_resume_choices",
+                               return_value=choices), \
+                mock.patch.object(laintas_cli, "select_dialog",
+                                  side_effect=interact):
+            self.assertIsNone(laintas_cli.show_resume_picker("/unused"))
+        items = captured["items"]
+        # The session renders once; only the named fork adds a row.
+        self.assertEqual(len(items), 2)
+        self.assertTrue(any("alt" in label for label in items))
+        self.assertFalse(any("old work" in label for label in items))
 
 
 if __name__ == "__main__":

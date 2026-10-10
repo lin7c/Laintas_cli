@@ -521,6 +521,58 @@ class AgentIsolationTests(unittest.TestCase):
             result["exit_reason"], agent_loop.TRANSITION_BACKEND_ERROR)
         self.assertIn("Empty-response retry 2/2", result["state"]["shortTermMemory"])
 
+    def _run_dropped_stream(self, name, responses):
+        attempts = []
+        deps = _deps()
+
+        def backend(**kwargs):
+            attempts.append(kwargs)
+            return dict(next(responses))
+
+        deps.call_backend = backend
+        child = agent_loop.register_agent(name=name, depth=1, role="subagent")
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                mock.patch.object(
+                    agent_persistence, "AGENTS_DIR", Path(tmp) / "agents"):
+            Path(".laintas").mkdir()
+            result = agent_loop.run_agent_loop(
+                deps, "retry a dropped stream", {}, child.state,
+                child.chat_history, depth=1, agent_id=child.id,
+                events_cb=lambda events: None, max_loops_override=4)
+        return attempts, result
+
+    _DROPPED = {
+        "reply": "Server Error: Model provider request failed",
+        "tool_calls": [], "done": True, "error": True,
+        "error_code": "upstream_request_failed",
+        "error_retryable": True, "error_charged_credits": 3.7,
+    }
+
+    def test_a_stream_dropped_before_any_prose_is_asked_again(self):
+        attempts, result = self._run_dropped_stream("dropped-retry", iter([
+            self._DROPPED, self._DROPPED,
+            {"reply": "recovered", "tool_calls": [],
+             "finish_reason": "stop", "done": True, "error": False},
+        ]))
+        self.assertEqual(len(attempts), 3)
+        self.assertNotEqual(
+            result["exit_reason"], agent_loop.TRANSITION_BACKEND_ERROR)
+        self.assertIn("Dropped-stream retry 2/2", result["state"]["shortTermMemory"])
+
+    def test_a_provider_that_keeps_dropping_ends_the_turn(self):
+        import itertools
+        attempts, result = self._run_dropped_stream(
+            "dropped-give-up", itertools.repeat(self._DROPPED))
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(result["exit_reason"], agent_loop.TRANSITION_BACKEND_ERROR)
+
+    def test_a_failure_the_gateway_did_not_mark_retryable_is_not_retried(self):
+        refused = dict(self._DROPPED, error_retryable=False)
+        attempts, result = self._run_dropped_stream(
+            "dropped-not-retryable", iter([refused]))
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(result["exit_reason"], agent_loop.TRANSITION_BACKEND_ERROR)
+
     def test_upstream_truncated_stops_after_old_retry_budget(self):
         attempts = []
         truncated = {
@@ -2461,11 +2513,21 @@ class ThinkingLiveTests(unittest.TestCase):
         parent = agent_loop.register_agent(name="primary", role="primary")
         barrier = threading.Barrier(2, timeout=3)
         calls = []
+        started = set()
+        calls_lock = threading.Lock()
         emitted = []
 
         def backend(**kwargs):
-            calls.append(agent_loop.get_thread_agent_id() or "foreground")
-            barrier.wait()
+            actor = agent_loop.get_thread_agent_id() or "foreground"
+            with calls_lock:
+                calls.append(actor)
+                first_call = actor not in started
+                started.add(actor)
+            # A child's completion can trigger a parent follow-up. Only the
+            # initial streams must rendezvous; no child remains to join a
+            # barrier on a later call.
+            if first_call:
+                barrier.wait()
             on_chunk = kwargs.get("on_chunk")
             if on_chunk:
                 on_chunk("reply", "ok")
@@ -2495,7 +2557,7 @@ class ThinkingLiveTests(unittest.TestCase):
         self.assertEqual(result["msg"], "ok")
         self.assertIsNotNone(child)
         self.assertEqual(child.status, "done")
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(set(calls), {"foreground", child_id})
         self.assertTrue(any(event.get("type") == "ai_stream"
                             for event in emitted))
 
@@ -2506,12 +2568,17 @@ class ThinkingLiveTests(unittest.TestCase):
         parent = agent_loop.register_agent(name="primary", role="primary")
         barrier = threading.Barrier(7, timeout=5)
         calls = []
+        started = set()
         calls_lock = threading.Lock()
 
         def backend(**kwargs):
+            actor = agent_loop.get_thread_agent_id() or "foreground"
             with calls_lock:
-                calls.append(agent_loop.get_thread_agent_id() or "foreground")
-            barrier.wait()
+                calls.append(actor)
+                first_call = actor not in started
+                started.add(actor)
+            if first_call:
+                barrier.wait()
             on_chunk = kwargs.get("on_chunk")
             if on_chunk:
                 on_chunk("reply", "ok")
@@ -2543,7 +2610,7 @@ class ThinkingLiveTests(unittest.TestCase):
             agent_loop.close_all_agents()
 
         self.assertEqual(result["msg"], "ok")
-        self.assertEqual(len(calls), 7)
+        self.assertEqual(set(calls), {"foreground", *children})
         self.assertTrue(all(info is not None and info.status == "done"
                             for info in infos))
         self.assertEqual(agent_loop._running_count, 0)

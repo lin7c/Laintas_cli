@@ -15,11 +15,19 @@ import hashlib
 import os
 import platform
 import tempfile
-import time
 from pathlib import Path
 from typing import Optional
 
 import requests
+
+from download_progress import (
+    format_size as _format_download_size,
+    live_hostile_stdout as _live_hostile_stdout,
+    open_tty as _open_tty,
+    stream_download,
+    write_tty as _write_tty,
+)
+
 
 # ── hashing ────────────────────────────────────────────────────────────────
 
@@ -114,153 +122,20 @@ def platform_id() -> str:
 
 # ── download (progress bar) ────────────────────────────────────────────────
 
-def _open_tty():
-    """Open /dev/tty for direct writes, bypassing prompt_toolkit."""
-    try:
-        fd = os.open("/dev/tty", os.O_WRONLY | os.O_NOCTTY)
-    except OSError:
-        return None, 0
-    width = 80
-    try:
-        import struct
-        import fcntl
-        import termios
-        packed = fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
-        _rows, cols = struct.unpack("hhhh", packed)[:2]
-        if cols > 0:
-            width = cols
-    except Exception:
-        pass
-    return fd, width
 
 
-def _write_tty(fd: int, text: str) -> None:
-    try:
-        os.write(fd, text.encode("utf-8", errors="replace"))
-    except OSError:
-        pass
-
-
-def _format_download_size(value: int) -> str:
-    size = float(max(0, value))
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024 or unit == "GB":
-            return (f"{size:.0f} {unit}" if unit == "B"
-                    else f"{size:.1f} {unit}")
-        size /= 1024
-    return f"{size:.1f} GB"
-
-
-def _live_hostile_stdout(console_file) -> bool:
-    """True when Rich animations can't render on the active output."""
-    for stream in (console_file, None):
-        if stream is None:
-            continue
-        name = type(stream).__name__
-        module = type(stream).__module__ or ""
-        if (name == "StdoutProxy"
-                or module.startswith("prompt_toolkit.")
-                or module == "repl_mirror"):
-            return True
-    return False
-
-
-def download(url: str, *,
-             label: str = "downloading",
+def download(url: str, *, label: str = "downloading",
              session: Optional[requests.Session] = None,
-             timeout: int = 30,
-             console=None) -> bytes:
-    """Download *url* into memory, showing a progress bar.
-
-    When *session* is provided its headers/cookies/verify settings are
-    used; otherwise a plain ``requests.get`` call is made.
-    """
-    s = session or requests
-    resp = s.get(url, timeout=timeout, stream=True)
-    resp.raise_for_status()
-    _len = resp.headers.get("Content-Length")
-    total = int(_len) if _len and _len.isdigit() else None
-
+             timeout: int = 30, console=None) -> bytes:
+    """Download using the shared meter and the supplied session's credentials."""
+    resp = (session or requests).get(url, timeout=timeout, stream=True)
     try:
-        from rich.console import Console as _Console
-        from rich.progress import (BarColumn, DownloadColumn, Progress,
-                                   TextColumn, TimeRemainingColumn,
-                                   TransferSpeedColumn)
-    except Exception:
-        return resp.content
-
-    con = console if console is not None else _Console()
-    if not getattr(con, "is_terminal", False):
-        try:
-            con.print(f"  ↓ {label}")
-        except Exception:
-            pass
-        return resp.content
-
-    # prompt_toolkit ➜ direct /dev/tty output
-    if _live_hostile_stdout(getattr(con, "file", None)):
-        buf = bytearray()
-        started = time.monotonic()
-        tty_fd, tty_width = _open_tty()
-        if tty_fd is not None:
-            def _render(final: bool = False) -> None:
-                dl = len(buf)
-                now = time.monotonic()
-                elapsed = max(now - started, 0.001)
-                speed = _format_download_size(int(dl / elapsed)) + "/s"
-                if total:
-                    pct = min(100, int(dl * 100 / total))
-                    if final and dl >= (total or 0):
-                        pct = 100
-                    detail = (f"{pct:3d}% · "
-                              f"{_format_download_size(dl)}/"
-                              f"{_format_download_size(total)}")
-                else:
-                    detail = _format_download_size(dl)
-                mark = "✓" if final else "↓"
-                line = f"\r  {mark} {label}  {detail}  {speed}"
-                if tty_width > 0:
-                    line = line[:tty_width]
-                _write_tty(tty_fd, line + ("\n" if final else ""))
-            try:
-                for chunk in resp.iter_content(chunk_size=65536):
-                    if chunk:
-                        buf.extend(chunk)
-                        _render()
-                _render(final=True)
-                return bytes(buf)
-            finally:
-                try:
-                    os.close(tty_fd)
-                except OSError:
-                    pass
-        # fallback — buffered
-        for chunk in resp.iter_content(chunk_size=65536):
-            if chunk:
-                buf.extend(chunk)
-        return bytes(buf)
-
-    # Rich Progress bar
-    buf = bytearray()
-    with Progress(
-        TextColumn("  [#3fb950]↓[/#3fb950] "
-                   "[#6b7d6b]{task.description}[/#6b7d6b]"),
-        BarColumn(bar_width=None, complete_style="#3fb950",
-                  finished_style="#4ade80", pulse_style="#3fb950"),
-        DownloadColumn(),
-        TransferSpeedColumn(),
-        TimeRemainingColumn(),
-        console=con, transient=True,
-        redirect_stdout=False, redirect_stderr=False,
-    ) as progress:
-        task = progress.add_task(label, total=total)
-        for chunk in resp.iter_content(chunk_size=65536):
-            if chunk:
-                buf.extend(chunk)
-                progress.update(task, advance=len(chunk))
-        if total is None:
-            progress.update(task, total=len(buf), completed=len(buf))
-    return bytes(buf)
+        resp.raise_for_status()
+    except BaseException:
+        resp.close()
+        raise
+    return stream_download(resp, label=label, console=console,
+                           tty_open=_open_tty, tty_write=_write_tty)
 
 
 # ── atomic install ─────────────────────────────────────────────────────────

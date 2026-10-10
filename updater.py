@@ -66,6 +66,15 @@ from typing import Optional
 
 import requests
 
+from download_progress import (
+    format_size as _format_download_size,
+    live_hostile_stdout as _live_hostile_stdout,
+    open_tty as _open_tty,
+    stream_download,
+    write_tty as _write_tty,
+)
+
+
 try:
     import certifi
     _CA_BUNDLE = certifi.where()
@@ -310,204 +319,16 @@ def fetch_manifest() -> dict:
     return data
 
 
-def _open_tty():
-    """Open /dev/tty for direct writes, bypassing prompt_toolkit's StdoutProxy.
-
-    Returns (fd, width) or (None, 0). The fd is a raw OS file descriptor;
-    callers must os.close() it. width is the terminal column count for
-    line truncation, queried from the tty itself via TIOCGWINSZ.
-    """
-    try:
-        fd = os.open("/dev/tty", os.O_WRONLY | os.O_NOCTTY)
-    except OSError:
-        return None, 0
-    width = 80
-    try:
-        import struct
-        import fcntl
-        import termios
-        packed = fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
-        _rows, cols = struct.unpack("hhhh", packed)[:2]
-        if cols > 0:
-            width = cols
-    except Exception:
-        pass
-    return fd, width
-
-
-def _write_tty(fd: int, text: str) -> None:
-    """Write text to a raw tty fd, ignoring errors."""
-    try:
-        os.write(fd, text.encode("utf-8", errors="replace"))
-    except OSError:
-        pass
-
-
 def _download(url: str, label: str = "downloading", console=None) -> bytes:
-    """Download ``url`` into memory, showing a curl-style progress bar.
-
-    Streams the body so a rich progress bar (percent · size · speed · ETA) can
-    render as bytes arrive. Falls back to a plain buffered read when there is no
-    interactive console (non-TTY, rich unavailable, or unknown length is fine —
-    rich shows a pulsing bar). ``console`` should be the caller's rich Console
-    so the bar renders inline with the rest of the update output.
-    """
+    """Download with the shared Laintas rail, preserving CA verification."""
     resp = requests.get(url, timeout=_TIMEOUT, verify=_CA_BUNDLE, stream=True)
-    resp.raise_for_status()
-    _len = resp.headers.get("Content-Length")
-    total = int(_len) if _len and _len.isdigit() else None
-
     try:
-        from rich.progress import (Progress, TextColumn, BarColumn,
-                                   DownloadColumn, TransferSpeedColumn,
-                                   TimeRemainingColumn)
-        from rich.console import Console as _Console
-    except Exception:
-        return resp.content
-
-    con = console if console is not None else _Console()
-    # No animated bar on a non-interactive stream — print a breadcrumb + buffer.
-    if not getattr(con, "is_terminal", False):
-        try:
-            con.print(f"  ↓ {label}")
-        except Exception:
-            pass
-        return resp.content
-
-    # prompt_toolkit's StdoutProxy is line-oriented: Rich's carriage-return
-    # animation is buffered or overwritten by the active input prompt. Bypass
-    # it by writing directly to /dev/tty with \r-based single-line refresh.
-    # If /dev/tty is unavailable (non-PTY SSH, container without tty),
-    # fall back to throttled multi-line output via the console.
-    if _live_hostile_stdout(getattr(con, "file", None)):
-        buf = bytearray()
-        started = time.monotonic()
-
-        tty_fd, tty_width = _open_tty()
-        if tty_fd is not None:
-            # Direct TTY path: single-line \r refresh.
-            def _render(final: bool = False) -> None:
-                downloaded = len(buf)
-                now = time.monotonic()
-                elapsed = max(now - started, 0.001)
-                speed = _format_download_size(int(downloaded / elapsed)) + "/s"
-                if total:
-                    pct = min(100, int(downloaded * 100 / total))
-                    if final and downloaded >= total:
-                        pct = 100
-                    detail = f"{pct:3d}% · {_format_download_size(downloaded)}/{_format_download_size(total)}"
-                else:
-                    detail = _format_download_size(downloaded)
-                mark = "✓" if final else "↓"
-                line = f"  {mark} {label}  {detail} · {speed}"
-                # Truncate to terminal width, leave room for \r.
-                if tty_width > 4 and len(line) > tty_width - 1:
-                    line = line[: tty_width - 2] + "…"
-                _write_tty(tty_fd, "\r" + line)
-                if final:
-                    _write_tty(tty_fd, "\n")
-
-            last_render = 0.0
-            _render()
-            for chunk in resp.iter_content(chunk_size=65536):
-                if chunk:
-                    buf.extend(chunk)
-                    now = time.monotonic()
-                    if now - last_render >= 0.15:
-                        last_render = now
-                        _render()
-            _render(final=True)
-            try:
-                os.close(tty_fd)
-            except OSError:
-                pass
-            return bytes(buf)
-
-        # Fallback: no /dev/tty - throttled multi-line via console.
-        last_reported_at = started
-
-        def report(force: bool = False) -> None:
-            nonlocal last_reported_at
-            downloaded = len(buf)
-            now = time.monotonic()
-            if total:
-                percent = min(100, int(downloaded * 100 / total))
-                if not force and now - last_reported_at < 5:
-                    return
-                detail = f"{percent:3d}% · {_format_download_size(downloaded)}/{_format_download_size(total)}"
-            else:
-                if not force and now - last_reported_at < 5:
-                    return
-                detail = _format_download_size(downloaded)
-            elapsed = max(now - started, 0.001)
-            speed = _format_download_size(int(downloaded / elapsed)) + "/s"
-            con.print(f"  ↓ {label}  {detail} · {speed}")
-            last_reported_at = now
-
-        report(force=True)
-        for chunk in resp.iter_content(chunk_size=65536):
-            if chunk:
-                buf.extend(chunk)
-                report()
-        report(force=True)
-        return bytes(buf)
-
-    buf = bytearray()
-    with Progress(
-        TextColumn("  [#3fb950]↓[/#3fb950] [#6b7d6b]{task.description}[/#6b7d6b]"),
-        BarColumn(bar_width=None, complete_style="#3fb950",
-                  finished_style="#4ade80", pulse_style="#3fb950"),
-        DownloadColumn(),
-        TransferSpeedColumn(),
-        TimeRemainingColumn(),
-        console=con, transient=True,
-        # redirect_stdout defaults to True: rich would swap sys.stdout for its
-        # own FileProxy, and when the console writes through repl_mirror.TeeFile
-        # (which resolves sys.stdout dynamically) that feeds the Live's output
-        # back into itself and deadlocks Live.__exit__. Keep the real stdout.
-        redirect_stdout=False, redirect_stderr=False,
-    ) as progress:
-        task = progress.add_task(label, total=total)
-        for chunk in resp.iter_content(chunk_size=65536):
-            if chunk:
-                buf.extend(chunk)
-                progress.update(task, advance=len(chunk))
-        # Content-Length missing → finalize the bar at the true size.
-        if total is None:
-            progress.update(task, total=len(buf), completed=len(buf))
-    return bytes(buf)
-
-
-def _live_hostile_stdout(console_file=None) -> bool:
-    """True when a Rich Live animation can't render cleanly on the active output.
-
-    Rich's Live (progress bars, spinners) uses carriage-return animation. When
-    stdout is prompt_toolkit's line-oriented StdoutProxy — or the shared console
-    routes through repl_mirror.TeeFile, which forwards to that proxy — the
-    animation is buffered/overwritten and the display looks frozen. Detect both
-    the console's own file and the live sys.stdout so the caller can fall back to
-    plain newline output.
-    """
-    for stream in (console_file, sys.stdout):
-        if stream is None:
-            continue
-        name = type(stream).__name__
-        module = type(stream).__module__ or ""
-        if (name == "StdoutProxy"
-                or module.startswith("prompt_toolkit.")
-                or module == "repl_mirror"):
-            return True
-    return False
-
-
-def _format_download_size(value: int) -> str:
-    """Small dependency-free formatter for persistent update progress."""
-    size = float(max(0, value))
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024 or unit == "GB":
-            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{size:.1f} GB"
+        resp.raise_for_status()
+    except BaseException:
+        resp.close()
+        raise
+    return stream_download(resp, label=label, console=console,
+                           tty_open=_open_tty, tty_write=_write_tty)
 
 
 # ── update planning ──────────────────────────────────────────────────────

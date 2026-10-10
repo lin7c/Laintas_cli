@@ -296,6 +296,59 @@ class ResourceBrowserModelTests(unittest.TestCase):
         rendered = "".join(text for _, text in browser._detail_fragments())
         self.assertEqual(rendered, "  unchanged\n -old\n +new\n")
 
+    def test_timeline_shows_a_verdict_glyph_and_reddens_failed_bodies(self):
+        """The recorded verdict drives the glyph; an absent one stays neutral.
+
+        A line with no state must not be painted green or red — legacy records
+        never stored a verdict, and claiming success for them would be a lie.
+        """
+        browser = self._browser(presentation="timeline")
+        browser.detail = resource_ui.UIDetail(
+            "Conversation", lines=[
+                resource_ui.UILine("PROMPT", "class:detail.heading"),
+                resource_ui.UILine("run the suite"),
+                resource_ui.UILine("TOOL · Read", "class:detail.heading",
+                                   state="ok"),
+                resource_ui.UILine("def login():"),
+                resource_ui.UILine("TOOL · Bash", "class:detail.heading",
+                                   state="failed"),
+                resource_ui.UILine("ModuleNotFoundError", state="failed"),
+                resource_ui.UILine("KNOWLEDGE", "class:detail.heading"),
+                resource_ui.UILine("learned context"),
+            ], kind="timeline")
+        fragments = browser._detail_fragments()
+        rendered = "".join(text for _, text in fragments)
+        self.assertIn("✓ TOOL · Read", rendered)
+        self.assertIn("✗ TOOL · Bash", rendered)
+        # Neutral headings keep the rail glyph they always had.
+        self.assertIn("● PROMPT", rendered)
+        self.assertIn("├ KNOWLEDGE", rendered)
+
+        styles = dict((text, style) for style, text in fragments)
+        self.assertEqual(styles[" ✗ "], "class:timeline.failed")
+        self.assertEqual(styles["TOOL · Bash"], "class:timeline.failed")
+        self.assertEqual(styles[" ✓ "], "class:timeline.tool")
+        # The failed call's own output is red; the successful and the
+        # verdict-less bodies keep their ordinary style.
+        self.assertEqual(styles["ModuleNotFoundError"], "class:detail.failed")
+        self.assertEqual(styles["def login():"], "class:detail")
+        self.assertEqual(styles["learned context"], "class:detail")
+
+    def test_failed_verdict_is_visible_in_document_and_operations_modes(self):
+        for presentation in ("document", "operations"):
+            browser = self._browser(presentation=presentation)
+            browser.detail = resource_ui.UIDetail(
+                "Conversation", lines=[
+                    resource_ui.UILine("TOOL · Bash", "class:detail.heading",
+                                       state="failed"),
+                    resource_ui.UILine("ModuleNotFoundError",
+                                       "class:detail.code", state="failed"),
+                ], kind="timeline")
+            styles = dict((text, style)
+                          for style, text in browser._detail_fragments())
+            self.assertEqual(styles["ModuleNotFoundError"],
+                             "class:detail.failed", presentation)
+
     def test_section_navigation_wraps_across_headings_and_changes(self):
         browser = self._browser(presentation="document")
         browser.detail = resource_ui.UIDetail(
@@ -317,6 +370,57 @@ class ResourceBrowserModelTests(unittest.TestCase):
         browser.detail_scroll = 0
         browser._jump_detail_anchor(True)
         self.assertEqual(browser.detail_scroll, 1)
+
+    def test_expanded_timeline_scrolls_through_a_long_body(self):
+        browser = self._browser(presentation="timeline", collapsible_detail=True)
+        browser.detail = resource_ui.UIDetail(
+            "History", kind="timeline", collapsible=True, expanded_sections={0},
+            lines=[resource_ui.UILine("TOOL", "class:detail.heading")]
+                  + [resource_ui.UILine(f"output {i}") for i in range(100)])
+        with mock.patch.object(resource_ui.shutil, "get_terminal_size",
+                               return_value=os.terminal_size((100, 30))):
+            for _ in range(35):
+                browser._move_detail(3)
+                browser._detail_fragments()
+            rendered = "".join(text for _, text in browser._detail_fragments())
+        self.assertIn("output 99", rendered)
+        self.assertEqual(browser.selected_section, 0)
+
+    def test_timeline_search_expands_and_locates_each_hidden_match(self):
+        browser = self._browser(presentation="timeline", collapsible_detail=True)
+        browser.detail = resource_ui.UIDetail(
+            "History", kind="timeline", collapsible=True,
+            lines=[resource_ui.UILine("FIRST", "class:detail.heading")]
+                  + [resource_ui.UILine(f"first {i}") for i in range(40)]
+                  + [resource_ui.UILine("needle one"),
+                     resource_ui.UILine("SECOND", "class:detail.heading")]
+                  + [resource_ui.UILine(f"second {i}") for i in range(40)]
+                  + [resource_ui.UILine("needle two")])
+        with mock.patch.object(resource_ui.shutil, "get_terminal_size",
+                               return_value=os.terminal_size((100, 30))):
+            browser._detail_query = "needle"
+            browser._rebuild_detail_matches(reset=True)
+            self.assertEqual(browser.detail.expanded_sections, {0})
+            self.assertIn("needle one", "".join(t for _, t in browser._detail_fragments()))
+            browser._jump_detail_match(1)
+            self.assertEqual(browser.detail.expanded_sections, {0, 1})
+            self.assertEqual(browser.selected_section, 1)
+            self.assertIn("needle two", "".join(t for _, t in browser._detail_fragments()))
+            browser._jump_detail_anchor(True)
+            self.assertEqual(browser.selected_section, 0)
+
+    def test_collapsed_section_selection_survives_viewport_clamping(self):
+        browser = self._browser(presentation="timeline", collapsible_detail=True)
+        browser.detail = resource_ui.UIDetail(
+            "History", kind="timeline", collapsible=True,
+            lines=[resource_ui.UILine(str(i), "class:detail.heading") for i in range(3)])
+        browser._move_detail(1)
+        browser._detail_fragments()
+        browser._move_detail(1)
+        browser._detail_fragments()
+        self.assertEqual(browser.selected_section, 2)
+        browser._move_detail(-1)
+        self.assertEqual(browser.selected_section, 1)
 
     def test_custom_pane_headers_report_focus_and_detail_title(self):
         browser = self._browser(

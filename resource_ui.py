@@ -96,6 +96,9 @@ class UILine:
     text: str
     style: str = "class:detail"
     level: int = 1
+    #: Verdict recorded by the producer: "", "ok" or "failed". Display-only —
+    #: a line without one is rendered neutral rather than guessed as success.
+    state: str = ""
 
 
 @dataclass
@@ -105,6 +108,8 @@ class UIDetail:
     lines: list[UILine] = field(default_factory=list)
     start_line: int = 0
     kind: str = ""
+    collapsible: bool = False
+    expanded_sections: set[int] = field(default_factory=set)
 
     @classmethod
     def text(cls, title: str, content: Any, subtitle: str = "",
@@ -246,6 +251,7 @@ class ResourceBrowser:
                  empty_message: str = "Nothing here yet.",
                  initial_key: str = "", presentation: str = "operations",
                  pane_labels: Optional[tuple[str, str]] = None,
+                 collapsible_detail: bool = False,
                  assistant_handler: Optional[AssistantHandler] = None,
                  assistant_placeholder: str = "Ask about this context",
                  assistant_label: str = "AI",
@@ -263,6 +269,7 @@ class ResourceBrowser:
         self.presentation = (presentation if presentation in _PRESENTATIONS
                              else "operations")
         self.pane_labels = pane_labels or _PANE_LABELS[self.presentation]
+        self.collapsible_detail = bool(collapsible_detail)
         self.assistant_handler = assistant_handler
         self.assistant_placeholder = assistant_placeholder
         self.assistant_label = assistant_label
@@ -274,6 +281,8 @@ class ResourceBrowser:
         self.selected = 0
         self.list_scroll = 0
         self.detail_scroll = 0
+        self.selected_section = 0
+        self._detail_cursor = 0
         self.detail: Optional[UIDetail] = None
         self.detail_key = ""
         self.detail_cache: dict[str, UIDetail] = {}
@@ -387,6 +396,18 @@ class ResourceBrowser:
         if not self._detail_matches or self._detail_match_index < 0:
             return
         line_index = self._detail_matches[self._detail_match_index][0]
+        if self.detail and self.collapsible_detail and self.detail.collapsible:
+            headings = self._detail_headings()
+            section = next((i for i in reversed(range(len(headings)))
+                            if headings[i] <= line_index), None)
+            if section is not None:
+                self.selected_section = section
+                self.detail.expanded_sections.add(section)
+            visible = self._detail_visible_indices()
+            if line_index not in visible:
+                return
+            line_index = visible.index(line_index)
+            self._detail_cursor = line_index
         # Put the hit near the upper third instead of pinning it to the edge.
         height = max(4, shutil.get_terminal_size((100, 30)).lines - 7)
         self.detail_scroll = max(0, line_index - max(0, height // 3))
@@ -487,6 +508,8 @@ class ResourceBrowser:
         self.detail = detail
         self.detail_key = item.key
         self.detail_scroll = max(0, int(detail.start_line or 0))
+        self.selected_section = 0
+        self._detail_cursor = 0
         if changed_item:
             self._detail_query = ""
             self._detail_search_key = ""
@@ -505,10 +528,58 @@ class ResourceBrowser:
                                    self.selected + delta))
         self._sync_detail()
 
+    def _detail_visible_indices(self) -> list[int]:
+        if not self.detail or not (self.collapsible_detail and self.detail.collapsible):
+            return list(range(len(self.detail.lines))) if self.detail else []
+        visible, section = [], -1
+        for index, line in enumerate(self.detail.lines):
+            if line.style == "class:detail.heading":
+                section += 1; visible.append(index)
+            elif section in self.detail.expanded_sections:
+                visible.append(index)
+        return visible
+
+    def _detail_headings(self) -> list[int]:
+        return [i for i, line in enumerate(self.detail.lines)
+                if line.style == "class:detail.heading"] if self.detail else []
+
+    def _toggle_detail_section(self, source_line: int) -> None:
+        if not self.detail or not self.detail.collapsible: return
+        headings = self._detail_headings()
+        if source_line in headings:
+            section = headings.index(source_line)
+            self.selected_section = section
+            if section in self.detail.expanded_sections: self.detail.expanded_sections.remove(section)
+            else: self.detail.expanded_sections.add(section)
+            self._detail_cursor = self._detail_visible_indices().index(source_line)
+            self.detail_scroll = self._detail_cursor
+            self.app.invalidate()
+
+    def _expand_all_detail(self) -> None:
+        if not self.detail or not self.detail.collapsible: return
+        count = len(self._detail_headings())
+        if len(self.detail.expanded_sections) == count: self.detail.expanded_sections.clear()
+        else: self.detail.expanded_sections = set(range(count))
+        headings = self._detail_headings()
+        if headings:
+            self.selected_section = min(self.selected_section, len(headings) - 1)
+            self._detail_cursor = self._detail_visible_indices().index(
+                headings[self.selected_section])
+            self.detail_scroll = self._detail_cursor
+        self.app.invalidate()
+
     def _move_detail(self, delta: int) -> None:
-        count = len(self.detail.lines) if self.detail else 0
-        self.detail_scroll = max(0, min(max(0, count - 1),
-                                        self.detail_scroll + delta))
+        visible = self._detail_visible_indices()
+        count = len(visible)
+        collapsible = bool(self.detail and self.collapsible_detail and self.detail.collapsible)
+        start = self._detail_cursor if collapsible else self.detail_scroll
+        self.detail_scroll = max(0, min(max(0, count - 1), start + delta))
+        if visible and collapsible:
+            self._detail_cursor = self.detail_scroll
+            source_line = visible[self.detail_scroll]
+            headings = self._detail_headings()
+            self.selected_section = max(
+                0, sum(index <= source_line for index in headings) - 1)
 
     def _detail_anchors(self) -> list[int]:
         """Return meaningful navigation stops for the current inspector."""
@@ -521,6 +592,20 @@ class ResourceBrowser:
                 if line.style == "class:detail.heading"]
 
     def _jump_detail_anchor(self, forward: bool = True) -> None:
+        if self.detail and self.collapsible_detail and self.detail.collapsible:
+            headings = self._detail_headings()
+            if headings:
+                visible = self._detail_visible_indices()
+                anchors = [visible.index(index) for index in headings]
+                cursor = self._detail_cursor
+                if forward:
+                    target = next((i for i in anchors if i > cursor), anchors[0])
+                else:
+                    target = next((i for i in reversed(anchors) if i < cursor), anchors[-1])
+                self.selected_section = anchors.index(target)
+                self._detail_cursor = target
+                self.detail_scroll = target
+            return
         anchors = self._detail_anchors()
         if not anchors:
             return
@@ -709,23 +794,37 @@ class ResourceBrowser:
             return [("class:muted", "\n  Select an item to see its details.\n")]
         _, height = shutil.get_terminal_size((100, 30))
         body_height = max(4, height - 7)
-        max_scroll = max(0, len(detail.lines) - body_height)
+        visible = self._detail_visible_indices()
+        headings = self._detail_headings()
+        max_scroll = max(0, len(visible) - body_height)
         self.detail_scroll = max(0, min(self.detail_scroll, max_scroll))
-        end = min(len(detail.lines), self.detail_scroll + body_height)
+        end = min(len(visible), self.detail_scroll + body_height)
         fragments = []
-        for line_index in range(self.detail_scroll, end):
+        for position in range(self.detail_scroll, end):
+            line_index = visible[position]
             line = detail.lines[line_index]
             if self.presentation == "timeline" and detail.kind != "diff":
                 heading = line.style == "class:detail.heading"
                 upper = line.text.upper()
                 if heading:
-                    if upper.startswith(("PROMPT", "USER")):
+                    if line.state == "failed":
+                        glyph, style = "✗", "class:timeline.failed"
+                    elif line.state == "ok":
+                        glyph, style = "✓", "class:timeline.tool"
+                    elif upper.startswith(("PROMPT", "USER")):
                         glyph, style = "●", "class:timeline.user"
                     elif upper.startswith(("AI", "ASSISTANT")):
                         glyph, style = "●", "class:timeline.ai"
                     else:
                         glyph, style = "├", "class:timeline.tool"
-                    fragments.append((style, f" {glyph} "))
+                    if self.collapsible_detail and detail.collapsible:
+                        section = headings.index(line_index)
+                        marker = "▼" if section in detail.expanded_sections else "▶"
+                        if section == self.selected_section:
+                            style += " reverse"
+                        fragments.append((style, f" {marker}{glyph} "))
+                    else:
+                        fragments.append((style, f" {glyph} "))
                     fragments.extend(self._detail_text_fragments(
                         line_index, plain(line.text), style))
                     fragments.append((style, "\n"))
@@ -733,20 +832,22 @@ class ResourceBrowser:
                     fragments.append(("class:timeline.rail", " │\n"))
                 else:
                     fragments.append(("class:timeline.rail", " │  "))
-                    base_style = line.style or "class:detail"
+                    base_style = ("class:detail.failed" if line.state == "failed"
+                            else (line.style or "class:detail"))
                     fragments.extend(self._detail_text_fragments(
                         line_index, clean_ansi(line.text), base_style))
                     fragments.append((base_style, "\n"))
             else:
                 prefix = "   " if self.presentation == "document" else " "
-                base_style = line.style or "class:detail"
+                base_style = ("class:detail.failed" if line.state == "failed"
+                            else (line.style or "class:detail"))
                 fragments.append((base_style, prefix))
                 fragments.extend(self._detail_text_fragments(
                     line_index, clean_ansi(line.text), base_style))
                 fragments.append((base_style, "\n"))
-        if end < len(detail.lines):
+        if end < len(visible):
             fragments.append(("class:muted",
-                              f"\n  ↓ {len(detail.lines) - end} more lines"))
+                              f"\n  ↓ {len(visible) - end} more lines"))
         return fragments
 
     def _help_fragments(self):
@@ -754,6 +855,8 @@ class ResourceBrowser:
             ("NAVIGATION", "↑/↓ or j/k  move    g/G  first/last    PgUp/PgDn  page"),
             ("VIEW", "Enter  open/focus    Tab  switch pane    [/ ]  section"),
         ]
+        if self.collapsible_detail:
+            rows.append(("READ", "↑/↓  scroll    [/]  select section    Enter  expand/collapse    p  read next    x  expand/collapse all"))
         if self.searchable:
             rows.append(("SEARCH", "/  find in focused pane    n/N  next/previous match"))
         if self.assistant_handler is not None:
@@ -778,6 +881,10 @@ class ResourceBrowser:
             return None
         if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
             self._move_detail(3)
+            return None
+        if mouse_event.event_type == MouseEventType.MOUSE_UP and self.detail and self.detail.collapsible:
+            visible=self._detail_visible_indices(); pos=self.detail_scroll+max(0,mouse_event.position.y)
+            if pos < len(visible): self._toggle_detail_section(visible[pos])
             return None
         return NotImplemented
 
@@ -892,6 +999,10 @@ class ResourceBrowser:
                         parts.append(("n/N", "Match"))
             parts.append(("?", "Keys"))
             parts.append(("Esc", "Close"))
+        if self.collapsible_detail and self.detail and self.detail.collapsible and (
+                self.focus == "detail" or (not self.is_wide and self.mode == "detail")):
+            parts = [("↑↓", "Scroll"), ("[/]", "Section"), ("↵", "Expand/Collapse"), ("p", "Next"),
+                     ("x", "Expand/Collapse all"), ("Esc", "Back")]
         if self.assistant_handler is not None and not self.assistant_active:
             parts.insert(-1, ("a", "Ask AI"))
         fragments = []
@@ -970,6 +1081,8 @@ class ResourceBrowser:
         @kb.add("home", filter=browsing)
         def _home(event):
             if self.focus == "detail" or (not self.is_wide and self.mode == "detail"):
+                self.selected_section = 0
+                self._detail_cursor = 0
                 self.detail_scroll = 0
             else:
                 self.selected = 0
@@ -978,7 +1091,7 @@ class ResourceBrowser:
         @kb.add("end", filter=browsing)
         def _end(event):
             if self.focus == "detail" or (not self.is_wide and self.mode == "detail"):
-                self.detail_scroll = max(0, len(self.detail.lines) - 1) if self.detail else 0
+                self._move_detail(len(self._detail_visible_indices()))
             elif self.filtered:
                 self.selected = len(self.filtered) - 1
                 self._sync_detail()
@@ -1001,6 +1114,19 @@ class ResourceBrowser:
             if self.focus == "detail" or (not self.is_wide and self.mode == "detail"):
                 self._jump_detail_anchor(False)
 
+        @kb.add("p", filter=browsing)
+        def _read_next(event):
+            if self.detail and self.detail.collapsible:
+                headings=self._detail_headings()
+                nxt=next((i for i in range(len(headings)) if i not in self.detail.expanded_sections), None)
+                if nxt is not None:
+                    self.selected_section = nxt
+                    self.detail.expanded_sections.add(nxt); self.detail_scroll=self._detail_visible_indices().index(headings[nxt]); event.app.invalidate()
+                    self._detail_cursor = self.detail_scroll
+
+        @kb.add("x", filter=browsing)
+        def _expand(event): self._expand_all_detail()
+
         @kb.add("enter")
         def _enter(event):
             if self.assistant_active:
@@ -1009,6 +1135,13 @@ class ResourceBrowser:
                 self.search_active = False
                 pane = (self.mode if not self.is_wide else self.focus)
                 self._focus_pane(pane, event.app)
+            elif self.detail and self.detail.collapsible and (self.focus == "detail" or (not self.is_wide and self.mode == "detail")):
+                headings=self._detail_headings()
+                if headings:
+                    current = max(0, min(len(headings) - 1, self.selected_section))
+                    self._toggle_detail_section(headings[current])
+                    self.detail_scroll = self._detail_visible_indices().index(headings[current])
+                    event.app.invalidate()
             elif not self.is_wide and self.mode == "detail":
                 self.mode = "list"
                 self._focus_pane("list", event.app)

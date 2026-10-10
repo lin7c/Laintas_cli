@@ -99,7 +99,9 @@ export const GROUPS = [
             ),
           },
           { t: 'h', ...L('Windows', 'Windows') },
-          { t: 'p', ...L('[下载 laintas-Helpwo-cli-for-windows](https://cli.laintas.com/windows/LaintasSetup.exe)，双击安装，然后从开始菜单启动 Laintas Windows。', '[Download laintas-Helpwo-cli-for-windows](https://cli.laintas.com/windows/LaintasSetup.exe), open the installer, then launch Laintas Windows from Start.') },
+          { t: 'code', label: 'PowerShell', code: 'irm https://cli.laintas.com/install.ps1 | iex' },
+          { t: 'p', ...L('在 PowerShell 中执行以上指令，脚本会下载最新 Windows 安装包、校验 SHA-256，然后打开安装器。也可以直接下载。', 'Run the command in PowerShell to download the latest Windows installer, verify its SHA-256 and open it. You can also download it directly.') },
+          { t: 'p', ...L('[下载 laintas-Helpwo-cli-for-windows](https://cli.laintas.com/windows/releases/0.4.6/LaintasSetup.exe)，双击安装，然后从开始菜单启动 Laintas Windows。', '[Download laintas-Helpwo-cli-for-windows](https://cli.laintas.com/windows/releases/0.4.6/LaintasSetup.exe), open the installer, then launch Laintas Windows from Start.') },
           {
             t: 'p', ...L(
               '独立桌面版复用 Helpwo 聊天 UI，agent 和 kernel 在 Windows 本机运行。需要 Windows 10/11 x86_64 和 WebView2；安装器可联网安装 WebView2。',
@@ -108,9 +110,11 @@ export const GROUPS = [
           },
           {
             t: 'note', title: L('SmartScreen 提示', 'SmartScreen'),
-            ...L('安装程序暂未代码签名，首次运行时 Windows 可能提示「已保护你的电脑」。选择「更多信息 → 仍要运行」；如需确认文件来源，请对照 [SHA-256 校验值](https://cli.laintas.com/windows/releases/0.1.0/SHA256SUMS.txt)。',
-              'The installer is not code-signed yet, so Windows may say it protected your PC on first run. Choose "More info → Run anyway"; to be sure the file is ours, compare it with the [SHA-256 checksum](https://cli.laintas.com/windows/releases/0.1.0/SHA256SUMS.txt).'),
+            ...L('安装程序暂未代码签名，首次运行时 Windows 可能提示「已保护你的电脑」。选择「更多信息 → 仍要运行」；如需确认文件来源，请对照 [SHA-256 校验值](https://cli.laintas.com/windows/releases/0.4.6/SHA256SUMS.txt)。',
+              'The installer is not code-signed yet, so Windows may say it protected your PC on first run. Choose "More info → Run anyway"; to be sure the file is ours, compare it with the [SHA-256 checksum](https://cli.laintas.com/windows/releases/0.4.6/SHA256SUMS.txt).'),
           },
+          { t: 'p', ...L('Windows 0.4.6 只运行 Helpwo 桌面版。文件树与网页版一致；在云存储菜单里「打开本地文件夹」可添加外链目录，不改变当前工作空间；切换工作空间请进入「设置 → 运行环境」。新安装默认使用用户目录下的 HelpwoWorkspace，已有安装的工作文件保留原位。', 'Windows 0.4.6 runs Helpwo on the desktop. The file tree matches the web version; Open Local Folder in the Cloud Storage menu links an external directory without changing the workspace; select another workspace in Settings > Runtime Environments. New installations use HelpwoWorkspace in the user profile; existing workspace files stay in place.') },
+          { t: 'p', ...L('0.4.6 还原了原版文件树，并重做了文件操作：删除会在窗口内确认一次后进入回收站，复制、移动、导入、导出不会覆盖已有文件，操作会给出结果或错误提示而不再一直等待。此前的工具条、框选、与系统剪贴板互通和拖出到桌面已移除。遇到问题时，在内置终端输入 helpwo selftest 检查文件操作，输入 helpwo logs 查看本地日志（日志不包含文件内容、聊天文本和凭据）。0.4.1 终端以及 Act、Auto、Plan 模式继续保留；Act 模式下模型修改文件仍需审批。', 'Version 0.4.6 restores the original file tree and rebuilds file operations: delete asks once in the window and moves entries to the Recycle Bin; copy, move, import and export never replace an existing file; and an action ends with a result or an error instead of waiting forever. The earlier toolbar, marquee selection, system-clipboard interop and dragging out to the desktop are removed. If something goes wrong, type helpwo selftest in the built-in terminal to test file operations and helpwo logs to read the local log, which never contains file contents, chat text or credentials. The 0.4.1 terminal and Act, Auto and Plan modes remain; model file changes require approval in Act mode.') },
           { t: 'h', ...L('源码包', 'Source package') },
           {
             t: 'p', ...L('用于不支持独立二进制的平台，或者你想审计、调试、修改 CLI：', 'For platforms without a standalone build, or when you want to audit, debug or modify the CLI:'),
@@ -283,18 +287,18 @@ export const GROUPS = [
               ['`/model`', '列出可用模型并为当前终端选择模型；`/model reset` 恢复默认'],
               ['`/model aux`', '选择辅助任务（如压缩摘要）使用的模型'],
               ['`/usage [7d|30d|90d]`', '本地 token 统计加上 Laintas 账户的用量与额度'],
-              ['`/usage buy calls|storage`', '购买调用包或存储'],
+              ['`/usage buy calls|storage`', '购买积分加油包或存储'],
             ], [
               ['`/model`', 'List available models and choose one for this terminal; `/model reset` restores the default'],
               ['`/model aux`', 'Choose the model used for auxiliary work such as compaction summaries'],
               ['`/usage [7d|30d|90d]`', 'Local token statistics plus usage and allowance from your Laintas account'],
-              ['`/usage buy calls|storage`', 'Buy a call pack or storage'],
+              ['`/usage buy calls|storage`', 'Buy a credit pack or storage'],
             ]),
           },
           {
             t: 'p', ...L(
-              `模型按档位计费，档位越高，一次调用从会员额度里扣的单位越多。各档位包含的模型和价格见 [定价页](https://laintas.com/pricing#token-pricing)。`,
-              `Models are billed by tier; a higher tier draws more units from the allowance per call. Which models are in each tier, and their prices, are on the [pricing page](https://laintas.com/pricing#token-pricing).`,
+              `档位（T0–T5）表示模型强度，价格是每个模型自己的：用余额按模型公开标价加手续费计费；用会员积分时走会员线路，按每次调用的实际成本加手续费扣积分。各模型的价格见 [定价页](https://laintas.com/pricing#token-pricing)。`,
+              `A tier (T0–T5) says how strong a model is; the price is each model's own. Paid from balance, a call is charged the model's public list price plus a fee; paid with member credits, it runs on the member route and draws what it actually cost plus a fee. Per-model prices are on the [pricing page](https://laintas.com/pricing#token-pricing).`,
             ),
           },
         ],
@@ -953,7 +957,7 @@ export const GROUPS = [
             t: 'table', head: L(['命令', '说明'], ['Command', 'Description']),
             rows: L([
               ['`/login`', '重新登录'],
-              ['`/usage`', 'AI 用量：本地 token 统计 + Laintas 账户用量；`buy` 购买调用包或存储'],
+              ['`/usage`', 'AI 用量：本地 token 统计 + Laintas 账户用量；`buy` 购买积分加油包或存储'],
               ['`/resume`、`/fork`、`/new`', '切换、分支、新建会话'],
               ['`/quit`、`/exit`', '退出（保留登录）/ 退出登录并退出'],
               ['`/back`', '从子终端脱离'],

@@ -455,6 +455,96 @@ class SlashRegistryTests(unittest.TestCase):
         self.assertIn(("TOOL  •  List", "class:detail.heading"), rendered)
         self.assertIn("three files", [line.text for line in detail.lines])
 
+    def test_told_browse_marks_failed_tools_and_failed_turns(self):
+        """A failed call must be visible without opening every section.
+
+        The verdict is already recorded on the event (``ok``/``returncode``
+        from transcript_view.build_tool_event, ``message_kind=turn_failed``
+        from a turn that died), so the browser only has to surface it — and
+        must not invent one for records that never carried a verdict.
+        """
+        history = [
+            {"role": "user", "content": "run the suite"},
+            {"role": "tool", "tool_name": "fs.read", "display_name": "Read",
+             "summary": "auth.py", "content": "def login():", "ok": True,
+             "returncode": None, "elapsed": 0.2},
+            {"role": "tool", "tool_name": "shell.exec", "display_name": "Bash",
+             "summary": "pytest -q", "content": "ModuleNotFoundError",
+             "ok": False, "returncode": 4, "elapsed": 2.4,
+             "extra": {"error": "ModuleNotFoundError: No module named 'paths'"}},
+            # Legacy prose record: no verdict was ever stored.
+            {"role": "knowledge", "content": "learned context"},
+            {"role": "assistant", "content": "Fixed it.",
+             "message_kind": "final"},
+            {"role": "user", "content": "and the deploy?"},
+            {"role": "assistant", "content": "NOT answered: backend error",
+             "message_kind": "turn_failed"},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                mock.patch.object(laintas_cli.paths, "project_dir",
+                                  return_value=Path(tmpdir)), \
+                mock.patch.object(
+                    laintas_cli.resource_ui, "ResourceBrowser") as picker:
+            laintas_cli._told_browse_history(history)
+        kwargs = picker.call_args.kwargs
+        rows = {row.payload["prompt"]: row for row in kwargs["load_items"]()}
+
+        broken = rows["run the suite"]
+        self.assertEqual(broken.status, "✗ 1 tool failed")
+        self.assertEqual(broken.status_style, "class:error")
+        self.assertIn("1 failed", broken.subtitle)
+        self.assertIn("1 ok", broken.subtitle)
+        # The failure is searchable from the list without opening the detail.
+        self.assertIn("1 tool failed", broken.search_text)
+
+        dead = rows["and the deploy?"]
+        self.assertEqual(dead.status, "✗ turn failed")
+        self.assertEqual(dead.status_style, "class:error")
+
+        detail = kwargs["load_detail"](broken)
+        states = {line.text: line.state for line in detail.lines}
+        self.assertEqual(states["TOOL  •  Read"], "ok")
+        failed_heading = next(text for text in states
+                              if text.startswith("TOOL  •  Bash"))
+        self.assertEqual(states[failed_heading], "failed")
+        # Cause, exit code and slow-call marker ride along on the heading.
+        self.assertIn("exit 4", failed_heading)
+        self.assertIn("ModuleNotFoundError: No module named 'paths'",
+                      failed_heading)
+        self.assertIn("2.4s", failed_heading)
+        self.assertEqual(states["ModuleNotFoundError"], "failed")
+        self.assertEqual(states["learned context"], "")
+        self.assertEqual(states["Fixed it."], "")
+
+        dead_detail = kwargs["load_detail"](dead)
+        dead_states = {line.text: line.state for line in dead_detail.lines}
+        failed_reply = next(text for text in dead_states
+                            if text.startswith("AI REPLY 1"))
+        self.assertIn("TURN_FAILED", failed_reply)
+        self.assertEqual(dead_states[failed_reply], "failed")
+        self.assertEqual(dead_states["NOT answered: backend error"], "failed")
+
+    def test_told_browse_reports_quiet_success_without_a_failure_claim(self):
+        history = [
+            {"role": "user", "content": "read two files"},
+            {"role": "tool", "tool_name": "fs.read", "display_name": "Read",
+             "summary": "a.py", "content": "body", "ok": True},
+            {"role": "tool", "tool_name": "fs.read", "display_name": "Read",
+             "summary": "b.py", "content": "body", "ok": True},
+            {"role": "assistant", "content": "Both read.",
+             "message_kind": "final"},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                mock.patch.object(laintas_cli.paths, "project_dir",
+                                  return_value=Path(tmpdir)), \
+                mock.patch.object(
+                    laintas_cli.resource_ui, "ResourceBrowser") as picker:
+            laintas_cli._told_browse_history(history)
+        row = picker.call_args.kwargs["load_items"]()[0]
+        self.assertEqual(row.status, "✓ 2 ok")
+        self.assertEqual(row.status_style, "class:success")
+        self.assertNotIn("failed", row.subtitle)
+
     def test_told_browse_extracts_provider_text_blocks(self):
         history = [
             {"role": "user", "content": "question"},

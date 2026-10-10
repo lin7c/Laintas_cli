@@ -556,6 +556,107 @@ class VisibilityGateTests(unittest.TestCase):
         self.assertEqual({self.path: [[1, 500]]}, state["_visible_reads"])
 
 
+class FingerprintGateTests(unittest.TestCase):
+    """A held line range describes lines of ONE version of the file.
+
+    Measured failure: a peer session rewrote the file, the gate still saw the
+    old range as covering the request, and declined with "re-reading them
+    returns the same bytes" — which was false, and left the model holding
+    content that no longer existed with no way to fetch the current one.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "module.py")
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write(_py_source(60))
+        self.state = {"_ctx_page_chars": 10_500}
+        self.ctx = tools.ToolCtx(cwd=self.tmp.name, agent_id="a1",
+                                 state=self.state)
+
+    def read(self, **params):
+        params.setdefault("path", self.path)
+        return tools._bi_fs_read(params, self.ctx)
+
+    def _hold(self, *spans, fp=None):
+        self.state["_visible_reads"] = {self.path: [list(s) for s in spans]}
+        if fp is not None:
+            self.state["_visible_reads_fp"] = {self.path: list(fp)}
+
+    def test_a_range_from_the_current_version_still_declines(self):
+        self._hold((1, 500), fp=file_pager.fingerprint(self.path))
+        r = self.read(offset=100, limit=50)
+        self.assertFalse(r["ok"])
+        self.assertIn("already in your context", r["error"])
+
+    def test_a_range_from_a_rewritten_file_does_not_decline(self):
+        self._hold((1, 500), fp=file_pager.fingerprint(self.path))
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write(_py_source(80))
+        r = self.read(offset=100, limit=50)
+        self.assertTrue(r["ok"], r.get("error"))
+        self.assertEqual(50, r["lines_returned"])
+
+    def test_a_range_without_a_recorded_fingerprint_still_declines(self):
+        """Refs written before the fingerprint existed must not disable the gate."""
+        self._hold((1, 500))
+        self.assertFalse(self.read(offset=100, limit=50)["ok"])
+
+    def test_a_read_records_the_version_it_delivered(self):
+        ref = self.read(offset=1, limit=10)["_read_ref"]
+        self.assertEqual(list(file_pager.fingerprint(self.path)), ref["fp"])
+
+    def test_the_projection_carries_the_newest_version_of_a_file(self):
+        """Two reads of one file, a rewrite between them: the newest wins."""
+        old_fp = file_pager.fingerprint(self.path)
+        state = {"_pager_msgs": {
+            "c1": {"path": self.path, "page": 0, "lines": [1, 100],
+                   "fp": list(old_fp)},
+            "c2": {"path": self.path, "page": 0, "lines": [101, 200],
+                   "fp": list(old_fp)},
+        }}
+        thread = [{"role": "tool", "tool_call_id": cid, "content": "1\u2192x"}
+                  for cid in ("c1", "c2")]
+        agent_loop._project_paged_reads(thread, state)
+        self.assertEqual(list(old_fp), state["_visible_reads_fp"][self.path])
+
+    def test_a_changed_file_reopens_every_range_of_it(self):
+        """The gate must not decline one window and serve another."""
+        self._hold((1, 500), fp=file_pager.fingerprint(self.path))
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write(_py_source(80))
+        self.assertTrue(self.read(offset=100, limit=50)["ok"])
+        self.assertTrue(self.read(offset=300, limit=50)["ok"])
+
+    def test_partial_reread_does_not_validate_other_windows_of_an_old_version(self):
+        old_fp = list(file_pager.fingerprint(self.path))
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write(_py_source(80))
+        new_fp = list(file_pager.fingerprint(self.path))
+        self.state["_pager_msgs"] = {
+            "old": {"path": self.path, "page": 0, "lines": [1, 30], "fp": old_fp},
+            "new": {"path": self.path, "page": 0, "lines": [31, 60], "fp": new_fp},
+        }
+        thread = [{"role": "tool", "tool_call_id": cid, "content": cid}
+                  for cid in ("old", "new")]
+        agent_loop._project_paged_reads(thread, self.state)
+        self.assertEqual([[31, 60]], file_pager.visible_ranges(self.state, self.path))
+        self.assertTrue(self.read(offset=1, limit=30)["ok"])
+        self.assertFalse(self.read(offset=31, limit=30)["ok"])
+
+    def test_legacy_window_does_not_inherit_a_newer_reads_fingerprint(self):
+        self.state["_pager_msgs"] = {
+            "old": {"path": self.path, "page": 0, "lines": [1, 30]},
+            "new": {"path": self.path, "page": 0, "lines": [31, 60],
+                    "fp": list(file_pager.fingerprint(self.path))},
+        }
+        thread = [{"role": "tool", "tool_call_id": cid, "content": cid}
+                  for cid in ("old", "new")]
+        agent_loop._project_paged_reads(thread, self.state)
+        self.assertEqual([[31, 60]], file_pager.visible_ranges(self.state, self.path))
+
+
 class BodyCacheTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
