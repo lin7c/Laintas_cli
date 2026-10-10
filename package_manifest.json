@@ -103,6 +103,7 @@
     "download_progress",
     "skill_router",
     "terminal_arbiter",
+    "terminal_theme",
     "term_attach",
     "tokenizer",
     "web_search",

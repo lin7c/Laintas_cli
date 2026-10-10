@@ -2465,7 +2465,7 @@ class ResumeTranscriptTests(unittest.TestCase):
 
 
 class TerminalOutputStyleTests(unittest.TestCase):
-    def test_markdown_and_code_inherit_terminal_background(self):
+    def test_markdown_prose_keeps_terminal_colors_and_code_plate_is_paired(self):
         output = io.StringIO()
         test_console = Console(
             file=output,
@@ -2473,17 +2473,19 @@ class TerminalOutputStyleTests(unittest.TestCase):
             color_system="truecolor",
             width=100,
             theme=laintas_cli.LAINTAS_THEME,
-            style="white",
+            style="foreground",
         )
 
         test_console.print(laintas_cli.Markdown(
-            "ordinary `inline`\n\n```python\nprint('white')\n```"))
+            "ordinary `inline`\n\n```python\nprint('plate')\n```"))
 
-        rendered = output.getvalue()
-        self.assertIn("ordinary", rendered)
-        self.assertIn("print", rendered)
-        self.assertNotIn("\x1b[48;", rendered)
-        self.assertNotIn("\x1b[44m", rendered)
+        prose, _, code = output.getvalue().partition("\n\n")
+        # Prose and inline code: the terminal's own foreground and background.
+        self.assertEqual("ordinary inline", prose.strip())
+        # The fenced block paints a plate, so its text color is set with it.
+        self.assertIn("38;2;230;237;243;48;2;22;27;34mprint", code)
+        self.assertNotIn("\x1b[37", code)
+        self.assertNotIn("\x1b[44m", code)
 
     def test_prompt_toolkit_chrome_preserves_slash_menu_only(self):
         style = laintas_cli._build_prompt_style()

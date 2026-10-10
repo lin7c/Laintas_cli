@@ -40,6 +40,7 @@ import time
 from typing import Callable, Optional
 
 import symbols
+import terminal_theme
 from rich.console import Console
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
@@ -345,11 +346,11 @@ def _current_theme_name() -> str:
         import terminal_preferences
         name = terminal_preferences.get_ui_preferences().get("theme")
         if name:
-            return str(name)
+            return terminal_theme.resolve_quietly(name)
     except Exception:
         pass
     try:
-        return str(agent_loop.get_runtime_config("theme") or "dark")
+        return terminal_theme.resolve_quietly(agent_loop.get_runtime_config("theme"))
     except Exception:
         return "dark"
 

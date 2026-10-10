@@ -441,7 +441,25 @@ def get_mode(name: str) -> Optional[dict]:
     return _normalize_mode(name, value) if value is not None else None
 
 
+#: A mode chosen for this process only (--mode). It is never written to the
+#: terminal's preferences, and any explicit switch replaces it.
+_session_mode: Optional[str] = None
+
+
+def set_session_mode(name: str) -> tuple[bool, str]:
+    """Use ``name`` for this process without changing the saved mode."""
+    global _session_mode
+    name = (name or "").strip().lower()
+    if get_mode(name) is None:
+        known = ", ".join(sorted(str(mode.get("name")) for mode in list_modes()))
+        return False, f"Unknown mode: {name} (available: {known})"
+    _session_mode = name
+    return True, f"Using {name.upper()} mode for this run."
+
+
 def _active_mode_name() -> str:
+    if _session_mode and get_mode(_session_mode) is not None:
+        return _session_mode
     name = _load_instance_active_mode() or "act"
     if get_mode(name) is not None:
         return name
@@ -462,10 +480,12 @@ def activate(name: str) -> tuple[bool, str]:
     name = (name or "").strip().lower()
     if get_mode(name) is None:
         return False, f"Unknown mode: {name}"
+    global _session_mode
     try:
         _save_instance_active_mode(name)
     except OSError as exc:
         return False, f"Could not activate mode: {exc}"
+    _session_mode = None
     return True, f"Switched to {name.upper()} mode."
 
 

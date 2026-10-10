@@ -17,6 +17,18 @@ import transcript_view
 class AppendConsole(Console):
     """Hold ordinary output until the connected append region closes."""
 
+    #: Set with the theme; maps style strings Rich would parse into raw ANSI
+    #: colors (``dim yellow``) onto the active palette.
+    style_resolver = None
+
+    def get_style(self, name, *, default=None):
+        resolver = self.style_resolver
+        if resolver is not None and isinstance(name, str):
+            style = resolver(name)
+            if style is not None:
+                return style
+        return super().get_style(name, default=default)
+
     def print(self, *objects, **kwargs):
         ui = current(self)
         # Rich refreshes by printing a Control. These must reach Live even
@@ -58,7 +70,7 @@ class AppendInput:
         self._thinking_t0 = self._t0
         self._paused = False
         self._live = None
-        self._spinner = Spinner("dots", style="#3fb950")
+        self._spinner = Spinner("dots", style="accent")
         self._spinner.frames = list(symbols.SPINNER_RELAY)
         self._spinner.interval = symbols.SPINNER_INTERVAL_MS
 
@@ -98,7 +110,7 @@ class AppendInput:
         header = ("─╮ " if entries else "") + label
         header += f" {time.monotonic() - t0:.1f}s · {model or '—'} · {mode}"
         self._spinner.text = Text(
-            transcript_view.crop_cells(header, max(1, width - 3)), style="#8b949e")
+            transcript_view.crop_cells(header, max(1, width - 3)), style="muted")
         if not entries:
             return self._spinner
         # Newlines and tabs from a paste stay in the submitted message, but
@@ -123,7 +135,7 @@ class AppendInput:
             row += transcript_view.crop_cells(preview, max(0, width - len(prefix)), middle=True)
             rows.append(row)
         return Group(self._spinner, *(
-            Text(transcript_view.crop_cells(row, width), style="#8b949e", no_wrap=True)
+            Text(transcript_view.crop_cells(row, width), style="muted", no_wrap=True)
             for row in rows))
 
     def set_draft(self, text):

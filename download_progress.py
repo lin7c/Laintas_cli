@@ -16,9 +16,8 @@ from rich.console import Console
 from rich.live import Live
 from rich.text import Text
 
-ACCENT = "#3fb950"
-MUTED = "#8b949e"
-TRACK = "#484f58"
+import terminal_theme
+
 INTERVAL = 0.15
 
 
@@ -89,9 +88,15 @@ class DownloadMeter:
 
     @property
     def styles(self):
+        # Names and values are body text: the terminal's own foreground.
+        mode = terminal_theme.active()
+        if mode == "mono":
+            return {"accent": "bold", "muted": "", "track": "", "error": "bold",
+                    "foreground": "", "value": "bold"}
         return {
-            "accent": ACCENT, "muted": MUTED, "track": TRACK,
-            "error": "#f85149", "foreground": "#c9d1d9", "value": "bold #e6edf3",
+            **{role: terminal_theme.color(role, mode)
+               for role in ("accent", "muted", "track", "error")},
+            "foreground": "", "value": "bold",
         }
 
     def header(self, width: int) -> Text:

@@ -6,6 +6,7 @@ import collections
 import copy
 import functools
 import background_compaction
+import terminal_theme
 import prompt_budget
 import fnmatch
 import os
@@ -194,7 +195,7 @@ _DEFAULT_CONFIG = {
     "browser_auto_snapshot": True,     # return page snapshot after state-changing browser actions
     "detail": False,                   # Record per-conversation tool/AI details for /detail trace; live rendering is unchanged
     "stream_preview": "one",          # off / one / detail (three-line bounded tail)
-    "theme": "dark",                  # dark / light / mono semantic palette
+    "theme": "auto",                  # auto / dark / light / mono text colors
     "markdown_theme": "default",       # default / green-red / custom (custom reads the global markdown_theme.json)
     "deny_exits_loop": True,           # True = terminate the agent loop the moment the user denies an approval prompt; False = old behavior (feed denial back as a tool error and keep looping)
     "precheck_capture": False,         # Training-content capture is explicit opt-in. Operational execution never depends on it.
@@ -360,11 +361,18 @@ def get_recent_tool_failures(*, agent_id: str = "", terminal: str = "",
 # A bright green highlight band sweeps left→right across the status label
 # while the agent is thinking/streaming. Recomputed every Live draw from the
 # elapsed clock, so it flows smoothly without any extra timer.
-_SHIMMER_BASE = "#1f7a3f"
-_SHIMMER_GRAD = (
-    "#2ea043", "#3fb950", "#4ade80", "#7ee787",
-    "#b7f7c0", "#7ee787", "#4ade80", "#3fb950",
-)
+# Each band peaks away from the terminal background: brighter on a dark
+# terminal, deeper on a light one.
+_SHIMMER = {
+    "dark": ("#2ea043", (
+        "#3fb950", "#4ade80", "#7ee787", "#b7f7c0",
+        "#d3fbd8", "#b7f7c0", "#7ee787", "#4ade80",
+    )),
+    "light": ("#238636", (
+        "#1f7a34", "#176f2c", "#116329", "#0b4f1f",
+        "#063d16", "#0b4f1f", "#116329", "#176f2c",
+    )),
+}
 
 _THINKING_SPINNER_FRAMES = symbols.SPINNER_RELAY
 
@@ -377,15 +385,17 @@ def _shimmer_segments(label: str, elapsed: float) -> list[tuple[str, str]]:
     renderers visually identical without letting either renderer touch the
     other's cursor region.
     """
-    if get_runtime_config("theme") == "mono":
+    mode = terminal_theme.active()
+    if mode == "mono":
         return [("", label)]
+    base, gradient = _SHIMMER[mode]
     segments: list[tuple[str, str]] = []
-    span = len(_SHIMMER_GRAD)
+    span = len(gradient)
     head = (elapsed * 14.0) % (len(label) + span)
     for index, char in enumerate(label):
         distance = head - index
-        style = (f"bold {_SHIMMER_GRAD[int(distance)]}"
-                 if 0 <= distance < span else _SHIMMER_BASE)
+        style = (f"bold {gradient[int(distance)]}"
+                 if 0 <= distance < span else base)
         if segments and segments[-1][0] == style:
             old_style, old_text = segments[-1]
             segments[-1] = (old_style, old_text + char)
@@ -536,7 +546,7 @@ class _ActivityStatus:
         from rich.console import Group
         from rich.text import Text
         from rich.spinner import Spinner
-        spinner = Spinner("dots", style="#3fb950")
+        spinner = Spinner("dots", style="accent")
         spinner.frames = list(symbols.SPINNER_RELAY)
         spinner.interval = symbols.SPINNER_INTERVAL_MS
         status = self
@@ -548,12 +558,12 @@ class _ActivityStatus:
                     return Text("")
                 width = max(20, (status.console.width or 80) - 1)
                 text = _shimmer_label(status.label, elapsed)
-                text.append(f" {elapsed:.1f}s", style="#8b949e")
+                text.append(f" {elapsed:.1f}s", style="muted")
                 if width >= 72:
                     text.append(
                         f" {symbols.BULLET} {_live_status_model() or '—'}"
                         f" {symbols.BULLET} {_active_mode_label()}",
-                        style="#8b949e")
+                        style="muted")
                 spinner.text = text
                 parts = [spinner]
                 if (status.detail
@@ -1012,7 +1022,7 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "repetition_policy": "How repeated behavior is handled: warn or interrupt",
     "detail": "Record tool calls, outputs, and whole-file changes for /detail trace (live display unchanged)",
     "stream_preview": "Streaming prose preview: off, one, or detail",
-    "theme": "Terminal UI theme: dark, light, or mono",
+    "theme": "Text colors for your terminal background: auto, dark, light, or mono",
     "markdown_theme": "Markdown output palette: default, green-red, or custom (custom reads the global markdown_theme.json)",
     "deny_exits_loop": "Terminate the agent loop immediately when the user denies an approval prompt",
     "precheck_capture": "Log local tool-call diagnostics to .laintas/precheck_samples.jsonl (never uploaded by laintas_cli)",
@@ -1111,7 +1121,7 @@ _RUNTIME_ENUM_CHOICES: dict[str, tuple[str, ...]] = {
     "reasoning_effort": ("auto", "none", "low", "medium", "high", "max"),
     "repetition_policy": ("warn", "interrupt"),
     "stream_preview": ("off", "one", "detail"),
-    "theme": ("dark", "light", "mono"),
+    "theme": ("auto", "dark", "light", "mono"),
     "markdown_theme": ("default", "green-red", "custom"),
     "critic_profile": ("lenient", "balanced", "strict"),
     "compact_review_effort": ("auto", "none", "low", "medium", "high", "max"),
@@ -10743,6 +10753,33 @@ _EVOLUTION_LAB_ALLOWED_TOOLS = frozenset({
 _PROTOCOL_TOOLS = ("task.complete", "agent_return", "agent.ask_parent")
 
 
+#: Process-wide tool narrowing from --tools / --disallow-tools. Like every
+#: other scope it only ever narrows, and it applies to sub-agents too.
+_startup_tool_allow: Optional[list] = None
+_startup_tool_deny: list = []
+#: Text from --append-system-prompt, added after the product prompt.
+_startup_prompt_append: str = ""
+
+
+def set_startup_tool_scope(allow: Optional[list], deny: Optional[list]) -> None:
+    global _startup_tool_allow, _startup_tool_deny
+    _startup_tool_allow = list(allow) if allow else None
+    _startup_tool_deny = list(deny or [])
+
+
+def set_startup_prompt_append(text: str) -> None:
+    global _startup_prompt_append
+    _startup_prompt_append = str(text or "").strip()
+
+
+def _tool_allowed_at_startup(name: str) -> bool:
+    if name in _PROTOCOL_TOOLS:
+        return True
+    if any(name == pat or fnmatch.fnmatchcase(name, pat) for pat in _startup_tool_deny):
+        return False
+    return _tool_in_scope(name, _startup_tool_allow)
+
+
 def _tool_in_scope(name: str, scope: Optional[list]) -> bool:
     """Whether a workflow node's tool scope permits ``name``.
 
@@ -10803,6 +10840,8 @@ def _allowed_tool_names_for_state(
     scope = state.get("_tool_allowlist")
     if scope:
         names = {name for name in names if _tool_in_scope(name, scope)}
+    if _startup_tool_allow or _startup_tool_deny:
+        names = {name for name in names if _tool_allowed_at_startup(name)}
     return names
 
 
@@ -11022,6 +11061,14 @@ def _authorize_tool_call(
         return {
             "ok": False,
             "error": f"BLOCKED: tool '{name}' not allowed in current workflow phase",
+            "tool": name, "returncode": -1,
+        }
+    if not _tool_allowed_at_startup(name):
+        return {
+            "ok": False,
+            "error": (
+                f"BLOCKED: tool '{name}' is disabled for this run "
+                "(--tools / --disallow-tools)"),
             "tool": name, "returncode": -1,
         }
     tool_scope = state.get("_tool_allowlist")
@@ -12259,6 +12306,14 @@ def run_agent_loop(
         prompt_template = _private_prompt_read(deps, str(paths.project_file(paths.CWD_CLI_PROP))) or ""
         if not prompt_template:
             prompt_template = deps.generate_prompt()
+        if _startup_prompt_append:
+            # Appended, never substituted: the product prompt carries the
+            # safety, tool and completion contracts.
+            prompt_template = (
+                prompt_template.rstrip()
+                + "\n\n<startup_instructions>\n"
+                + _startup_prompt_append
+                + "\n</startup_instructions>\n")
         prompt_override = (state.get('_prompt_override') or "").strip()
         if prompt_override:
             prompt_template = (
@@ -13262,7 +13317,7 @@ def run_agent_loop(
 
                 # Create the Spinner ONCE — a fresh Spinner resets start_time
                 # on each draw, freezing the animation on frame 0.
-                _spinner = Spinner("dots", style="#3fb950")
+                _spinner = Spinner("dots", style="accent")
                 _spinner.frames = list(symbols.SPINNER_RELAY)
                 _spinner.interval = symbols.SPINNER_INTERVAL_MS
 
@@ -13290,11 +13345,11 @@ def run_agent_loop(
                     # region fixed to one line in compact mode. Only glyph
                     # styles change; text width and layout never change.
                     _txt = _shimmer_label(_label, _elapsed)
-                    _txt.append(f" {_elapsed:.1f}s", style="#8b949e")
+                    _txt.append(f" {_elapsed:.1f}s", style="muted")
                     if _detail:
                         _txt.append(
                             f" {symbols.BULLET} {symbols.ARROW_U}{_fmt_tokens(_cur_in_est)} {symbols.ARROW_D}{_fmt_tokens(_cur_out_est)}",
-                            style="#8b949e",
+                            style="muted",
                         )
                     if _cw >= 72:
                         # What was asked for, and what the serving account
@@ -13308,7 +13363,7 @@ def run_agent_loop(
                         else:
                             _gear_label = _spin_effort
                         _gear = f" {symbols.BULLET} {_gear_label}" if _gear_label else ""
-                        _txt.append(f" {symbols.BULLET} {_spin_model}{_gear} {symbols.BULLET} {_spin_mode}", style="#8b949e")
+                        _txt.append(f" {symbols.BULLET} {_spin_model}{_gear} {symbols.BULLET} {_spin_mode}", style="muted")
                     _spinner.text = _txt
                     parts.append(_spinner)
                     # Reserve a constant number of preview rows for the whole
@@ -13334,7 +13389,7 @@ def run_agent_loop(
                         cmd_preview = stream_state["command"]
                         if len(cmd_preview) > 120:
                             cmd_preview = cmd_preview[:117] + "..."
-                        parts.append(Text(f"→ {cmd_preview}", style="#2ea043"))
+                        parts.append(Text(f"→ {cmd_preview}", style="accent.dim"))
                     return Group(*parts)
 
                 # Wrapper that re-computes _render() on every draw so the

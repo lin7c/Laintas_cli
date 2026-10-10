@@ -74,6 +74,38 @@ python3 laintas_cli.py
 
 Optional browser, MCP, and advanced web-fetch dependencies are documented in `requirements.txt`.
 
+### Launch options
+
+Options given at launch apply to that run only. They never write your saved
+preferences, so `--model x` today does not change what a plain launch uses
+tomorrow; `/model`, `/mode`, `/config` and `/theme` remain the way to save a
+choice.
+
+```bash
+laintas-cli "fix the failing test"            # opens a session with this as the first message
+laintas-cli "summarize the diff" > notes.txt  # piped output: runs once, like --execute
+git diff | laintas-cli -e -                    # - reads the task from standard input
+laintas-cli -e "run the checks" --model ID --mode review --max-loops 10
+laintas-cli -e "apply the plan" --yes --output-format json
+```
+
+| Option | Effect for this run |
+|---|---|
+| `--cwd DIR` | Work in `DIR` |
+| `--model ID`, `--route NAME` | Model, or a direct model route |
+| `--mode NAME`, `--plan` | Working mode; `--plan` starts in PLAN mode |
+| `--auto-approve none\|writes\|commands\|all`, `--yes` | What is approved without asking. The command policy still applies |
+| `--effort LEVEL`, `--max-loops N`, `--config KEY=VALUE` | Any `/config` setting; `--config` repeats |
+| `--theme NAME`, `--no-color`, `--verbose` | Text colors, colorless output, detail recording |
+| `--append-system-prompt TEXT`, `--append-system-prompt-file FILE` | Extra instructions after the system prompt. The product prompt is never replaced |
+| `--tools LIST`, `--disallow-tools LIST` | Narrow the tools offered (comma-separated names or globs). Applies to sub-agents too |
+| `--mcp-config FILE` | Load MCP servers from `FILE` |
+| `--resume [SESSION_ID]` | Resume the latest session here, or one by `--session-id` name, saved id or prefix, or its number in `/resume` |
+| `--output-format json` | With `--execute`: one JSON object on standard output (`success`, `result`, `error`, `exit_code`, `session_id`, `model`, `mode`, `cwd`, `duration_ms`); everything else goes to standard error |
+
+Standard input is read only when the task is `-`, so an unattended caller that
+leaves a pipe open cannot stall a run.
+
 ### Use from an ACP editor (Zed & friends)
 
 The CLI speaks the [Agent Client Protocol](https://agentclientprotocol.com)
@@ -385,7 +417,7 @@ Agent roles and workflow phases can narrow tools and specialize instructions for
 
 For new domain behavior, prefer composing roles and workflows with registered skill/MCP/extension tools. Editing `hwo_runner.py`, `workflow_engine.py`, or UI internals directly is core development, not a compatibility-stable customization path.
 
-Theme and terminal behavior are user preferences exposed by commands such as `/theme` and `/config`. Resource screens inherit shared styles and key bindings; specialized live workspaces add only interactions required by their domain.
+Theme and terminal behavior are user preferences exposed by commands such as `/theme` and `/config`. `/theme` only chooses text colors and never repaints the terminal: `auto` (the default) asks the terminal for its background once and picks text made for a dark or a light one, `dark` and `light` set that choice by hand, and `mono` uses no color. Body text always keeps the terminal's own foreground. Resource screens inherit shared styles and key bindings; specialized live workspaces add only interactions required by their domain.
 
 ## Security Boundaries
 

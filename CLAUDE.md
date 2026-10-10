@@ -26,7 +26,12 @@ source venv/bin/activate                 # Python venv lives in ./venv
 python laintas_cli.py                    # Run from source (interactive REPL)
 python laintas_cli.py --execute "task"   # Non-interactive single task
 python laintas_cli.py --backend URL      # Override LAINTAS_BACKEND
+python laintas_cli.py -e "task" --model ID --yes --output-format json
 ```
+
+Launch flags (`--model`, `--mode`, `--config KEY=VALUE`, `--theme`, …) are
+process-only overrides applied in `_apply_startup_overrides`; they must never
+write `terminal_preferences`. See "Launch options" in `README.md`.
 
 There IS a test suite — ~185 files under `tests/`, ~3,500 test functions. Activate the venv first (`source venv/bin/activate`); two modules import `pytest`, which the system python lacks.
 

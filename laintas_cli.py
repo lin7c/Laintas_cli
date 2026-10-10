@@ -358,62 +358,50 @@ from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from prompt_toolkit.application.current import get_app
 
 # ── Central UI theme ──────────────────────────────────────────────────
-# Minimal palette: one accent, muted secondaries, semantic status colors.
-# Use these names instead of inline literals so the whole UI restyles here.
-LAINTAS_THEME = Theme({
-    "accent":   "#3fb950",          # primary action / active state
-    "accent.dim": "#2ea043",
-    "success":  "#4ade80",
-    "error":    "bold #f85149",
-    "warning":  "#e3b341",
-    "foreground": "#e6edf3",
-    "muted":    "#8b949e",
-    "subtle":   "#6e7681",
-    "surface":  "on #161b22",
-    "selected": "bold #f0f6fc on #21262d",
-    "agent":    "#a78bfa",          # agent / orchestration (soft violet, kept distinct)
-    "path":     "#c9d1d9",
-    "glyph":    "#3fb950",
-    "rule":     "#30363d",
-    # Rich's default Markdown inline-code style is cyan on black. Keep all
-    # ordinary/model text on the terminal's default background instead.
-    "markdown.code": "white",
-    "markdown.code_block": "white",
-})
+# Text colors only; the terminal keeps its own background. Body text uses
+# the terminal's default foreground and the palette lives in terminal_theme.
+# Use the semantic names instead of inline literals so the UI restyles there.
+import terminal_theme
+
+LAINTAS_THEME = Theme(terminal_theme.rich_styles("dark"))
 
 
-class _PlainWhiteSyntaxTheme(SyntaxTheme):
-    """Code blocks use plain white text and inherit the terminal background."""
+class _ThemeSyntax(SyntaxTheme):
+    """Uncolored code tokens, optionally on the theme's code plate."""
+
+    def __init__(self, plated: bool):
+        self._plated = plated
 
     def get_style_for_token(self, token_type) -> RichStyle:
-        return RichStyle(color="white")
+        # A painted plate needs its paired text color; without one the code
+        # keeps the terminal's own foreground.
+        mode = terminal_theme.active()
+        if self._plated and mode != "mono":
+            return RichStyle(color=terminal_theme.color("plate_fg", mode))
+        return RichStyle()
 
     def get_background_style(self) -> RichStyle:
+        mode = terminal_theme.active()
+        if self._plated and mode != "mono":
+            return RichStyle(bgcolor=terminal_theme.color("plate_bg", mode))
         return RichStyle()
 
 
-class _PlatedWhiteSyntaxTheme(_PlainWhiteSyntaxTheme):
-    """Same white tokens, but the whole block sits on a dark plate."""
-
-    def get_background_style(self) -> RichStyle:
-        return RichStyle(bgcolor="#161b22")
-
-
-_PLAIN_WHITE_SYNTAX = _PlainWhiteSyntaxTheme()
-_PLATED_WHITE_SYNTAX = _PlatedWhiteSyntaxTheme()
+_PLAIN_SYNTAX = _ThemeSyntax(plated=False)
+_PLATED_SYNTAX = _ThemeSyntax(plated=True)
 
 
 class LaintasMarkdown(RichMarkdown):
     """Markdown renderer with no baked-in black/blue code treatment.
 
-    Fenced code blocks render on a dark plate (#161b22, same as the
-    ``surface`` semantic color); inline code stays on the terminal background.
+    Fenced code blocks render on the theme's code plate with its paired text
+    color; prose and inline code stay on the terminal's own colors.
     """
 
     def __init__(self, markup: str, **kwargs):
-        kwargs.setdefault("code_theme", _PLATED_WHITE_SYNTAX)
-        kwargs.setdefault("inline_code_theme", _PLAIN_WHITE_SYNTAX)
-        kwargs.setdefault("style", "white")
+        kwargs.setdefault("code_theme", _PLATED_SYNTAX)
+        kwargs.setdefault("inline_code_theme", _PLAIN_SYNTAX)
+        kwargs.setdefault("style", "foreground")
         super().__init__(markup, **kwargs)
 
 
@@ -433,6 +421,8 @@ console = append_input.AppendConsole(
     style="foreground",
     no_color=_no_color_requested(),
 )
+
+console.style_resolver = terminal_theme.StyleResolver(LAINTAS_THEME.styles, "dark")
 
 # ── /agents mirror: the shared console tees every chunk into the current
 # Agent's ANSI scrollback so the full-screen view can show the real REPL
@@ -456,19 +446,19 @@ console.file = repl_mirror.TeeFile(_mirror_target_agent_id)
 # (h1 -> markdown.h1, bold -> markdown.strong, italic -> markdown.em,
 # quote -> markdown.block_quote; headings h1..h6 are looked up by
 # rich.markdown.Heading). An empty string means "no style override" (keep the
-# Rich/terminal default). The `default` palette preserves the pre-existing
-# plain-white behavior.
+# Rich/terminal default). The `default` palette leaves model output in the
+# terminal's own text color.
 _MARKDOWN_THEMES: dict[str, dict[str, str]] = {
     "default": {
         "h1": "", "h2": "", "h3": "", "h4": "", "h5": "", "h6": "",
-        "code": "white", "code_block": "white", "link": "",
+        "code": "", "code_block": "", "link": "",
         "bold": "", "italic": "", "quote": "",
     },
     "green-red": {
         "h1": "bold #4ade80", "h2": "bold #22c55e",      # green titles
         "h3": "bold #f85149", "h4": "bold #f85149",       # red sub-titles
         "h5": "#f85149", "h6": "#f85149",
-        "code": "white", "code_block": "white", "link": "",
+        "code": "", "code_block": "", "link": "",
         "bold": "", "italic": "", "quote": "",
     },
 }
@@ -497,23 +487,10 @@ for _preset_name, _preset in _MARKDOWN_THEMES.items():
 
 # Semantic palette variants applied on top of the shared Console.
 _THEME_VARIANTS = {
-    "dark": LAINTAS_THEME,
-    "light": Theme({
-        "accent": "#176f2c", "accent.dim": "#238636", "success": "#116329",
-        "error": "bold #cf222e", "warning": "#9a6700", "foreground": "#24292f",
-        "muted": "#57606a", "subtle": "#6e7781", "surface": "on #f6f8fa",
-        "selected": "bold #24292f on #d0d7de", "agent": "#8250df",
-        "path": "#24292f", "glyph": "#176f2c", "rule": "#d0d7de",
-        "markdown.code": "#24292f", "markdown.code_block": "#24292f",
-    }),
-    "mono": Theme({
-        "accent": "bold", "accent.dim": "dim", "success": "bold",
-        "error": "bold reverse", "warning": "bold", "foreground": "",
-        "muted": "dim", "subtle": "dim", "surface": "", "selected": "reverse",
-        "agent": "bold", "path": "", "glyph": "bold", "rule": "dim",
-        "markdown.code": "", "markdown.code_block": "",
-    }),
+    name: Theme(terminal_theme.rich_styles(name)) for name in ("dark", "light", "mono")
 }
+
+
 def _load_markdown_palette(name: str) -> dict[str, str]:
     """Resolve a markdown_theme value to a complete {key: style} palette.
 
@@ -574,18 +551,20 @@ def _markdown_theme_styles(palette: dict[str, str]) -> dict[str, str]:
 _console_theme_pushed = False
 
 
-def _apply_ui_theme(name: str) -> str:
-    """Apply a semantic Rich theme without replacing the shared Console."""
+def _apply_ui_theme(name: str, *, refresh: bool = False) -> str:
+    """Apply a theme setting to the shared Console; return the resolved mode.
+
+    ``auto`` follows the terminal's background (asked once per process, or
+    again with ``refresh``); the result is always dark, light or mono.
+    """
     global _console_theme_pushed
-    normalized = str(name or "dark").strip().lower()
-    if normalized not in _THEME_VARIANTS:
-        raise ValueError("theme expects dark, light, or mono")
+    resolved = terminal_theme.resolve(name, refresh=refresh)
     # Merge the semantic palette with the active Markdown palette so one
     # push_theme call covers both; markdown_theme="default" contributes no
-    # heading overrides and preserves the historical plain-white rendering.
+    # overrides and leaves model output in the terminal's own text color.
     palette = _load_markdown_palette(get_runtime_config("markdown_theme"))
     merged = Theme({
-        **_THEME_VARIANTS[normalized].styles,
+        **_THEME_VARIANTS[resolved].styles,
         **_markdown_theme_styles(palette),
     })
     if _console_theme_pushed:
@@ -595,7 +574,80 @@ def _apply_ui_theme(name: str) -> str:
             pass
     console.push_theme(merged, inherit=False)
     _console_theme_pushed = True
-    return normalized
+    terminal_theme.set_active(resolved)
+    console.style_resolver = terminal_theme.StyleResolver(merged.styles, resolved)
+    return resolved
+
+
+def _warn_theme_mismatch(name: str) -> None:
+    """Say so when a hand-picked theme fights the terminal's background.
+
+    dark and light only choose text colors; the terminal keeps its own
+    background, so the wrong one leaves text close to unreadable.
+    """
+    if name not in ("dark", "light"):
+        return
+    background = terminal_theme.detect_background()
+    if background and background != name:
+        console.print(
+            f"[warning]Your terminal background looks {background}; "
+            f"{name} text is made for a {name} background. "
+            "Use /theme auto to follow the terminal.[/warning]")
+
+
+def _theme_startup_notice(setting: str, saved: bool) -> None:
+    """Say once how text colors were chosen, then never again.
+
+    A new user learns that colors follow the terminal and where to change
+    them; a saved choice that fights the terminal is pointed out a single
+    time rather than at every launch.
+    """
+    marker = paths.LAINTAS_HOME / "theme_notice_shown"
+    try:
+        if marker.exists() or not sys.stdout.isatty():
+            return
+    except (OSError, ValueError):
+        return
+    background = terminal_theme.detect_background()
+    if saved:
+        if setting not in ("dark", "light") or not background or background == setting:
+            return
+        _warn_theme_mismatch(setting)
+    elif background:
+        console.print(
+            f"[muted]Text colors follow your {background} terminal background. "
+            "Change them with /theme.[/muted]")
+    else:
+        console.print(
+            "[muted]Text colors assume a dark terminal background. "
+            "Use /theme light if yours is light.[/muted]")
+    try:
+        marker.write_text("", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _restore_typeahead() -> None:
+    """Hand back what was typed while the terminal answered the theme probe.
+
+    Finished lines are submitted in order; an unfinished one returns to the
+    prompt for the user to complete.
+    """
+    global _pending_prompt_default
+    typed = terminal_theme.take_typeahead()
+    if not typed:
+        return
+    *lines, rest = typed.split("\n")
+    for line in lines:
+        if line.strip():
+            _enqueue_user_input(line)
+    if rest:
+        _pending_prompt_default = rest
+
+
+def _ui_theme_mode() -> str:
+    """The resolved mode for prompt_toolkit styles: dark, light or mono."""
+    return terminal_theme.resolve_quietly(get_runtime_config("theme"))
 
 
 def _ptk_fragments(pairs):
@@ -1057,7 +1109,7 @@ def select_dialog(
             return sum(text.count("\n") for _style, text in lines)
 
         if title:
-            lines.append(("bold #e6edf3", f"{title}\n"))
+            lines.append(("bold", f"{title}\n"))
 
         vis = _clamp_sel()
 
@@ -1354,14 +1406,22 @@ def select_dialog(
         ))
 
     layout = Layout(HSplit(layout_panes))
-    style = Style.from_dict({
-        "selected": "bold #f0f6fc bg:#21262d",
-        "option": "#e6edf3",
-        "muted": "#8b949e",
-        "search-label": "bold #8b949e",
-        "search-input": "#e6edf3 bg:#161b22",
-        "auto-confirm": "#e3b341",
-    })
+    _mode = _ui_theme_mode()
+    if _mode == "mono":
+        style = Style.from_dict({
+            "selected": "bold reverse", "option": "", "muted": "",
+            "search-label": "bold", "search-input": "", "auto-confirm": "bold",
+        })
+    else:
+        _c = lambda role: terminal_theme.color(role, _mode)
+        style = Style.from_dict({
+            "selected": f"bold {_c('selected_fg')} bg:{_c('selected_bg')}",
+            "option": "",
+            "muted": _c("muted"),
+            "search-label": f"bold {_c('muted')}",
+            "search-input": f"{_c('plate_fg')} bg:{_c('plate_bg')}",
+            "auto-confirm": _c("warning"),
+        })
 
     app = Application(
         layout=layout,
@@ -3941,7 +4001,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/debug", "Browse or export debug entries", "Config & Tools", "/debug [clear|N|N <file> [--raw]]", subcommands=("clear",)),
     CommandSpec("/why", "Explain a recent tool failure", "Config & Tools", "/why [N|tool|terminal|agent]"),
     CommandSpec("/stream", "Set bounded streaming preview", "Config & Tools", "/stream [off|one|detail]", subcommands=("off", "one", "detail")),
-    CommandSpec("/theme", "Set terminal color theme", "Config & Tools", "/theme [dark|light|mono]", subcommands=("dark", "light", "mono")),
+    CommandSpec("/theme", "Set text colors for your terminal background", "Config & Tools", "/theme [auto|dark|light|mono]", subcommands=("auto", "dark", "light", "mono")),
     CommandSpec("/detail", "Record and browse conversation execution details", "Config & Tools", "/detail [on|off|trace [N]]", subcommands=("on", "off", "trace")),
     CommandSpec("/undo", "Restore a git checkpoint", "History", "/undo [sha]"),
     CommandSpec("/snapshot", "Create a git checkpoint", "History", "/snapshot [label]"),
@@ -5097,36 +5157,45 @@ class MetaCompleter(Completer):
 
 def _build_prompt_style() -> Style:
     """Build prompt_toolkit Style for the prompt, completion menu, and status bar."""
-    mode = str(get_runtime_config("theme") or "dark")
-    palettes = {
-        "dark": ("#c9d1d9", "#2ea043", "#4ade80", "#e3b341", "#8b949e", "#6e7681", "#a78bfa", "#161b22", "#21262d"),
-        "light": ("#24292f", "#176f2c", "#116329", "#9a6700", "#57606a", "#6e7781", "#8250df", "#f6f8fa", "#d0d7de"),
-        "mono": ("", "", "", "", "", "", "", "", "reverse"),
-    }
-    path, accent, success, warning, muted, subtle, agent, menu, selected = palettes.get(mode, palettes["dark"])
-    # The logo's red has no other job in the chrome, so it is not part of the
-    # shared palette tuple. Mono deliberately gets nothing: that theme is
-    # colourless by contract and bold alone still reads.
-    logo_red = {"dark": "#f85149", "light": "#cf222e", "mono": ""}.get(mode, "#f85149")
-    menu_bg = f"bg:{menu}" if menu.startswith("#") else menu
-    selected_bg = f"bg:{selected}" if selected.startswith("#") else selected
+    mode = _ui_theme_mode()
+    if mode == "mono":
+        # Mono deliberately gets nothing: that theme is colourless by
+        # contract and bold alone still reads.
+        accent = success = warning = muted = subtle = agent = ""
+        logo_green = logo_red = menu_text = menu_meta = ""
+        menu_bg, selected_bg = "", "reverse"
+    else:
+        accent, success, warning, muted, subtle, agent = (
+            terminal_theme.color(role, mode) for role in
+            ("accent_dim", "success", "warning", "muted", "subtle", "agent"))
+        # The L> mark keeps the banner logo's own two colours, independent of
+        # the status palette.
+        logo_green = {"dark": "#4ade80", "light": "#116329"}[mode]
+        logo_red = {"dark": "#f85149", "light": "#cf222e"}[mode]
+        # Rows that paint a background carry their paired text colour.
+        menu_text = terminal_theme.color("menu_fg", mode)
+        menu_meta = terminal_theme.color("menu_meta", mode)
+        menu_bg = "bg:" + terminal_theme.color("plate_bg", mode)
+        selected_bg = "bg:" + terminal_theme.color("selected_bg", mode)
+    # Paths and counters are body text: the terminal's own foreground.
+    path = ""
     return Style.from_dict({
         "prompt-path": path,
         "prompt-gutter": f"{accent} bold",
         "prompt-gutter-plan": f"{warning} bold",
-        "prompt-caret": success,
+        "prompt-caret": logo_green,
         "prompt-agent": f"{agent} bold",
         "prompt-agent-sup": muted,
         "separator": accent,
         "paste-placeholder": f"bold {success}",
         # Slash-command completion menu keeps its established visual identity.
         "completion-menu": menu_bg,
-        "completion-menu.completion": f"{menu_bg} {path}",
-        "completion-menu.completion.current": f"{selected_bg} {path} bold",
-        "completion-menu.meta.completion": f"{menu_bg} {muted}",
-        "completion-menu.meta.completion.current": f"{selected_bg} {muted}",
+        "completion-menu.completion": f"{menu_bg} {menu_text}",
+        "completion-menu.completion.current": f"{selected_bg} {menu_text} bold",
+        "completion-menu.meta.completion": f"{menu_bg} {menu_meta}",
+        "completion-menu.meta.completion.current": f"{selected_bg} {menu_meta}",
         # Bottom status bar also inherits the terminal background.
-        "bottom-toolbar": "#ffffff",
+        "bottom-toolbar": path,
         "stbar-sep": subtle,
         "stbar-model": f"{accent} bold",
         "stbar-mode-act": f"{success} bold",
@@ -5138,7 +5207,7 @@ def _build_prompt_style() -> Style:
         "stbar-dot-plan": f"{warning} bold",
         # rprompt (right side of prompt line — no background)
         # The L> mark, same two colours as the banner logo.
-        "rprompt-logo-l": f"{success} bold",
+        "rprompt-logo-l": f"{logo_green} bold",
         "rprompt-logo-gt": f"{logo_red} bold",
         "rprompt-logo-count": f"{accent} bold",
         "rprompt-mode-act": f"{success} bold",
@@ -5147,7 +5216,7 @@ def _build_prompt_style() -> Style:
         "rprompt-model": muted,
         "rprompt-context": agent,
         # Alt+1..9 positional slot-selection highlight (right prompt).
-        "rprompt-slot-selected": f"{selected_bg} {path} bold",
+        "rprompt-slot-selected": f"{selected_bg} {menu_text} bold",
     })
 
 
@@ -7484,14 +7553,23 @@ def get_selected_model() -> str:
     store) is consulted as a fallback so a model set there before the
     per-terminal migration — or set as a global default — is still honoured.
     """
+    if _startup_model_override:
+        return _startup_model_override
     val = terminal_preferences.get("model", "")
     if not val:
         val = load_config().get("model", "")
     return str(val).strip() if val else ""
 
 
+#: Model named with --model: used by this process, never saved, and replaced
+#: by the first explicit /model choice.
+_startup_model_override = ""
+
+
 def set_selected_model(model: str) -> None:
     """Persist the selected model for this terminal only."""
+    global _startup_model_override
+    _startup_model_override = ""
     model = model.strip()
     if model:
         terminal_preferences.set_value("model", model)
@@ -8372,12 +8450,15 @@ def _login_via_browser_local() -> Optional[dict]:
     return None
 
 
-def ensure_auth() -> Optional[dict]:
+def ensure_auth(*, interactive: bool = True) -> Optional[dict]:
     """Ensure the user is authenticated, returning a session or ``None``.
 
     Flow: cached session → return if valid.
           No cache → ask for login method → browser or terminal.
           Expired cache → clear and return None (use /login to re-auth).
+
+    ``interactive=False`` never starts a sign-in: an unattended run has
+    nobody to complete it, and waiting on one stalls the caller.
     """
     # 1. Try cached session
     session = load_session()
@@ -8401,6 +8482,9 @@ def ensure_auth() -> Optional[dict]:
             return session
         console.print("[yellow]Session expired. Use /login to re-authenticate.[/yellow]")
         clear_session()
+        return None
+
+    if not interactive:
         return None
 
     # 2. No cached account — perform one browser/device authorization attempt.
@@ -20900,21 +20984,31 @@ def _cmd_stream(parts: list) -> None:
 
 def _cmd_theme(parts: list) -> None:
     if len(parts) == 1:
+        setting = str(get_runtime_config("theme") or "auto")
+        shown = (f"auto ({terminal_theme.active()} terminal)"
+                 if setting == "auto" else setting)
         console.print(
-            f"[muted]Theme is [bold]{escape(str(get_runtime_config('theme')))}[/bold]. "
-            "Use /theme dark|light|mono.[/muted]")
+            f"[muted]Theme is [bold]{escape(shown)}[/bold]. "
+            "Use /theme auto|dark|light|mono.[/muted]")
         return
     name = parts[1].strip().lower()
-    if len(parts) != 2 or name not in {"dark", "light", "mono"}:
-        console.print("[error]Usage: /theme \\[dark|light|mono][/error]")
+    if len(parts) != 2 or name not in terminal_theme.THEMES:
+        console.print("[error]Usage: /theme \\[auto|dark|light|mono][/error]")
         return
     set_runtime_config("theme", name)
     terminal_preferences.set_ui_preference("theme", name)
-    _apply_ui_theme(name)
+    # Asking again covers a terminal whose colors changed since startup.
+    resolved = _apply_ui_theme(name, refresh=True)
+    _restore_typeahead()
     global _prompt_session
     if _prompt_session is not None:
         _prompt_session.style = _build_prompt_style()
+    if name == "auto":
+        console.print(
+            f"[success]Theme follows your terminal: {escape(resolved)} background.[/success]")
+        return
     console.print(f"[success]Theme changed to {escape(name)}.[/success]")
+    _warn_theme_mismatch(name)
 
 
 def _cmd_why(parts: list) -> None:
@@ -21665,7 +21759,7 @@ def _attach_primary_runtime_view(agent, *, show_result: bool = True):
         _set_run_input_state("running")
         try:
             with _safe_status(
-                    f"[#3fb950]Thinking… {symbols.BULLET} primary runtime[/#3fb950]",
+                    f"[accent]Thinking… {symbols.BULLET} primary runtime[/accent]",
                     spinner="dots"):
                 while worker.is_alive():
                     worker.join(timeout=0.1)
@@ -23482,7 +23576,7 @@ def _cmd_config_import(args: list) -> None:
         ui.update(persisted)
         terminal_preferences.update({"ui": ui})
     if any(key in {"theme", "markdown_theme"} for key in keys):
-        _apply_ui_theme(str(get_runtime_config("theme") or "dark"))
+        _apply_ui_theme(str(get_runtime_config("theme") or "auto"))
     console.print(f"[green]Imported {len(keys)} setting(s) from {escape(str(path))}:[/green]")
     for key in keys:
         console.print(f"  {escape(_config_display_key(key))} = {get_runtime_config(key)!r}")
@@ -23618,7 +23712,7 @@ def _cmd_config(parts: list) -> None:
                 if terminal_preferences.is_persisted(key):
                     terminal_preferences.set_ui_preference(key, value)
                 if key in {"theme", "markdown_theme"}:
-                    _apply_ui_theme(str(get_runtime_config("theme") or "dark"))
+                    _apply_ui_theme(str(get_runtime_config("theme") or "auto"))
                 console.print(
                     f"[green]{key} = {value!r} ({type(value).__name__})[/green]")
         except (ValueError, KeyError) as e:
@@ -27222,6 +27316,8 @@ def _sync_session_approval_from_mode():
         aa = mode_manager.get_auto_approve()
     except Exception:
         aa = "none"
+    if _startup_auto_approve:
+        aa = _startup_auto_approve
     _session_approval_state["all_writes"] = aa in ("writes", "all")
     _session_approval_state["all_commands"] = aa in ("commands", "all")
 
@@ -27242,17 +27338,17 @@ def _arrow_approval_prompt(title: str, body_lines: list[str],
     def _line_markup(ln: str) -> str:
         esc = escape(ln)
         if ln.startswith("+") and not ln.startswith("+++"):
-            return f"[#9ece6a]{esc}[/#9ece6a]"
+            return f"[success]{esc}[/success]"
         if ln.startswith("-") and not ln.startswith("---"):
-            return f"[#f7768e]{esc}[/#f7768e]"
+            return f"[error]{esc}[/error]"
         if ln.startswith("@@"):
-            return f"[#7aa2f7]{esc}[/#7aa2f7]"
-        return f"[#c0c0c0]{esc}[/#c0c0c0]"
+            return f"[info]{esc}[/info]"
+        return esc
 
     # Split "action — question" back into the action word for the header.
     _action = title.split(" — ")[0] if " — " in title else title
     _target = body_lines[0] if body_lines else ""
-    _header_color = "#f85149" if destructive else "#e3b341"
+    _header_color = terminal_theme.color("error" if destructive else "warning") or "default"
 
     console.print(
         f"  [bold {_header_color}]{escape(_action)}[/bold {_header_color}]"
@@ -27393,7 +27489,7 @@ def _compact_parallel_approval_prompt(title: str, body: str, question: str, *,
 
     _cmd = body.split("\n", 1)[0]
     _agent_label = _requesting_agent_label()
-    _color = "#f85149" if destructive else "#e3b341"
+    _color = terminal_theme.color("error" if destructive else "warning") or "default"
     # Parentheses, not brackets: a literal "[y/a/n]" would be parsed by Rich
     # as an (unrecognized, zero-width) markup tag and silently vanish --
     # the exact same bracket-injection failure mode fixed earlier in the
@@ -28138,21 +28234,97 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
     return response
 
 
-def run_execute_mode(task: str, session: dict, depth: int, session_id: str = None) -> int:
+def run_execute_mode(task: str, session: dict, depth: int, session_id: str = None,
+                     *, output_format: str = "text") -> int:
+    if output_format == "json":
+        return _run_execute_mode_json(task, session, depth, session_id)
+    return _run_execute_mode_leased(task, session, depth, session_id)
+
+
+def _run_execute_mode_leased(task: str, session: dict, depth: int, session_id: str = None,
+                             report: Optional[dict] = None) -> int:
     if not session_id:
-        return _run_execute_mode(task, session, depth, session_id)
+        return _run_execute_mode(task, session, depth, session_id, report)
     cwd = os.getcwd()
     claim = {"session_id": session_id, "cwd": cwd, "owner_user_id": paths.ACCOUNT_USER_ID}
     if _acquire_resume_lease(claim) is None:
+        if report is not None:
+            report["error"] = f"session {session_id} is in use by another process"
         return 1
     try:
-        return _run_execute_mode(task, session, depth, session_id)
+        return _run_execute_mode(task, session, depth, session_id, report)
     finally:
         import peer_coordination
         peer_coordination.release_session_lease(cwd, session_id)
 
 
-def _run_execute_mode(task: str, session: dict, depth: int, session_id: str = None) -> int:
+def _run_execute_mode_json(task: str, session: dict, depth: int, session_id: str = None) -> int:
+    """Run one task and print a single JSON object on standard output.
+
+    Progress, tool output and diagnostics move to standard error for the
+    whole run, so a caller can parse standard output without filtering.
+    """
+    started = time.monotonic()
+    report = {"success": False, "result": "", "error": ""}
+    code = 1
+    _divert_stdout_for_json()
+    try:
+        code = _run_execute_mode_leased(task, session, depth, session_id, report)
+    except BaseException as exc:
+        if not isinstance(exc, (Exception, KeyboardInterrupt)):
+            raise
+        report["error"] = ("interrupted" if isinstance(exc, KeyboardInterrupt)
+                           else f"{type(exc).__name__}: {exc}")
+        code = 130 if isinstance(exc, KeyboardInterrupt) else 1
+    report.update({
+        "success": code == 0 and bool(report.get("success")),
+        "session_id": session_id or "",
+        "duration_ms": int((time.monotonic() - started) * 1000),
+    })
+    _emit_execute_json(report, code)
+    return code
+
+
+#: The real standard output while a JSON run has diverted ordinary output.
+_json_stdout = None
+
+
+def _divert_stdout_for_json() -> None:
+    """Send ordinary output to standard error until it is restored."""
+    global _json_stdout
+    if _json_stdout is None:
+        _json_stdout = sys.stdout
+        sys.stdout = sys.stderr
+
+
+def _restore_diverted_stdout():
+    """Give standard output back; return the stream that was restored."""
+    global _json_stdout
+    out = _json_stdout or sys.stdout
+    if _json_stdout is not None:
+        sys.stdout = _json_stdout
+        _json_stdout = None
+    return out
+
+
+def _emit_execute_json(report: dict, code: int) -> None:
+    """Print the single result object of a JSON run and restore output."""
+    import json
+    out = _restore_diverted_stdout()
+    payload = {"success": False, "result": "", "error": "", "session_id": ""}
+    payload.update(report)
+    payload.update({
+        "exit_code": code,
+        "model": get_selected_model() or "",
+        "mode": str(mode_manager.get_active_mode().get("name") or ""),
+        "cwd": os.getcwd(),
+    })
+    out.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    out.flush()
+
+
+def _run_execute_mode(task: str, session: dict, depth: int, session_id: str = None,
+                      report: Optional[dict] = None) -> int:
     """Non-interactive single-task execution.
 
     Called when laintas-cli is invoked with --execute. Runs one agent loop,
@@ -28205,12 +28377,16 @@ def _run_execute_mode(task: str, session: dict, depth: int, session_id: str = No
     last_output = response.get("state", {}).get("lastOutput", "")
     if last_output:
         result += "\n" + last_output
+    failure = ("" if response.get("success")
+               else str(response.get("state", {}).get("_last_error") or "").strip())
+    if report is not None:
+        report.update({"success": bool(response.get("success")),
+                       "result": result, "error": failure})
+        return 0 if response.get("success") else 1
     print(result)
-    if not response.get("success"):
+    if failure:
         # Nothing printed and status 1 told an unattended caller nothing.
-        failure = str(response.get("state", {}).get("_last_error") or "").strip()
-        if failure:
-            print(failure, file=sys.stderr)
+        print(failure, file=sys.stderr)
 
     return 0 if response.get("success") else 1
 
@@ -28275,16 +28451,225 @@ def _parse_subtask_json(text: str):
     return None
 
 
+# ── Launch options ────────────────────────────────────────────────────
+# Everything a flag sets here lasts for this process only. Preferences are
+# what /model, /mode, /config and /theme save; a launch flag never writes
+# them, so a one-off `--model x` cannot change what the next plain launch uses.
+
+#: Approval posture from --auto-approve / --yes, re-applied after the mode's
+#: own posture so the flag wins for the run.
+_startup_auto_approve: Optional[str] = None
+#: Task given as a positional argument for an interactive session.
+_startup_first_message: Optional[str] = None
+
+
+def _split_startup_list(value: Optional[str]) -> list:
+    return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def _resolve_startup_task(args) -> None:
+    """Fold the positional task and ``-`` (standard input) into the options.
+
+    At a terminal a positional task opens the session it starts; anywhere
+    else there is nobody to continue the conversation, so it runs once like
+    --execute. Standard input is read only when asked for with ``-``: an
+    unattended caller may hold a pipe open that never closes.
+    """
+    global _startup_first_message
+    if args.task is not None and args.execute is not None:
+        raise ValueError("give the task once: either as an argument or with --execute")
+
+    def read(value: str) -> str:
+        if value != "-":
+            return value
+        if sys.stdin.isatty():
+            raise ValueError("- reads the task from standard input, but nothing is piped in")
+        text = sys.stdin.read().strip()
+        if not text:
+            raise ValueError("standard input was empty; no task to run")
+        return text
+
+    if args.execute is not None:
+        args.execute = read(args.execute)
+    elif args.task is not None:
+        piped = args.task == "-"
+        task = read(args.task)
+        if piped or not (sys.stdin.isatty() and sys.stdout.isatty()):
+            args.execute = task
+        else:
+            _startup_first_message = task
+    if args.output_format != "text" and args.execute is None:
+        raise ValueError("--output-format applies to --execute (or a piped task)")
+
+
+def _apply_early_startup_options(args) -> None:
+    """Options that must be in place before anything reads the environment."""
+    if args.cwd:
+        target = os.path.abspath(os.path.expanduser(args.cwd))
+        if not os.path.isdir(target):
+            raise ValueError(f"--cwd: not a directory: {args.cwd}")
+        os.chdir(target)
+    if args.route:
+        import model_route
+        os.environ[model_route.ENV_OVERRIDE] = args.route.strip()
+    if args.mcp_config:
+        target = Path(os.path.abspath(os.path.expanduser(args.mcp_config)))
+        if not target.is_file():
+            raise ValueError(f"--mcp-config: no such file: {args.mcp_config}")
+        import mcp_client
+        mcp_client.CONFIG_PATH = target
+    if args.append_system_prompt_file:
+        try:
+            extra = Path(os.path.expanduser(args.append_system_prompt_file)).read_text(
+                encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(f"--append-system-prompt-file: {exc}") from None
+        args.append_system_prompt = "\n\n".join(
+            part for part in (args.append_system_prompt, extra.strip()) if part)
+
+
+def _apply_startup_overrides(args) -> None:
+    """Apply launch flags on top of the restored preferences."""
+    global _startup_model_override, _startup_auto_approve
+    import agent_loop as _agent_loop
+
+    settings = []
+    for item in args.config:
+        key, sep, value = str(item).partition("=")
+        if not sep or not key.strip():
+            raise ValueError(f"--config expects KEY=VALUE, got: {item}")
+        settings.append((key.strip(), value.strip()))
+    # Named flags are shorthand for the same settings and win over --config.
+    if args.effort is not None:
+        settings.append(("reasoning_effort", args.effort))
+    if args.max_loops is not None:
+        settings.append(("max_loops", args.max_loops))
+    if args.verbose:
+        settings.append(("detail", True))
+    if args.theme:
+        settings.append(("theme", args.theme))
+    if args.no_color:
+        settings.append(("theme", "mono"))
+    for key, value in settings:
+        try:
+            known = set_runtime_config(key, value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key}: {exc}") from None
+        if not known:
+            raise ValueError(f"unknown setting: {key} (see /config)")
+    if args.no_color:
+        console.no_color = True
+    if args.theme or args.no_color:
+        _apply_ui_theme(str(get_runtime_config("theme") or "auto"))
+
+    if args.model:
+        _startup_model_override = args.model.strip()
+    mode = "plan" if args.plan else (args.mode or "").strip().lower()
+    if args.plan and args.mode and args.mode.strip().lower() != "plan":
+        raise ValueError("--plan and --mode name two different modes")
+    if mode == "plan":
+        import plan_mode
+        mode_manager.set_session_mode("act")
+        plan_mode.arm_plan_mode()
+    elif mode:
+        ok, message = mode_manager.set_session_mode(mode)
+        if not ok:
+            raise ValueError(message)
+    if args.yes and args.auto_approve not in (None, "all"):
+        raise ValueError("--yes and --auto-approve name two different postures")
+    _startup_auto_approve = "all" if args.yes else args.auto_approve
+    _sync_session_approval_from_mode()
+
+    allow = _split_startup_list(args.tools)
+    deny = _split_startup_list(args.disallow_tools)
+    if allow or deny:
+        _agent_loop.set_startup_tool_scope(allow, deny)
+    if args.append_system_prompt:
+        _agent_loop.set_startup_prompt_append(args.append_system_prompt)
+
+
+def _startup_resume_blob(cwd: str, selector: Optional[str], agent_id: str) -> Optional[dict]:
+    """The session --resume names: a logical id, a saved session id or prefix,
+    a 1-based number from the /resume list, or the latest when unnamed."""
+    if not selector:
+        return load_resume_state(cwd, agent_id=agent_id)
+    blob = load_resume_state(cwd, selector, agent_id=agent_id)
+    if blob:
+        return blob
+    choices = list_resume_states(cwd, agent_id=agent_id)
+    for choice in choices:
+        saved = str(choice.get("session_id")
+                    or (choice.get("state") or {}).get("_session_id") or "")
+        if saved and (saved == selector or saved.startswith(selector)):
+            return choice
+    if selector.isdigit() and 1 <= int(selector) <= len(choices):
+        return choices[int(selector) - 1]
+    if selector.lower() in ("latest", "last") and choices:
+        return choices[0]
+    return None
+
+
 def main():
     """Entry point."""
     if sys.argv[1:2] == ["pow"]:
         raise SystemExit(_run_pow_command(sys.argv[2:]))
     import argparse
 
-    parser = argparse.ArgumentParser(description="Laintas CLI — Autonomous AI agent")
+    parser = argparse.ArgumentParser(
+        description="Laintas CLI — Autonomous AI agent",
+        epilog="Options given at launch apply to this run only; nothing is "
+               "saved to your preferences.")
+    parser.add_argument(
+        "task", nargs="?", default=None,
+        help="Task to start with. At a terminal it becomes the first message "
+             "of an interactive session; with piped output it runs like "
+             "--execute. Use - to read the task from standard input.")
     parser.add_argument("--version", "-V", action="version",
                         version=RELEASE_NAME)
-    parser.add_argument("--name", type=str, help="Set agent name (shows in Helpwo AGNETS)")
+    parser.add_argument("--name", type=str, help="Set agent name (shows in Helpwo AGENTS)")
+    parser.add_argument("--cwd", type=str, default=None, metavar="DIR",
+                        help="Work in DIR instead of the current directory")
+    parser.add_argument("--model", type=str, default=None, metavar="ID",
+                        help="Model to use for this run")
+    parser.add_argument("--route", type=str, default=None, metavar="NAME",
+                        help="Direct model route to use for this run (see /model route list)")
+    parser.add_argument("--mode", type=str, default=None, metavar="NAME",
+                        help="Working mode for this run (see /mode); plan starts in PLAN mode")
+    parser.add_argument("--plan", action="store_true", default=False,
+                        help="Start in PLAN mode (same as --mode plan)")
+    parser.add_argument("--auto-approve", type=str, default=None,
+                        choices=["none", "writes", "commands", "all"],
+                        help="What to approve without asking in this run")
+    parser.add_argument("--yes", "-y", action="store_true", default=False,
+                        help="Approve file writes and commands without asking "
+                             "(same as --auto-approve all); the command policy still applies")
+    parser.add_argument("--effort", type=str, default=None, metavar="LEVEL",
+                        help="Reasoning effort: auto, none, low, medium, high, max")
+    parser.add_argument("--max-loops", type=int, default=None, metavar="N",
+                        help="Maximum agent loop iterations per task")
+    parser.add_argument("--config", "-c", action="append", default=[], metavar="KEY=VALUE",
+                        help="Set a /config value for this run; repeat for several")
+    parser.add_argument("--theme", type=str, default=None,
+                        choices=list(terminal_theme.THEMES),
+                        help="Text colors for your terminal background")
+    parser.add_argument("--no-color", action="store_true", default=False,
+                        help="Print without color")
+    parser.add_argument("--verbose", "-v", action="store_true", default=False,
+                        help="Record tool calls and outputs for /detail trace")
+    parser.add_argument("--append-system-prompt", type=str, default=None, metavar="TEXT",
+                        help="Extra instructions added after the system prompt")
+    parser.add_argument("--append-system-prompt-file", type=str, default=None, metavar="FILE",
+                        help="Read extra system-prompt instructions from FILE")
+    parser.add_argument("--tools", type=str, default=None, metavar="LIST",
+                        help="Only offer these tools (comma-separated names or globs, e.g. file.*,web.search)")
+    parser.add_argument("--disallow-tools", type=str, default=None, metavar="LIST",
+                        help="Never offer these tools (comma-separated names or globs)")
+    parser.add_argument("--mcp-config", type=str, default=None, metavar="FILE",
+                        help="Load MCP servers from FILE instead of ~/.laintas/mcp.json")
+    parser.add_argument("--output-format", type=str, default="text",
+                        choices=["text", "json"],
+                        help="Result format for --execute: json prints one object "
+                             "on standard output and everything else on standard error")
     parser.add_argument("--account", type=str, default=None,
                         help="Use a saved account alias, email or userId")
     parser.add_argument("--account-return", action="store_true", help=argparse.SUPPRESS)
@@ -28297,44 +28682,49 @@ def main():
                         help="Serve the Agent Client Protocol (ACP) over stdio "
                              "— lets ACP editors (Zed & friends) drive this CLI. "
                              "Optional: pip install agent-client-protocol")
-    parser.add_argument("--execute", "-e", type=str, default=None,
-                        help="Execute a single task non-interactively and exit")
+    parser.add_argument("--execute", "-e", type=str, default=None, metavar="TASK",
+                        help="Execute a single task non-interactively and exit; "
+                             "- reads the task from standard input")
     parser.add_argument("--session-id", type=str, default=None,
                         help="Persist/resume --execute context under this logical session id")
-    parser.add_argument("--depth", "-d", type=int, default=0,
-                        help="Nesting depth (0=user terminal, 1+=sub-agent)")
+    # Internal: set by the CLI when it launches itself as a sub-terminal.
+    parser.add_argument("--depth", "-d", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--simple-prompt", action="store_true", default=False,
                         help="Use plain input() instead of prompt_toolkit")
     parser.add_argument("--monitor-only", action="store_true", default=False,
                         help="Start as a remote executor only — register, heartbeat, "
                              "and poll HelpwoAI for tasks. No local REPL.")
-    parser.add_argument("--resume", action="store_true", default=False,
-                        help="Resume the saved conversation for this directory on startup")
+    parser.add_argument("--resume", nargs="?", const=True, default=False, metavar="SESSION_ID",
+                        help="Resume the saved conversation for this directory on "
+                             "startup, or the one saved under SESSION_ID")
     parser.add_argument("--continue", dest="continue_session", action="store_true", default=False,
                         help="Alias for --resume (session continuation)")
-    parser.add_argument("--agent-id", type=str, default=None,
-                        help="Pre-assigned agent id (used by sub-terminals)")
-    parser.add_argument("--agent-name", type=str, default=None,
-                        help="Pre-assigned agent display name (used by sub-terminals)")
+    parser.add_argument("--agent-id", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--agent-name", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--agent-role", type=str, default=None,
                         choices=["pool", "deployed", "primary", "subagent"],
-                        help="Role for the pre-assigned agent (used by sub-terminals)")
-    parser.add_argument("--terminal-name", type=str, default=None,
-                        help="Name of the terminal this sub-process represents")
-    parser.add_argument("--parent-terminal", type=str, default=None,
-                        help="Name of the parent terminal that spawned this sub-process")
-    parser.add_argument("--parent-agent-id", type=str, default=None,
-                        help="Agent id of the parent process that spawned this sub-process")
-    parser.add_argument("--remote-parent-id", type=str, default=None,
-                        help="Helpwo backend agent id of the primary CLI that owns this sub-terminal")
-    parser.add_argument("--connect", action="store_true", default=False,
-                        help="Hand this sub-terminal over to Helpwo at startup (internal; used by term-new)")
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--terminal-name", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--parent-terminal", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--parent-agent-id", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--remote-parent-id", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--connect", action="store_true", default=False, help=argparse.SUPPRESS)
     # Internal: this sub-terminal hosts an application (/helpwo, /app).
     parser.add_argument("--app", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--app-state", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--app-launch-id", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--app-options", type=str, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    try:
+        _resolve_startup_task(args)
+        _apply_early_startup_options(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    # A run's standard output is its result. First-run notices and startup
+    # diagnostics go to standard error instead of landing in front of it; a
+    # JSON run keeps that up to the end, a text run until the task starts.
+    if args.execute is not None:
+        _divert_stdout_for_json()
 
     # ACP owns stdout and authenticates non-interactively. Enter it before
     # REPL startup can print diagnostics or prompt for browser/device login.
@@ -28421,6 +28811,10 @@ def main():
     # All REPL instances use full-color console — sub-terminals are full
     # laintas-cli instances and should look identical to the main terminal.
 
+    # First-run notices print before preferences are restored; let them
+    # already match the terminal. The saved theme is applied further down.
+    _apply_ui_theme("auto")
+
     # Initialize unified home directory and auto-migrate old layout
     paths.ensure_home()
     backend_profiles.ensure_template()
@@ -28495,7 +28889,13 @@ def main():
             set_runtime_config(_key, _value)
         except (KeyError, TypeError, ValueError):
             continue
-    _apply_ui_theme(str(get_runtime_config("theme") or "dark"))
+    _apply_ui_theme(str(get_runtime_config("theme") or "auto"))
+    try:
+        _apply_startup_overrides(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    _theme_startup_notice(str(get_runtime_config("theme") or "auto"),
+                          saved="theme" in _host_ui_preferences or bool(args.theme))
     # Model/provider selection is terminal-local: it survives a relaunch in
     # this shell without affecting another concurrently open terminal.
     _update_status_cache(model=get_selected_model())
@@ -28503,7 +28903,8 @@ def main():
     # Official mode uses the Laintas account. Custom/local backends are a
     # separate trust and billing domain and must not require or receive it.
     _active_backend = get_backend_profile()
-    session = (ensure_auth() or {}) if _active_backend.sends_laintas_credentials else {}
+    session = ((ensure_auth(interactive=args.execute is None) or {})
+               if _active_backend.sends_laintas_credentials else {})
     if session.get("userId") and session["userId"] != paths.ACCOUNT_USER_ID:
         account_store.remember(paths.ROOT_HOME, session)
         _restart_after_login(session["userId"])
@@ -28624,9 +29025,15 @@ def main():
     if args.execute:
         if (_active_backend.sends_laintas_credentials
                 and not session.get("userId")):
-            console.print("[red]Authentication required for --execute mode. Use /login first.[/red]")
+            print("Not signed in. Start laintas-cli once at a terminal and sign in, "
+                  "then run this again.", file=sys.stderr)
+            if args.output_format == "json":
+                _emit_execute_json({"error": "not signed in"}, 1)
             sys.exit(1)
-        sys.exit(run_execute_mode(args.execute, session, args.depth, args.session_id))
+        if args.output_format != "json":
+            _restore_diverted_stdout()
+        sys.exit(run_execute_mode(args.execute, session, args.depth, args.session_id,
+                                  output_format=args.output_format))
 
     # ── Simple prompt (PTY subprocess mode) ──
     global _IN_SUB_TERMINAL, _USE_SIMPLE_PROMPT
@@ -28674,6 +29081,7 @@ def main():
     # /resume; it is never injected into the new session automatically.
     if args.depth == 0:
         _explicit_startup_resume = bool(args.resume or args.continue_session)
+        _startup_resume_id = args.resume if isinstance(args.resume, str) else None
         # Which agent this terminal was last using decides every session
         # namespace below (previous-live archive, fresh live session, resume
         # blob). It must be resolved BEFORE those loads, not at the registry
@@ -28762,9 +29170,9 @@ def main():
             _startup_advisories = _close_stale_admission
 
         # Only the explicit-restore path still needs the blob up front.
-        _resume_blob = (_previous_live_session if args.account_return else load_resume_state(
-                            _session_start_cwd,
-                            agent_id=_startup_agent_id)
+        _resume_blob = (_previous_live_session if args.account_return else _startup_resume_blob(
+                            _session_start_cwd, _startup_resume_id,
+                            _startup_agent_id)
                         if _explicit_startup_resume else None)
         if _resume_blob and _resume_blob.get("chat_history"):
             switched = _switch_resume_session(
@@ -28777,7 +29185,10 @@ def main():
                 console.print("[green]Resumed saved session.[/green]")
                 _print_resume_transcript({"chat_history": chat_history}, 20)
         elif _explicit_startup_resume:
-            console.print("[yellow]No saved session for this directory.[/yellow]")
+            console.print(
+                f"[yellow]No saved session {escape(_startup_resume_id)} for this directory.[/yellow]"
+                if _startup_resume_id else
+                "[yellow]No saved session for this directory.[/yellow]")
 
         # Bind /continue to the exact in-memory objects restored at startup.
         # Without this, the command mutates a deserialized session copy and the
@@ -29349,6 +29760,13 @@ def main():
 
     if args.app and args.app_state and args.depth > 0:
         _bootstrap_hosted_app(args, agent_registry, session)
+
+    # A task named at launch is the session's first message, submitted the
+    # way a typed line is. Injected lines are not echoed, so show it.
+    if _startup_first_message and args.depth == 0:
+        console.print(f"[bold]{escape(_startup_first_message)}[/bold]", highlight=False)
+        _enqueue_user_input(_startup_first_message)
+    _restore_typeahead()
 
     # Main interactive loop
 
