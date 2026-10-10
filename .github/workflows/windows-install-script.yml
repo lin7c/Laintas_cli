@@ -1,0 +1,49 @@
+name: Windows install script
+
+# Manual only: runs the published PowerShell install command on a real
+# Windows machine, in both PowerShell editions users have.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      LAINTAS_INSTALL_SILENT: "1"
+    steps:
+      - name: Keep LF line endings
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      # The same way `irm ... | iex` runs it: the script text, evaluated.
+      - name: Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          "PowerShell $($PSVersionTable.PSVersion)"
+          Get-Content -Raw laintas_cli_download/public/install.ps1 | Invoke-Expression
+          $dir = "$env:LOCALAPPDATA\laintas-cli-windows"
+          Get-ChildItem $dir | Format-Table Name, Length -AutoSize | Out-String | Write-Host
+          if (-not (Test-Path "$dir\laintas-terminal.exe")) { throw 'the window was not installed' }
+          if (-not (Test-Path "$dir\runtime\usr\bin\bash.exe")) { throw 'the runtime was not installed' }
+          & "$dir\runtime\usr\bin\bash.exe" -c 'PATH=/usr/bin:$PATH; python3 "$(cygpath -u "$LOCALAPPDATA")/laintas-cli-windows/app/laintas_cli.py" --version'
+          Get-ChildItem "$env:APPDATA\Microsoft\Windows\Start Menu\Programs" -Recurse -Filter *laintas* | ForEach-Object { "shortcut: $($_.FullName)" }
+          Start-Process -FilePath "$dir\uninstall.exe" -ArgumentList '/S' -Wait
+          Start-Sleep -Seconds 5
+          "left after uninstall: $(Test-Path "$dir\laintas-terminal.exe")"
+
+      - name: PowerShell 7
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          "PowerShell $($PSVersionTable.PSVersion)"
+          Get-Content -Raw laintas_cli_download/public/install.ps1 | Invoke-Expression
+          $dir = "$env:LOCALAPPDATA\laintas-cli-windows"
+          if (-not (Test-Path "$dir\laintas-terminal.exe")) { throw 'the window was not installed' }
+          "installed"

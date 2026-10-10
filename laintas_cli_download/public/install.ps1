@@ -1,4 +1,5 @@
-# Download the current official Windows installer and verify it before launch.
+# Install laintas-cli-windows: download the current installer, verify it, run it.
+# Set LAINTAS_INSTALL_SILENT=1 to install without the wizard.
 & {
     $ErrorActionPreference = 'Stop'
     $ProgressPreference = 'SilentlyContinue'
@@ -108,7 +109,7 @@
             Write-LaintasText $row.Substring($headLength) muted $State.Plain
         }
     }
-    function Get-LaintasDownload([string]$Url, [string]$Path, [long]$ExpectedSize) {
+    function Get-LaintasDownload([string]$Url, [string]$Path, [long]$ExpectedSize, [string]$Label = 'installer') {
         Add-Type -AssemblyName System.Net.Http
         $width = 80; $animate = $false
         try {
@@ -121,7 +122,7 @@
             Timer = [Diagnostics.Stopwatch]::StartNew(); LastPaint = -1.0
         }
         Write-LaintasText ('  ' + [char]0x2193 + ' ') activity $state.Plain
-        Write-LaintasText 'LaintasSetup.exe' foreground $state.Plain
+        Write-LaintasText $Label foreground $state.Plain
         Write-Host ''
         $client = New-Object Net.Http.HttpClient
         $cancel = New-Object Threading.CancellationTokenSource
@@ -167,12 +168,13 @@
         }
     }
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    $release = Invoke-RestMethod -Uri 'https://cli.laintas.com/windows/download.json' -ErrorAction Stop
+    $release = Invoke-RestMethod -Uri 'https://cli.laintas.com/windows-cli/download.json' -ErrorAction Stop
     $version = [string]$release.version
     $checksum = [string]$release.sha256
     $size = 0L
-    if ($version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$' -or
-        [string]$release.installer -cne "https://cli.laintas.com/windows/releases/$version/LaintasSetup.exe" -or
+    $file = "laintas-cli-windows_${version}_x64-setup.exe"
+    if ($version -notmatch '^[0-9A-Za-z][0-9A-Za-z.-]{0,40}$' -or
+        [string]$release.installer -cne "https://cli.laintas.com/windows-cli/$version/$file" -or
         $checksum -notmatch '^[0-9a-fA-F]{64}$' -or
         -not [long]::TryParse([string]$release.size_bytes, [ref]$size) -or $size -le 0) {
         throw 'The Windows release metadata is invalid. No installer was run.'
@@ -180,17 +182,22 @@
     $directory = Join-Path ([IO.Path]::GetTempPath()) ('laintas-install-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $directory -ErrorAction Stop | Out-Null
     try {
-        $installer = Join-Path $directory 'LaintasSetup.exe'
-        Write-Host "Laintas Windows v$version"
-        Get-LaintasDownload $release.installer $installer $size
+        $installer = Join-Path $directory $file
+        Write-Host "laintas-cli-windows $version"
+        Get-LaintasDownload $release.installer $installer $size $file
         if ((Get-Item -LiteralPath $installer).Length -ne $size -or
             (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash -ine $checksum) {
             throw 'The installer failed its size or SHA-256 check. No installer was run.'
         }
-        Write-Host 'Installer verified. Opening the installation wizard...'
-        $process = Start-Process -FilePath $installer -Wait -PassThru -ErrorAction Stop
+        if ($env:LAINTAS_INSTALL_SILENT -eq '1') {
+            Write-Host 'Installer verified. Installing...'
+            $process = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru -ErrorAction Stop
+        } else {
+            Write-Host 'Installer verified. Opening the installation wizard...'
+            $process = Start-Process -FilePath $installer -Wait -PassThru -ErrorAction Stop
+        }
         if ($process.ExitCode -ne 0) { throw "The installer exited with code $($process.ExitCode)." }
-        Write-Host 'Installation completed. Start Laintas Windows from the Start menu.'
+        Write-Host 'Installation completed. Start laintas-cli-windows from the Start menu.'
     } finally {
         Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction SilentlyContinue
     }
