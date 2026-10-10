@@ -84,24 +84,22 @@ jobs:
           workspaces: build/windows/app/src-tauri
           cache-on-failure: true
 
+      # One build only: the build copies the payload beside the executable,
+      # and a second pass cannot overwrite the runtime's read-only files.
       - name: Build the window
         working-directory: build/windows/app
-        run: npx tauri build --no-bundle
+        run: |
+          if ("${{ inputs.installer }}" -eq "true") { npx tauri build } else { npx tauri build --no-bundle }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem src-tauri\target\release\bundle\nsis\*.exe -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host ("installer: {0}  {1} MB" -f $_.Name, [math]::Round($_.Length / 1MB))
+          }
 
       - name: Test the real window
         working-directory: build/windows/app
         run: |
           $root = (Resolve-Path payload).Path
           node scripts/window_test.mjs src-tauri\target\release\laintas-terminal.exe $root test-out
-
-      - name: Build the installer
-        if: inputs.installer
-        working-directory: build/windows/app
-        run: |
-          npx tauri build
-          Get-ChildItem src-tauri\target\release\bundle\nsis\*.exe | ForEach-Object {
-            Write-Host ("installer: {0}  {1} MB" -f $_.Name, [math]::Round($_.Length / 1MB))
-          }
 
       # The installed copy is tested where real users trip: an install path
       # and a user profile with a space and non-ASCII characters in them.

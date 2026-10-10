@@ -20,7 +20,13 @@ GIT_KEEP = {"git.exe", "git-receive-pack.exe", "git-upload-pack.exe",
 REMOVE_DIRS = (
     "usr/share/locale", "usr/share/doc", "usr/share/man", "usr/share/info",
     "usr/share/gtk-doc", "usr/include", "var/cache", "var/lib/pacman/sync",
+    # Cross-toolchain copies of the binutils; nothing here runs them.
+    "usr/x86_64-pc-cygwin",
 )
+# The package manager and its helpers: the runtime is replaced whole by the
+# installer and never updated in place.
+REMOVE_BIN = ("pacman.exe", "pacman-conf.exe", "pactree.exe", "testpkg.exe",
+              "vercmp.exe", "pacman-db-upgrade", "pacman-key", "makepkg")
 PYTHON_REMOVE = ("test", "idlelib", "tkinter", "turtledemo", "lib2to3")
 
 
@@ -64,6 +70,11 @@ def trim(root: str) -> None:
     print(f"git built-in copies removed: {_dedupe_git(root)}")
     for rel in REMOVE_DIRS:
         shutil.rmtree(os.path.join(root, *rel.split("/")), ignore_errors=True)
+    for name in REMOVE_BIN:
+        try:
+            os.remove(os.path.join(root, "usr", "bin", name))
+        except OSError:
+            pass
     lib = os.path.join(root, "usr", "lib")
     for name in os.listdir(lib) if os.path.isdir(lib) else []:
         if name.startswith("python3"):
