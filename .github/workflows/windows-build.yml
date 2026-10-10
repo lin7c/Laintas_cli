@@ -109,6 +109,12 @@ jobs:
         run: |
           $setup = (Get-ChildItem src-tauri\target\release\bundle\nsis\*.exe | Select-Object -First 1).FullName
           $dir = "$env:LOCALAPPDATA\Laintas 测试 dir"
+          # Upgrade path: put the published installer there first, then
+          # install this build over it.
+          $previous = "$env:RUNNER_TEMP\previous-setup.exe"
+          Invoke-WebRequest -Uri "https://cli.laintas.com/windows-cli/beta-v3/laintas-cli-windows_beta-v3_x64-setup.exe" -OutFile $previous -UseBasicParsing
+          $old = Start-Process -FilePath $previous -ArgumentList "/S", "/D=$dir" -Wait -PassThru
+          Write-Host ("published installer exit code {0}; installed over next" -f $old.ExitCode)
           $started = Get-Date
           $install = Start-Process -FilePath $setup -ArgumentList "/S", "/D=$dir" -Wait -PassThru
           Write-Host ("installer exit code {0} after {1:n0}s" -f $install.ExitCode, ((Get-Date) - $started).TotalSeconds)
