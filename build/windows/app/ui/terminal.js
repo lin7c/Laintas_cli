@@ -6,28 +6,18 @@
   const { listen } = window.__TAURI__.event;
   const appWindow = window.__TAURI__.window.getCurrentWindow();
 
-  // The CLI asks the terminal for its background and picks its text palette
-  // to match, so these two schemes are the only place the window sets color.
-  const THEMES = {
-    dark: {
-      background: "#0d1117", foreground: "#e6edf3", cursor: "#e6edf3", cursorAccent: "#0d1117",
-      selectionBackground: "#264f78",
-      black: "#484f58", red: "#ff7b72", green: "#3fb950", yellow: "#d29922",
-      blue: "#58a6ff", magenta: "#bc8cff", cyan: "#39c5cf", white: "#b1bac4",
-      brightBlack: "#6e7681", brightRed: "#ffa198", brightGreen: "#56d364", brightYellow: "#e3b341",
-      brightBlue: "#79c0ff", brightMagenta: "#d2a8ff", brightCyan: "#56d4dd", brightWhite: "#f0f6fc",
-    },
-    light: {
-      background: "#ffffff", foreground: "#24292f", cursor: "#24292f", cursorAccent: "#ffffff",
-      selectionBackground: "#b6d7ff",
-      black: "#24292f", red: "#cf222e", green: "#116329", yellow: "#4d2d00",
-      blue: "#0969da", magenta: "#8250df", cyan: "#1b7c83", white: "#6e7781",
-      brightBlack: "#57606a", brightRed: "#a40e26", brightGreen: "#1a7f37", brightYellow: "#633c01",
-      brightBlue: "#218bff", brightMagenta: "#a475f9", brightCyan: "#3192aa", brightWhite: "#8c959f",
-    },
+  // The window is always a soft dark gray. A white background washed out
+  // several of the CLI's colors, and the CLI asks the terminal for its
+  // background and picks its text palette to match, so a gray one gets the
+  // dark palette whatever the Windows theme is.
+  const THEME = {
+    background: "#22272e", foreground: "#d6dee6", cursor: "#d6dee6", cursorAccent: "#22272e",
+    selectionBackground: "#3b5070",
+    black: "#545d68", red: "#f47067", green: "#57ab5a", yellow: "#c69026",
+    blue: "#539bf5", magenta: "#b083f0", cyan: "#39c5cf", white: "#909dab",
+    brightBlack: "#636e7b", brightRed: "#ff938a", brightGreen: "#6bc46d", brightYellow: "#daaa3f",
+    brightBlue: "#6cb6ff", brightMagenta: "#dcbdfb", brightCyan: "#56d4dd", brightWhite: "#cdd9e5",
   };
-  const scheme = window.matchMedia("(prefers-color-scheme: light)");
-  const theme = () => (scheme.matches ? THEMES.light : THEMES.dark);
 
   const term = new Terminal({
     allowProposedApi: true,
@@ -35,7 +25,7 @@
     fontFamily: '"Cascadia Mono", "Cascadia Code", Consolas, "Microsoft YaHei UI", "Microsoft YaHei", monospace',
     fontSize: 14,
     scrollback: 20000,
-    theme: theme(),
+    theme: THEME,
   });
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
@@ -55,7 +45,6 @@
   } catch (_) {
     // The default renderer stays in place where WebGL is unavailable.
   }
-  scheme.addEventListener("change", () => { term.options.theme = theme(); });
 
   const encoder = new TextEncoder();
   const send = (bytes) => invoke("term_input", { data: Array.from(bytes) }).catch(() => {});
