@@ -1,0 +1,10 @@
+{
+  "identifier": "main",
+  "description": "The terminal window, which only ever loads the bundled page",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-close",
+    "core:window:allow-set-title"
+  ]
+}

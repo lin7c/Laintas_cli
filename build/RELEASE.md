@@ -109,10 +109,12 @@ The local diagnostic modules currently registered (`event_log` / `critic` /
 serve CLI recovery and local diagnostics only; they upload nothing to the
 training pipeline.
 
-**Laintas CLI packages Linux and macOS only.** Do not build a Windows CLI,
-WSL distribution, launcher, kernel helper or Windows installer from this
-repository. Do not add Windows jobs or assets to `release.yml`,
-`scripts/build_release_assets.py` or the source-update manifest.
+**Releases package Linux and macOS only.** A Windows terminal build is in
+progress under `build/windows/` and is built and tested by the manual
+`windows-build.yml` workflow; it is not a release asset yet. Until it is, do
+not add Windows jobs or assets to `release.yml`,
+`scripts/build_release_assets.py` or the source-update manifest, and do not
+add a WSL distribution or kernel helper at all.
 
 **Windows desktop releases are independent.** The product is named
 `laintas-Helpwo-cli-for-windows`. The private project

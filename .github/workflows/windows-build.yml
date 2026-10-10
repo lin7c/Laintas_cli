@@ -1,0 +1,116 @@
+name: Windows build
+
+# Manual only. Windows runners bill at twice the Linux rate and a cold Rust
+# build takes several minutes, so this never runs on a push.
+on:
+  workflow_dispatch:
+    inputs:
+      installer:
+        description: "Also build and upload the installer"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      # The launcher and shell fixtures must keep LF endings.
+      - name: Keep LF line endings
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: build/windows/app/package-lock.json
+
+      # A fresh runtime in its own directory: what gets installed here is
+      # what ships, with nothing inherited from the runner's own copy.
+      - uses: msys2/setup-msys2@v2
+        id: runtime
+        with:
+          msystem: MSYS
+          update: false
+          location: ${{ runner.temp }}\laintas-runtime
+          install: python python-pip python-cryptography git
+
+      - name: Install the CLI's dependencies into the runtime
+        shell: msys2 {0}
+        run: |
+          python -m pip install --quiet --break-system-packages --no-warn-script-location \
+            requests certifi rich prompt_toolkit "pyte>=0.8.2,<0.9" pysocks
+          python -m pip install --quiet --break-system-packages --no-warn-script-location websockets \
+            || echo "websockets: not installable"
+          python laintas_cli.py --version
+
+      - name: Assemble the payload
+        run: |
+          python build/windows/assemble_payload.py
+          $src = "${{ steps.runtime.outputs.msys2-location }}"
+          $dst = "build\windows\app\payload\runtime"
+          robocopy $src $dst /E /NFL /NDL /NJH /NP /R:1 /W:1 `
+            /XD "$src\var\cache" "$src\tmp" "$src\home" "$src\usr\share\doc" "$src\usr\share\man" "$src\usr\share\info"
+          if ($LASTEXITCODE -ge 8) { throw "robocopy failed with $LASTEXITCODE" }
+          New-Item -ItemType Directory -Force "$dst\tmp" | Out-Null
+          $mb = [math]::Round((Get-ChildItem $dst -Recurse -File | Measure-Object Length -Sum).Sum / 1MB)
+          Write-Host "runtime: $mb MB"
+          exit 0
+
+      - name: Install window dependencies
+        working-directory: build/windows/app
+        run: npm ci
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: build/windows/app/src-tauri
+
+      - name: Build the window
+        working-directory: build/windows/app
+        run: npx tauri build --no-bundle
+
+      - name: Test the real window
+        working-directory: build/windows/app
+        run: |
+          $root = (Resolve-Path payload).Path
+          node scripts/window_test.mjs src-tauri\target\release\laintas-terminal.exe $root test-out
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: window-screenshots
+          path: build/windows/app/test-out/
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Build the installer
+        if: inputs.installer
+        working-directory: build/windows/app
+        run: npx tauri build
+
+      - name: Upload the installer
+        if: inputs.installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: laintas-windows-installer
+          path: build/windows/app/src-tauri/target/release/bundle/nsis/*.exe
+          retention-days: 3

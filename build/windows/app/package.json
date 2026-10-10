@@ -1,0 +1,18 @@
+{
+  "name": "laintas-terminal",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "vendor": "node scripts/vendor.mjs",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/addon-unicode11": "0.9.0",
+    "@xterm/addon-webgl": "0.19.0",
+    "@xterm/xterm": "6.0.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.1"
+  }
+}

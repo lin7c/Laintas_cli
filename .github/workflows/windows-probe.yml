@@ -13,7 +13,7 @@ on:
           tests/test_select_dialog.py tests/test_local_runtime.py
           tests/test_shell_idle_budget.py tests/test_subterminal_navigation.py
           tests/test_file_lock.py tests/test_child_registry.py
-          tests/test_terminal_ui.py tests/test_slash_commands.py
+          tests/test_windows_term_host.py
 
 permissions:
   contents: read
@@ -25,7 +25,7 @@ concurrency:
 jobs:
   probe:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       # Shell fixtures must keep LF endings or bash rejects them.
       - name: Keep LF line endings
@@ -49,15 +49,14 @@ jobs:
         with:
           msystem: MSYS
           update: false
-          install: python python-pip git
+          install: python python-pip python-cryptography git
 
       - name: POSIX-layer Python - environment
         shell: msys2 {0}
         run: |
-          python -m venv /tmp/venv
+          python -m venv --system-site-packages /tmp/venv
           /tmp/venv/bin/python -m pip install --quiet requests certifi rich prompt_toolkit "pyte>=0.8.2,<0.9" pysocks pytest pytest-timeout
           /tmp/venv/bin/python -m pip install --quiet websockets || echo "websockets: not installable"
-          /tmp/venv/bin/python -m pip install --quiet pillow || echo "pillow: not installable"
           /tmp/venv/bin/python build/windows/probe_imports.py
 
       - name: POSIX-layer Python - pty, fork, select
@@ -76,9 +75,8 @@ jobs:
         shell: msys2 {0}
         continue-on-error: true
         run: |
-          set +e
-          /tmp/venv/bin/python -m pytest ${{ inputs.suite }} -q -rfE \
-            --timeout=120 --continue-on-collection-errors -p no:cacheprovider \
-            > /tmp/pytest.log 2>&1
-          echo "pytest exit code: $?"
-          tail -n 250 /tmp/pytest.log
+          # Verbose and unbuffered: a run that is cancelled or times out
+          # still shows which test it had reached.
+          /tmp/venv/bin/python -u -m pytest ${{ inputs.suite }} -v -rfE \
+            --timeout=60 --maxfail=40 --continue-on-collection-errors \
+            -p no:cacheprovider

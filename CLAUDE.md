@@ -113,12 +113,21 @@ The project has grown from two core modules to ten, organized in layers:
   - Optional deps (`pip install .[web]`): `trafilatura` for article extraction — without it the fallback keeps nav bars and footers in what the model reads — and `curl_cffi` for the fingerprint rung.
 
 **Platform boundary:**
-The CLI targets Linux and macOS. Windows desktop adapters, kernel tools,
-installer and updater belong to the independent
-`lin7c/laintas-Helpwo-cli-agent-for-windows` project (product name
-`laintas-Helpwo-cli-for-windows`). Do not reintroduce Windows modules, WSL
-launchers or kernel discovery into this repository. `runtime_host.py` is a
-generic injectable host boundary with no desktop dependencies.
+The CLI's code targets POSIX (Linux and macOS) and stays that way. The
+Windows build (`build/windows/`, in progress) ships this same code unchanged:
+a terminal window of our own (`app/`, Tauri + xterm.js) starts
+`term_host.py` inside a bundled POSIX runtime, which gives the CLI a real pty
+and relays it over pipes. It uses neither WSL nor the Windows console. A
+probe on a Windows runner settled this: native CPython imports 0 of 125
+modules, the POSIX-layer Python imports 123 and passes the pty check. So do
+not add `win32` branches, native Windows modules, WSL launchers or kernel
+discovery to the CLI; fix Windows behaviour in `build/windows/` or by making
+the code more portable POSIX. Windows work is tested only through the manual
+`windows-probe.yml` and `windows-build.yml` workflows (billed at twice the
+Linux rate - never a retry loop). The Helpwo desktop application remains the
+independent `lin7c/laintas-Helpwo-cli-agent-for-windows` project.
+`runtime_host.py` is a generic injectable host boundary with no desktop
+dependencies.
 
 **Cross-cutting subsystems:**
 - **`policy.py`** (~1,770 lines) — Security policy engine: evaluates every command as allow/needs_approval/deny via regex rules. Config in `~/.laintas/policy.json` (mtime-cached, zero-restart updates). Audit log in `~/.laintas/audit.log`. Three modes: audit, enforce, disabled.
