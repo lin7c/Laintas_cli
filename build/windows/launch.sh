@@ -15,6 +15,9 @@ export SHELL=/usr/bin/bash
 export LANG="${LANG:-C.UTF-8}"
 export TERM=xterm-256color
 export COLORTERM=truecolor
+# Links the CLI opens (the sign-in page first of all) go to the Windows
+# default browser.
+export BROWSER="$app/build/windows/open_url.sh"
 
 if [ -n "$LAINTAS_START_DIR" ] && [ -d "$(cygpath -u "$LAINTAS_START_DIR")" ]; then
     cd "$(cygpath -u "$LAINTAS_START_DIR")" || exit 1

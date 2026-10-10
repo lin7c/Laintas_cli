@@ -22571,7 +22571,10 @@ def _helpwo_start_in_process(opts, agent_registry, session, *, state=None, state
 
 
 def _can_open_graphical_browser() -> bool:
-    return sys.platform == "darwin" or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    # BROWSER is the standard way an environment names its own opener; one
+    # that sets it has a browser to show even without an X or Wayland display.
+    return sys.platform == "darwin" or bool(
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY") or os.environ.get("BROWSER"))
 
 
 def _app_label(app: str) -> str:

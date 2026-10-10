@@ -12,7 +12,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
-WINDOWS_FILES = ("launch.sh", "term_host.py")
+WINDOWS_FILES = ("launch.sh", "open_url.sh", "term_host.py")
 
 
 def assemble(dest: str) -> int:

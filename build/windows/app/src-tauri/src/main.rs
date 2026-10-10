@@ -207,10 +207,29 @@ fn term_resize(state: tauri::State<TermState>, rows: u16, cols: u16) -> Result<(
     state.send(frame(b'R', &payload))
 }
 
+/// Open a link the user Ctrl+clicked in the terminal. Only web links are
+/// accepted, and the link is handed over as one argument, never to a shell.
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    let web = url.starts_with("https://") || url.starts_with("http://");
+    if !web || url.len() > 4096 || url.chars().any(|c| c.is_control() || c == '"') {
+        return Err("Only web links can be opened".into());
+    }
+    let mut command = Command::new("rundll32.exe");
+    command.arg("url.dll,FileProtocolHandler").arg(&url);
+    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    command.spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
 fn main() {
     let app = tauri::Builder::default()
         .manage(TermState::default())
-        .invoke_handler(tauri::generate_handler![term_start, term_input, term_resize])
+        .invoke_handler(tauri::generate_handler![term_start, term_input, term_resize, open_url])
         .setup(|app| {
             #[allow(unused_mut)]
             let mut builder = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))

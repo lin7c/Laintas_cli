@@ -42,6 +42,11 @@
   // Width tables that match what the CLI computes for CJK text and emoji.
   term.loadAddon(new Unicode11Addon.Unicode11Addon());
   term.unicode.activeVersion = "11";
+  // Ctrl+click opens a link in the default browser; a plain click stays
+  // with the program on screen, which may be using the mouse itself.
+  term.loadAddon(new WebLinksAddon.WebLinksAddon((event, uri) => {
+    if (event.ctrlKey) invoke("open_url", { url: uri }).catch(() => {});
+  }));
   term.open(document.getElementById("terminal"));
   try {
     const webgl = new WebglAddon.WebglAddon();

@@ -3,7 +3,9 @@
 // this script reads the emulator's screen back and types through the same
 // path a keyboard does (page -> native host -> terminal host -> pty).
 //
-//   node scripts/window_test.mjs <laintas-terminal.exe> <payload-root> <out-dir>
+//   node scripts/window_test.mjs <laintas-terminal.exe> <payload-root|-> <out-dir>
+//
+// A payload root of "-" tests an installed copy, which finds its own files.
 import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -28,7 +30,7 @@ async function openWindow(port, extraEnv) {
   const child = spawn(exe, [], {
     env: {
       ...process.env, ...extraEnv,
-      LAINTAS_TERMINAL_ROOT: root,
+      ...(root === "-" ? {} : { LAINTAS_TERMINAL_ROOT: root }),
       LAINTAS_TERMINAL_DEBUG_PORT: String(port),
       WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port}`,
     },
@@ -143,6 +145,25 @@ async function shellPass() {
     await win.type("clear; stty size; echo resized-$((1+1))\r");
     screen = await win.waitFor((s) => s.text.includes("resized-2"), "output after a resize");
     check(screen.text.includes("28 90"), "a resize reaches the pty");
+    // The pieces the CLI leans on inside the runtime: git, HTTPS with the
+    // bundled certificates, and the opener for the default browser.
+    const expect = async (text, label, timeoutMs = 60000) => {
+      try {
+        await win.waitFor((s) => s.text.includes(text), label, timeoutMs);
+        check(true, label);
+      } catch (error) {
+        check(false, label, String(error.message).split("\n").slice(1, 12).join(" | "));
+      }
+    };
+    await win.type("clear; cd /tmp && rm -rf lt-git && git init -q lt-git && cd lt-git && git -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m probe; echo git-$(git log --oneline | wc -l | tr -d ' ')-ok; cd\r");
+    await expect("git-1-ok", "git works in the runtime");
+    await win.type("clear; python3 -c \"import requests; print('tls-%d' % requests.get('https://cli.laintas.com/releases/latest/manifest.json', timeout=30).status_code)\"\r");
+    await expect("tls-200", "HTTPS works with the bundled certificates");
+    await win.type("clear; python3 -c \"import webbrowser; print('browser-%s' % webbrowser.open('https://cli.laintas.com/'))\"\r");
+    await expect("browser-True", "links open in the default browser");
+    await win.type("clear; echo home=$HOME; pwd\r");
+    await sleep(1500);
+    console.log((await win.screen()).text);
     await win.type("\x03");
     await win.type("echo alive-$((2+3))\r");
     await win.waitFor((s) => s.text.includes("alive-5"), "a prompt after Ctrl+C");

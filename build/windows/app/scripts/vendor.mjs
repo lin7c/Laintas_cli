@@ -12,6 +12,7 @@ for (const file of [
   "@xterm/xterm/css/xterm.css",
   "@xterm/addon-fit/lib/addon-fit.js",
   "@xterm/addon-unicode11/lib/addon-unicode11.js",
+  "@xterm/addon-web-links/lib/addon-web-links.js",
   "@xterm/addon-webgl/lib/addon-webgl.js",
 ]) {
   copyFileSync(join(root, "node_modules", file), join(out, file.split("/").pop()));
