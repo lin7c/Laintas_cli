@@ -1,0 +1,84 @@
+name: Windows probe
+
+# Manual only. Windows runners bill at twice the Linux rate, so this never
+# runs on a push: start it from the Actions tab or `gh workflow run`.
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "pytest targets to run under the POSIX-layer Python"
+        required: false
+        default: >-
+          tests/test_terminal_arbiter.py tests/test_term_attach.py
+          tests/test_select_dialog.py tests/test_local_runtime.py
+          tests/test_shell_idle_budget.py tests/test_subterminal_navigation.py
+          tests/test_file_lock.py tests/test_child_registry.py
+          tests/test_terminal_ui.py tests/test_slash_commands.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-probe
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      # Shell fixtures must keep LF endings or bash rejects them.
+      - name: Keep LF line endings
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Native CPython - which modules import
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          python -m pip install --quiet requests certifi rich prompt_toolkit "pyte>=0.8.2,<0.9" pysocks
+          python build/windows/probe_imports.py
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          update: false
+          install: python python-pip git
+
+      - name: POSIX-layer Python - environment
+        shell: msys2 {0}
+        run: |
+          python -m venv /tmp/venv
+          /tmp/venv/bin/python -m pip install --quiet requests certifi rich prompt_toolkit "pyte>=0.8.2,<0.9" pysocks pytest pytest-timeout
+          /tmp/venv/bin/python -m pip install --quiet websockets || echo "websockets: not installable"
+          /tmp/venv/bin/python -m pip install --quiet pillow || echo "pillow: not installable"
+          /tmp/venv/bin/python build/windows/probe_imports.py
+
+      - name: POSIX-layer Python - pty, fork, select
+        shell: msys2 {0}
+        continue-on-error: true
+        run: /tmp/venv/bin/python build/windows/probe_pty.py
+
+      - name: POSIX-layer Python - CLI starts
+        shell: msys2 {0}
+        continue-on-error: true
+        run: |
+          time /tmp/venv/bin/python laintas_cli.py --version
+          /tmp/venv/bin/python laintas_cli.py --help | head -20
+
+      - name: POSIX-layer Python - test suite
+        shell: msys2 {0}
+        continue-on-error: true
+        run: |
+          set +e
+          /tmp/venv/bin/python -m pytest ${{ inputs.suite }} -q -rfE \
+            --timeout=120 --continue-on-collection-errors -p no:cacheprovider \
+            > /tmp/pytest.log 2>&1
+          echo "pytest exit code: $?"
+          tail -n 250 /tmp/pytest.log
