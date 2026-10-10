@@ -18,6 +18,7 @@ const WINDOWS_RELEASE = { version: 'beta v3', installer: WINDOWS_DOWNLOAD };
 const INSTALL_COMMANDS = {
   linux: 'curl -fsSL https://cli.laintas.com/install.sh | bash',
   mac: 'curl -fsSL https://cli.laintas.com/install.sh | bash',
+  windows: 'irm https://cli.laintas.com/install.ps1 | iex',
 };
 
 const DOWNLOADS = [
@@ -434,16 +435,14 @@ export default function DownloadSection() {
                   <button type="button" key={platform} className={installPlatform === platform ? 'active' : ''} onClick={() => setInstallPlatform(platform)} aria-pressed={installPlatform === platform}>{c[platform]}</button>
                 ))}
               </div>
-              {installPlatform !== 'windows' && (
-                <div className="st-install-line">
-                  <code><span aria-hidden="true">$</span>{INSTALL_COMMANDS[installPlatform]}</code>
-                  <CopyButton key={installPlatform} value={INSTALL_COMMANDS[installPlatform]} labels={c} />
-                </div>
-              )}
+              <div className="st-install-line">
+                <code><span aria-hidden="true">{installPlatform === 'windows' ? 'PS>' : '$'}</span>{INSTALL_COMMANDS[installPlatform]}</code>
+                <CopyButton key={installPlatform} value={INSTALL_COMMANDS[installPlatform]} labels={c} />
+              </div>
             </div>
-            {installPlatform === 'windows' && <a className="st-link" href={windowsRelease.installer}><ArrowDownToLine size={16} />{lang === 'zh' ? '下载 laintas-cli-windows 安装包' : 'Download the laintas-cli-windows installer'} · {windowsRelease.version}</a>}
+            {installPlatform === 'windows' && <a className="st-link" href={windowsRelease.installer}><ArrowDownToLine size={16} />{lang === 'zh' ? '或直接下载安装包' : 'Or download the installer'} · {windowsRelease.version}</a>}
             <ol className="st-start">
-              {(installPlatform === 'windows' ? (lang === 'zh' ? [['下载并安装','双击安装包，无需管理员权限。测试版尚未签名，Windows 提示时选「更多信息 → 仍要运行」'],['启动并登录','从开始菜单打开 laintas-cli-windows，登录页会在默认浏览器里打开'],['开始对话','在默认工作区给 agent 一个任务']] : [['Download and install','Open the installer; no administrator rights needed. This beta is not signed yet: choose More info → Run anyway if Windows asks'],['Launch and sign in','Open laintas-cli-windows from Start; the sign-in page opens in your default browser'],['Start a conversation','Give the agent a task in the default workspace']]) : c.startSteps).map(([title, detail], index) => (
+              {(installPlatform === 'windows' ? (lang === 'zh' ? [['安装','在 PowerShell 执行指令，或直接下载安装包；无需管理员权限'],['启动并登录','从开始菜单打开 laintas-cli-windows，登录页会在默认浏览器里打开'],['开始对话','在默认工作区给 agent 一个任务']] : [['Install','Run the command in PowerShell, or download the installer; no administrator rights needed'],['Launch and sign in','Open laintas-cli-windows from Start; the sign-in page opens in your default browser'],['Start a conversation','Give the agent a task in the default workspace']]) : c.startSteps).map(([title, detail], index) => (
                 <li key={title}><span>0{index + 1}</span><strong>{title}</strong><p>{detail}</p></li>
               ))}
             </ol>

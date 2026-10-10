@@ -99,6 +99,8 @@ export const GROUPS = [
             ),
           },
           { t: 'h', ...L('Windows', 'Windows') },
+          { t: 'code', label: 'PowerShell', code: 'irm https://cli.laintas.com/install.ps1 | iex' },
+          { t: 'p', ...L('在 PowerShell 中执行以上指令，脚本会下载最新的 laintas-cli-windows 安装包、校验大小和 SHA-256，然后打开安装器。先执行 `$env:LAINTAS_INSTALL_SILENT=1` 可跳过安装向导。也可以直接下载。', 'Run the command in PowerShell to download the latest laintas-cli-windows installer, verify its size and SHA-256 and open it. Run `$env:LAINTAS_INSTALL_SILENT=1` first to skip the wizard. You can also download it directly.') },
           { t: 'p', ...L('[下载 laintas-cli-windows beta v3](https://cli.laintas.com/windows-cli/beta-v3/laintas-cli-windows_beta-v3_x64-setup.exe)，双击安装（无需管理员权限），然后从开始菜单启动 laintas-cli-windows。', '[Download laintas-cli-windows beta v3](https://cli.laintas.com/windows-cli/beta-v3/laintas-cli-windows_beta-v3_x64-setup.exe), open the installer (no administrator rights needed), then launch laintas-cli-windows from Start.') },
           {
             t: 'p', ...L(
