@@ -160,7 +160,9 @@ async function cliPass() {
     const screen = await win.waitFor((s) => s.text.trim().length > 0, "the CLI to draw anything", 120000);
     await sleep(8000);
     const settled = await win.screen();
-    console.log(`--- screen ${settled.rows}x${settled.cols} ---\n${settled.text}\n---`);
+    // The sign-in link carries a one-time secret; keep it out of the log.
+    const shown = settled.text.replace(/https?:\/\/\S+(\n\S*(secret|device_id)\S*)*/g, "<url>");
+    console.log(`--- screen ${settled.rows}x${settled.cols} ---\n${shown}\n---`);
     check(!/Traceback|Error:|could not start/.test(settled.text), "the CLI starts without an error on screen");
     check(/laintas/i.test(settled.text) || screen.text.length > 0, "the CLI draws its first screen");
     await win.screenshot("cli.png");
