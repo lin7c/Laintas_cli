@@ -34,11 +34,24 @@ curl -fsSL https://cli.laintas.com/install.sh | bash
 laintas-cli
 ```
 
-Windows uses the independent **laintas-Helpwo-cli-for-windows** desktop app.
-Download [LaintasSetup.exe](https://cli.laintas.com/windows/LaintasSetup.exe),
-install it and open Laintas Windows from the Start menu. It reuses Helpwo's
-chat UI and runs the agent and kernel locally on Windows. The CLI repository
-builds Linux and macOS terminal packages only.
+On Windows 10 or 11 (x86_64), install **laintas-cli-windows** from PowerShell,
+then open it from the Start menu:
+
+```powershell
+irm https://cli.laintas.com/install.ps1 | iex
+```
+
+It is this same CLI in a terminal window of its own. It needs no WSL and does
+not use the Windows console, so the interface, colors and keys match Linux and
+macOS. Commands run in the bundled bash environment, where drives appear as
+`/c/Users/...`; account data stays in `.laintas` in your user profile. The
+script verifies the installer's size and SHA-256 before running it, and
+`$env:LAINTAS_INSTALL_SILENT=1` skips the wizard. You can also download the
+[installer](https://cli.laintas.com/windows-cli/beta-v3/laintas-cli-windows_beta-v3_x64-setup.exe)
+directly. This first beta is not code-signed, so Windows may ask before
+running it: choose More info, then Run anyway. No administrator rights are
+needed. Ctrl+click opens a link, Ctrl+C copies when text is selected and
+interrupts otherwise, and Ctrl+V pastes.
 
 The macOS build is a native terminal CLI for Apple Silicon (`arm64`) and Intel
 (`x86_64`). The installer detects the architecture automatically and verifies
@@ -611,8 +624,9 @@ closes that view. Protected browser autofill remains unavailable.
 
 The CLI no longer installs, starts or communicates with Helpwo Kernel.
 `/helpwo` retains its hosted-application entry point; remote machine sharing
-is unavailable without a separately supplied host adapter. The independent
-Windows desktop app owns its local kernel integration and chat UI.
+is unavailable without a separately supplied host adapter. The Helpwo
+desktop application for Windows is a separate product with its own kernel
+integration and chat UI; it is not laintas-cli-windows.
 
 `/app` runs other applications the same way, from manifests in
 `~/.laintas/apps/*.json` or `./.laintas/apps/*.json`:
@@ -710,12 +724,22 @@ The package manifest is intentionally explicit. When adding a runtime module, bu
 - SHA-256 checksums and source-update manifests
 
 The download page offers Linux and macOS installers that select the CPU
-architecture, plus the independent `laintas-Helpwo-cli-for-windows` installer.
-CLI archives, Debian packages, source ZIPs and checksums are mirrored at
-`cli.laintas.com/releases/latest/`. Windows installers and signed updates use
-`cli.laintas.com/windows/`; CLI releases must never overwrite that channel.
-Existing historical release notes below describe the builds shipped at the
-time and are not instructions for producing new Windows CLI packages.
+architecture, and the laintas-cli-windows installer. CLI archives, Debian
+packages, source ZIPs and checksums are mirrored at
+`cli.laintas.com/releases/latest/`.
+
+laintas-cli-windows is built separately by the manual
+`.github/workflows/windows-build.yml` workflow from `build/windows/`: a
+terminal window (Tauri and xterm.js), a bundled POSIX runtime with bash, git
+and Python, and this repository's CLI sources unchanged. The workflow installs
+the result on a Windows runner and drives the real window before anything is
+published. Installers live at `cli.laintas.com/windows-cli/<release>/`, and
+`windows-cli/download.json` names the one `install.ps1` installs. A newer
+version is installed by running its installer; the window does not update
+itself yet.
+`cli.laintas.com/windows/` belongs to the Helpwo desktop application and its
+signed updates; CLI releases must never overwrite that channel. Historical
+release notes below describe the builds shipped at the time.
 
 The current public release is [laintas-cli-beta v3](https://github.com/lin7c/Laintas_cli/releases/tag/laintas-cli-beta-v3)
 (tag `laintas-cli-beta-v3`). It is an ordinary GitHub Release, marked `latest`;
@@ -747,7 +771,9 @@ The history below is curated from the repository tags and changes, following an 
 - `/resume` no longer adds a duplicate checkpoint when nothing changed, and
   long rows scroll while their tree prefix stays in place.
 - With `--execute` in text mode, start-up notices go to standard error.
-- The Windows and WSL code paths were removed from the CLI package.
+- The Windows and WSL code paths were removed from the CLI package. Windows
+  is now served by laintas-cli-windows, which runs the unchanged CLI in its
+  own terminal window (first beta, installer not yet code-signed).
 
 ### [laintas-cli-beta v2](https://github.com/lin7c/Laintas_cli/releases/tag/laintas-cli-beta-v2) — 2026-09-30
 
