@@ -47,7 +47,7 @@ macOS. Commands run in the bundled bash environment, where drives appear as
 `/c/Users/...`; account data stays in `.laintas` in your user profile. The
 script verifies the installer's size and SHA-256 before running it, and
 `$env:LAINTAS_INSTALL_SILENT=1` skips the wizard. You can also download the
-[installer](https://cli.laintas.com/windows-cli/beta-v3/laintas-cli-windows_beta-v3_x64-setup.exe)
+[installer](https://cli.laintas.com/windows-cli/beta-v3-2/laintas-cli-windows_beta-v3-2_x64-setup.exe)
 directly. This first beta is not code-signed, so Windows may ask before
 running it: choose More info, then Run anyway. No administrator rights are
 needed. Ctrl+click opens a link, Ctrl+C copies when text is selected and

@@ -116,7 +116,13 @@ both `laintas_cli_download/public/windows-cli/<release>/` and
 `dist/windows-cli/<release>/` as
 `laintas-cli-windows_<release>_x64-setup.exe`, with a `SHA256SUMS.txt` beside
 it, then point `WINDOWS_DOWNLOAD` in `DownloadSection.jsx` and the links in
-`src/docs/content.js` at it. `beta v3` is at `windows-cli/beta-v3/`. The
+`src/docs/content.js` and `README.md` at it, and update
+`windows-cli/download.json` (version, installer, sha256, size_bytes), which
+is what `install.ps1` installs. Never replace a published installer in
+place: the CDN keeps serving the old file for up to four hours while the new
+checksum is already live, and the install command then refuses it. Give
+every build its own `<release>` directory instead (`beta-v3`, `beta-v3-2`,
+...); the page label can stay `beta v3`. The
 installer is not code-signed. Do not add Windows jobs or assets to
 `release.yml`, `scripts/build_release_assets.py` or the source-update
 manifest, and do not add a WSL distribution or kernel helper at all.

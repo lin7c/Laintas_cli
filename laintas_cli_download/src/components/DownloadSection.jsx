@@ -13,7 +13,7 @@ const RELEASE_BASE = 'https://cli.laintas.com/releases/latest';
 const RELEASE_API = 'https://api.github.com/repos/lin7c/Laintas_cli/releases/latest';
 // laintas-cli-windows: the CLI in its own terminal window. It is published
 // beside the Unix releases, apart from the Helpwo desktop channel in /windows/.
-const WINDOWS_DOWNLOAD = 'https://cli.laintas.com/windows-cli/beta-v3/laintas-cli-windows_beta-v3_x64-setup.exe';
+const WINDOWS_DOWNLOAD = 'https://cli.laintas.com/windows-cli/beta-v3-2/laintas-cli-windows_beta-v3-2_x64-setup.exe';
 const WINDOWS_RELEASE = { version: 'beta v3', installer: WINDOWS_DOWNLOAD };
 const INSTALL_COMMANDS = {
   linux: 'curl -fsSL https://cli.laintas.com/install.sh | bash',
