@@ -32,11 +32,15 @@ jobs:
           Get-ChildItem $dir | Format-Table Name, Length -AutoSize | Out-String | Write-Host
           if (-not (Test-Path "$dir\laintas-terminal.exe")) { throw 'the window was not installed' }
           if (-not (Test-Path "$dir\runtime\usr\bin\bash.exe")) { throw 'the runtime was not installed' }
-          & "$dir\runtime\usr\bin\bash.exe" -c 'PATH=/usr/bin:$PATH; python3 "$(cygpath -u "$LOCALAPPDATA")/laintas-cli-windows/app/laintas_cli.py" --version'
+          # No nested quotes: Windows PowerShell drops them on the way to a program.
+          $env:LT_APP = "$dir\app"
+          & "$dir\runtime\usr\bin\bash.exe" -c 'PATH=/usr/bin:$PATH; mkdir -p /tmp; python3 $(cygpath -u $LT_APP)/laintas_cli.py --version'
+          if ($LASTEXITCODE -ne 0) { throw 'the installed CLI did not start' }
           Get-ChildItem "$env:APPDATA\Microsoft\Windows\Start Menu\Programs" -Recurse -Filter *laintas* | ForEach-Object { "shortcut: $($_.FullName)" }
           Start-Process -FilePath "$dir\uninstall.exe" -ArgumentList '/S' -Wait
           Start-Sleep -Seconds 5
           "left after uninstall: $(Test-Path "$dir\laintas-terminal.exe")"
+          exit 0
 
       - name: PowerShell 7
         shell: pwsh
