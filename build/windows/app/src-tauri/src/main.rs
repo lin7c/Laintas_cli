@@ -212,7 +212,8 @@ fn main() {
         .manage(TermState::default())
         .invoke_handler(tauri::generate_handler![term_start, term_input, term_resize])
         .setup(|app| {
-            tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
+            #[allow(unused_mut)]
+            let mut builder = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
                 .title("Laintas")
                 .inner_size(1040.0, 680.0)
                 .min_inner_size(480.0, 300.0)
@@ -221,8 +222,18 @@ fn main() {
                     url.scheme() == "tauri"
                         || ((url.scheme() == "http" || url.scheme() == "https")
                             && url.host_str() == Some("tauri.localhost"))
-                })
-                .build()?;
+                });
+            // The window test reads the screen back through the webview's
+            // debugging port. It is opened only when this variable names one.
+            #[cfg(windows)]
+            if let Ok(port) = std::env::var("LAINTAS_TERMINAL_DEBUG_PORT") {
+                if !port.is_empty() && port.len() <= 5 && port.chars().all(|c| c.is_ascii_digit()) {
+                    builder = builder.additional_browser_args(&format!(
+                        "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-debugging-port={port}"
+                    ));
+                }
+            }
+            builder.build()?;
             Ok(())
         })
         .build(tauri::generate_context!())

@@ -71,6 +71,12 @@ jobs:
           New-Item -ItemType Directory -Force "$dst\tmp" | Out-Null
           $mb = [math]::Round((Get-ChildItem $dst -Recurse -File | Measure-Object Length -Sum).Sum / 1MB)
           Write-Host "runtime: $mb MB"
+          foreach ($dir in @("$dst", "$dst\usr", "$dst\usr\lib", "$dst\usr\share")) {
+            Get-ChildItem $dir -Directory | ForEach-Object {
+              $size = [math]::Round((Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1MB)
+              if ($size -ge 15) { Write-Host ("  {0,6} MB  {1}" -f $size, $_.FullName.Substring((Resolve-Path $dst).Path.Length)) }
+            }
+          }
           exit 0
 
       - name: Install window dependencies
@@ -82,6 +88,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: build/windows/app/src-tauri
+          cache-on-failure: true
 
       - name: Build the window
         working-directory: build/windows/app

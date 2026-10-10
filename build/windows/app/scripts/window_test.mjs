@@ -29,19 +29,37 @@ async function openWindow(port, extraEnv) {
     env: {
       ...process.env, ...extraEnv,
       LAINTAS_TERMINAL_ROOT: root,
+      LAINTAS_TERMINAL_DEBUG_PORT: String(port),
       WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port}`,
     },
     stdio: "ignore",
   });
+  let exited = null;
+  let lastError = "";
+  child.on("exit", (code, signal) => { exited = `code ${code}, signal ${signal}`; });
+  child.on("error", (error) => { exited = `spawn error: ${error.message}`; });
   let target = null;
   for (let i = 0; i < 120 && !target; i++) {
     await sleep(500);
     try {
       const pages = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
       target = pages.find((p) => p.type === "page" && p.webSocketDebuggerUrl);
-    } catch (_) { /* the webview is still starting */ }
+    } catch (error) { lastError = String(error.cause?.code || error.message); }
+    if (exited) break;
   }
-  if (!target) throw new Error("the window never exposed a debuggable page");
+  if (!target) {
+    console.log(`window process: ${exited ? `exited (${exited})` : "still running"}; last probe error: ${lastError}`);
+    if (process.platform === "win32") {
+      const report = spawnSync("powershell", ["-NoProfile", "-Command",
+        "Get-Process laintas-terminal,msedgewebview2,bash,python3* -ErrorAction SilentlyContinue | Format-Table Id,ProcessName,MainWindowTitle -AutoSize | Out-String -Width 200; " +
+        `Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -ge 9000 -and $_.LocalPort -le 9999 } | Format-Table LocalAddress,LocalPort,OwningProcess -AutoSize | Out-String; ` +
+        "Get-WinEvent -FilterHashtable @{LogName='Application'; Level=2; StartTime=(Get-Date).AddMinutes(-3)} -MaxEvents 3 -ErrorAction SilentlyContinue | Format-List TimeCreated,ProviderName,Message | Out-String -Width 300"],
+        { encoding: "utf8" });
+      console.log(report.stdout || report.stderr);
+    }
+    if (!exited) spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+    throw new Error("the window never exposed a debuggable page");
+  }
   const socket = new WebSocket(target.webSocketDebuggerUrl);
   await new Promise((resolve, reject) => { socket.onopen = resolve; socket.onerror = reject; });
   let nextId = 0;
