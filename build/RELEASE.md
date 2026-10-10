@@ -109,12 +109,23 @@ The local diagnostic modules currently registered (`event_log` / `critic` /
 serve CLI recovery and local diagnostics only; they upload nothing to the
 training pipeline.
 
-**Releases package Linux and macOS only.** A Windows terminal build is in
-progress under `build/windows/` and is built and tested by the manual
-`windows-build.yml` workflow; it is not a release asset yet. Until it is, do
-not add Windows jobs or assets to `release.yml`,
-`scripts/build_release_assets.py` or the source-update manifest, and do not
-add a WSL distribution or kernel helper at all.
+**`release.yml` packages Linux and macOS only.** `laintas-cli-windows` is
+built and tested by the manual `windows-build.yml` workflow and published by
+hand: download the run's `laintas-windows-installer` artifact and copy it to
+both `laintas_cli_download/public/windows-cli/<release>/` and
+`dist/windows-cli/<release>/` as
+`laintas-cli-windows_<release>_x64-setup.exe`, with a `SHA256SUMS.txt` beside
+it, then point `WINDOWS_DOWNLOAD` in `DownloadSection.jsx` and the links in
+`src/docs/content.js` at it. `beta v3` is at `windows-cli/beta-v3/`. The
+installer is not code-signed. Do not add Windows jobs or assets to
+`release.yml`, `scripts/build_release_assets.py` or the source-update
+manifest, and do not add a WSL distribution or kernel helper at all.
+
+Rebuild the download page without copying `public/` and without emptying the
+live `dist`: build with a config that sets `publicDir: false` into a scratch
+directory, prerender there, then `rsync -a` the result into `dist/`. The
+`npm run build -- --outDir` form shown below passes the option to the
+prerenderer, not to Vite.
 
 **Windows desktop releases are independent.** The product is named
 `laintas-Helpwo-cli-for-windows`. The private project

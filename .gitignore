@@ -38,5 +38,6 @@ laintas_cli_download/public/releases/
 
 # Independent desktop release artifacts are mirrored here, never committed.
 laintas_cli_download/public/windows/
+laintas_cli_download/public/windows-cli/
 
 *.egg-info/
