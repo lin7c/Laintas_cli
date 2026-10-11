@@ -77,6 +77,31 @@ and confirm `/v update` selects the `darwin` archive. Keep the resulting
 transcript with the release notes. CI cannot verify interactive terminal
 behavior by itself.
 
+### Rebuilding a published tag in place
+
+To ship a fix under the same release name and version (done for
+`laintas-cli-beta-v3` on 2026-10-11):
+
+```bash
+gh release delete laintas-cli-beta-v3 --yes     # keeps the tag; `gh release create` refuses an existing release
+git tag -f laintas-cli-beta-v3 <commit>
+git push --force origin laintas-cli-beta-v3     # only the tag: this starts release.yml
+```
+
+The tagged commit's message must not contain `[skip ci]`. Until the run
+finishes there is no GitHub release for the tag; the site mirror keeps
+serving the previous build. Then sync the mirror as usual.
+
+Run `scripts/build_release_assets.py` from a clean checkout of the tagged
+commit, not from a work tree with uncommitted edits: it builds
+`manifest.json` and `src_manifest.zip` from the files on disk, so local
+edits would ship to every source install. With a scratch `git worktree`,
+link its `laintas_cli_download/dist` and `laintas_cli_download/public/releases`
+to the real directories first.
+
+The version does not change, so `/v update` reports installed copies as up
+to date. Users who already have that version need `/v update --force`.
+
 ## 1. Pre-release checks
 
 From the repository root:

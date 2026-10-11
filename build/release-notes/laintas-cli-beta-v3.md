@@ -12,4 +12,4 @@ Laintas CLI beta v3 (package version 1.32.5b3) is now available.
 - Faster menus and tool handling in long sessions.
 
 Download and install: https://cli.laintas.com/
-Existing users can update with /v update.
+Existing users can update with /v update. Beta v3 was rebuilt on 2026-10-11; if you installed it before then, run /v update --force to get the rebuilt package.
