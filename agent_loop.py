@@ -6,7 +6,6 @@ import collections
 import copy
 import functools
 import background_compaction
-import terminal_theme
 import prompt_budget
 import fnmatch
 import os
@@ -361,18 +360,11 @@ def get_recent_tool_failures(*, agent_id: str = "", terminal: str = "",
 # A bright green highlight band sweeps left→right across the status label
 # while the agent is thinking/streaming. Recomputed every Live draw from the
 # elapsed clock, so it flows smoothly without any extra timer.
-# Each band peaks away from the terminal background: brighter on a dark
-# terminal, deeper on a light one.
-_SHIMMER = {
-    "dark": ("#2ea043", (
-        "#3fb950", "#4ade80", "#7ee787", "#b7f7c0",
-        "#d3fbd8", "#b7f7c0", "#7ee787", "#4ade80",
-    )),
-    "light": ("#238636", (
-        "#1f7a34", "#176f2c", "#116329", "#0b4f1f",
-        "#063d16", "#0b4f1f", "#116329", "#176f2c",
-    )),
-}
+_SHIMMER_BASE = "#1f7a3f"
+_SHIMMER_GRAD = (
+    "#2ea043", "#3fb950", "#4ade80", "#7ee787",
+    "#b7f7c0", "#7ee787", "#4ade80", "#3fb950",
+)
 
 _THINKING_SPINNER_FRAMES = symbols.SPINNER_RELAY
 
@@ -385,17 +377,15 @@ def _shimmer_segments(label: str, elapsed: float) -> list[tuple[str, str]]:
     renderers visually identical without letting either renderer touch the
     other's cursor region.
     """
-    mode = terminal_theme.active()
-    if mode == "mono":
+    if get_runtime_config("theme") == "mono":
         return [("", label)]
-    base, gradient = _SHIMMER[mode]
     segments: list[tuple[str, str]] = []
-    span = len(gradient)
+    span = len(_SHIMMER_GRAD)
     head = (elapsed * 14.0) % (len(label) + span)
     for index, char in enumerate(label):
         distance = head - index
-        style = (f"bold {gradient[int(distance)]}"
-                 if 0 <= distance < span else base)
+        style = (f"bold {_SHIMMER_GRAD[int(distance)]}"
+                 if 0 <= distance < span else _SHIMMER_BASE)
         if segments and segments[-1][0] == style:
             old_style, old_text = segments[-1]
             segments[-1] = (old_style, old_text + char)
@@ -546,7 +536,7 @@ class _ActivityStatus:
         from rich.console import Group
         from rich.text import Text
         from rich.spinner import Spinner
-        spinner = Spinner("dots", style="accent")
+        spinner = Spinner("dots", style="#3fb950")
         spinner.frames = list(symbols.SPINNER_RELAY)
         spinner.interval = symbols.SPINNER_INTERVAL_MS
         status = self
@@ -558,12 +548,12 @@ class _ActivityStatus:
                     return Text("")
                 width = max(20, (status.console.width or 80) - 1)
                 text = _shimmer_label(status.label, elapsed)
-                text.append(f" {elapsed:.1f}s", style="muted")
+                text.append(f" {elapsed:.1f}s", style="#8b949e")
                 if width >= 72:
                     text.append(
                         f" {symbols.BULLET} {_live_status_model() or '—'}"
                         f" {symbols.BULLET} {_active_mode_label()}",
-                        style="muted")
+                        style="#8b949e")
                 spinner.text = text
                 parts = [spinner]
                 if (status.detail
@@ -13317,7 +13307,7 @@ def run_agent_loop(
 
                 # Create the Spinner ONCE — a fresh Spinner resets start_time
                 # on each draw, freezing the animation on frame 0.
-                _spinner = Spinner("dots", style="accent")
+                _spinner = Spinner("dots", style="#3fb950")
                 _spinner.frames = list(symbols.SPINNER_RELAY)
                 _spinner.interval = symbols.SPINNER_INTERVAL_MS
 
@@ -13345,11 +13335,11 @@ def run_agent_loop(
                     # region fixed to one line in compact mode. Only glyph
                     # styles change; text width and layout never change.
                     _txt = _shimmer_label(_label, _elapsed)
-                    _txt.append(f" {_elapsed:.1f}s", style="muted")
+                    _txt.append(f" {_elapsed:.1f}s", style="#8b949e")
                     if _detail:
                         _txt.append(
                             f" {symbols.BULLET} {symbols.ARROW_U}{_fmt_tokens(_cur_in_est)} {symbols.ARROW_D}{_fmt_tokens(_cur_out_est)}",
-                            style="muted",
+                            style="#8b949e",
                         )
                     if _cw >= 72:
                         # What was asked for, and what the serving account
@@ -13363,7 +13353,7 @@ def run_agent_loop(
                         else:
                             _gear_label = _spin_effort
                         _gear = f" {symbols.BULLET} {_gear_label}" if _gear_label else ""
-                        _txt.append(f" {symbols.BULLET} {_spin_model}{_gear} {symbols.BULLET} {_spin_mode}", style="muted")
+                        _txt.append(f" {symbols.BULLET} {_spin_model}{_gear} {symbols.BULLET} {_spin_mode}", style="#8b949e")
                     _spinner.text = _txt
                     parts.append(_spinner)
                     # Reserve a constant number of preview rows for the whole
@@ -13389,7 +13379,7 @@ def run_agent_loop(
                         cmd_preview = stream_state["command"]
                         if len(cmd_preview) > 120:
                             cmd_preview = cmd_preview[:117] + "..."
-                        parts.append(Text(f"→ {cmd_preview}", style="accent.dim"))
+                        parts.append(Text(f"→ {cmd_preview}", style="#2ea043"))
                     return Group(*parts)
 
                 # Wrapper that re-computes _render() on every draw so the

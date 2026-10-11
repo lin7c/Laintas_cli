@@ -358,51 +358,74 @@ from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from prompt_toolkit.application.current import get_app
 
 # ── Central UI theme ──────────────────────────────────────────────────
-# Text colors only; the terminal keeps its own background. Body text uses
-# the terminal's default foreground and the palette lives in terminal_theme.
-# Use the semantic names instead of inline literals so the UI restyles there.
+# Minimal palette: one accent, muted secondaries, semantic status colors.
+# Use these names instead of inline literals so the whole UI restyles here.
+# terminal_theme only recolors the fixed lines commands print (``[dim]``,
+# ``[yellow]``); everything named here keeps its own value.
 import terminal_theme
 
-LAINTAS_THEME = Theme(terminal_theme.rich_styles("dark"))
+LAINTAS_THEME = Theme({
+    "accent":   "#3fb950",          # primary action / active state
+    "accent.dim": "#2ea043",
+    "success":  "#4ade80",
+    "error":    "bold #f85149",
+    "warning":  "#e3b341",
+    "foreground": "#e6edf3",
+    "muted":    "#8b949e",
+    "subtle":   "#6e7681",
+    "surface":  "on #161b22",
+    "selected": "bold #f0f6fc on #21262d",
+    "agent":    "#a78bfa",          # agent / orchestration (soft violet, kept distinct)
+    "path":     "#c9d1d9",
+    "glyph":    "#3fb950",
+    "rule":     "#30363d",
+    # Rich's default Markdown inline-code style is cyan on black. Keep all
+    # ordinary/model text on the terminal's default background instead.
+    "markdown.code": "white",
+    "markdown.code_block": "white",
+})
 
 
-class _ThemeSyntax(SyntaxTheme):
-    """Uncolored code tokens, optionally on the theme's code plate."""
-
-    def __init__(self, plated: bool):
-        self._plated = plated
+class _PlainWhiteSyntaxTheme(SyntaxTheme):
+    """Code blocks use plain white text and inherit the terminal background."""
 
     def get_style_for_token(self, token_type) -> RichStyle:
-        # A painted plate needs its paired text color; without one the code
-        # keeps the terminal's own foreground.
-        mode = terminal_theme.active()
-        if self._plated and mode != "mono":
-            return RichStyle(color=terminal_theme.color("plate_fg", mode))
-        return RichStyle()
+        return RichStyle(color="white")
 
     def get_background_style(self) -> RichStyle:
-        mode = terminal_theme.active()
-        if self._plated and mode != "mono":
-            return RichStyle(bgcolor=terminal_theme.color("plate_bg", mode))
         return RichStyle()
 
 
-_PLAIN_SYNTAX = _ThemeSyntax(plated=False)
-_PLATED_SYNTAX = _ThemeSyntax(plated=True)
+class _PlatedWhiteSyntaxTheme(_PlainWhiteSyntaxTheme):
+    """Same white tokens, but the whole block sits on a dark plate."""
+
+    def get_background_style(self) -> RichStyle:
+        return RichStyle(bgcolor="#161b22")
+
+
+_PLAIN_WHITE_SYNTAX = _PlainWhiteSyntaxTheme()
+_PLATED_WHITE_SYNTAX = _PlatedWhiteSyntaxTheme()
 
 
 class LaintasMarkdown(RichMarkdown):
     """Markdown renderer with no baked-in black/blue code treatment.
 
-    Fenced code blocks render on the theme's code plate with its paired text
-    color; prose and inline code stay on the terminal's own colors.
+    Fenced code blocks render on a dark plate (#161b22, same as the
+    ``surface`` semantic color); inline code stays on the terminal background.
     """
 
     def __init__(self, markup: str, **kwargs):
-        kwargs.setdefault("code_theme", _PLATED_SYNTAX)
-        kwargs.setdefault("inline_code_theme", _PLAIN_SYNTAX)
-        kwargs.setdefault("style", "foreground")
+        kwargs.setdefault("code_theme", _PLATED_WHITE_SYNTAX)
+        kwargs.setdefault("inline_code_theme", _PLAIN_WHITE_SYNTAX)
+        kwargs.setdefault("style", "white")
         super().__init__(markup, **kwargs)
+
+    def __rich_console__(self, console, options):
+        # Model output keeps its authored styles; only fixed command lines
+        # are recolored for the terminal background.
+        with terminal_theme.authored_styles():
+            segments = list(super().__rich_console__(console, options))
+        yield from segments
 
 
 # Keep the existing dependency-injection surface (`deps.Markdown`) stable.
@@ -446,19 +469,19 @@ console.file = repl_mirror.TeeFile(_mirror_target_agent_id)
 # (h1 -> markdown.h1, bold -> markdown.strong, italic -> markdown.em,
 # quote -> markdown.block_quote; headings h1..h6 are looked up by
 # rich.markdown.Heading). An empty string means "no style override" (keep the
-# Rich/terminal default). The `default` palette leaves model output in the
-# terminal's own text color.
+# Rich/terminal default). The `default` palette preserves the pre-existing
+# plain-white behavior.
 _MARKDOWN_THEMES: dict[str, dict[str, str]] = {
     "default": {
         "h1": "", "h2": "", "h3": "", "h4": "", "h5": "", "h6": "",
-        "code": "", "code_block": "", "link": "",
+        "code": "white", "code_block": "white", "link": "",
         "bold": "", "italic": "", "quote": "",
     },
     "green-red": {
         "h1": "bold #4ade80", "h2": "bold #22c55e",      # green titles
         "h3": "bold #f85149", "h4": "bold #f85149",       # red sub-titles
         "h5": "#f85149", "h6": "#f85149",
-        "code": "", "code_block": "", "link": "",
+        "code": "white", "code_block": "white", "link": "",
         "bold": "", "italic": "", "quote": "",
     },
 }
@@ -487,10 +510,23 @@ for _preset_name, _preset in _MARKDOWN_THEMES.items():
 
 # Semantic palette variants applied on top of the shared Console.
 _THEME_VARIANTS = {
-    name: Theme(terminal_theme.rich_styles(name)) for name in ("dark", "light", "mono")
+    "dark": LAINTAS_THEME,
+    "light": Theme({
+        "accent": "#176f2c", "accent.dim": "#238636", "success": "#116329",
+        "error": "bold #cf222e", "warning": "#9a6700", "foreground": "#24292f",
+        "muted": "#57606a", "subtle": "#6e7781", "surface": "on #f6f8fa",
+        "selected": "bold #24292f on #d0d7de", "agent": "#8250df",
+        "path": "#24292f", "glyph": "#176f2c", "rule": "#d0d7de",
+        "markdown.code": "#24292f", "markdown.code_block": "#24292f",
+    }),
+    "mono": Theme({
+        "accent": "bold", "accent.dim": "dim", "success": "bold",
+        "error": "bold reverse", "warning": "bold", "foreground": "",
+        "muted": "dim", "subtle": "dim", "surface": "", "selected": "reverse",
+        "agent": "bold", "path": "", "glyph": "bold", "rule": "dim",
+        "markdown.code": "", "markdown.code_block": "",
+    }),
 }
-
-
 def _load_markdown_palette(name: str) -> dict[str, str]:
     """Resolve a markdown_theme value to a complete {key: style} palette.
 
@@ -561,7 +597,7 @@ def _apply_ui_theme(name: str, *, refresh: bool = False) -> str:
     resolved = terminal_theme.resolve(name, refresh=refresh)
     # Merge the semantic palette with the active Markdown palette so one
     # push_theme call covers both; markdown_theme="default" contributes no
-    # overrides and leaves model output in the terminal's own text color.
+    # heading overrides and preserves the historical plain-white rendering.
     palette = _load_markdown_palette(get_runtime_config("markdown_theme"))
     merged = Theme({
         **_THEME_VARIANTS[resolved].styles,
@@ -1109,7 +1145,7 @@ def select_dialog(
             return sum(text.count("\n") for _style, text in lines)
 
         if title:
-            lines.append(("bold", f"{title}\n"))
+            lines.append(("bold #e6edf3", f"{title}\n"))
 
         vis = _clamp_sel()
 
@@ -1406,22 +1442,14 @@ def select_dialog(
         ))
 
     layout = Layout(HSplit(layout_panes))
-    _mode = _ui_theme_mode()
-    if _mode == "mono":
-        style = Style.from_dict({
-            "selected": "bold reverse", "option": "", "muted": "",
-            "search-label": "bold", "search-input": "", "auto-confirm": "bold",
-        })
-    else:
-        _c = lambda role: terminal_theme.color(role, _mode)
-        style = Style.from_dict({
-            "selected": f"bold {_c('selected_fg')} bg:{_c('selected_bg')}",
-            "option": "",
-            "muted": _c("muted"),
-            "search-label": f"bold {_c('muted')}",
-            "search-input": f"{_c('plate_fg')} bg:{_c('plate_bg')}",
-            "auto-confirm": _c("warning"),
-        })
+    style = Style.from_dict({
+        "selected": "bold #f0f6fc bg:#21262d",
+        "option": "#e6edf3",
+        "muted": "#8b949e",
+        "search-label": "bold #8b949e",
+        "search-input": "#e6edf3 bg:#161b22",
+        "auto-confirm": "#e3b341",
+    })
 
     app = Application(
         layout=layout,
@@ -5158,44 +5186,35 @@ class MetaCompleter(Completer):
 def _build_prompt_style() -> Style:
     """Build prompt_toolkit Style for the prompt, completion menu, and status bar."""
     mode = _ui_theme_mode()
-    if mode == "mono":
-        # Mono deliberately gets nothing: that theme is colourless by
-        # contract and bold alone still reads.
-        accent = success = warning = muted = subtle = agent = ""
-        logo_green = logo_red = menu_text = menu_meta = ""
-        menu_bg, selected_bg = "", "reverse"
-    else:
-        accent, success, warning, muted, subtle, agent = (
-            terminal_theme.color(role, mode) for role in
-            ("accent_dim", "success", "warning", "muted", "subtle", "agent"))
-        # The L> mark keeps the banner logo's own two colours, independent of
-        # the status palette.
-        logo_green = {"dark": "#4ade80", "light": "#116329"}[mode]
-        logo_red = {"dark": "#f85149", "light": "#cf222e"}[mode]
-        # Rows that paint a background carry their paired text colour.
-        menu_text = terminal_theme.color("menu_fg", mode)
-        menu_meta = terminal_theme.color("menu_meta", mode)
-        menu_bg = "bg:" + terminal_theme.color("plate_bg", mode)
-        selected_bg = "bg:" + terminal_theme.color("selected_bg", mode)
-    # Paths and counters are body text: the terminal's own foreground.
-    path = ""
+    palettes = {
+        "dark": ("#c9d1d9", "#2ea043", "#4ade80", "#e3b341", "#8b949e", "#6e7681", "#a78bfa", "#161b22", "#21262d"),
+        "light": ("#24292f", "#176f2c", "#116329", "#9a6700", "#57606a", "#6e7781", "#8250df", "#f6f8fa", "#d0d7de"),
+        "mono": ("", "", "", "", "", "", "", "", "reverse"),
+    }
+    path, accent, success, warning, muted, subtle, agent, menu, selected = palettes.get(mode, palettes["dark"])
+    # The logo's red has no other job in the chrome, so it is not part of the
+    # shared palette tuple. Mono deliberately gets nothing: that theme is
+    # colourless by contract and bold alone still reads.
+    logo_red = {"dark": "#f85149", "light": "#cf222e", "mono": ""}.get(mode, "#f85149")
+    menu_bg = f"bg:{menu}" if menu.startswith("#") else menu
+    selected_bg = f"bg:{selected}" if selected.startswith("#") else selected
     return Style.from_dict({
         "prompt-path": path,
         "prompt-gutter": f"{accent} bold",
         "prompt-gutter-plan": f"{warning} bold",
-        "prompt-caret": logo_green,
+        "prompt-caret": success,
         "prompt-agent": f"{agent} bold",
         "prompt-agent-sup": muted,
         "separator": accent,
         "paste-placeholder": f"bold {success}",
         # Slash-command completion menu keeps its established visual identity.
         "completion-menu": menu_bg,
-        "completion-menu.completion": f"{menu_bg} {menu_text}",
-        "completion-menu.completion.current": f"{selected_bg} {menu_text} bold",
-        "completion-menu.meta.completion": f"{menu_bg} {menu_meta}",
-        "completion-menu.meta.completion.current": f"{selected_bg} {menu_meta}",
+        "completion-menu.completion": f"{menu_bg} {path}",
+        "completion-menu.completion.current": f"{selected_bg} {path} bold",
+        "completion-menu.meta.completion": f"{menu_bg} {muted}",
+        "completion-menu.meta.completion.current": f"{selected_bg} {muted}",
         # Bottom status bar also inherits the terminal background.
-        "bottom-toolbar": path,
+        "bottom-toolbar": "#ffffff",
         "stbar-sep": subtle,
         "stbar-model": f"{accent} bold",
         "stbar-mode-act": f"{success} bold",
@@ -5207,7 +5226,7 @@ def _build_prompt_style() -> Style:
         "stbar-dot-plan": f"{warning} bold",
         # rprompt (right side of prompt line — no background)
         # The L> mark, same two colours as the banner logo.
-        "rprompt-logo-l": f"{logo_green} bold",
+        "rprompt-logo-l": f"{success} bold",
         "rprompt-logo-gt": f"{logo_red} bold",
         "rprompt-logo-count": f"{accent} bold",
         "rprompt-mode-act": f"{success} bold",
@@ -5216,7 +5235,7 @@ def _build_prompt_style() -> Style:
         "rprompt-model": muted,
         "rprompt-context": agent,
         # Alt+1..9 positional slot-selection highlight (right prompt).
-        "rprompt-slot-selected": f"{selected_bg} {menu_text} bold",
+        "rprompt-slot-selected": f"{selected_bg} {path} bold",
     })
 
 
@@ -21759,7 +21778,7 @@ def _attach_primary_runtime_view(agent, *, show_result: bool = True):
         _set_run_input_state("running")
         try:
             with _safe_status(
-                    f"[accent]Thinking… {symbols.BULLET} primary runtime[/accent]",
+                    f"[#3fb950]Thinking… {symbols.BULLET} primary runtime[/#3fb950]",
                     spinner="dots"):
                 while worker.is_alive():
                     worker.join(timeout=0.1)
@@ -27325,6 +27344,7 @@ def _sync_session_approval_from_mode():
     _session_approval_state["all_commands"] = aa in ("commands", "all")
 
 
+@terminal_theme.authored_styles()  # a tool's own display keeps its styles
 def _arrow_approval_prompt(title: str, body_lines: list[str],
                            options: list[str], *,
                            auto_confirm_seconds: Optional[float] = None,
@@ -27341,17 +27361,17 @@ def _arrow_approval_prompt(title: str, body_lines: list[str],
     def _line_markup(ln: str) -> str:
         esc = escape(ln)
         if ln.startswith("+") and not ln.startswith("+++"):
-            return f"[success]{esc}[/success]"
+            return f"[#9ece6a]{esc}[/#9ece6a]"
         if ln.startswith("-") and not ln.startswith("---"):
-            return f"[error]{esc}[/error]"
+            return f"[#f7768e]{esc}[/#f7768e]"
         if ln.startswith("@@"):
-            return f"[info]{esc}[/info]"
-        return esc
+            return f"[#7aa2f7]{esc}[/#7aa2f7]"
+        return f"[#c0c0c0]{esc}[/#c0c0c0]"
 
     # Split "action — question" back into the action word for the header.
     _action = title.split(" — ")[0] if " — " in title else title
     _target = body_lines[0] if body_lines else ""
-    _header_color = terminal_theme.color("error" if destructive else "warning") or "default"
+    _header_color = "#f85149" if destructive else "#e3b341"
 
     console.print(
         f"  [bold {_header_color}]{escape(_action)}[/bold {_header_color}]"
@@ -27467,6 +27487,7 @@ def _requesting_agent_label() -> str:
 _PARALLEL_APPROVAL_BODY_LINES = 8
 
 
+@terminal_theme.authored_styles()  # a tool's own display keeps its styles
 def _compact_parallel_approval_prompt(title: str, body: str, question: str, *,
                                       allow_always: bool, destructive: bool,
                                       auto_confirm_seconds) -> str:
@@ -27492,7 +27513,7 @@ def _compact_parallel_approval_prompt(title: str, body: str, question: str, *,
 
     _cmd = body.split("\n", 1)[0]
     _agent_label = _requesting_agent_label()
-    _color = terminal_theme.color("error" if destructive else "warning") or "default"
+    _color = "#f85149" if destructive else "#e3b341"
     # Parentheses, not brackets: a literal "[y/a/n]" would be parsed by Rich
     # as an (unrecognized, zero-width) markup tag and silently vanish --
     # the exact same bracket-injection failure mode fixed earlier in the

@@ -11,6 +11,7 @@ from rich.spinner import Spinner
 from rich.text import Text
 
 import symbols
+import terminal_theme
 import transcript_view
 
 
@@ -23,7 +24,8 @@ class AppendConsole(Console):
 
     def get_style(self, name, *, default=None):
         resolver = self.style_resolver
-        if resolver is not None and isinstance(name, str):
+        if (resolver is not None and isinstance(name, str)
+                and not terminal_theme.authored()):
             style = resolver(name)
             if style is not None:
                 return style
@@ -70,7 +72,7 @@ class AppendInput:
         self._thinking_t0 = self._t0
         self._paused = False
         self._live = None
-        self._spinner = Spinner("dots", style="accent")
+        self._spinner = Spinner("dots", style="#3fb950")
         self._spinner.frames = list(symbols.SPINNER_RELAY)
         self._spinner.interval = symbols.SPINNER_INTERVAL_MS
 
@@ -110,7 +112,7 @@ class AppendInput:
         header = ("─╮ " if entries else "") + label
         header += f" {time.monotonic() - t0:.1f}s · {model or '—'} · {mode}"
         self._spinner.text = Text(
-            transcript_view.crop_cells(header, max(1, width - 3)), style="muted")
+            transcript_view.crop_cells(header, max(1, width - 3)), style="#8b949e")
         if not entries:
             return self._spinner
         # Newlines and tabs from a paste stay in the submitted message, but
@@ -135,7 +137,7 @@ class AppendInput:
             row += transcript_view.crop_cells(preview, max(0, width - len(prefix)), middle=True)
             rows.append(row)
         return Group(self._spinner, *(
-            Text(transcript_view.crop_cells(row, width), style="muted", no_wrap=True)
+            Text(transcript_view.crop_cells(row, width), style="#8b949e", no_wrap=True)
             for row in rows))
 
     def set_draft(self, text):

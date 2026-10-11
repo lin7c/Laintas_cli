@@ -430,7 +430,7 @@ Agent roles and workflow phases can narrow tools and specialize instructions for
 
 For new domain behavior, prefer composing roles and workflows with registered skill/MCP/extension tools. Editing `hwo_runner.py`, `workflow_engine.py`, or UI internals directly is core development, not a compatibility-stable customization path.
 
-Theme and terminal behavior are user preferences exposed by commands such as `/theme` and `/config`. `/theme` only chooses text colors and never repaints the terminal: `auto` (the default) asks the terminal for its background once and picks text made for a dark or a light one, `dark` and `light` set that choice by hand, and `mono` uses no color. Body text always keeps the terminal's own foreground. Resource screens inherit shared styles and key bindings; specialized live workspaces add only interactions required by their domain.
+Theme and terminal behavior are user preferences exposed by commands such as `/theme` and `/config`. `/theme` only chooses text colors and never repaints the terminal: `auto` (the default) asks the terminal for its background once and picks text made for a dark or a light one, `dark` and `light` set that choice by hand, and `mono` uses no color. The fixed lines that commands print are recolored to stay readable on that background; tool rows, thinking notes, model output, the prompt and menus keep their established styles. Resource screens inherit shared styles and key bindings; specialized live workspaces add only interactions required by their domain.
 
 ## Security Boundaries
 

@@ -1,11 +1,8 @@
-"""Text colors follow the terminal background and never repaint it."""
+"""Fixed command output is recolored for the terminal background; nothing else is."""
 import io
 
 import pytest
-from rich.color import ColorType
-from rich.console import Console
 from rich.style import Style
-from rich.theme import Theme
 
 import agent_loop
 import append_input
@@ -24,7 +21,7 @@ def _contrast(first: str, second: str) -> float:
     return (high + 0.05) / (low + 0.05)
 
 
-TEXT_ROLES = ("muted", "subtle", "success", "warning", "error", "info", "agent", "accent")
+TEXT_ROLES = ("muted", "subtle", "success", "warning", "error", "info", "agent")
 # Backgrounds people actually run: black, common editor/terminal defaults,
 # Solarized, Ubuntu aubergine; white, light grey, Solarized light.
 BACKGROUNDS = {
@@ -41,15 +38,9 @@ def test_text_roles_stay_readable_on_real_terminal_backgrounds(mode):
             assert ratio >= 4.5, (mode, role, background, round(ratio, 2))
 
 
-@pytest.mark.parametrize("mode", ("dark", "light"))
-def test_painted_backgrounds_carry_their_own_readable_text(mode):
-    palette = terminal_theme.PALETTES[mode]
-    assert _contrast(palette["plate_fg"], palette["plate_bg"]) >= 7
-    assert _contrast(palette["selected_fg"], palette["selected_bg"]) >= 7
-
-
 def _console(mode: str) -> append_input.AppendConsole:
-    theme = Theme(terminal_theme.rich_styles(mode))
+    import laintas_cli
+    theme = laintas_cli._THEME_VARIANTS[mode]
     console = append_input.AppendConsole(
         file=io.StringIO(), force_terminal=True, color_system="truecolor",
         theme=theme, width=120, highlight=False)
@@ -79,8 +70,7 @@ def test_legacy_markup_uses_the_palette_instead_of_ansi_colors(mode):
 
 @pytest.mark.parametrize("mode", ("dark", "light"))
 def test_body_text_and_white_keep_the_terminal_foreground(mode):
-    assert _render(mode, "plain [white]white[/white] [foreground]body[/foreground]") == (
-        "plain white body\n")
+    assert _render(mode, "plain [white]white[/white]") == "plain white\n"
     assert _render(mode, "[bold white]title[/bold white]") == "\x1b[1mtitle\x1b[0m\n"
 
 
@@ -93,7 +83,35 @@ def test_ordinary_output_never_paints_a_background():
 def test_compound_styles_may_mix_semantic_names():
     console = _console("dark")
     style = console.get_style("bold accent")
-    assert style.bold and style.color.get_truecolor().hex == terminal_theme.color("accent", "dark")
+    assert style.bold and style.color.get_truecolor().hex == "#3fb950"
+
+
+def test_named_theme_styles_keep_their_own_colors():
+    output = _render("dark", "[muted]a[/muted][success]b[/success][accent]c[/accent]")
+    assert "38;2;139;148;158" in output      # muted  #8b949e
+    assert "38;2;74;222;128" in output       # success #4ade80
+    assert "38;2;63;185;80" in output        # accent #3fb950
+
+
+def test_tool_rows_thinking_notes_and_model_output_are_not_recolored():
+    import laintas_cli
+    import transcript_view
+
+    console = _console("dark")
+    view = transcript_view.TranscriptRenderer(console, markdown_cls=laintas_cli.Markdown)
+    view.note("looking at the file")
+    view.command_block("ls", 0, "a\nb")
+    view.assistant("prose `code`")
+    transcript_view.bg_print(console, "[dim]row[/dim] [yellow]warn[/yellow]")
+    output = console.file.getvalue()
+    muted = terminal_theme.color("muted", "dark")
+    red, green, blue = (int(muted[i:i + 2], 16) for i in (1, 3, 5))
+    assert f"38;2;{red};{green};{blue}" not in output
+    assert "\x1b[2m" in output               # the note's faint text, as written
+    assert "\x1b[37m" in output              # markdown prose in white
+    # The bypass ends with the call that asked for it.
+    console.print("[dim]fixed line[/dim]")
+    assert f"38;2;{red};{green};{blue}" in console.file.getvalue()
 
 
 def test_explicit_colors_and_painted_backgrounds_pass_through():
@@ -106,17 +124,6 @@ def test_explicit_colors_and_painted_backgrounds_pass_through():
 def test_mono_carries_no_color():
     output = _render("mono", "[yellow]a[/yellow][red]b[/red][error]c[/error][accent]d[/accent]")
     assert "38;" not in output and "\x1b[3" not in output
-    for style in terminal_theme.rich_styles("mono").values():
-        style = style if isinstance(style, Style) else Style.parse(style)
-        assert style.color is None or style.color.type != ColorType.STANDARD
-
-
-def test_rich_default_styles_are_moved_onto_the_palette():
-    styles = Theme(terminal_theme.rich_styles("light")).styles
-    for name, style in styles.items():
-        if style.bgcolor is None and not style.reverse:
-            assert not style.dim, name
-            assert style.color is None or style.color.type != ColorType.STANDARD, name
 
 
 # ---------- terminal background ----------

@@ -21,6 +21,7 @@ status tail.
 import re
 
 import symbols
+import terminal_theme
 
 # Tools whose successful calls print nothing: the live task list already
 # reflects them, and a replay must stay just as quiet.
@@ -370,7 +371,8 @@ def bg_print(console, markup_text: str, width: int = 0) -> None:
         text = Text(markup_text)
     text.set_length(width)
     text.stylize("surface")
-    console.print(text, highlight=False)
+    with terminal_theme.authored_styles():
+        console.print(text, highlight=False)
 
 
 def print_markdown(console, content: str, markdown_cls=None) -> bool:
@@ -384,7 +386,8 @@ def print_markdown(console, content: str, markdown_cls=None) -> bool:
     if markdown_cls is None:
         from rich.markdown import Markdown as markdown_cls  # noqa: N813
     try:
-        console.print(markdown_cls(content))
+        with terminal_theme.authored_styles():
+            console.print(markdown_cls(content))
         return True
     except Exception:
         console.print(content, markup=False, highlight=False)
@@ -478,7 +481,8 @@ class TranscriptRenderer:
         bg_print(self.console, markup, self._width)
 
     def _plain(self, markup: str) -> None:
-        self.console.print(markup, highlight=False)
+        with terminal_theme.authored_styles():
+            self.console.print(markup, highlight=False)
 
     def flush(self) -> None:
         """Close an open read group."""
@@ -558,8 +562,9 @@ class TranscriptRenderer:
             return
         style = "error" if rc not in (0, -1) else "muted"
         from rich.text import Text
-        for line in fold_lines(output, self._fold_limit()):
-            self.console.print(Text(f"  {line}", style=style))
+        with terminal_theme.authored_styles():
+            for line in fold_lines(output, self._fold_limit()):
+                self.console.print(Text(f"  {line}", style=style))
 
     def rule(self) -> None:
         self.flush()

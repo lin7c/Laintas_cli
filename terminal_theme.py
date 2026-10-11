@@ -1,25 +1,24 @@
-"""Text colors chosen for the terminal's own background.
+"""Readable colors for the fixed lines commands print.
 
-The CLI never repaints the terminal. Body text keeps the terminal's default
-foreground, so it is exactly as bright as everything else the user reads
-there; only secondary and status text carry a color, picked for a dark or a
-light background.
+Fixed output is spelled the old way (``[dim]``, ``[yellow]``,
+``style="cyan"``). Those names render with the terminal's 16-color palette
+and the faint attribute, which is where washed-out output came from.
+``adapt`` and ``StyleResolver`` reroute them onto a palette picked for a dark
+or a light terminal background. The CLI never repaints the terminal.
 
-Most call sites still spell their styles the old way (``[dim]``,
-``[yellow]``, ``style="cyan"``). Those names would otherwise render with the
-terminal's 16-color palette and the faint attribute, which is where washed-out
-output came from. ``adapt`` and ``StyleResolver`` reroute them onto the
-palette, so the whole CLI follows ``/theme`` without touching those sites.
-Styles that paint their own background are left alone: they carry their own
-paired foreground.
+Nothing else is recolored: named theme styles, explicit RGB values and
+styles that paint a background pass through, and tool rows, thinking notes
+and model output render inside ``authored_styles``, which skips the resolver.
 
-This module imports no agent state, so the updater's progress bar can use it.
+This module imports no agent state.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import sys
+import threading
 import time
 
 THEMES = ("auto", "dark", "light", "mono")
@@ -30,23 +29,11 @@ PALETTES = {
         "muted": "#a3adb8", "subtle": "#8e98a4",
         "success": "#56d364", "warning": "#e3b341", "error": "#ff7b72",
         "info": "#79d8e0", "agent": "#b9a3ff",
-        "accent": "#3fb950", "accent_dim": "#2ea043", "rule": "#586069",
-        # Paired colors for the few places that paint a background.
-        "plate_fg": "#e6edf3", "plate_bg": "#161b22",
-        "selected_fg": "#f0f6fc", "selected_bg": "#21262d",
-        # The slash-command menu keeps its established look.
-        "menu_fg": "#c9d1d9", "menu_meta": "#8b949e",
-        "track": "#484f58",
     },
     "light": {
         "muted": "#57606a", "subtle": "#626a73",
         "success": "#17752f", "warning": "#8a5a00", "error": "#cf222e",
         "info": "#0f6f78", "agent": "#7a44d6",
-        "accent": "#176f2c", "accent_dim": "#238636", "rule": "#afb8c1",
-        "plate_fg": "#24292f", "plate_bg": "#f6f8fa",
-        "selected_fg": "#24292f", "selected_bg": "#d0d7de",
-        "menu_fg": "#24292f", "menu_meta": "#57606a",
-        "track": "#d0d7de",
     },
 }
 
@@ -249,47 +236,28 @@ def adapt(style, mode: str | None = None):
     return _rebuild(style, color_value=value, dim=False if style.dim else style.dim)
 
 
-def rich_styles(mode: str) -> dict:
-    """Every Rich style name the CLI renders with, for one resolved mode."""
-    from rich.default_styles import DEFAULT_STYLES
-    styles = {name: adapt(style, mode) for name, style in DEFAULT_STYLES.items()}
-    # Headings are body text set apart by weight; Rich's magenta would read
-    # as the agent identity color.
-    for level in range(1, 8):
-        heading = styles.get(f"markdown.h{level}")
-        if heading is not None:
-            styles[f"markdown.h{level}"] = _rebuild(heading, color_value=None, dim=False)
-    if mode == "mono":
-        styles.update({
-            "accent": "bold", "accent.dim": "dim", "success": "bold",
-            "error": "bold reverse", "warning": "bold", "info": "", "foreground": "",
-            "muted": "dim", "subtle": "dim", "surface": "", "selected": "reverse",
-            "agent": "bold", "path": "", "glyph": "bold", "rule": "dim", "track": "dim",
-            "markdown.code": "", "markdown.code_block": "",
-        })
-        return styles
-    p = PALETTES[mode]
-    styles.update({
-        "foreground": "", "path": "",
-        "muted": p["muted"], "subtle": p["subtle"],
-        "success": p["success"], "warning": p["warning"], "error": "bold " + p["error"],
-        "info": p["info"], "agent": p["agent"],
-        "accent": p["accent"], "accent.dim": p["accent_dim"], "glyph": p["accent"],
-        "rule": p["rule"], "track": p["track"],
-        "surface": f"{p['plate_fg']} on {p['plate_bg']}",
-        "selected": f"bold {p['selected_fg']} on {p['selected_bg']}",
-        "markdown.code": "", "markdown.code_block": "",
-        # Rich quotes in magenta, which here is the agent identity color.
-        "markdown.block_quote": "italic " + p["muted"],
-    })
-    return styles
+_authored = threading.local()
+
+
+@contextlib.contextmanager
+def authored_styles():
+    """Render this thread's output with styles exactly as written."""
+    _authored.depth = getattr(_authored, "depth", 0) + 1
+    try:
+        yield
+    finally:
+        _authored.depth -= 1
+
+
+def authored() -> bool:
+    return bool(getattr(_authored, "depth", 0))
 
 
 class StyleResolver:
-    """Resolve style strings that are not theme names (``dim yellow``).
+    """Resolve plain style spellings (``dim``, ``dim yellow``, ``bold accent``).
 
-    Rich parses those straight into ANSI colors, bypassing the theme. This
-    resolves them word by word through the theme and adapts what is left.
+    Rich turns those straight into ANSI colors and the faint attribute. This
+    adapts them, word by word where they mix in a theme name.
     """
 
     _KEYWORDS = frozenset({"on", "not", "link"})
@@ -313,8 +281,9 @@ class StyleResolver:
     def _resolve(self, name: str):
         from rich.style import Style
         from rich import errors
-        if name in self._styles:
-            return None
+        # A plain style spelling (``dim``, ``yellow``) is adapted even though
+        # Rich also lists it as a default theme name; a name that only the
+        # theme knows (``muted``, ``markdown.code``) is left to the theme.
         try:
             return adapt(Style.parse(name), self._mode)
         except errors.StyleSyntaxError:
@@ -324,11 +293,11 @@ class StyleResolver:
             return None
         parts = []
         for word in words:
-            known = self._styles.get(word)
-            if known is None:
-                try:
-                    known = adapt(Style.parse(word), self._mode)
-                except errors.StyleSyntaxError:
+            try:
+                known = adapt(Style.parse(word), self._mode)
+            except errors.StyleSyntaxError:
+                known = self._styles.get(word)
+                if known is None:
                     return None
             parts.append(known)
         return Style.combine(parts)
