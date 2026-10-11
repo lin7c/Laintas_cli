@@ -87,10 +87,12 @@ def test_compound_styles_may_mix_semantic_names():
 
 
 def test_named_theme_styles_keep_their_own_colors():
-    output = _render("dark", "[muted]a[/muted][success]b[/success][accent]c[/accent]")
-    assert "38;2;139;148;158" in output      # muted  #8b949e
-    assert "38;2;74;222;128" in output       # success #4ade80
-    assert "38;2;63;185;80" in output        # accent #3fb950
+    # Resolved styles, not rendered bytes: Rich caches a Style's escape codes
+    # for the first color system that renders it, and the theme is shared.
+    console = _console("dark")
+    for name, expected in (("muted", "#8b949e"), ("success", "#4ade80"),
+                           ("accent", "#3fb950")):
+        assert console.get_style(name).color.get_truecolor().hex == expected
 
 
 def test_tool_rows_thinking_notes_and_model_output_are_not_recolored():

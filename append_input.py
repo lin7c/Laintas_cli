@@ -55,9 +55,13 @@ def current(console=None):
 
 
 class AppendInput:
-    def __init__(self, console, labels):
+    def __init__(self, console, labels, shimmer=None):
         self.console = console
         self.labels = labels
+        # ``shimmer(label, elapsed) -> [(style, text), ...]``: the status
+        # verb is drawn the same way here as in the stream's own row, so it
+        # does not change color when that row takes over.
+        self._shimmer = shimmer
         self._lock = threading.RLock()
         self._display_lock = threading.RLock()
         self.draft = ""
@@ -109,10 +113,18 @@ class AppendInput:
         if entries:
             label = "Writing…" if label == "Writing…" else "Thinking…"
             t0 = thinking_t0
-        header = ("─╮ " if entries else "") + label
-        header += f" {time.monotonic() - t0:.1f}s · {model or '—'} · {mode}"
-        self._spinner.text = Text(
+        connector = "─╮ " if entries else ""
+        elapsed = time.monotonic() - t0
+        header = f"{connector}{label} {elapsed:.1f}s · {model or '—'} · {mode}"
+        text = Text(
             transcript_view.crop_cells(header, max(1, width - 3)), style="#8b949e")
+        if self._shimmer is not None:
+            start = len(connector)
+            for style, part in self._shimmer(label, elapsed):
+                if style:
+                    text.stylize(style, start, start + len(part))
+                start += len(part)
+        self._spinner.text = text
         if not entries:
             return self._spinner
         # Newlines and tabs from a paste stay in the submitted message, but

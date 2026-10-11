@@ -28025,7 +28025,8 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
     import agent_loop as _run_status
     run_ui = append_input.AppendInput(
         console, lambda: (_run_status._live_status_model(),
-                         _run_status._active_mode_label()))
+                         _run_status._active_mode_label()),
+        shimmer=_run_status._shimmer_segments)
     try:
         if not (events_cb is not None and _repl_process_depth() == 0
                 and sys.stdin.isatty() and run_ui.start()):

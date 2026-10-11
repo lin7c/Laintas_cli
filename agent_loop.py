@@ -5328,6 +5328,9 @@ def spawn_subagent(parent_id: str, task: str, deps,
     _turn_note = _child_turn_limit_note()
     if _turn_note:
         effective_task = f"{_turn_note}\n\n{effective_task}"
+        # The note is ours, not the caller's words: the intent pass measures
+        # and reads the task without it.
+        child.state["_turn_limit_note"] = _turn_note
     if role:
         child.state["_role_name"] = role
         role_obj = agent_roles.get_role(role)
@@ -12205,10 +12208,14 @@ def run_agent_loop(
                 _intent_st["phase"] = intent.SPEC_READY
                 state["_intent"] = _intent_st
 
+            _intent_task = original_input
+            _own_note = str(state.get("_turn_limit_note") or "")
+            if _own_note and _intent_task.startswith(_own_note):
+                _intent_task = _intent_task[len(_own_note):].lstrip()
             if (_intent_thread is None
                     and _intent_st.get("phase") == intent.IDLE
                     and intent.should_start(
-                        original_input,
+                        _intent_task,
                         thread_mode=_thread_mode,
                         enabled=bool(get_runtime_config("intent_enabled")),
                         has_contract=bool(state.get("_contract")),
@@ -12268,7 +12275,7 @@ def run_agent_loop(
                 except Exception:
                     pass
 
-                def _intent_worker(_task=original_input, _fn=_intent_llm_fn,
+                def _intent_worker(_task=_intent_task, _fn=_intent_llm_fn,
                                    _out=_intent_result,
                                    _tree=_int_tree_block,
                                    _rounds=int(get_runtime_config(

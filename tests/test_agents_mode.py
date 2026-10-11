@@ -25,6 +25,13 @@ import hwo_runner
 import laintas_cli
 
 
+class _WideOutput(DummyOutput):
+    """Wide enough for the rail-and-conversation layout (DummyOutput is 80)."""
+
+    def get_size(self):
+        return Size(rows=40, columns=120)
+
+
 class AgentsModeTests(unittest.TestCase):
     def setUp(self):
         agent_loop.close_all_agents()
@@ -308,7 +315,7 @@ class AgentsModeTests(unittest.TestCase):
 
             sender = threading.Thread(target=keys)
             sender.start()
-            controller.run(input=pipe_input, output=DummyOutput())
+            controller.run(input=pipe_input, output=_WideOutput())
             sender.join(timeout=1)
 
         self.assertEqual(calls, ["hello"])
@@ -345,7 +352,7 @@ class AgentsModeTests(unittest.TestCase):
 
             sender = threading.Thread(target=keys)
             sender.start()
-            controller.run(input=pipe_input, output=DummyOutput())
+            controller.run(input=pipe_input, output=_WideOutput())
             sender.join(timeout=1)
 
             self.assertEqual(agent.status, "thinking")
@@ -443,6 +450,21 @@ class AgentsModeTests(unittest.TestCase):
             "term0", mock.Mock(), {})
         with create_pipe_input() as pipe_input:
             pipe_input.send_bytes(b"/exit\r")
+            controller.run(input=pipe_input, output=_WideOutput())
+
+        self.assertFalse(any(
+            event.event_type == "user_message"
+            for event in agent_ui_events.hub.events("term0")))
+
+    def test_exit_command_works_from_a_narrow_conversation(self):
+        self._agent("primary", role="primary")
+        self._agent("worker", role="pool")
+        controller = agents_mode.AgentsModeController(
+            "term0", mock.Mock(), {})
+        with create_pipe_input() as pipe_input:
+            # Narrow terminals open on the agent list; Enter opens the
+            # selected conversation, where the prompt takes commands.
+            pipe_input.send_bytes(b"\r/exit\r")
             controller.run(input=pipe_input, output=DummyOutput())
 
         self.assertFalse(any(

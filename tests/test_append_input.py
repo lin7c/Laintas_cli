@@ -36,6 +36,31 @@ class AppendInputTests(unittest.TestCase):
         pyte.Stream(screen).feed(self.output.getvalue().replace('\n', '\r\n'))
         return [line.rstrip() for line in screen.display if line.strip()]
 
+    def test_status_verb_shimmers_before_the_stream_row_and_while_composing(self):
+        import agent_loop
+        self.ui._shimmer = agent_loop._shimmer_segments
+
+        def styles(connector):
+            text = self.ui.__rich__().renderables[0].text if connector else self.ui.__rich__().text
+            plain = text.plain
+            at = lambda needle: {
+                str(span.style) for span in text.spans
+                if span.start <= plain.index(needle) < span.end}
+            return plain, at("Thinking"), at("s ·"), text.style
+
+        # No stream row installed yet: the verb is green from the first frame.
+        plain, verb, tail, base = styles(False)
+        self.assertTrue(plain.startswith("Thinking… "))
+        self.assertTrue(verb and all("#" in style for style in verb), verb)
+        self.assertEqual((tail, base), (set(), "#8b949e"))
+        # Composing: the connector stays grey, the verb keeps the shimmer.
+        self.ui.set_draft("more detail")
+        plain, verb, tail, base = styles(True)
+        self.assertTrue(plain.startswith("─╮ Thinking… "))
+        self.assertTrue(verb and all("#" in style for style in verb), verb)
+        text = self.ui.__rich__().renderables[0].text
+        self.assertFalse(any(span.start < 3 for span in text.spans))
+
     def test_connected_rows_hide_preview_execution_and_logs(self):
         with self.ui.status(lambda: Text('reply preview\nexecuting shell command')):
             self.ui.set_draft('Analyze only; do not edit')
