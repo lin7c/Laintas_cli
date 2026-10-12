@@ -44,6 +44,8 @@ class ArgumentContractTests(unittest.TestCase):
                 "/extensions pack demo --output demo.lext",
                 "/usage 7d local", "/usage buy calls",
                 "/helpwo", "/helpwo stop",
+                "/v update --overwrite-local",
+                "/version update --force --overwrite-local",
                 "/shared rm old --yes",
                 "/web cookies clear example.com", "/identity capture work a.com,b.com",
                 "/evolve activate cand-1 --force", "/prompt status"):
@@ -55,6 +57,7 @@ class ArgumentContractTests(unittest.TestCase):
                 "/prop sys 2 3", "/usage buy calls now", "/img list extra",
                 "/retask help me",
                 "/helpwo --remote", "/helpwo stpo",
+                "/v update --overwrite-remote",
                 "/handoff list mine", "/shared ls a b", "/shared delete a b",
                 "/web status now", "/web test google bing",
                 "/identity delete a b", "/why 1 2", "/hwo status run1 run2", "/evolve status now",

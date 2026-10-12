@@ -372,6 +372,20 @@ class SourceCheckoutTests(unittest.TestCase):
     delete its own backups afterwards.
     """
 
+    def test_safe_name_accepts_hidden_files_but_rejects_traversal(self):
+        for name in (
+                ".gitignore",
+                "default_skills/.shipped-digests.json",
+                "nested/.metadata/file.json"):
+            with self.subTest(name=name):
+                self.assertTrue(updater._safe_name(name))
+
+        for name in (
+                "", ".", "..", "nested/../escape", "nested/./file",
+                "nested//file", "/absolute", "nested\\\\file"):
+            with self.subTest(name=name):
+                self.assertFalse(updater._safe_name(name))
+
     @staticmethod
     def _manifest(payload=b"released\n"):
         import hashlib
@@ -406,6 +420,30 @@ class SourceCheckoutTests(unittest.TestCase):
         self.assertFalse(ok)
         download.assert_not_called()
         self.assertTrue(any("git checkout" in m for m in messages), messages)
+
+    def test_manifest_and_zip_accept_the_shipped_digest_file(self):
+        import hashlib
+        import io
+        import zipfile
+
+        name = "default_skills/.shipped-digests.json"
+        payload = b'{"skills": {}}\n'
+        digest = hashlib.sha256(payload).hexdigest()
+        manifest = {"version": "9.9.9", "files": {
+            name: {"sha256": digest}}}
+        bundle = io.BytesIO()
+        with zipfile.ZipFile(bundle, "w") as zf:
+            zf.writestr(name, payload)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(updater, "install_dir", return_value=tmp), \
+                    mock.patch.object(updater, "_download",
+                                      return_value=bundle.getvalue()):
+                ok = updater.apply_source_update(
+                    manifest, [(name, digest)], "latest",
+                    lambda *_a, **_k: None)
+            self.assertTrue(ok)
+            self.assertEqual(Path(tmp, name).read_bytes(), payload)
 
     def test_allow_checkout_lets_a_deliberate_overwrite_through(self):
         import io
