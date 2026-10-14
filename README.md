@@ -1,8 +1,14 @@
-# Laintas CLI
+<p align="center">
+  <img src="docs/assets/laintas-cli-mark.png" width="88" alt="Laintas CLI logo">
+</p>
 
-**Cross-platform autonomous AI agent for terminal work**
+<h1 align="center">Laintas CLI</h1>
 
-[Download](https://cli.laintas.com) · [Documentation](https://cli.laintas.com/docs) · [Releases](https://github.com/lin7c/Laintas_cli/releases) · [Laintas](https://laintas.com)
+<p align="center"><strong>Cross-platform autonomous AI agent for terminal work</strong></p>
+
+<p align="center">
+  <a href="https://cli.laintas.com">Download</a> · <a href="https://cli.laintas.com/docs">Documentation</a> · <a href="https://github.com/lin7c/Laintas_cli/releases">Releases</a> · <a href="https://laintas.com">Laintas</a>
+</p>
 
 [![A recorded laintas-cli session: it runs the test suite, finds why one test fails, shows the patch, waits for approval, applies it, and re-runs the suite green](docs/assets/terminal-session.svg)](https://cli.laintas.com)
 
@@ -1412,3 +1418,14 @@ earlier distributions.
 ## Contributors
 
 Laintas CLI is maintained by its contributors. Parts of the release packaging and documentation workflow were developed with OpenAI Codex assistance.
+
+<p align="center">
+  <a href="https://laintas.com">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/laintas-mark-dark.png">
+      <img src="docs/assets/laintas-mark-light.png" width="165" alt="Laintas">
+    </picture>
+  </a>
+</p>
+
+<p align="center"><sub>Laintas CLI is part of <a href="https://laintas.com">Laintas</a>.</sub></p>
