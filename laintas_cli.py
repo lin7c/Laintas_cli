@@ -15586,7 +15586,11 @@ def _show_usage_command(args: list, session: dict) -> None:
                 spent = int(ov.get("total_spent_cents", 0) or 0)
                 bal_calls = int(ov.get("balance_calls", 0) or 0)
                 sub_calls = int(ov.get("sub_calls", 0) or 0)
-                plan = ((bal.get("subscription") or {}).get("plan") or "").upper()
+                # laintas names the plan (server plans.js); the id is the
+                # fallback for an older server. coversAll marks the top plan.
+                _sub = bal.get("subscription") or {}
+                plan = str(_sub.get("name") or _sub.get("plan") or "").upper()
+                top_plan = bool(_sub.get("coversAll")) if "coversAll" in _sub else _sub.get("plan") == "gen"
 
                 body.append(_usage_section("agent", "LAINTAS",
                                            f"{profile.origin} {symbols.BULLET} all products {symbols.BULLET} {rng}"))
@@ -15600,7 +15604,7 @@ def _show_usage_command(args: list, session: dict) -> None:
                     if plan:
                         balance_val.append("  ")
                         balance_val.append(f" {plan} ",
-                                           style="black on #bb9af7" if plan == "GEN"
+                                           style="black on #bb9af7" if top_plan
                                            else "black on #7aa2f7")
                     grid.add_row("balance", balance_val)
                 grid.add_row("spent", Text(_fmt_cents(spent),
@@ -16995,8 +16999,11 @@ def _shared_storage_client(session: dict):
 def _shared_print_usage(usage) -> None:
     import shared_storage as ss
 
-    tier = {"pro": "Pro", "gen": "Gen"}.get(usage.tier, "Free")
-    line = (f"[bold]{tier}[/bold] {symbols.BULLET} "
+    # Shown only when the server names one: guessing "Free" told every member
+    # they were on the free tier.
+    raw_tier = str(usage.tier or "").strip()
+    tier = f"[bold]{raw_tier.capitalize()}[/bold] {symbols.BULLET} " if raw_tier else ""
+    line = (f"{tier}"
             f"{ss.human_bytes(usage.used_bytes)} used {symbols.BULLET} "
             f"{ss.human_bytes(usage.free_bytes)} free {symbols.BULLET} "
             f"{ss.human_bytes(usage.max_bytes)} limit")

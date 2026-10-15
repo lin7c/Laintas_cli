@@ -32,10 +32,12 @@ const DOWNLOADS = [
 const CAP_ICONS = [TerminalSquare, Waypoints, ShieldCheck, Layers3];
 
 // Pricing shown on this page mirrors laintas.com/pricing (the authoritative
-// source). Values are kept in sync with the main site's plan cards; the full
+// source: laintas server/plans.js, served at laintas.com/api/plans). Values
+// are kept in sync with the main site's plan cards; the full
 // tier table and allowance comparison live on the pricing page itself.
 const PLANS = [
   { id: 'free', price: '$0', period: '/ mo', title: { zh: '按量使用', en: 'Pay as you go' }, desc: { zh: '无需订阅。用多少付多少，单价公开透明。', en: 'No subscription. Only pay for what you use.' }, features: { zh: ['新用户 100 次调用试用', '用多少付多少', '模型分档，单价透明'], en: ['100-call trial for new accounts', 'Only pay for usage', 'Transparent model tiers'] }, badge: null, highlight: false },
+  { id: 'go', price: '$5', period: '/ mo', title: { zh: 'Go', en: 'Go' }, desc: { zh: '以最低门槛用上会员价，适合轻度使用。', en: 'Member prices at the lowest entry point, for lighter use.' }, features: { zh: ['每月会员积分', '所有产品共用同一额度', '按会员价扣积分，比按量便宜', '超出后可继续按量'], en: ['Monthly member credits', 'One pool across every product', 'Drawn at member prices, below pay-as-you-go', 'Continue pay-as-you-go after'] }, badge: null, highlight: false },
   { id: 'pro', price: '$19.9', period: '/ mo', title: { zh: 'Pro', en: 'Pro' }, desc: { zh: '每月一份会员积分，全产品共用。', en: 'A monthly pool of member credits, shared across every product.' }, features: { zh: ['每月会员积分', '所有产品共用同一额度', '按会员价扣积分，比按量便宜', '超出后可继续按量'], en: ['Monthly member credits', 'One pool across every product', 'Drawn at member prices, below pay-as-you-go', 'Continue pay-as-you-go after'] }, badge: { zh: '最受欢迎', en: 'Most popular' }, highlight: true },
   { id: 'gen', price: '$49.9', period: '/ mo', title: { zh: 'Gen', en: 'Gen' }, desc: { zh: '每月更多会员积分，会员手续费更低。', en: 'A larger monthly pool of member credits, at a lower member fee.' }, features: { zh: ['每月更多会员积分', '突发速率提高', '全产品共用额度', '面向全职 agent 工作流'], en: ['More monthly member credits', 'Higher burst rate', 'One pooled allowance', 'For full-time agent workflows'] }, badge: { zh: '全产品', en: 'All products' }, highlight: false },
 ];
@@ -117,7 +119,7 @@ const COPY = {
     gateNote: '具体落在哪一档，取决于当前模式、项目策略与组织策略。',
 
     priceKicker: '03 · 价格', priceTitle: ['先装上，', '再决定用多少。'],
-    priceIntro: 'Laintas CLI 本身不收费。模型调用按量计费或订阅，Pro 与 Gen 的额度在所有 Laintas 产品间共用。',
+    priceIntro: 'Laintas CLI 本身不收费。模型调用按量计费或订阅会员，会员额度在所有 Laintas 产品间共用。',
     perMonth: '/ 月', pricing: '查看完整定价与模型分档',
     ecoTitle: '同一个账号，也通向这些',
     eco: [
@@ -185,7 +187,7 @@ const COPY = {
     gateNote: 'Which tier an action lands in depends on the active mode, project policy and organization policy.',
 
     priceKicker: '03 · PRICING', priceTitle: ['Install first.', 'Decide how much later.'],
-    priceIntro: 'Laintas CLI itself is free. Model calls are pay-as-you-go or subscription, and Pro and Gen allowances are shared across every Laintas product.',
+    priceIntro: 'Laintas CLI itself is free. Model calls are pay-as-you-go or by membership, and every plan's allowance is shared across every Laintas product.',
     perMonth: '/ mo', pricing: 'Full pricing and model tiers',
     ecoTitle: 'The same account also opens',
     eco: [

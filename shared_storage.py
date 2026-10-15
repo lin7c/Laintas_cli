@@ -124,7 +124,8 @@ class SharedStorage:
     def usage(self) -> Usage:
         data = self._call("GET", "/api/storage/usage")
         return Usage(
-            tier=data.get("tier", "free"),
+            # The storage API names no tier today; "" = unknown, never "free".
+            tier=str(data.get("tier") or ""),
             used_bytes=data.get("used_bytes", 0),
             free_bytes=data.get("free_bytes", 0),
             max_bytes=data.get("max_bytes", 0),
