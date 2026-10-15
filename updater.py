@@ -337,13 +337,14 @@ def _safe_name(name: str) -> bool:
     """Reject anything that could escape the install dir.
 
     Subdir paths ARE allowed (vendored packages like ``agent_tools/…`` ship in
-    the manifest), but every component must be a plain name — no ``..``, no
-    absolute paths, no backslashes, no dot-entries.
+    the manifest), as are ordinary hidden files (for example
+    ``default_skills/.shipped-digests.json``). Reject traversal components,
+    absolute paths, backslashes, and empty components.
     """
     if not name or "\\" in name or os.path.isabs(name):
         return False
     for part in name.split("/"):
-        if not part or part == "." or part == ".." or part.startswith("."):
+        if not part or part == "." or part == "..":
             return False
     return True
 

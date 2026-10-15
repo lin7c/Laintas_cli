@@ -14069,8 +14069,8 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/told", "log"): _arg_rule(2, "/told log [N]"),
     ("/version", "check"): _arg_rule(1, "/version check"),
     ("/version", "update"): _arg_rule(
-        2, "/version update [--force]", flag_start=1,
-        allowed_flags=("--force", "-f")),
+        3, "/version update [--force] [--overwrite-local]", flag_start=1,
+        allowed_flags=("--force", "-f", "--overwrite-local")),
     ("/version", "--force"): _arg_rule(0, "/version [check|update [--force]]"),
     ("/version", "-f"): _arg_rule(0, "/version [check|update [--force]]"),
     ("/update", "check"): _arg_rule(1, "/update check"),
