@@ -438,6 +438,7 @@ def _no_color_requested() -> bool:
 
 
 import append_input
+import progress_report
 
 console = append_input.AppendConsole(
     theme=LAINTAS_THEME,
@@ -1549,6 +1550,7 @@ from agent_loop import (
     next_debug_loop, get_debug_logs,
     run_agent_loop, LoopDeps, compaction_status_text,
     captured_system_prompt, lab_prompt_fallback,
+    aux_model_override, resolve_agent_model,
     register_terminal, unregister_terminal,
     get_terminal, get_all_terminals, close_all_terminals,
     rename_terminal,
@@ -3672,6 +3674,13 @@ class CommandSpec:
 COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec("/help", "Show command help", "Basics", "/help [command]"),
     CommandSpec("/cwd", "Show the working directory", "Basics"),
+    CommandSpec(
+        "/progress", "Report progress while the task keeps running", "Basics",
+        "/progress", help_text=(
+            "During a running task, press Alt+P or type /progress. A separate "
+            "tool-less AI call summarizes recorded progress using /model aux. "
+            "The main task keeps running; the report uses an additional AI call."
+        )),
     CommandSpec("/fg", "Return to the command detached from term0 with Ctrl+]", "Basics"),
     CommandSpec(
         "/messages", "Read the notices behind the L> mark", "Basics",
@@ -9969,6 +9978,10 @@ def _native_to_tool_calls(frags: dict, name_map: Optional[dict] = None,
         if not isinstance(args, dict):
             args = {"value": args}
         call = {"name": name, "arguments": args}
+        if isinstance(slot.get("extra_content"), dict):
+            # Provider state riding on the call (Gemini's thought signature);
+            # it must go back on this same call next step.
+            call["_extra_content"] = slot["extra_content"]
         if _is_damaged:
             # Tagged per CALL, not just per turn: a cut-off batch usually has
             # intact calls in front of the one that ran out of budget, and the
@@ -9977,6 +9990,28 @@ def _native_to_tool_calls(frags: dict, name_map: Optional[dict] = None,
             call["_damaged"] = True
         out.append(call)
     return out
+
+
+def _merge_reasoning_details(acc: list, items) -> None:
+    """Fold streamed `reasoning_details` fragments into whole items (in place).
+
+    Providers stream one item in pieces sharing an `index` (text first, the
+    signature last); the gateway's own converters send each item whole. String
+    pieces concatenate, everything else is taken as sent.
+    """
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        index = item.get("index")
+        target = next((d for d in acc if index is not None and d.get("index") == index), None)
+        if target is None:
+            acc.append(dict(item))
+            continue
+        for key, value in item.items():
+            if key in ("text", "data", "summary", "signature") and isinstance(value, str):
+                target[key] = str(target.get(key) or "") + value
+            else:
+                target[key] = value
 
 
 def _extract_tagged_tool_calls(text: str) -> Optional[list]:
@@ -10175,6 +10210,8 @@ def _salvage_broken_stream(kind: str, error_message: str,
         "_truncation_kind": kind,
         "_truncation_detail": error_message,
         "_reasoning": reasoning,
+        "_served_model": str(frame_locals.get("streamed_model") or ""),
+        "_reasoning_details": list(frame_locals.get("provider_reasoning") or []),
         "_billing": frame_locals.get("billing_info") or {},
         "_budget": frame_locals.get("budget_info") or {},
         "_diag_events": (frame_locals.get("_diag_events") or []) + [kind],
@@ -10323,6 +10360,7 @@ def _call_backend_stream_impl(
     max_tokens_override: Optional[int] = None,
     prompt_budget: Optional[dict] = None,
     _local_sink: Optional[dict] = None,
+    request_timeout_override: Optional[float] = None,
 ) -> dict:
     """Call Helpwo backend /api/chat/stream, same as Helpwo frontend.
     Returns parsed {reply, command, memory, done, _billing} dict.
@@ -10503,7 +10541,8 @@ def _call_backend_stream_impl(
                     # up as a broken response. nginx sits at 360s; this stays
                     # above it so whichever layer is genuinely stuck is the one
                     # that reports it.
-                    timeout=420,
+                    timeout=(min(10.0, request_timeout_override), request_timeout_override)
+                    if request_timeout_override is not None else 420,
                     allow_redirects=False,
                 )
             except requests.Timeout:
@@ -10613,6 +10652,7 @@ def _call_backend_stream_impl(
             except Exception: pass
         accumulated = ""
         reasoning_accumulated = ""  # reasoning models emit delta.reasoning_content
+        provider_reasoning: list = []  # delta.reasoning_details (signatures, encrypted reasoning)
         billing_info: dict = {}
         budget_info: dict = {}
         streamed_model: str = ""
@@ -10739,6 +10779,8 @@ def _call_backend_stream_impl(
             # OpenAI-style native tool_calls in delta: reassemble streamed
             # fragments (keyed by index) instead of dropping them.
             _delta = _choices[0].get("delta", {}) if isinstance(_choices, list) and _choices else {}
+            if _delta.get("reasoning_details"):
+                _merge_reasoning_details(provider_reasoning, _delta["reasoning_details"])
             if _delta.get("tool_calls"):
                 for _frag in _delta["tool_calls"]:
                     if not isinstance(_frag, dict):
@@ -10752,6 +10794,8 @@ def _call_backend_stream_impl(
                         _slot["name"] = _fn["name"]
                     if _fn.get("arguments"):
                         _slot["arguments"] += _fn["arguments"]
+                    if isinstance(_frag.get("extra_content"), dict):
+                        _slot["extra_content"] = _frag["extra_content"]
                 # Native mode: surface the tool name as a command preview as it
                 # streams (un-mangled), so the UI shows what's about to run.
                 if on_chunk is not None and native_tc_frags:
@@ -11005,6 +11049,8 @@ def _call_backend_stream_impl(
                     "_dropped_calls": [c.get("name") for c in native_calls
                                        if c.get("_damaged")],
                     "_reasoning": reasoning_accumulated,
+                    "_served_model": _usage_model,
+                    "_reasoning_details": provider_reasoning,
                     "_billing": billing_info,
                     "_budget": budget_info,
                     "_diag_events": _diag_events + (
@@ -11021,6 +11067,8 @@ def _call_backend_stream_impl(
                 "error": False,
                 "_truncated": False,
                 "_reasoning": reasoning_accumulated,
+                "_served_model": _usage_model,
+                "_reasoning_details": provider_reasoning,
                 "_billing": billing_info,
                 "_budget": budget_info,
                 "_diag_events": _diag_events + ["parsed_native_tool_calls"],
@@ -11044,6 +11092,8 @@ def _call_backend_stream_impl(
                     "_truncation_kind": _truncation_kind or "tool_args",
                     "_truncation_detail": _upstream_cut,
                     "_reasoning": reasoning_accumulated,
+                    "_served_model": _usage_model,
+                    "_reasoning_details": provider_reasoning,
                     "_billing": billing_info,
                     "_budget": budget_info,
                     "_diag_events": _diag_events + ["truncated_tagged_tool_calls_dropped"],
@@ -11056,6 +11106,8 @@ def _call_backend_stream_impl(
                 "error": False,
                 "_truncated": False,
                 "_reasoning": reasoning_accumulated,
+                "_served_model": _usage_model,
+                "_reasoning_details": provider_reasoning,
                 "_billing": billing_info,
                 "_budget": budget_info,
                 "_diag_events": _diag_events + ["parsed_tagged_tool_calls"],
@@ -11075,6 +11127,8 @@ def _call_backend_stream_impl(
             "_truncation_kind": _truncation_kind,
             "_truncation_detail": _upstream_cut,
             "_reasoning": reasoning_accumulated,
+            "_served_model": _usage_model,
+            "_reasoning_details": provider_reasoning,
             "_billing": billing_info,
             "_budget": budget_info,
             "_diag_events": _diag_events,
@@ -13857,10 +13911,17 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     **{
         (name,): _arg_rule(0, name)
         for name in (
-            "/cwd", "/fg", "/scan", "/login", "/max",
-            "/tools", "/snapshots", "/continue", "/password", "/private",
+            "/cwd", "/fg", "/progress", "/scan", "/login", "/max",
+            "/tools", "/snapshots", "/continue", "/password",
         )
     },
+    # /private was in the zero-argument set above, which rejected every
+    # documented form. `set` takes a path and up to three permission words;
+    # private_files.handle_command validates the words themselves.
+    ("/private",): _arg_rule(
+        5, "/private [list|set <path> hidden|no-read|no-write [...]|remove <path>]"),
+    ("/private", "list"): _arg_rule(1, "/private list"),
+    ("/private", "remove"): _arg_rule(2, "/private remove <path>"),
     # /prop takes `sys` and/or a conversation number; prop_ui.parse_target
     # validates the words themselves. It used to sit in the zero-argument set
     # above, which made both documented forms unreachable.
@@ -19832,6 +19893,21 @@ def _cmd_work(parts: list) -> None:
 
 
 
+
+@contextmanager
+def _beta_v1_colors():
+    """Render task checklists in the beta v1 palette on every terminal.
+
+    The dark/light text palettes leave these lines alone: named styles come
+    from LAINTAS_THEME and plain ones (``white``) render as written.
+    """
+    if terminal_theme.active() == "mono":
+        yield
+        return
+    with terminal_theme.authored_styles(), console.use_theme(LAINTAS_THEME):
+        yield
+
+
 def _task_ui_source(task: dict) -> tuple[str, str]:
     """Return a compact source badge and style for TODO/HWO/HWG tasks."""
     metadata = task.get("metadata") or {}
@@ -19871,6 +19947,7 @@ _LIVE_TASK_STATUS_UI = {
 }
 
 
+@_beta_v1_colors()
 def display_live_task_list(tasks: list[dict], agent_id: str) -> None:
     """Print only the tasks that changed since the previous render.
 
@@ -19940,6 +20017,7 @@ _LIVE_RETASK_STATUS_UI = {
 }
 
 
+@_beta_v1_colors()
 def display_live_retask(summary: dict) -> None:
     """Print the checklist lines a retask change touched.
 
@@ -19967,6 +20045,7 @@ def display_live_retask(summary: dict) -> None:
             console.print(Text(f"      └ {note}", style="error" if status == "rejected" else "muted"))
 
 
+@_beta_v1_colors()
 def _render_task_todolist(tasks: list[dict], cwd: str) -> None:
     """Render the shared TODO/HWO/HWG execution view without colored backgrounds."""
     rank = {"in_progress": 0, "pending": 1, "blocked": 2,
@@ -20070,6 +20149,7 @@ def _task_agent_order(current: Optional[AgentInfo], tasks: list[dict]) -> list[s
     return order
 
 
+@_beta_v1_colors()
 def _render_task_agent_tree(tasks: list[dict], cwd: str,
                             current: Optional[AgentInfo], session_id: str) -> None:
     """Render current agent plus descendant task ownership for one session."""
@@ -20551,7 +20631,7 @@ def _cmd_workflow(raw_args: str, parts: list) -> None:
             console.print(f"[dim]Start one with: /workflow start <name> \"description\"[/dim]")
             console.print(f"[dim]Available: {', '.join(_we.list_workflow_templates())}[/dim]")
         else:
-            current = wf.current
+            current = None if wf.completed else wf.current
             phase_info = ""
             if current:
                 phase_info = f"\nCurrent: [bold]{current.name}[/bold] — {current.description}"
@@ -20569,8 +20649,10 @@ def _cmd_workflow(raw_args: str, parts: list) -> None:
             console.print(Panel(
                 f"[bold]{wf.name}[/bold] — {wf.description}\n\n"
                 f"Progress: {wf.progress_str}{phase_info}{history_text}",
-                title="Active Workflow",
-                border_style="cyan",
+                title=("Active Workflow" if not wf.completed else
+                       "Ended Workflow" if wf.ended_early else
+                       "Completed Workflow"),
+                border_style="cyan" if not wf.completed else "dim",
             ))
     elif sub == "advance":
         _, summary_raw = _raw_tail_after_word(raw_args)
@@ -20610,7 +20692,7 @@ def _cmd_workflow(raw_args: str, parts: list) -> None:
         _, summary_raw = _raw_tail_after_word(raw_args)
         summary = _decode_text_arg(summary_raw)
         wf = _we.get_active_workflow()
-        if wf:
+        if wf and not wf.completed:
             _we.end_workflow(summary)
             console.print(f"[dim]Workflow '{wf.name}' ended.[/dim]")
         else:
@@ -22115,7 +22197,20 @@ def _cmd_abort(parts: list) -> None:
     if not target_id:
         console.print("[dim]Agent selection cancelled.[/dim]")
     else:
-        if abort_agent(target_id):
+        # abort_agent() succeeds for any registered agent, so look first: a
+        # second /abort, or one aimed at a finished agent, must not read like
+        # a fresh signal.
+        info = get_agent(target_id)
+        if info is not None and info.status in {"done", "aborted", "error"}:
+            console.print(
+                f"[dim]Agent [bold]{target_id}[/bold] has already stopped "
+                f"({info.status}); nothing to abort.[/dim]")
+        elif info is not None and info.abort_event.is_set():
+            abort_agent(target_id)
+            console.print(
+                f"[dim]Abort was already signaled to [bold]{target_id}[/bold]; "
+                f"it is still stopping ({info.status}).[/dim]")
+        elif abort_agent(target_id):
             console.print(f"[yellow]Abort signaled to [bold]{target_id}[/bold][/yellow]")
         else:
             console.print(f"[red]Agent '{target_id}' not found.[/red]")
@@ -25804,6 +25899,9 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
     elif action == "/cwd":
         _cmd_cwd()
 
+    elif action == "/progress":
+        _request_progress_report()
+
     elif action == "/fg":
         _cmd_fg()
 
@@ -26802,6 +26900,57 @@ _foreground_run_active = False
 _bg_prompt_session: Optional[PromptSession] = None
 _run_input_state = "idle"
 _run_input_state_lock = threading.RLock()
+_progress_reporter: Optional[progress_report.ProgressReporter] = None
+
+
+def _progress_notice(kind, text, snapshot):
+    """Reports are display events, never supplementary task instructions."""
+    owner = str(snapshot.get("agent_id") or "primary")
+    text = _redact_sensitive_text(text)
+    title = f"Progress · {owner} · as of {progress_report.snapshot_time(snapshot)}"
+    renderable = (Panel(LaintasMarkdown(text), title=title, border_style="accent")
+                  if kind == "report" else Text(text, style="muted"))
+    # When /agents owns the screen, append only to the originating Agent's
+    # mirror. Printing through the console would route to the current focus.
+    if repl_mirror.hub.is_agents():
+        repl_mirror.hub.write(owner, f"\n{title}\n{text}\n")
+        return
+    with thread_agent(owner):
+        ui = append_input.current(console)
+        if ui is not None:
+            ui.print_notice(renderable)
+        else:
+            console.print(renderable)
+
+
+def _request_progress_report():
+    reporter = _progress_reporter
+    if reporter is not None and reporter.request():
+        return True
+    ui = append_input.current(console)
+    notice = Text("No foreground task is running. /progress is available during a task.", style="muted")
+    if ui is not None:
+        ui.print_notice(notice)
+    else:
+        console.print(notice)
+    return True
+
+
+def _enrich_progress_snapshot(snapshot):
+    # Explicit run/session/work identifiers prevent switching the Agent view
+    # or the process-global task pointer from changing the report's scope.
+    work_id, session_id = snapshot.get("work_id"), snapshot.get("session_id")
+    if not work_id or not session_id:
+        return
+    import workgraph
+    tasks = workgraph.list_steps(
+        work_id, cwd=snapshot["cwd"], session_id=session_id)
+    snapshot["task_status_counts"] = dict(collections.Counter(
+        task.get("status", "pending") for task in tasks))
+    snapshot["tasks"] = [{
+        "subject": str(task.get("subject") or "")[:300],
+        "status": task.get("status"), "notes": str(task.get("notes") or "")[:500],
+    } for task in tasks[:40]]
 
 
 def _set_run_input_state(value: str) -> None:
@@ -26816,6 +26965,12 @@ def _queue_supplementary(target_queue: queue.Queue, line: str,
     line = str(line or "").strip()
     if not line:
         return False
+    if line.split(maxsplit=1)[0].lower() == "/progress":
+        if line.lower() != "/progress":
+            _progress_notice("error", "Usage: /progress", {
+                "agent_id": "primary", "captured_at": time.time()})
+            return True
+        return _request_progress_report()
     try:
         ui = append_input.current()
         if ui is not None:
@@ -26873,6 +27028,10 @@ def _bg_reader_prompt_mode(target_queue: queue.Queue,
             signal.raise_signal(signal.SIGINT)
         except (ValueError, OSError):
             pass
+
+    @bindings.add("escape", "p")
+    def _progress(_event):
+        _request_progress_report()
 
     _bg_prompt_session = PromptSession(key_bindings=bindings, multiline=False)
     try:
@@ -27038,6 +27197,11 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
 
             if key.name == "eof":
                 break
+
+            if (key.name == "alt" and str(key.text or "").lower() == "p"
+                    and _bg_answer_mode is None):
+                _request_progress_report()
+                continue
 
             if key.name == "alt" and str(key.text or "").lower() == "a":
                 if ui is None:
@@ -27956,6 +28120,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
 
     Returns the same dict as run_agent_loop().
     """
+    global _progress_reporter
     active_agent = get_current_agent()
     _descendants_before = set()
     if active_agent is not None:
@@ -28044,6 +28209,40 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
     # Background stdin reader: supplementary instructions + bare-Esc soft
     # interrupt during the run (wired straight to the interrupt event, never
     # a signal, so Esc can never kill the CLI).
+    _aux_model, _aux_provider = aux_model_override()
+    if not _aux_model:
+        _aux_model, _aux_provider = resolve_agent_model(
+            active_agent, agent_state.get("_model_override", ""),
+            agent_state.get("_provider_override", ""))
+    reporter = progress_report.ProgressReporter(
+        getattr(deps, "call_backend", call_backend_stream),
+        account_store.frozen_auth(session), user_input,
+        os.getcwd(), active_agent.id if active_agent is not None else "primary",
+        _aux_model, _aux_provider, _progress_notice,
+        enrich=_enrich_progress_snapshot, initial_state=agent_state,
+        continuing=continue_thread,
+        scrub=_redact_sensitive_text,
+        max_tokens=get_runtime_config("progress_max_tokens"))
+    _progress_reporter = reporter
+
+    def _publish_report_evidence(state, phase):
+        children = []
+        if active_agent is not None:
+            for child_id in list(active_agent.child_ids)[:20]:
+                child = get_agent(child_id)
+                if child is not None:
+                    if (child_id in _descendants_before
+                            and child.status in ("idle", "done", "error", "aborted")):
+                        continue
+                    assignment = child.active_assignment
+                    children.append({
+                        "agent_id": child.id, "status": child.status,
+                        "task": str(assignment.task if assignment else
+                                    child.state.get("objective", ""))[:500],
+                        "last_reply": str(child.last_reply or "")[:1000],
+                    })
+        reporter.publish(state, phase, children)
+
     _start_bg_input_reader(_msg_queue, _interrupt_event)
 
     # Everything the loop prints is Agent conversation — record it into the
@@ -28144,6 +28343,7 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
                 # passes this, so sub-agents are never affected.
                 max_loops_override=_step_cap,
                 step_mode=_step_cap is not None,
+                progress_cb=_publish_report_evidence,
             )
     except Exception as exc:
         run_error = f"{type(exc).__name__}: {exc}"
@@ -28205,6 +28405,9 @@ def _run_agent_loop_with_interrupt(deps, user_input, session, agent_state,
     finally:
         _foreground_run_active = False
         _foreground_run_thread = None
+        reporter.close()
+        if _progress_reporter is reporter:
+            _progress_reporter = None
         # Esc stops the AGENT the user was talking to. Everything that turn
         # started underneath it has to stop with it — a sub-agent runs on its
         # own thread watching its OWN abort_event, which setting the parent's

@@ -271,3 +271,23 @@ def test_typeahead_is_resubmitted_and_the_unfinished_line_returns_to_the_prompt(
     laintas_cli._restore_typeahead()
     assert submitted == ["ls -la"]
     assert laintas_cli._pending_prompt_default == "git st"
+
+
+@pytest.mark.parametrize("mode", ("dark", "light"))
+def test_task_checklists_keep_the_beta_v1_palette(mode, monkeypatch):
+    import laintas_cli
+
+    console = _console(mode)
+    monkeypatch.setattr(laintas_cli, "console", console)
+    monkeypatch.setattr(terminal_theme, "_active", mode)
+    monkeypatch.setattr(laintas_cli, "_live_task_snapshots", {})
+    laintas_cli.display_live_task_list([
+        {"id": "1", "subject": "search for the logo", "status": "pending"},
+        {"id": "2", "subject": "suggest a placement", "status": "in_progress"},
+        {"id": "3", "subject": "update the readme", "status": "completed"},
+    ], "current")
+    output = console.file.getvalue()
+    assert "\x1b[37m  ○ \x1b[0m\x1b[37msearch for the logo" in output   # ANSI white
+    assert "38;2;227;179;65m" in output   # v1 warning #e3b341
+    assert "38;2;74;222;128m" in output   # v1 success #4ade80
+    assert "38;2;139;148;158m" in output  # v1 muted #8b949e

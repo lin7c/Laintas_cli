@@ -1195,7 +1195,10 @@ class AgentTerminationTests(unittest.TestCase):
                 max_loops_override=2,
             )
         sent = calls[0]["messages"]
-        user_texts = [m.get("content") for m in sent if m.get("role") == "user"]
+        # The newest message carries this step's <harness_state> block after
+        # the prompt; the prompt itself must be there, unchanged.
+        user_texts = [str(m.get("content")).split("\n\n<harness_state>")[0]
+                      for m in sent if m.get("role") == "user"]
         self.assertIn("new interrupted task", user_texts)
         self.assertTrue(result["success"])
 

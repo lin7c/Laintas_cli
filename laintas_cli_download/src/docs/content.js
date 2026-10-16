@@ -54,8 +54,8 @@ export const GROUPS = [
           },
           {
             t: 'note', title: L('账户与计费', 'Account and billing'),
-            ...L(`CLI 本身免费。使用 Laintas 官方后端时，AI 调用从你的 Laintas 账户付款（会员额度、试用次数或余额）。规则见 [平台文档](${PLATFORM}#how-billing-works)。`,
-              `The CLI itself is free. With the official Laintas backend, AI calls are paid from your Laintas account — allowance, trial calls or balance. See the [platform documentation](${PLATFORM}#how-billing-works).`),
+            ...L(`CLI 本身免费。使用 Laintas 官方后端时，AI 调用从你的 Laintas 账户付款（会员额度、试用次数或余额）。规则见 [账户与计费文档](${PLATFORM}#how-billing-works)。`,
+              `The CLI itself is free. With the official Laintas backend, AI calls are paid from your Laintas account — allowance, trial calls or balance. See the [account and billing documentation](${PLATFORM}#how-billing-works).`),
           },
         ],
       },
@@ -144,8 +144,8 @@ export const GROUPS = [
           },
           {
             t: 'p', ...L(
-              `登录状态保存在 \`~/.laintas/session.json\`，只有当前用户可读。设备授权的细节见 [平台文档](${PLATFORM}#device-login)。`,
-              `The session is stored in \`~/.laintas/session.json\`, readable only by your user. See the [platform documentation](${PLATFORM}#device-login) for how device authorization works.`,
+              `登录状态保存在 \`~/.laintas/session.json\`，只有当前用户可读。设备授权的细节见 [账户与计费文档](${PLATFORM}#device-login)。`,
+              `The session is stored in \`~/.laintas/session.json\`, readable only by your user. See the [account and billing documentation](${PLATFORM}#device-login) for how device authorization works.`,
             ),
           },
           {
@@ -296,8 +296,8 @@ export const GROUPS = [
           },
           {
             t: 'p', ...L(
-              `档位（T0–T5）表示模型强度，价格是每个模型自己的：用余额按模型公开标价加手续费计费；用会员积分时走会员线路，按每次调用的实际成本加手续费扣积分。各模型的价格见 [定价页](https://laintas.com/pricing#token-pricing)。`,
-              `A tier (T0–T5) says how strong a model is; the price is each model's own. Paid from balance, a call is charged the model's public list price plus a fee; paid with member credits, it runs on the member route and draws what it actually cost plus a fee. Per-model prices are on the [pricing page](https://laintas.com/pricing#token-pricing).`,
+              `档位（T0–T5）表示模型强度，价格是每个模型自己的：用余额付款按定价页的余额价计费；用会员积分付款按会员价扣积分，大多数模型便宜得多。各模型的价格见 [定价页](https://laintas.com/pricing#token-pricing)。`,
+              `A tier (T0–T5) says how strong a model is; the price is each model's own. Paid from balance, a call is charged the balance price on the pricing page; paid with member credits, it draws the member price in credits — far less for most models. Per-model prices are on the [pricing page](https://laintas.com/pricing#token-pricing).`,
             ),
           },
         ],
@@ -939,14 +939,14 @@ export const GROUPS = [
               ['`/help [command]`', '命令帮助'],
               ['`/cwd`', '显示工作目录'],
               ['`/fg`', '回到用 `Ctrl+]` 转入后台的命令'],
-              ['`/messages`', '阅读平台通知（别名 `/msg`）'],
+              ['`/messages`', '阅读 Laintas 站内消息（别名 `/msg`）'],
               ['`/scan`', '列出 PATH 上面向用户的命令'],
               ['`/img <path> [question]`', '读取图片：提问或转写文字'],
             ], [
               ['`/help [command]`', 'Command help'],
               ['`/cwd`', 'Show the working directory'],
               ['`/fg`', 'Return to a command detached with `Ctrl+]`'],
-              ['`/messages`', 'Read platform notices (alias `/msg`)'],
+              ['`/messages`', 'Read your Laintas inbox (alias `/msg`)'],
               ['`/scan`', 'List user-facing commands on PATH'],
               ['`/img <path> [question]`', 'Read an image: ask about it or transcribe it'],
             ]),
@@ -1060,8 +1060,8 @@ export const GROUPS = [
         blocks: [
           { t: 'h', ...L('调用被拒绝，提示余额或额度', 'A call is refused over balance or allowance') },
           {
-            t: 'p', ...L(`这类拒绝都没有扣费。错误码的含义和处理方法见 [平台文档：计费相关的拒绝](${PLATFORM}#errors)。用 \`/usage\` 查看当前额度。`,
-              `Nothing is charged for these refusals. The codes and what to do about each are in the [platform documentation](${PLATFORM}#errors). Check your allowance with \`/usage\`.`),
+            t: 'p', ...L(`这类拒绝都没有扣费。错误码的含义和处理方法见 [账户与计费文档：计费相关的拒绝](${PLATFORM}#errors)。用 \`/usage\` 查看当前额度。`,
+              `Nothing is charged for these refusals. The codes and what to do about each are in the [account and billing documentation](${PLATFORM}#errors). Check your allowance with \`/usage\`.`),
           },
           { t: 'h', ...L('看起来卡住了', 'It looks stuck') },
           {

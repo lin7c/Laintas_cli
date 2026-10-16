@@ -303,7 +303,7 @@ const ZH = {
   apply: "应用到 Helpwo", applyNeedsHelpwo: "请在 Helpwo 设置里点「预算」打开此页，再应用", download: "下载 .config",
   undo: "撤销修改", defaults: "恢复出厂默认",
   nav: {back: "后退", up: "上一级", enter: "进入", tree: "结构树", hint: "单击选中 · 双击进入 · Backspace 返回上一级"},
-  overview: "概览", root: "上下文窗口", input: "输入预算", output: "输出预留", conv: CLI ? "对话历史" : "对话与工具",
+  overview: "概览", root: "上下文窗口", input: "输入预算", output: "输出预留", conv: "对话历史",
   untagged: "未标注文本", free: "空闲",
   viewSum: (b, c) => `分配额度 <b>${b}</b> · 原始内容 <b>${c}</b> tokens`, viewWhole: (w) => `整个窗口 <b>${w}</b> tokens · 双击进入`,
   pill: {cut: "将被压缩", contains: "子块压缩", fixed: "🔒 不压缩", absent: "本次未出现", pin: "已锁定"},
@@ -324,7 +324,7 @@ const ZH = {
   minNote: (m) => `保底 ${m} tokens 生效，比例再调小也不会变小`,
   rootNote: "整个上下文窗口：先给模型的回答留出输出预留，剩下的是输入预算。双击或点「进入」查看分区。",
   inputNote: "输入预算按比例分给各块，剩下的留给对话。改动一个块时，对话部分先让出或补上；对话用完后，其它未锁定的块按比例让出。",
-  convNote: CLI ? "对话拿走输入预算里其它块剩下的部分；达到下面的比例时开始压缩。" : "对话和工具定义拿走输入预算里其它块剩下的部分。",
+  convNote: "对话拿走输入预算里其它块剩下的部分；达到下面的比例时开始压缩。",
   convActual: (x) => `其它块没用满的部分也归对话，所以实际可用约 ${x}`,
   textTitle: "原文", textLegendKept: "按当前设置会发送", textLegendCut: "会被省略",
   tabNow: "按当前设置", tabSent: "采集时发送", noText: "这个块没有文字内容。", cutAt: (n) => `省略约 ${n} tokens`,
@@ -332,7 +332,7 @@ const ZH = {
   changes: "修改", noChanges: "还没有修改。拖动分割线，或在右侧调整比例。",
   advanced: "高级设置与兼容参数", hysteresis: "恢复完整内容的阈值", hysteresisDesc: "例如设为 90%：分区额度 10,000 tokens，被裁剪后需降到 9,000 或以下才恢复完整。调低会更晚恢复，调高会更早恢复，用来减少反复切换。",
   scalarNames: {assumed_window: "备用上下文容量", assumed_summary_window: "备用摘要容量", chars_per_token: "裁剪时的字符换算系数"},
-  scalarHelp: {assumed_window:"未提供模型时使用的备用值；不改变当前采集记录的模型容量，也不能扩大模型本身的窗口。",assumed_summary_window:CLI ? "摘要模型没有容量信息时使用的备用值。" : "CLI 兼容参数。当前 Helpwo 网页运行器不读取它，修改不会影响网页对话。",chars_per_token:CLI ? "按字符裁剪时，一个 token 对应的估算字符数；不是模型的真实分词结果。" : "CLI 兼容参数。当前 Helpwo 网页运行器不读取它，修改不会影响网页裁剪。"},
+  scalarHelp: {assumed_window:"未提供模型时使用的备用值；不改变当前采集记录的模型容量，也不能扩大模型本身的窗口。",assumed_summary_window:"摘要模型没有容量信息时使用的备用值。",chars_per_token:"按字符裁剪时，一个 token 对应的估算字符数；不是模型的真实分词结果。"},
   guideTitle: "先了解：这页控制 AI 每次能看到多少内容",
   guideIntro: "这里的预算是文字容量，不是余额或费用。Token 是模型计算文字的单位，不等于字数。先给回答留空间，再把剩下的容量分给指令、任务状态和对话。",
   guideExample: "例如模型容量为 100,000 tokens，回答预留 25% 时会先留出 25,000，输入剩下 75,000；最低额度和模型输出上限也会影响结果。",
@@ -361,7 +361,7 @@ const EN = {
   apply: "Apply to Helpwo", applyNeedsHelpwo: "Open this page with Budget in Helpwo's settings to apply it", download: "Download .config",
   undo: "Undo changes", defaults: "Shipped defaults",
   nav: {back: "Back", up: "Up", enter: "Open", tree: "Tree", hint: "click selects · double-click opens · Backspace goes up"},
-  overview: "Overview", root: "Context window", input: "Input budget", output: "Output reserve", conv: CLI ? "Conversation" : "Conversation & tools",
+  overview: "Overview", root: "Context window", input: "Input budget", output: "Output reserve", conv: "Conversation",
   untagged: "Untagged text", free: "free",
   viewSum: (b, c) => `budget <b>${b}</b> · content <b>${c}</b>`, viewWhole: (w) => `the whole window, <b>${w}</b> · double-click to open`,
   pill: {cut: "compressed", contains: "child compressed", fixed: "🔒 never cut", absent: "not in this request", pin: "locked"},
@@ -382,7 +382,7 @@ const EN = {
   minNote: (m) => `the ${m}-token floor applies; a smaller share makes no difference`,
   rootNote: "The whole context window: the output reserve is kept for the model's answer; the rest is the input budget. Double-click or press Open to see the partitions.",
   inputNote: "The input budget is shared out to the blocks; what is left goes to the conversation. Changing one block takes from, or gives to, the conversation first; once that is used up, the other unlocked blocks give way in proportion.",
-  convNote: CLI ? "The conversation gets what the other blocks leave of the input budget; compaction starts at the fractions below." : "The conversation and tool schemas get what the other blocks leave of the input budget.",
+  convNote: "The conversation gets what the other blocks leave of the input budget; compaction starts at the fractions below.",
   convActual: (x) => `Room the other blocks leave unused also goes to the conversation, so about ${x} is actually available`,
   textTitle: "Original text", textLegendKept: "sent with these settings", textLegendCut: "left out",
   tabNow: "These settings", tabSent: "Sent at capture", noText: "This block has no text.", cutAt: (n) => `about ${n} tokens left out`,
@@ -390,7 +390,7 @@ const EN = {
   changes: "Changes", noChanges: "No changes yet. Drag a divider, or adjust a share on the right.",
   advanced: "Advanced & compatibility settings", hysteresis: "Threshold to restore full content", hysteresisDesc: "At 90%, a clipped section with 10,000 tokens of space returns to full content at 9,000 tokens or less. Lower means later recovery; higher means earlier recovery, reducing repeated switching.",
   scalarNames: {assumed_window: "Fallback context capacity", assumed_summary_window: "Fallback summary capacity", chars_per_token: "Characters per token when clipping"},
-  scalarHelp: {assumed_window:"Fallback when no model is provided. It does not change this captured window or enlarge the model's capacity.",assumed_summary_window:CLI ? "Fallback capacity when the summary model has no window information." : "CLI compatibility setting. Helpwo's browser runner does not read it; changing it has no effect on browser chat.",chars_per_token:CLI ? "Estimated characters per token for character-based clipping, not the model's real tokenizer." : "CLI compatibility setting. Helpwo's browser runner does not read it; changing it has no effect on browser clipping."},
+  scalarHelp: {assumed_window:"Fallback when no model is provided. It does not change this captured window or enlarge the model's capacity.",assumed_summary_window:"Fallback capacity when the summary model has no window information.",chars_per_token:"Estimated characters per token for character-based clipping, not the model's real tokenizer."},
   guideTitle: "Start here: how much content the AI can see in one request",
   guideIntro: "This budget is text capacity, not money or credits. A token is a model's unit of text, not a character count. Reserve room for the answer, then divide the rest between instructions, task state and chat.",
   guideExample: "For a 100,000-token window, a 25% answer reserve leaves 25,000 for output and 75,000 for input. Minimum space and the model's output limit also affect the result.",
@@ -613,8 +613,8 @@ function quotaOf(id) {
 }
 function contentOf(id) {
   if (id === "@" || id === "" || id === "output" || id.endsWith("#free")) return null;
-  if (id === "input") return TOPS.reduce((s, tp) => s + (B[tp] ? B[tp].natural : 0), 0) + (CLI && B.thread ? B.thread.natural : 0);
-  if (id === "thread") return CLI && B.thread ? B.thread.natural : null;
+  if (id === "input") return TOPS.reduce((s, tp) => s + (B[tp] ? B[tp].natural : 0), 0) + (active.has("thread") && B.thread ? B.thread.natural : 0);
+  if (id === "thread") return active.has("thread") && B.thread ? B.thread.natural : null;
   if (id.endsWith("#rest")) return planOf(vparent(id)).restText;
   return B[id] ? B[id].natural : 0;
 }
@@ -973,7 +973,7 @@ function advancedFields(id) {
 }
 const kidsOfCfg = (p) => Object.keys(cfg).filter((k) => parentOf(k) === p && "share" in cfg[k]);
 function threadSection() {
-  if (!CLI) return "";
+  if (!active.has("thread")) return "";
   const th = cfg.thread || {}, u = T.rest || 1, used = B.thread ? B.thread.natural : 0;
   const marks = ["compact_target", "compact_background", "compact_foreground"].filter((k) => typeof th[k] === "number");
   return `<div class="note">${esc(L.threadNow(fmt(used), fmt(u)))}</div>
@@ -1070,7 +1070,7 @@ function configText() { // laintas_cli: one /config line per setting changed on 
 }
 function compactError() {
   const th = cfg.thread || {};
-  if (!CLI || ["compact_target", "compact_background", "compact_foreground"].some((k) => typeof th[k] !== "number")) return "";
+  if (!active.has("thread") || ["compact_target", "compact_background", "compact_foreground"].some((k) => typeof th[k] !== "number")) return "";
   return th.compact_target < th.compact_background && th.compact_background < th.compact_foreground && th.compact_foreground <= 1 ? "" : L.compactOrder;
 }
 const showVal = (l, v) => l === "shrink" ? (L.shrinkNames[v] || v) : l === "min" || /window/.test(l) ? fmt(v) : typeof v === "number" && v <= 1 ? pctText(v) : v;
@@ -1090,8 +1090,8 @@ function renderAdvanced() {
   $("adv-title").textContent = L.advanced;
   const rows = Object.keys(scal).map((k) => k === "hysteresis"
     ? `<span data-label="s:${k}">${esc(L.hysteresis)} · ${pctText(scal[k])}</span><input aria-label="${esc(L.hysteresis)}" type="range" min="0.5" max="1" step="0.01" value="${scal[k]}" data-s="${k}"><span class="param-help full">${esc(L.hysteresisDesc)}</span>`
-    : `<span>${esc(L.scalarNames[k] || k)}</span><input aria-label="${esc(L.scalarNames[k] || k)}" type="number" min="0" step="${k === "chars_per_token" ? 0.1 : 1024}" value="${scal[k]}" data-s="${k}" ${!CLI && ["assumed_summary_window","chars_per_token"].includes(k) ? "disabled" : ""}><span class="param-help full">${esc(L.scalarHelp[k] || "")}</span>`).join("");
-  const aux = CLI ? Object.keys(cfg).filter((k) => topOf(k) === "aux" && "share" in cfg[k]) : [];
+    : `<span>${esc(L.scalarNames[k] || k)}</span><input aria-label="${esc(L.scalarNames[k] || k)}" type="number" min="0" step="${k === "chars_per_token" ? 0.1 : 1024}" value="${scal[k]}" data-s="${k}" ><span class="param-help full">${esc(L.scalarHelp[k] || "")}</span>`).join("");
+  const aux = (CLI || active.has("aux")) ? Object.keys(cfg).filter((k) => topOf(k) === "aux" && "share" in cfg[k]) : [];
   $("adv-body").innerHTML = `<div class="adv">${rows}</div>` +
     (aux.length ? `<h2 style="margin-top:14px;font-size:12.5px">${esc(L.aux)}</h2><div class="adv">${aux.map((k) => `<span data-label="${k}">${esc(k.slice(4).split(".").map((s) => L.names[s] || s).join(" · "))} · ${pctText(share(k))}</span><input type="range" min="0" max="0.5" step="0.001" value="${share(k)}" data-p="${k}" data-l="share">`).join("")}</div>` : "");
 }

@@ -8,7 +8,7 @@ All Laintas CLI release documentation and public announcements must be in
 English. For the website's required `titleZh` / `bodyZh` fields, repeat the
 English title and body so the announcement stays English in either locale.
 
-## `laintas-cli-beta v3` release (`laintas-cli-beta-v3`)
+## `laintas-cli-beta v4` release (`laintas-cli-beta-v4`)
 
 The Mac build is a native terminal CLI for Intel (`amd64`) and Apple Silicon
 (`arm64`). It does **not** install, start, or depend on Helpwo Kernel. Helpwo
@@ -40,16 +40,16 @@ PyInstaller's ad-hoc signature; Developer ID signing and notarization are
 required before treating this as the general public Mac installer.
 
 Publish after both Mac jobs pass. `version.py` keeps the PEP 440 package
-version `1.32.5b3` for pip and Debian packaging, while the public release
-name is `laintas-cli-beta v3`. Commit the intended source, tag that commit
-`laintas-cli-beta-v3`, and push the tag. This tag is published as an ordinary
+version `1.32.5b4` for pip and Debian packaging, while the public release
+name is `laintas-cli-beta v4`. Commit the intended source, tag that commit
+`laintas-cli-beta-v4`, and push the tag. This tag is published as an ordinary
 GitHub Release and is marked `latest`. Check the release and both architecture
 archives:
 
 ```bash
-gh release view laintas-cli-beta-v3 --json isPrerelease,assets
-curl -fsSIL https://github.com/lin7c/Laintas_cli/releases/download/laintas-cli-beta-v3/laintas-cli_darwin_arm64.tar.gz
-curl -fsSIL https://github.com/lin7c/Laintas_cli/releases/download/laintas-cli-beta-v3/laintas-cli_darwin_amd64.tar.gz
+gh release view laintas-cli-beta-v4 --json isPrerelease,assets
+curl -fsSIL https://github.com/lin7c/Laintas_cli/releases/download/laintas-cli-beta-v4/laintas-cli_darwin_arm64.tar.gz
+curl -fsSIL https://github.com/lin7c/Laintas_cli/releases/download/laintas-cli-beta-v4/laintas-cli_darwin_amd64.tar.gz
 ```
 
 Mac users can install the current release with the same command as Linux:
@@ -58,17 +58,17 @@ Mac users can install the current release with the same command as Linux:
 curl -fsSL https://cli.laintas.com/install.sh | bash
 ```
 
-To pin this release, set `LAINTAS_INSTALL_TAG=laintas-cli-beta-v3` for the
-installer or `LAINTAS_UPDATE_CHANNEL=laintas-cli-beta-v3` for `/v update`.
+To pin this release, set `LAINTAS_INSTALL_TAG=laintas-cli-beta-v4` for the
+installer or `LAINTAS_UPDATE_CHANNEL=laintas-cli-beta-v4` for `/v update`.
 The installer downloads archives and `SHA256SUMS.txt` from
 `https://cli.laintas.com/releases/latest/` and verifies them. The
 download page offers a single Mac install link that selects Apple Silicon or
 Intel from the same mirror. `/v update` on every platform reads this mirror
 (the older `laintas-cli-beta v1` binaries still use GitHub Releases for `/v update`).
 Sync the site mirror with
-`LAINTAS_RELEASE_TAG=laintas-cli-beta-v3 python3 scripts/build_release_assets.py`.
+`LAINTAS_RELEASE_TAG=laintas-cli-beta-v4 python3 scripts/build_release_assets.py`.
 It writes both `dist/releases/latest/` and
-`dist/releases/laintas-cli-beta-v3/`.
+`dist/releases/laintas-cli-beta-v4/`.
 
 Run one real smoke test on each Mac architecture before announcing the beta:
 install the archive, launch `laintas-cli --version`, execute a shell command,

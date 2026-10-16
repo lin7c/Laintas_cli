@@ -65,14 +65,26 @@ class WorkflowInstance:
         return None
 
     @property
+    def ended_early(self) -> bool:
+        """Ended by /workflow end before the last phase finished."""
+        return self.completed and self.current_phase < len(self.phases)
+
+    @property
     def progress_str(self) -> str:
         total = len(self.phases)
-        cur = self.current_phase + 1 if not self.completed else total
+        # A workflow that ran out of phases has current_phase == total; one
+        # ended early keeps the phase it stopped in, and must not be reported
+        # as having gone the distance.
+        cur = min(self.current_phase + 1, total)
+        if self.ended_early:
+            cur = f"{cur}/{total} (ended early)"
+        else:
+            cur = f"{cur}/{total}"
         names = " → ".join(
             f"**{p.name}**" if i == self.current_phase and not self.completed else p.name
             for i, p in enumerate(self.phases)
         )
-        return f"Phase {cur}/{total}: {names}"
+        return f"Phase {cur}: {names}"
 
 
 _READ_ONLY_PHASE_TOOLS = [
@@ -583,7 +595,7 @@ def set_phase_data(key: str, value) -> None:
 def end_workflow(summary: str = "") -> None:
     """End the active workflow."""
     wf = get_active_workflow()
-    if wf:
+    if wf and not wf.completed:
         wf.completed = True
         wf.summary = summary
     _save_workflow()

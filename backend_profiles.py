@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional
@@ -138,9 +139,22 @@ def _policy_headers() -> dict:
     return {"X-Laintas-Policy": digest} if re.fullmatch(r"[a-f0-9]{64}", digest) else {}
 
 
+def _client_headers() -> dict:
+    """Name the Windows build to the gateway.
+
+    laintas-cli-windows is this same program under a POSIX runtime, reaching
+    the same host with the same credentials, so nothing in the transport tells
+    the console which of the two a call came from. Elsewhere the header is
+    absent and the call is recorded as the CLI.
+    """
+    return {"X-Laintas-Client": "cli-windows"} if sys.platform == "cygwin" else {}
+
+
 def request_auth(profile: BackendProfile, session: Optional[dict]) -> tuple[dict, dict]:
     """Return (headers, cookies) appropriate for this backend trust domain."""
     headers = {"Content-Type": "application/json", **_policy_headers()}
+    if profile.sends_laintas_credentials:
+        headers.update(_client_headers())
     # Report the CLI version on every gateway request so the gateway can
     # enforce "latest version only" server-side (the single authority).
     try:

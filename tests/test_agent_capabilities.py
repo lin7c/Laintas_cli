@@ -102,8 +102,10 @@ class ToolSchemaTests(unittest.TestCase):
                 mock.patch.object(
                     agent_loop.workflow_engine, "is_tool_allowed_in_workflow",
                     return_value=True):
+            # `think` is offered through built-in mode restrictions
+            # (agent_loop._ALWAYS_OFFERED_TOOLS); nothing else gets through.
             self.assertEqual(
-                agent_loop._allowed_tool_names_for_state({}), {"fs.read"})
+                agent_loop._allowed_tool_names_for_state({}), {"fs.read", "think"})
 
 
 class WritePolicyTests(unittest.TestCase):

@@ -5,8 +5,11 @@ Replaces and extends the static .laintas/commands.py / .laintas/loop.py pattern
 with a richer event-driven hook system.
 
 Hook types:
-  - pre_command: before shell command execution (can block)
-  - post_command: after shell command execution
+  - pre_command: before a shell command the agent runs (can block)
+  - post_command: after a shell command the agent runs
+
+Command and tool hooks guard what the agent does. A command the user types at
+the prompt runs in their own terminal and triggers no hook.
   - pre_tool: before tool invocation (can block)
   - post_tool: after tool invocation
   - on_session_start: when REPL starts

@@ -2014,6 +2014,45 @@ def _bi_time_now(params: dict, ctx: ToolCtx) -> dict:
                                     "iso": time.strftime("%Y-%m-%dT%H:%M:%S%z")}}
 
 
+def _bi_think(params: dict, ctx: ToolCtx) -> dict:
+    """Record a thought; with `question`, quote this session's own record.
+
+    Does nothing else. The thought itself is kept by being in the call's
+    arguments, which stay in the thread. The answer to a question is a
+    quotation (step_record.search), or a plain statement that there is none:
+    a gap the record cannot fill must be verified or called unknown, never
+    reconstructed.
+    """
+    thought = str(params.get("thought") or "").strip()
+    question = str(params.get("question") or "").strip()
+    if not thought and not question:
+        return {"ok": False, "error": "think needs a `thought`."}
+    out = {"ok": True, "thought": thought[:4000], "question": question[:1000]}
+    if not question:
+        out["result"] = "Noted."
+        return out
+    try:
+        import step_record
+        hits = step_record.search(
+            getattr(ctx, "session_id", "") or "", getattr(ctx, "agent_id", "") or "",
+            question, _result_budget("think", ctx))
+    except Exception:
+        hits = []
+    out["count"] = len(hits)
+    if not hits:
+        out["result"] = (
+            "Nothing in this session's record answers that question. It cannot "
+            "be recovered from the record: verify it with a tool before relying "
+            "on it, or treat it as unknown. Do not reconstruct it from memory.")
+        return out
+    parts = ["From this session's record, verbatim (the full text the harness "
+             "kept; quote it rather than restating it from memory):"]
+    for hit in hits:
+        parts.append(f"[step {hit['step']} · {hit['label']}]\n{hit['excerpt']}")
+    out["result"] = "\n\n".join(parts)
+    return out
+
+
 def _bi_task_create(params: dict, ctx: ToolCtx) -> dict:
     if _task_mgr is None:
         return {"ok": False, "error": "task_manager module not available"}
@@ -3049,7 +3088,9 @@ def _bi_fs_grep(params: dict, ctx: ToolCtx) -> dict:
 
     pattern = params.get("pattern", "")
     search_path = params.get("path", ".")
-    include = params.get("include", "**/*")
+    # `glob` is the shared catalog's name for this filter (and Helpwo's); a call
+    # written against that contract used to be searched unfiltered.
+    include = params.get("include") or params.get("glob") or "**/*"
     exclude = params.get("exclude", "")
     # No count of its own: matches are taken until this result's share of the
     # thread budget is full, and `offset` resumes after them. `max_results`
@@ -10301,6 +10342,32 @@ def register_builtin_tools() -> None:
             invoke=_bi_time_now,
         ),
         Tool(
+            name="think",
+            description=(
+                "Write down a thought. It runs nothing and returns at once, and it "
+                "does not end your turn. Unlike your private reasoning, what you "
+                "write here stays visible to you on every later step and survives "
+                "context compaction and model switches. It can go in the same "
+                "response as other tool calls. If something you need is not in "
+                "your context or cannot be checked from it, put it in `question`: "
+                "this session's full record (every step's reasoning, calls and "
+                "outputs) is searched and the matching text is returned verbatim, "
+                "or you are told there is none. Each call costs a step."),
+            schema={
+                "type": "object",
+                "properties": {
+                    "thought": {"type": "string",
+                                "description": "what you think now and why"},
+                    "question": {"type": "string",
+                                 "description": "optional: what you need but cannot see "
+                                                "or verify in your context, in words "
+                                                "likely to appear in it"},
+                },
+                "required": ["thought"],
+            },
+            invoke=_bi_think,
+        ),
+        Tool(
             name="fs.edit",
             description="Exact string replacement in a file. Replace old_string with new_string. "
                         "Use replace_all:true if the string is not unique. old_string must be "
@@ -10424,6 +10491,8 @@ def register_builtin_tools() -> None:
                                 "description": "comma-separated glob patterns to include, relative to path. "
                                                "A pattern without '/' matches at any depth ('*.ts' = every .ts file); "
                                                "one with '/' is anchored ('src/*.ts' = only directly under src)"},
+                    "glob": {"type": "string",
+                             "description": "alias of include"},
                     "exclude": {"type": "string", "default": "",
                                 "description": "comma-separated glob patterns to exclude"},
                     "max_results": {"type": "integer",

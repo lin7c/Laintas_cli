@@ -207,6 +207,10 @@ class AppendInput:
                 if resume:
                     self.resume()
 
+    def print_notice(self, *objects, **kwargs):
+        """Show an on-demand report immediately, preserving draft and appends."""
+        return self.print_output(objects, kwargs)
+
     @contextmanager
     def status(self, renderer=None, label="Thinking…", started=None):
         with self._lock:

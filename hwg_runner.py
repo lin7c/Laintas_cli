@@ -509,6 +509,28 @@ def _force_abort_node_agents(agent_ids: list) -> None:
             pass
 
 
+def _resolve_node_file(graph_path: str, file: str) -> str:
+    """Where a node's ``(file.hwo)`` binding points.
+
+    A graph names its steps relative to itself, so it runs the same from any
+    directory. A binding that only exists relative to the working directory
+    keeps working: that is how every relative binding used to be read.
+    """
+    if not file or os.path.isabs(file):
+        return file
+    graph_dir = os.path.dirname(os.path.abspath(graph_path))
+    if os.path.realpath(graph_dir) == os.path.realpath(os.getcwd()):
+        return file
+    beside_graph = os.path.join(graph_dir, file)
+    if os.path.exists(beside_graph) or not os.path.exists(file):
+        return beside_graph
+    return file
+
+
+def _node_path(node: dict) -> str:
+    return node.get("path") or node["file"]
+
+
 def _run_hwo_with_policy(node: dict, deps, session: dict, parent_id: Optional[str], inputs: dict,
                          events_cb=None, abort_event=None) -> dict:
     policy = node.get("policy") or {}
@@ -518,7 +540,7 @@ def _run_hwo_with_policy(node: dict, deps, session: dict, parent_id: Optional[st
     fingerprint = _workspace_fingerprint() if cache_ttl else None
     # No fingerprint means no way to tell a stale result from a fresh one, so
     # the cache is skipped rather than trusted.
-    cache_key = _cache_key(node["file"], node, inputs, fingerprint) if fingerprint else None
+    cache_key = _cache_key(_node_path(node), node, inputs, fingerprint) if fingerprint else None
     if cache_key:
         cached = workflow_state.cache_get(cache_key)
         if cached:
@@ -555,7 +577,7 @@ def _run_hwo_with_policy(node: dict, deps, session: dict, parent_id: Optional[st
 
         def target():
             holder.update(hwo_runner.run_hwo_file(
-                path=node["file"],
+                path=_node_path(node),
                 deps=deps,
                 session=session,
                 parent_id=parent_id,
@@ -716,6 +738,8 @@ def run_hwg_file(path: str, deps, session: dict, parent_id: Optional[str] = None
             f"hwg: this graph cannot run here: {named} bind tools "
             f"((tool:name)#id#), which only Helpwo executes today. "
             f"Compiling and visualising the graph works.")}
+    for n in nodes:
+        n["path"] = _resolve_node_file(path, n["file"])
     edges = graph["edges"]
     node_by_id = {n["id"]: n for n in nodes}
     outgoing = {n["id"]: [] for n in nodes}

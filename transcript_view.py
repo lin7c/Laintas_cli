@@ -170,6 +170,13 @@ def build_tool_event(name: str, display_name: str, summary: str, output: str,
         extra["count"] = count
     if name == "task.complete":
         extra["complete_summary"] = str(result.get("summary") or "")
+    if name == "think":
+        # Shown as thinking, not as a tool row; the replay needs the text.
+        for key in ("thought", "question"):
+            if result.get(key):
+                extra[key] = str(result[key])
+        if result.get("question"):
+            extra["count"] = int(result.get("count") or 0)
     event = {
         "role": "tool",
         "content": str(output or "")[:2000],
@@ -613,6 +620,9 @@ class TranscriptRenderer:
             if not str(extra.get("complete_summary") or "").strip():
                 self.rule()
             return
+        if ok and name == "think":
+            self._thought(event)
+            return
         hint = str(event.get("summary") or "") or str(
             event.get("display_name") or name)
         if ok and name in QUIET_READ_TOOLS:
@@ -624,6 +634,27 @@ class TranscriptRenderer:
         self.flush()
         self._emit(tool_row(event, self._width))
         self._after_row(event, name)
+
+    def _thought(self, event: dict) -> None:
+        """A `think` call: the thought as thinking, plus what its question found."""
+        from rich.markup import escape
+        self.flush()
+        extra = event.get("extra") or {}
+        thought = str(extra.get("thought") or event.get("summary") or "").strip()
+        limit = self._fold_limit()
+        lines = [ln for ln in thought.split("\n") if ln.strip()]
+        if limit > 0 and len(lines) > limit:
+            lines = fold_lines(thought, limit)
+        for index, line in enumerate(lines):
+            mark = f"[muted]{symbols.DOT_HALF}[/muted] " if index == 0 else "  "
+            self._emit(f"{mark}[dim]{escape(line)}[/dim]")
+        question = str(extra.get("question") or "").strip()
+        if question:
+            found = int(extra.get("count") or 0)
+            answer = (f"{found} place(s) in the session record" if found
+                      else "not in the session record")
+            self._emit(f"  [muted]? {escape(crop_cells(question, max(20, self._width - 8)))}"
+                       f" {symbols.BULLET} {answer}[/muted]")
 
     def _after_row(self, event: dict, name: str) -> None:
         """Folded shell output / diff glance, under the row that produced it."""

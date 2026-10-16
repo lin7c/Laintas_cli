@@ -1380,9 +1380,21 @@ def run_hwo_file(
     cancelled = bool(abort_event is not None and abort_event.is_set()) or bool(result.get("cancelled"))
     status = "cancelled" if cancelled else ("completed" if result.get("ok") else "failed")
     if run_state and workflow_state:
-        run_state["status"] = status
-        run_state["agentOutputs"] = result.get("agent_outputs") or {}
-        run_state = workflow_state.checkpoint(run_state, f"run_{status}", {"outputs": result.get("outputs") or {}})
+        # The local copy went stale at the first _emit: ctx (and each nested
+        # ctx) replaced its own. Finishing from it dropped the run's events,
+        # and the _emit below then saved ctx's copy back over the final
+        # status, leaving every successful run "running" forever. Finish from
+        # the stored record, which is whatever was written last.
+        with ctx.event_lock:
+            try:
+                stored = workflow_state.load_run(run_id)
+            except Exception:
+                stored = None
+            run_state = dict(stored or ctx.run_state or run_state)
+            run_state["status"] = status
+            run_state["agentOutputs"] = result.get("agent_outputs") or {}
+            run_state = workflow_state.checkpoint(run_state, f"run_{status}", {"outputs": result.get("outputs") or {}})
+            ctx.run_state = run_state
     _emit(ctx, "workflow_cancelled" if cancelled else ("workflow_completed" if result.get("ok") else "workflow_failed"), {
         "path": path, "status": status, "outputs": result.get("outputs") or {}
     })

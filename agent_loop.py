@@ -52,6 +52,7 @@ import symbols                # Centralized UI symbol constants
 import append_input           # Connected foreground status + supplementary input
 import transcript_view        # Shared live/replay conversation rendering
 import event_log              # Durable prompt admission + turn event log
+import step_record            # Full per-step text, searched by think(question=...)
 import precheck               # Tool-precheck labeled-sample capture + inference stub
 import redactor               # Outbound secret/PII redaction + weak-label capture
 import rag_signals            # Retrieval-rerank weak-label capture (search → selection)
@@ -108,6 +109,7 @@ _DEFAULT_CONFIG = {
     # DEFAULT_EFFORT_GEAR): the lowest gear that still thinks.
     "reasoning_effort": "low",
     "max_tokens": 0,              # 0 = ask the gateway for everything that fits (provider ceiling ∩ remaining window). A positive value is a deliberate cap, never a floor — the gateway clamps but never raises it.
+    "progress_max_tokens": 2048,  # Separate output budget for on-demand progress reports; 0 = provider/window limit.
     "max_debug_entries": 50,
     "loop_delay": 0.2,           # normal inter-iteration delay; failures back off adaptively
     "paged_reads": True,          # fs.read without offset/limit reads by page and evicts the page it leaves (file_pager); False restores the plain 2000-line window
@@ -987,6 +989,7 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "compact_review_effort": "Thinking level for the summary-review step of context compaction (default none = no thinking, fastest compaction; auto/low/medium/high/max re-enable it — costs output tokens)",
     "max_loops": "Maximum agent-loop iterations per task",
     "max_tokens": "Output-token cap to request (0 = whatever the model and window allow)",
+    "progress_max_tokens": "Output-token cap for independent progress reports (0 = provider/window limit; default 2048)",
     "max_debug_entries": "In-memory debug entry limit",
     "loop_delay": "Delay between loop iterations in seconds",
     "paged_reads": "Read files as paged documents: one page in context at a time, evicted pages leave an indexed stub",
@@ -1068,6 +1071,7 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
 _RUNTIME_CONFIG_DESCRIPTIONS.update(prompt_budget.config_descriptions())
 
 _RUNTIME_NONNEGATIVE = {
+    "progress_max_tokens",
     "loop_delay", "heartbeat_interval",
     "browser_action_delay_min", "browser_action_delay_max",
     "browser_post_action_wait",
@@ -6692,9 +6696,18 @@ def _serialize_thread_msg(m: dict) -> str:
             content = ctxpol.truncate_tool_output(content, _prune_policy())
         return f"[Tool {m.get('name', 'result')}]: {content}"
     if role == "assistant":
-        calls = "\n".join(json.dumps(tc, ensure_ascii=False)
-                          for tc in (m.get("tool_calls") or []))
+        # A call's `extra_content` is opaque provider state (a signature):
+        # nothing a summary can use.
+        calls = "\n".join(
+            json.dumps({k: v for k, v in tc.items() if k != "extra_content"}
+                       if isinstance(tc, dict) else tc, ensure_ascii=False)
+            for tc in (m.get("tool_calls") or []))
         parts = []
+        # The thinking is where the decisions were made; a summary that never
+        # saw it can only report what was done, not why.
+        reasoning = m.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning.strip():
+            parts.append(f"[Assistant reasoning]: {reasoning.strip()}")
         if content.strip():
             parts.append(f"[Assistant]: {content.strip()}")
         if calls:
@@ -7379,6 +7392,9 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
 
         changed = False
         # 1) Prune old tool outputs (outside the recent tail, not protected).
+        # Thinking is NOT pruned here: the summary below reads it
+        # (_serialize_thread_msg), so it is either kept or summarized with its
+        # turn. `_shed_reasoning` is the fallback when no summary is made.
         for i in range(1, protect_from):
             m = thread_messages[i]
             if m.get("role") != "tool":
@@ -7394,6 +7410,18 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
         if not force and _thread_tokens(thread_messages) <= target:
             return changed
 
+        def _shed_reasoning() -> bool:
+            """No summary this time: drop thinking outside the tail instead,
+            so the thread still shrinks the way it did before thinking was
+            kept for the summary."""
+            shed = False
+            if force or _thread_tokens(thread_messages) > target:
+                for m in thread_messages[1:protect_from]:
+                    if (isinstance(m, dict) and m.get("role") == "assistant"
+                            and _drop_reasoning(m)):
+                        shed = True
+            return changed or shed
+
         # 2) Keep a bounded recent tail, including within one long user turn.
         # Never separate a tool result from its assistant tool-call batch.
         # An oversized recent turn can itself occupy the whole window. In
@@ -7403,7 +7431,7 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
                      or tail_start <= 1 or tail_start >= len(thread_messages))
         if emergency:
             if before_tokens < trigger:
-                return changed
+                return _shed_reasoning()
             pending = set()
             for message in thread_messages:
                 pending.update(call.get("id") for call in message.get("tool_calls", [])
@@ -7411,11 +7439,11 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
                 if message.get("role") == "tool":
                     pending.discard(message.get("tool_call_id"))
             if pending:
-                return changed
+                return _shed_reasoning()
             tail_start = len(thread_messages)
         head = thread_messages[:tail_start]
         if not any((_serialize_thread_msg(m) or "").strip() for m in head):
-            return changed
+            return _shed_reasoning()
         announcement = (
             _compaction_status(deps, compaction_status_text(
                 auto=True, usable=usable, window=window))
@@ -7425,14 +7453,14 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
                 deps, session, head, state.get("_thread_summary"), lang,
                 str(state.get("_run_id") or ""), interrupt_event, report)
         if not summary:
-            return changed
+            return _shed_reasoning()
         summary_msg = {"role": "user",
                        "content": f"[CONVERSATION SUMMARY — earlier turns compacted]\n{summary}"}
         candidate = [summary_msg] + thread_messages[tail_start:]
         if (interrupt_event is not None and interrupt_event.is_set()
                 or (_thread_tokens(candidate) > target
                     and _thread_tokens(candidate) >= _thread_tokens(thread_messages))):
-            return changed
+            return _shed_reasoning()
         state["_thread_summary"] = summary
         thread_messages[:] = candidate
         state["_compact_background_at"] = time.time()
@@ -8654,6 +8682,9 @@ STATE_KEYS_CARRIED = frozenset({
 })
 
 STATE_KEYS_TURN_ONLY = frozenset({
+    # Model pins and diagnostic notes belong to the current admitted run.
+    "_model_override", "_provider_override", "_effort_override",
+    "_last_error", "_turn_limit_note",
     "_direct_commands", "_direct_commands_readable",
     "_budget_rows", "_gateway_ceded", "_budget_window",
     "_compaction_wait_failed", "_transient_prompt_tokens",
@@ -9338,7 +9369,7 @@ _FS_PATH_TOOLS = {"fs.read", "fs.write", "fs.edit", "fs.multi_edit", "fs.diff"}
 _LEDGER_EXEMPT_TOOLS = {
     "task.complete", "plan.submit", "plan.update",
     "time.now", "agent.wait", "agent.spawn", "agent.tell",
-    "terminal.read", "terminal.wait",
+    "terminal.read", "terminal.wait", "think",
 }
 
 
@@ -9420,8 +9451,17 @@ def _openai_tool_call(call_id: str, name: str, arguments) -> dict:
     }
 
 
-def _thread_messages_for_turn(reply: str, executed: list) -> list:
+def _thread_messages_for_turn(reply: str, executed: list,
+                              reasoning: str = "", reasoning_model: str = "",
+                              reasoning_details: Optional[list] = None) -> list:
     """Build the OpenAI message(s) recording one assistant turn.
+
+    `reasoning` is this turn's thinking channel, kept on the assistant message
+    of a tool-calling turn under `reasoning_content` and tagged with the model
+    that produced it ("" when that cannot be told; see `_project_reasoning`).
+    `reasoning_details` and each executed entry's `extra_content` are the
+    provider's opaque reasoning state (signatures, encrypted reasoning), only
+    ever sent back to that same model.
 
     `executed` is the list of tool calls placed in the assistant message, each a
     dict {id, name, arguments, output}. The caller MUST include an entry — with
@@ -9432,7 +9472,7 @@ def _thread_messages_for_turn(reply: str, executed: list) -> list:
 
     Returns:
       - [assistant(content, tool_calls), tool, tool, ...] when there are calls
-      - [assistant(content)] for a reply-only turn
+      - [assistant(content)] for a reply-only turn (its reasoning kept the same way)
       - [] when there is neither a reply nor any tool call (nothing to record)
     """
     msgs: list = []
@@ -9446,6 +9486,16 @@ def _thread_messages_for_turn(reply: str, executed: list) -> list:
                 for i, e in enumerate(executed)
             ],
         }
+        for call, e in zip(assistant["tool_calls"], executed):
+            if isinstance(e.get("extra_content"), dict) and e["extra_content"]:
+                call["extra_content"] = e["extra_content"]
+        if reasoning:
+            assistant["reasoning_content"] = reasoning
+        details = [d for d in reasoning_details or [] if isinstance(d, dict)]
+        if details:
+            assistant["reasoning_details"] = details
+        if reasoning or details or any("extra_content" in c for c in assistant["tool_calls"]):
+            assistant[_REASONING_MODEL_KEY] = reasoning_model or ""
         msgs.append(assistant)
         for i, e in enumerate(executed):
             msgs.append({
@@ -9454,8 +9504,165 @@ def _thread_messages_for_turn(reply: str, executed: list) -> list:
                 "content": "" if e.get("output") is None else str(e.get("output")),
             })
     elif reply:
-        msgs.append({"role": "assistant", "content": reply})
+        assistant = {"role": "assistant", "content": reply}
+        # The answer's thinking too: models that keep reasoning across turns
+        # (MiniMax, GLM preserved thinking) expect it, and the ones that do not
+        # drop it in their own chat template before it costs anything.
+        if reasoning:
+            assistant["reasoning_content"] = reasoning
+        details = [d for d in reasoning_details or [] if isinstance(d, dict)]
+        if details:
+            assistant["reasoning_details"] = details
+        if reasoning or details:
+            assistant[_REASONING_MODEL_KEY] = reasoning_model or ""
+        msgs.append(assistant)
     return msgs
+
+
+# ── Thinking carried across tool steps ───────────────────────────────────
+# GLM, Kimi, DeepSeek and MiniMax (models.dev `interleaved: reasoning_content`)
+# expect a tool-calling assistant turn to come back WITH the reasoning that
+# produced it; without it every step re-derives its plan from the visible
+# narration alone. The field itself is model-private: it is only replayed to
+# the model that wrote it, on every turn, and the model's own chat template
+# decides what it keeps (measured 2026-10-14: most keep it, some drop turns
+# before the latest user message, before it is ever tokenized). Any other
+# reader — after a model switch, under an auto-routed pick, or when the writer
+# cannot be told (`priority`) — gets the same thinking QUOTED instead: the full
+# text in a labelled block of the assistant text, so the why behind each step
+# survives a switch without being presented as the reader's own thinking.
+# Plain-text thinking is never cut short here; only compaction may shed it, and
+# only when the summary that would have carried it could not be made. Quoting
+# does not depend on which model the request lands on when the target is
+# unpinned, so an auto-routed thread keeps a stable, cacheable prefix, and old
+# turns are left alone for the same reason: dropping their reasoning at every
+# new user message would rewrite an already-sent prefix and miss the
+# provider's prompt cache for the whole previous tool loop, once per turn.
+_REASONING_MODEL_KEY = "_reasoning_model"
+_UNPINNED_MODELS = frozenset({"", "auto", "priority"})
+
+
+def _reasoning_tag(requested: str, served: str = "") -> str:
+    """The model id a turn's reasoning belongs to, or "" if it cannot be told."""
+    want = str(requested or "").strip()
+    got = str(served or "").strip()
+    if want.lower() in _UNPINNED_MODELS:
+        return ""
+    # A served name that is neither the request nor a dated variant of it
+    # means the gateway answered with another model than the one asked for.
+    if got and got.lower() != want.lower() and not got.lower().startswith(want.lower() + "-"):
+        return ""
+    return want
+
+
+def _reasoning_target_model(request_model: str = "") -> str:
+    """The model this request is addressed to, in the order the backend call resolves it."""
+    try:
+        import model_route
+        direct = model_route.active_model()
+        if direct:
+            return str(direct)
+    except Exception:
+        pass
+    if request_model:
+        return str(request_model)
+    try:
+        import laintas_cli
+        return str(laintas_cli.get_selected_model() or "")
+    except Exception:
+        return ""
+
+
+def _strip_provider_state(message: dict) -> None:
+    """Remove the opaque provider reasoning state from one assistant message (in place)."""
+    message.pop("reasoning_details", None)
+    if isinstance(message.get("tool_calls"), list):
+        message["tool_calls"] = [
+            {k: v for k, v in c.items() if k != "extra_content"} if isinstance(c, dict) else c
+            for c in message["tool_calls"]]
+
+
+def _drop_reasoning(message: dict) -> bool:
+    """Strip one stored message's reasoning in place; True if it had any."""
+    had = any(k in message for k in ("reasoning_content", "reasoning_details", _REASONING_MODEL_KEY))
+    message.pop("reasoning_content", None)
+    message.pop(_REASONING_MODEL_KEY, None)
+    _strip_provider_state(message)
+    return had
+
+
+def _fold_reasoning(reasoning: str) -> str:
+    """Another model's thinking for one step, whole, in a labelled block."""
+    text = str(reasoning or "").strip()
+    if not text:
+        return ""
+    return f'<prior_reasoning source="another model">\n{text}\n</prior_reasoning>'
+
+
+def _project_reasoning(messages: list, target_model: str) -> list:
+    """Wire copy: own reasoning replayed as-is, anyone else's folded into the text."""
+    target = str(target_model or "").strip().lower()
+    pinned = bool(target) and target not in _UNPINNED_MODELS
+    result = []
+    for message in messages:
+        if (isinstance(message, dict) and message.get("role") == "assistant"
+                and ("reasoning_content" in message or _REASONING_MODEL_KEY in message)):
+            message = dict(message)
+            tag = str(message.pop(_REASONING_MODEL_KEY, "") or "").lower()
+            if not (pinned and tag == target):
+                _strip_provider_state(message)
+                note = _fold_reasoning(message.pop("reasoning_content", ""))
+                if note:
+                    prose = _stringify_message_content(message.get("content") or "")
+                    message["content"] = f"{note}\n{prose}" if prose.strip() else note
+        result.append(message)
+    return result
+
+
+#: Tags of the per-step state block. Kept in step with the gateway, which cuts
+#: the block back out before it reads a tool result (experience.py).
+_HARNESS_STATE_OPEN = "<harness_state>"
+_HARNESS_STATE_CLOSE = "</harness_state>"
+
+# Taught once in the system prompt (thread mode). Without it a block at the
+# end of a tool result reads as part of that tool's output.
+_HARNESS_STATE_PROMPT = (
+    "<harness_state_notes>\n"
+    "The newest tool result (or the task message, before any tool has run) "
+    "ends with a <harness_state> block. The harness writes it fresh on every "
+    "step: progress, terminals, warnings and the time. It is not part of the "
+    "tool's output and not a new message from the user. Only the block at the "
+    "very end of the latest message is current.\n"
+    "</harness_state_notes>"
+)
+
+
+def _attach_harness_state(messages: list, text: str) -> list:
+    """Wire copy with this step's state appended to the newest message.
+
+    A separate trailing user message would open a new user turn on every
+    step, and chat templates that keep thinking only after the latest user
+    message then drop every earlier step's reasoning (measured 2026-10-14 on
+    two upstream channels). Appending to the latest tool result keeps the
+    turn's shape user -> assistant -> tool -> ... intact for every model. The
+    stored thread is never modified; only a copy of the last message is.
+    """
+    text = str(text or "").strip()
+    if not text:
+        return messages
+    block = f"{_HARNESS_STATE_OPEN}\n{text}\n{_HARNESS_STATE_CLOSE}"
+    last = messages[-1] if messages else None
+    if isinstance(last, dict) and last.get("role") in ("tool", "user"):
+        content = last.get("content")
+        if isinstance(content, str):
+            merged = dict(last)
+            merged["content"] = f"{content}\n\n{block}" if content.strip() else block
+            return messages[:-1] + [merged]
+        if last.get("role") == "user" and isinstance(content, list):
+            merged = dict(last)
+            merged["content"] = list(content) + [{"type": "text", "text": block}]
+            return messages[:-1] + [merged]
+    return messages + [{"role": "user", "content": block}]
 
 
 def _build_user_message(original_input: str, state: dict, memory_entries: list,
@@ -10050,6 +10257,9 @@ def _salient_arg(name: str, arguments: dict) -> str:
         return arguments.get("pattern", "") or ""
     if name == "fs.ls":
         return arguments.get("path", ".") or "."
+    if name == "think":
+        # Not a file path: keep the file tracker and fs.* checks off it.
+        return " ".join(str(arguments.get("thought") or "").split())[:200]
     if name == "agent.spawn":
         return (arguments.get("task") or "")[:80]
     if name == "agent.tell":
@@ -10429,6 +10639,8 @@ _READ_ONLY_TOOLS = frozenset({
     "web.search", "web.fetch",
     "read", "grep", "glob", "ls", "diff",
     "web_search", "web_fetch",
+    # Only reads this session's own record.
+    "think",
 })
 
 
@@ -10745,6 +10957,13 @@ _EVOLUTION_LAB_ALLOWED_TOOLS = frozenset({
 #: uselessness.
 _PROTOCOL_TOOLS = ("task.complete", "agent_return", "agent.ask_parent")
 
+#: Offered through every built-in restriction (modes, plan mode, roles,
+#: workflow phases, labs): it has no side effect for any of them to contain,
+#: and a restricted agent is no less likely to need to stop and think. A list
+#: someone wrote (an employee's allowed/denied tools, --tools /
+#: --disallow-tools, a .hwg node scope) is still honoured exactly.
+_ALWAYS_OFFERED_TOOLS = ("think",)
+
 
 #: Process-wide tool narrowing from --tools / --disallow-tools. Like every
 #: other scope it only ever narrows, and it applies to sub-agents too.
@@ -10789,6 +11008,32 @@ def _tool_in_scope(name: str, scope: Optional[list]) -> bool:
 
 
 def _allowed_tool_names_for_state(
+        state: dict, agent_id: Optional[str] = None) -> set[str]:
+    """The narrowed set below, plus the tools offered everywhere."""
+    names = _narrowed_tool_names_for_state(state, agent_id)
+    registered = {tool.name for tool in tools_mod.get_registry().list()}
+    for name in _ALWAYS_OFFERED_TOOLS:
+        if name in registered and _allowed_by_written_lists(name, state, agent_id):
+            names.add(name)
+    return names
+
+
+def _allowed_by_written_lists(name: str, state: dict, agent_id: Optional[str]) -> bool:
+    """Whether every tool list a person wrote admits `name`."""
+    employee = get_agent(agent_id) if agent_id else None
+    profile = getattr(employee, "profile", None) if employee else None
+    policy = getattr(profile, "tool_policy", None) if profile else None
+    if policy is not None:
+        if policy.allowed_tools is not None and name not in set(policy.allowed_tools):
+            return False
+        if name in set(policy.denied_tools or []):
+            return False
+    if not _tool_in_scope(name, (state or {}).get("_tool_allowlist")):
+        return False
+    return _tool_allowed_at_startup(name)
+
+
+def _narrowed_tool_names_for_state(
         state: dict, agent_id: Optional[str] = None) -> set[str]:
     """Return the exact internal tool set the current runtime may dispatch.
 
@@ -10952,6 +11197,17 @@ def _authorize_tool_call(
             ),
             "tool": name, "returncode": -1, "_repeat_blocked": True,
             "_repeat_count": _prev_n,
+        }
+
+    # Side-effect free and offered everywhere (see _ALWAYS_OFFERED_TOOLS):
+    # the mode/role/workflow/lab/scope gates below have nothing to contain.
+    if name in _ALWAYS_OFFERED_TOOLS:
+        if name in allowed_tool_names:
+            return None
+        return {
+            "ok": False,
+            "error": f"BLOCKED: tool '{name}' is disabled for this agent.",
+            "tool": name, "returncode": -1,
         }
 
     # Lab workers must never gain side effects in the real workspace.
@@ -11277,6 +11533,7 @@ def run_agent_loop(
     max_loops_override: int = None,             # per-run cap; avoids global config races
     step_mode: bool = False,    # STEP mode: the cap is one iteration and reaching it is the expected pause, not exhaustion
     foreground: bool = False,   # this run is the tty-owning REPL turn (any role/depth)
+    progress_cb: Optional[Callable] = None,  # detached evidence for on-demand reports
 ) -> dict:
     """Run the autonomous agent loop (mirrors AutonomousKernel.ts).
 
@@ -11295,6 +11552,14 @@ def run_agent_loop(
     message_queue: if provided, drained between iterations — supplementary
     messages from the user are injected into the conversation context.
     """
+    def _publish_progress_state(info, live_state, phase="working"):
+        _publish_live_state(info, live_state)
+        if progress_cb is not None:
+            try:
+                progress_cb(live_state, phase)
+            except Exception:
+                pass  # Reporting must never terminate or change the main run.
+
     # Login changes must never alter the execution identity of an admitted run.
     _proxy = get_agent(agent_id) if agent_id else None
     if _proxy is not None and _proxy.remote_terminal:
@@ -11447,6 +11712,7 @@ def run_agent_loop(
     # (compaction, memory consolidation) can stamp the same trajectory on their
     # training-capture labels instead of arriving unattributed.
     state["_run_id"] = _run_id
+    _publish_progress_state(_runtime_info, state, "preparing")
     # Training-capture label for this run's turns. Overridable so a caller that
     # spawns agents for something other than doing the user's work — a
     # side-by-side comparison, where one whole side is the approach that gets
@@ -12502,6 +12768,10 @@ def run_agent_loop(
         # <progress_check> blocks as harness-authored so mid-conversation
         # nudges carry system-level trust instead of being read as user prose
         # or adversarial tool output (Claude Code system-reminder pattern).
+        if _thread_mode:
+            system_prompt = (
+                system_prompt.rstrip() + "\n\n" + _HARNESS_STATE_PROMPT
+            )
         if _thread_mode and get_runtime_config("critic_enabled"):
             system_prompt = (
                 system_prompt.rstrip() + "\n\n" + critic.HOOK_SECTION
@@ -12815,17 +13085,20 @@ def run_agent_loop(
                 break
             _publish_context_headroom(thread_messages, state)
             user_input = _live_state  # for debug display
-            _thread_to_send = _project_paged_reads(thread_messages, state) + (
-                [{"role": "user", "content": _live_state}] if _live_state.strip() else []
-            )
             # Last-step wrap-up (opencode MAX_STEPS_PROMPT): on the final allowed
             # iteration, tell the model to stop calling tools and answer now, so it
             # isn't cut off mid-action at the loop cap. Ephemeral — not committed.
+            _step_state = _live_state.strip()
             if _final_turn:
-                _thread_to_send = _thread_to_send + [{
-                    "role": "user",
-                    "content": _FINAL_TURN_REMINDER,
-                }]
+                _step_state = (_step_state + "\n\n" + _FINAL_TURN_REMINDER).strip()
+            _thread_to_send = _attach_harness_state(_project_reasoning(
+                _project_paged_reads(thread_messages, state),
+                _reasoning_target_model(resolve_agent_model(
+                    current_agent,
+                    state.get('_model_override', ''),
+                    state.get('_provider_override', ''),
+                )[0]),
+            ), _step_state)
             _thread_to_send = _canonicalize_messages_for_provider(_thread_to_send)
         else:
             _live_state = None
@@ -13230,6 +13503,7 @@ def run_agent_loop(
             authorization set, which is a materially worse — and still billed —
             answer.
             """
+            _publish_progress_state(self_info, state, "thinking")
             _base = dict(
                 session=session,
                 message=user_input,
@@ -13308,6 +13582,8 @@ def run_agent_loop(
                     stream_state["gear"] = value
                     return
                 if field == "reply":
+                    if not stream_state["reply"]:
+                        _publish_progress_state(self_info, state, "writing")
                     stream_state["reply"] += value
                     # Event delivery is independent of local terminal
                     # ownership: silent children must still stream to Helpwo
@@ -13728,7 +14004,7 @@ def run_agent_loop(
             state["lastReply"] = display_reply
             # Published as it is produced: this is the text a supervisor
             # salvages as a partial answer if the agent is cut short.
-            _publish_live_state(self_info, state)
+            _publish_progress_state(self_info, state)
             # Preserve the real sequence. Historically intermediate assistant
             # narration was buffered until the whole run ended while tool
             # results were appended immediately, producing a persisted order
@@ -14090,7 +14366,7 @@ def run_agent_loop(
                 # outside — both are just an absence of new history rows.
                 state["_active_tool"] = {
                     "name": name, "arg": salient, "started": time.time()}
-                _publish_live_state(self_info, state)
+                _publish_progress_state(self_info, state, "tool")
                 _trace_before = (
                     detail_trace.capture_before(
                         name, arguments, state.get("cwd") or os.getcwd())
@@ -14554,7 +14830,7 @@ def run_agent_loop(
                 # last one lands. The rows only join terminalHistory at the end
                 # of the turn (below), so expose them as a pending tail here.
                 state["_pending_history"] = list(per_call_rows)
-                _publish_live_state(self_info, state)
+                _publish_progress_state(self_info, state)
 
                 if not result.get("ok", False):
                     _failure = {
@@ -14844,7 +15120,7 @@ def run_agent_loop(
             )
         state["terminalHistory"].extend(per_call_rows)
         state.pop("_pending_history", None)
-        _publish_live_state(self_info, state)
+        _publish_progress_state(self_info, state)
 
         # ── Commit this turn to the native message thread (Stage B) ──
         # Only on a successful (non-nudge) turn, so failed/retry turns never
@@ -14880,8 +15156,22 @@ def run_agent_loop(
                     "name": _tc.get("name", ""),
                     "arguments": _tc.get("arguments", {}),
                     "output": _out,
+                    "extra_content": _tc.get("_extra_content"),
                 })
-            thread_messages.extend(_thread_messages_for_turn(reply, executed))
+            # The full text of this step, for think(question=...). The thread
+            # will lose some of it (pruning, summaries, templates); this keeps it.
+            step_record.append_step(
+                state.get("_session_id") or "", agent_id or "primary",
+                int(state.get("_step_counter") or 0),
+                reasoning=str(response.get("_reasoning") or ""), reply=reply or "",
+                calls=executed)
+            thread_messages.extend(_thread_messages_for_turn(
+                reply, executed,
+                reasoning=str(response.get("_reasoning") or ""),
+                reasoning_details=response.get("_reasoning_details"),
+                reasoning_model=_reasoning_tag(
+                    _reasoning_target_model(_request_model),
+                    str(response.get("_served_model") or ""))))
 
         # ── Output similarity: track fingerprints for repetition detection ──
         # Detects when consecutive steps produce highly similar output
@@ -14899,9 +15189,11 @@ def run_agent_loop(
         # Its output can be empty or an async screen fragment and must not trip
         # the generic consecutive-output breaker. Exact repeated sends are
         # still covered by the command-pattern warning circuit breaker.
+        # `think` returns the same acknowledgement every time; a run of
+        # thoughts is not a run of identical results.
         _similarity_rows = [
             row for row in per_call_rows
-            if row.get("tool") not in {"terminal.send", "terminal.read", "terminal.wait"}
+            if row.get("tool") not in {"terminal.send", "terminal.read", "terminal.wait", "think"}
         ]
         if _similarity_rows:
             _step_signal = "\n---\n".join(

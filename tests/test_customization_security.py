@@ -43,6 +43,24 @@ class BackendProfileSecurityTests(unittest.TestCase):
         self.assertNotIn("official-secret", repr(headers))
         self.assertEqual(cookies, {})
 
+    def test_windows_build_names_itself_to_laintas_only(self):
+        """The console tells laintas-cli-windows from the CLI by this header;
+        a custom backend is not told which build is calling it."""
+        session = {"headers": {"Authorization": "Bearer t"}}
+        official = backend_profiles.BackendProfile(
+            "official", "official", "https://laintas.com")
+        custom = backend_profiles.BackendProfile(
+            "custom", "custom", "https://ai.example.com")
+        with mock.patch.object(backend_profiles.sys, "platform", "cygwin"):
+            self.assertEqual(
+                backend_profiles.request_auth(official, session)[0].get("X-Laintas-Client"),
+                "cli-windows")
+            self.assertNotIn(
+                "X-Laintas-Client", backend_profiles.request_auth(custom, session)[0])
+        with mock.patch.object(backend_profiles.sys, "platform", "linux"):
+            self.assertNotIn(
+                "X-Laintas-Client", backend_profiles.request_auth(official, session)[0])
+
     def test_only_exact_official_origin_gets_official_auth(self):
         session = {
             "headers": {"Authorization": "Bearer official-secret"},

@@ -28,6 +28,8 @@ CORE_TOOLS = frozenset({
     "skill.save",
     "task.complete", "task.create", "task.get", "task.list", "task.update",
     "agent_return", "workflow.phase_complete", "time.now",
+    # Whether to stop and think is never in the request's words.
+    "think",
     # Delegation is resident, not routed. Whether to hand part of a task to a
     # child is a judgement about the SHAPE of the work — are these pieces
     # independent — and the keyword groups below can only see the vocabulary of

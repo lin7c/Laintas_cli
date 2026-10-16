@@ -440,6 +440,10 @@ def list_all(cwd: Optional[str] = None) -> list:
 def append(hid: str, kind: str, actor: str, note: str = "",
            data: Optional[dict] = None, cwd: Optional[str] = None) -> dict:
     """Serialize the whole read-modify-write, including competing processes."""
+    # Refuse an unknown id before taking the lock: guard() creates the sidecar
+    # and, by design, nothing ever unlinks one, so a typo left a stray
+    # .<id>.lock behind for good.
+    load(hid, cwd)
     with guard(hid, cwd):
         env = load(hid, cwd)
         if (kind == "claim" and env.get("target_user_id")

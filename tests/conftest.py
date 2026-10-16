@@ -72,3 +72,11 @@ def _isolated_compaction_folds():
     yield
     background_compaction.forget_folds()
     background_compaction._failures.clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_step_record(tmp_path, monkeypatch):
+    """Every loop test commits steps; keep their records out of ~/.laintas."""
+    import step_record
+    target = tmp_path / "step-records"
+    monkeypatch.setattr(step_record, "record_dir", lambda: target)

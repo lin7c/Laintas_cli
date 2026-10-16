@@ -18,6 +18,8 @@ Laintas CLI combines a normal interactive shell with an agent runtime. Shell com
 
 It is designed for developers, server operators, and remote workspaces that want an AI agent close to the filesystem and terminal—not isolated in a separate chat window.
 
+Current release: [Laintas CLI beta v4 (1.32.5b4)](https://github.com/lin7c/Laintas_cli/releases/tag/laintas-cli-beta-v4). Existing users can run `/v update`.
+
 ## Highlights
 
 - Direct shell commands bypass the model and retain normal PTY behavior.
@@ -607,6 +609,22 @@ without terminating an independently started CLI. Lost contact expires the
 execution lease after 30 seconds and requests cancellation of delegated work;
 the relationship remains reserved until explicitly released. Status updates
 carry bounded result summaries; full execution history stays with A.
+
+### Progress reports during a task: `/progress`
+
+Press **Alt+P**, or type **`/progress`** and Enter, while an AI task is running.
+A separate AI call summarizes completed work, current activity, remaining work,
+and known blockers in English; the main task continues. Alt+P preserves your input draft.
+Reports use the model selected by `/model aux` (or the main model when aux is
+unset), consume an additional AI call, and show the time of the evidence snapshot.
+Repeated requests share the report already in progress. A failed or timed-out
+report does not interrupt the task. Reports do not become instructions or history
+in the main model's conversation.
+
+Set the report output budget before starting a task with
+`/config progress_max_tokens 4096`; inspect it with `/config progress_max_tokens`.
+The default is 2048 tokens. Set it to 0 to use the provider/window limit.
+This setting is separate from `/config max_tokens` for the working model.
 
 ### Password vault: `/password`
 
