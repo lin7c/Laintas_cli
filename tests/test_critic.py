@@ -175,6 +175,68 @@ class SummarizeActionsTests(unittest.TestCase):
         self.assertIn("[anchor: earlier action] assistant: way back", out)
         self.assertIn("[step 0] assistant: now", out)
 
+    def test_since_covers_every_step_after_the_anchor(self):
+        """Every 8 loops is 16+ messages; a 14-message tail skipped some."""
+        msgs = [{"role": "assistant", "content": f"m{i}"} for i in range(40)]
+        out = critic.summarize_actions(msgs, since=10, max_chars=100_000)
+        self.assertIn("[step 10] assistant: m10", out)
+        self.assertIn("[step 39] assistant: m39", out)
+        self.assertNotIn("[step 9]", out)
+
+    def test_over_budget_shortens_before_dropping(self):
+        msgs = [{"role": "assistant", "content": f"m{i} " + "x" * 600}
+                for i in range(20)]
+        out = critic.summarize_actions(msgs, since=0, max_chars=2400)
+        self.assertLessEqual(len(out), 2400)
+        self.assertIn("[step 0] assistant: m0", out)
+        self.assertIn("[step 19] assistant: m19", out)
+        self.assertNotIn("omitted", out)
+
+    def test_over_budget_keeps_anchor_and_counts_drops(self):
+        """The old text[-max_chars:] cut the anchor line first and could
+        start mid-line."""
+        anchor = {"role": "assistant", "content": "where we left off"}
+        msgs = [{"role": "assistant", "content": f"m{i}"} for i in range(400)]
+        out = critic.summarize_actions(
+            msgs, since=0, anchor=anchor, max_chars=1500)
+        self.assertLessEqual(len(out), 1500)
+        self.assertTrue(out.startswith("[anchor: earlier action]"))
+        self.assertRegex(out, r"\[\.\.\. \d+ earlier step\(s\) omitted")
+        self.assertIn("[step 399] assistant: m399", out)
+        for line in out.splitlines():
+            self.assertTrue(line.startswith("["), line)
+
+    def test_find_message_is_by_identity(self):
+        a = {"role": "assistant", "content": "same"}
+        b = {"role": "assistant", "content": "same"}
+        self.assertEqual(critic.find_message([b, a], a), 1)
+        self.assertIsNone(critic.find_message([b], a))
+        self.assertIsNone(critic.find_message([a], None))
+
+    def test_anchor_survives_compaction_by_identity(self):
+        """Compaction replaces the head with a summary and keeps the tail's
+        objects: the anchor is found at its NEW index, and an anchor that was
+        folded away is reported missing instead of aliasing another message."""
+        thread = [{"role": "user", "content": f"m{i}"} for i in range(30)]
+        kept, folded = thread[25], thread[3]
+        thread[:] = [{"role": "user", "content": "[SUMMARY]"}] + thread[20:]
+        self.assertEqual(critic.find_message(thread, kept), 6)
+        self.assertIsNone(critic.find_message(thread, folded))
+
+    def test_assess_uses_prerendered_actions(self):
+        seen = []
+
+        def fn(messages):
+            seen.append(messages[0]["content"])
+            return '{"on_track": true, "score": 90}'
+
+        verdict, fail = critic.assess_detailed(
+            "goal", None, fn, actions="[step 5] assistant: rendered")
+        self.assertIsNone(fail)
+        self.assertIn("[step 5] assistant: rendered", seen[0])
+        self.assertEqual(critic.assess_detailed("goal", None, fn, actions=""),
+                         (None, critic.FAIL_EMPTY))
+
     def test_content_parts_flattened(self):
         msgs = [{"role": "user",
                  "content": [{"type": "text", "text": "hello"},

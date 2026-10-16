@@ -203,28 +203,34 @@ def clip_goal(task: str, *, head: int = 800, tail: int = 700) -> str:
 
 
 def summarize_actions(messages, *, max_msgs: int = 14, max_chars: Optional[int] = None,
-                      anchor=None) -> str:
-    """Render a compact transcript of the recent thread for the critic: the last
-    few messages as ``[step N] role + trimmed content + tool names``.
+                      anchor=None, since: Optional[int] = None) -> str:
+    """Render a compact transcript of the recent thread for the critic:
+    ``[step N] role + trimmed content + tool names`` per message.
 
     ``anchor`` (optional) is a message dict from earlier in the thread —
-    typically the first assistant action after the previous critic assessment.
-    Including it gives the judge a "where we left off" reference point, so
-    gradual drift is visible against the earlier state instead of only an
-    amnesiac tail of self-consistent recent actions.
+    typically the last message the previous critic assessment saw. Including
+    it gives the judge a "where we left off" reference point, so gradual drift
+    is visible against the earlier state instead of only an amnesiac tail of
+    self-consistent recent actions.
+
+    ``since`` (optional) is the index of the first message to render. Every
+    message from there on is covered — the window is the work done since the
+    previous assessment, not a fixed tail. A fixed 14-message tail every
+    8 loops left steps nobody judged: one loop is an assistant message plus
+    one tool result per call, so 8 loops are 16+ messages. When the window
+    does not fit ``max_chars``, each message's text is shortened before any
+    message is dropped, and dropped messages are counted, never sliced
+    mid-line. Without ``since`` the last ``max_msgs`` messages are rendered.
 
     Every rendered message carries its index in ``messages``. Without a stable
     number a judge can only say "the recent work drifted", which names nothing
     the loop can act on; with one it can say *which* step went wrong, and the
     intent layer can render "steps 3-7 are void" into a correction the model
     can actually apply. The number is the position in the list handed in — in
-    the loop that is the thread index, so it survives across assessments.
+    the loop that is the thread index, which compaction renumbers.
     """
     if not isinstance(messages, list):
         return ""
-    lines = []
-    if isinstance(anchor, dict):
-        lines.append("[anchor: earlier action] " + _render_message(anchor))
     if max_chars is None:
         # The critic's share of the auxiliary model's window (budget tree
         # `aux.critic.source`), not a fixed 4000 characters.
@@ -233,16 +239,59 @@ def summarize_actions(messages, *, max_msgs: int = 14, max_chars: Optional[int] 
             max_chars = _al.aux_source_chars("critic")
         except Exception:
             max_chars = 4000
-    start = max(0, len(messages) - max_msgs)
-    for offset, m in enumerate(messages[start:]):
-        if not isinstance(m, dict):
-            continue
-        lines.append(_render_message(m, step=start + offset))
-    text = "\n".join(lines)
-    return text[-max_chars:]
+    max_chars = max(200, int(max_chars))
+    if since is None:
+        start = max(0, len(messages) - max_msgs)
+    else:
+        start = min(max(0, int(since)), len(messages))
+    window = [(start + offset, m) for offset, m in enumerate(messages[start:])
+              if isinstance(m, dict)]
+    head = ("[anchor: earlier action] " + _render_message(anchor)
+            if isinstance(anchor, dict) else "")
+
+    def _fit(limit: int):
+        lines = [_render_message(m, step=i, limit=limit) for i, m in window]
+        used = len(head) + sum(len(line) + 1 for line in lines)
+        return lines, used
+
+    lines, used = _fit(400)
+    for limit in (200, 100, 40):
+        if used <= max_chars:
+            break
+        lines, used = _fit(limit)
+    dropped = 0
+    # The omission marker needs room too, or appending it pushes the text
+    # back over budget and the final clip cuts the anchor line.
+    marker_room = 0 if used <= max_chars else 60
+    while used + marker_room > max_chars and len(lines) > 1:
+        used -= len(lines[0]) + 1
+        lines.pop(0)
+        dropped += 1
+    if dropped:
+        lines.insert(0, f"[... {dropped} earlier step(s) omitted for length ...]")
+    text = "\n".join(([head] if head else []) + lines)
+    return text[-max_chars:] if len(text) > max_chars else text
 
 
-def _render_message(m: dict, step: Optional[int] = None) -> str:
+def find_message(messages, target) -> Optional[int]:
+    """Index of ``target`` in ``messages`` by identity, or None.
+
+    The loop remembers where the previous assessment stopped as the message
+    object itself, not as an index: compaction rewrites the thread in place
+    (summary + kept tail), which renumbers every message but keeps the tail's
+    objects. An index saved before compaction then points at an unrelated
+    message, or past the end. An object either is still there, or was
+    compacted away — and the caller can tell which.
+    """
+    if not isinstance(messages, list) or target is None:
+        return None
+    for i, m in enumerate(messages):
+        if m is target:
+            return i
+    return None
+
+
+def _render_message(m: dict, step: Optional[int] = None, limit: int = 400) -> str:
     prefix = f"[step {step}] " if step is not None else ""
     role = m.get("role", "?")
     content = m.get("content", "")
@@ -250,7 +299,7 @@ def _render_message(m: dict, step: Optional[int] = None) -> str:
         content = " ".join(
             str(p.get("text", "")) for p in content if isinstance(p, dict))
     content = re.sub(r"\s+", " ", str(content or "")).strip()
-    piece = (f"{prefix}{role}: {content[:400]}" if content
+    piece = (f"{prefix}{role}: {content[:limit]}" if content
              else f"{prefix}{role}:")
     calls = m.get("tool_calls") or []
     names = []
@@ -360,16 +409,21 @@ def parse_verdict(reply: str) -> Optional[dict]:
 
 
 def assess_detailed(task: str, messages, llm_fn: Callable[[list], str],
-                    anchor=None, contract_text: str = ""):
+                    anchor=None, contract_text: str = "",
+                    actions: Optional[str] = None):
     """Run one critic pass.
 
     Returns ``(verdict, failure_reason)``: verdict is a dict on success and
     None on failure, in which case failure_reason is one of FAIL_LLM /
     FAIL_PARSE / FAIL_EMPTY so the caller can log why and count streaks.
-    ``anchor`` is an earlier message (see summarize_actions). Never raises.
+    ``anchor`` is an earlier message (see summarize_actions). ``actions`` is
+    an already rendered transcript: the loop renders it on its own thread, at
+    launch, so a background pass never reads messages the loop is mutating.
+    Never raises.
     """
     try:
-        actions = summarize_actions(messages, anchor=anchor)
+        if actions is None:
+            actions = summarize_actions(messages, anchor=anchor)
         if not actions:
             return None, FAIL_EMPTY
         try:

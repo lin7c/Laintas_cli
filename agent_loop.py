@@ -11422,12 +11422,12 @@ def run_agent_loop(
     _critic_last_issue = ""               # issue text of the last injected nudge
     _critic_similar_streak = 0            # suppressed similar-issue nudges in a row
     _critic_fail_streak = 0               # consecutive assess failures
-    _critic_anchor_idx = 0                # thread_messages index at last assessment
+    _critic_anchor_msg = None             # last message the previous assessment saw (by identity)
     _critic_disabled = False              # auto-disabled after persistent failures
     _critic_prompt_error_reported = ""    # avoid repeating one bad custom-file warning
     _critic_thread = None                 # in-flight background assessment
     _critic_result: dict = {}             # filled by that thread
-    _critic_launch_idx = 0                # thread length when it was launched
+    _critic_launch_msg = None             # newest thread message when it was launched
     # ── Intent alignment per-task state (see intent.py) ──────────────────
     # The spec lives in `state` rather than a local, because the system prompt
     # is rebuilt from `state` on every iteration. It is declared turn-only on
@@ -12952,7 +12952,7 @@ def run_agent_loop(
                     # was LAUNCHED, not where it stands now: the loop kept
                     # working while the critic thought, and the next critic pass
                     # must diff from what this one actually saw.
-                    _critic_anchor_idx = _critic_launch_idx
+                    _critic_anchor_msg = _critic_launch_msg
                     # Persist critic score for local diagnostics only. The server
                     # training pipeline does not read client critic scores.
                     if _verdict.get("score") is not None:
@@ -13063,8 +13063,25 @@ def run_agent_loop(
                         trajectory_id=_traj, cwd=_cwd,
                         model=_aux_m, provider=_aux_p)
 
-                _anchor = (thread_messages[_critic_anchor_idx]
-                           if 0 < _critic_anchor_idx < len(thread_messages) else None)
+                # Judge everything since the previous assessment, not a
+                # fixed tail. The anchor is found by identity: compaction
+                # renumbers the thread, so a saved index would point at an
+                # unrelated message. If the anchor itself was compacted away,
+                # the window starts at the summary that replaced it.
+                _anchor = None
+                _since = None
+                if _critic_anchor_msg is not None:
+                    _anchor_pos = critic.find_message(
+                        thread_messages, _critic_anchor_msg)
+                    if _anchor_pos is None:
+                        _since = 0
+                    else:
+                        _anchor = _critic_anchor_msg
+                        _since = _anchor_pos + 1
+                # Rendered here, on the loop's thread: the background pass
+                # must not read messages that pruning mutates in place.
+                _crit_actions = critic.summarize_actions(
+                    thread_messages, anchor=_anchor, since=_since)
 
                 # A contracted child is judged against what it owes, not
                 # against a paraphrase of its goal. A top-level task has no
@@ -13083,19 +13100,19 @@ def run_agent_loop(
                 except Exception:
                     _crit_contract = ""
 
-                def _critic_worker(_msgs=list(_thread_to_send), _anchor=_anchor,
+                def _critic_worker(_actions=_crit_actions,
                                    _fn=_crit_llm_fn, _out=_critic_result,
                                    _goal=original_input,
                                    _contract=_crit_contract):
                     try:
                         _v, _f = critic.assess_detailed(
-                            _goal, _msgs, _fn, anchor=_anchor,
-                            contract_text=_contract)
+                            _goal, None, _fn, contract_text=_contract,
+                            actions=_actions)
                     except Exception as _exc:      # never raise on a daemon thread
                         _v, _f = None, f"critic thread error: {_exc}"
                     _out["verdict"], _out["fail"] = _v, _f
 
-                _critic_launch_idx = len(thread_messages)
+                _critic_launch_msg = thread_messages[-1] if thread_messages else None
                 _critic_thread = threading.Thread(
                     target=_critic_worker, name="critic", daemon=True)
                 _critic_thread.start()
