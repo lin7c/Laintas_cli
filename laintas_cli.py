@@ -1607,6 +1607,7 @@ import workgraph                 # unified objective/plan/steps/workflow state
 import hooks as hooks_mod        # trusted Python hooks + argv hooks
 import backend_profiles          # backend trust domains + credential isolation
 import model_route               # /model route: backend-served vs. direct provider key
+import auto_routing              # /model routing: the auto model's preferences
 import trust_store               # workspace trust for executable customization
 import usage_tracker             # local AI token/cost accounting (/usage)
 import training_local            # /training local: on-machine interaction capture
@@ -3717,6 +3718,19 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "that path also accepts a .pdf. With no arguments, lists images in "
             "the working directory and recent browser screenshots. `--text` "
             "is accepted as an alias for the `text` action.")),
+    CommandSpec(
+        "/video", "Read a video: ask about it, index it, transcribe it", "Basics",
+        "/video [<path> [start-end] [question] | index <path> | text <path> [start-end] "
+        "| frames <path> [start-end] | list]",
+        subcommands=("index", "text", "frames", "list", "help"),
+        help_text=(
+            "With a question, a video model watches the clip (two minutes or "
+            "less; a longer range is read as keyframes plus transcript) and "
+            "answers. `index` builds a timeline: keyframes picked where the "
+            "picture changed, one caption each, and the speech per minute. "
+            "`text` transcribes the speech word for word. `frames` saves the "
+            "keyframes as images without calling any model. A range such as "
+            "1:00-2:30 narrows any of them. Needs ffmpeg.")),
     CommandSpec("/login", "Re-authenticate with Laintas", "Account & Session"),
     CommandSpec(
         "/account", "List, add or switch account profiles", "Account & Session",
@@ -3981,10 +3995,11 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     )),
     CommandSpec("/work", "Inspect or resume unified WorkGraph state", "Planning & Tasks", "/work [status|list|resume|history]", subcommands=("status", "list", "resume", "history")),
     CommandSpec("/workflow", "Run a multi-phase workflow", "Planning & Tasks", "/workflow {start|status|advance|approve|end|list}", subcommands=("start", "status", "advance", "approve", "end", "list")),
-    CommandSpec("/model", "Select the chat model: backend models or your own provider key", "Config & Tools", "/model [terminal|aux|@agent] [id|reset] | route [<route> [model] [window]|list] | add [provider] [key|$VAR] [model] [name] | remove <route>",
-        subcommands=("aux", "reset", "clear", "default", "route", "add", "remove"),
+    CommandSpec("/model", "Select the chat model: backend models or your own provider key", "Config & Tools", "/model [terminal|aux|@agent] [id|reset] | routing [everyday|complex <id|off>|candidates <id,…|all>|reset] | route [<route> [model] [window]|list] | add [provider] [key|$VAR] [model] [name] | remove <route>",
+        subcommands=("aux", "routing", "reset", "clear", "default", "route", "add", "remove"),
         completion_descriptions=(
             ("aux", "Pick the model for compaction, critic and memory extraction"),
+            ("routing", "Auto model: which models it may pick, and one for everyday or complex tasks"),
             ("reset", "Clear this terminal's model override (use gateway auto-routing)"),
             ("clear", "Clear this terminal's model override (use gateway auto-routing)"),
             ("default", "Clear this terminal's model override (use gateway auto-routing)"),
@@ -4211,6 +4226,32 @@ def _model_candidates(_fragment, _prior) -> list[tuple[str, str]]:
     return _cached_candidates("models", loader)
 
 
+def _auto_routing_cached_routes() -> list[str]:
+    """The models auto may pick, from the catalogue already fetched (no wait).
+
+    Same rule as _model_candidates: a keystroke never blocks on the network;
+    inside the live prompt the first miss starts the fetch in the background.
+    """
+    seen = auto_routing.catalogue(_rprompt_backend_cache_key())
+    if seen is not None:
+        return seen[0]
+    if _prompt_session is not None:
+        _rprompt_kick_model_fetch()
+    return []
+
+
+def _auto_routing_candidate_completions(fragment, _prior) -> list[tuple[str, str]]:
+    """`/model routing candidates a,b,…`: complete the segment after the last comma."""
+    head, _, _last = fragment.rpartition(",")
+    done = {m.strip() for m in head.split(",") if m.strip()}
+    prefix = f"{head}," if head else ""
+    rows = [(prefix + mid, "auto may pick this model")
+            for mid in _auto_routing_cached_routes() if mid not in done]
+    if not head:
+        rows.append(("all", "Every model auto serves"))
+    return rows
+
+
 def _help_candidates(fragment: str, _prior) -> list[tuple[str, str]]:
     slash = fragment.startswith("/")
     rows = []
@@ -4327,6 +4368,8 @@ def _identity_loader():
 
 
 _IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff")
+_VIDEO_SUFFIXES = (".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".mpg", ".mpeg",
+                   ".3gp", ".flv", ".wmv", ".ogv")
 _YES_FLAG = _static_candidates(("--yes", "Skip the confirmation prompt"))
 _FORCE_FLAG = _static_candidates(("--force", "Proceed even when it would normally refuse"))
 _TASK_IDS = _task_candidates()
@@ -4359,6 +4402,15 @@ _ARG_COMPLETIONS: dict[str, tuple] = {
         *((("add", *("*",) * depth), lambda f, p: _model_add_arg_candidates(f, p))
           for depth in range(6)),
         (("aux",), _static_candidates(("reset", "Use the terminal's own model again"))),
+        (("routing",), _static_candidates(
+            ("everyday", "Model for everyday tasks"),
+            ("complex", "Model for complex tasks: design, debugging, refactoring"),
+            ("candidates", "Models auto may pick, comma-separated"),
+            ("reset", "Back to defaults: auto picks from every model"))),
+        (("routing", ("everyday", "complex")), lambda fragment, _prior: [
+            ("off", "Let auto choose"),
+            *((mid, "auto may pick this model") for mid in _auto_routing_cached_routes())]),
+        (("routing", "candidates"), _auto_routing_candidate_completions),
         (("aux",), _terminal_candidates(include_primary=True, stationed_only=True)),
         (("*",), lambda fragment, prior: (
             [("reset", "Clear this terminal's override")]
@@ -4508,6 +4560,10 @@ _ARG_COMPLETIONS: dict[str, tuple] = {
     "/img": (
         ((), _path_candidates(_IMAGE_SUFFIXES)),
         (("text",), _path_candidates((*_IMAGE_SUFFIXES, ".pdf"))),
+    ),
+    "/video": (
+        ((), _path_candidates(_VIDEO_SUFFIXES)),
+        ((("index", "text", "frames"),), _path_candidates(_VIDEO_SUFFIXES)),
     ),
     "/undo": (((), _cached_provider("snapshots", _snapshot_loader)),),
     "/shared": (
@@ -7070,12 +7126,14 @@ class _PrivateCommandHistory(FileHistory):
     """
 
     def append_string(self, string: str) -> None:
-        if not _is_private_command(string):
+        import secret_guard
+        if not _is_private_command(string) and not secret_guard.input_error(string):
             super().append_string(string)
 
     def load_history_strings(self):
+        import secret_guard
         for string in super().load_history_strings():
-            if not _is_private_command(string):
+            if not _is_private_command(string) and not secret_guard.input_error(string):
                 yield string
 
 
@@ -7847,6 +7905,10 @@ def _remember_model_capabilities(payload) -> None:
     capabilities = payload.get("modelCapabilities")
     windows = payload.get("contextWindows")
     try:
+        auto_routing.remember_catalogue(payload, _rprompt_backend_cache_key())
+    except Exception:
+        pass
+    try:
         if isinstance(capabilities, dict):
             for model, spec in capabilities.items():
                 if isinstance(spec, dict):
@@ -7960,7 +8022,8 @@ def fetch_available_models(
 
 def show_model_selector(models: list[dict], current: str = "", *,
                         routes: Optional[list] = None,
-                        active_route: str = "") -> Optional[dict]:
+                        active_route: str = "",
+                        routing_settings: bool = False) -> Optional[dict]:
     """Interactive model selector. Returns the complete model row or None.
 
     Prepends an ``auto`` virtual entry at the start of the list. When the user
@@ -7970,6 +8033,10 @@ def show_model_selector(models: list[dict], current: str = "", *,
     *routes* (model_route.DirectRoute) are listed after the backend's models;
     picking one returns ``{"route": name}``. While one of them is
     *active_route*, it — not a backend model — carries the current mark.
+
+    *routing_settings* adds an "auto-routing settings" row under auto; picking
+    it returns ``{"routing_settings": True}`` (the bare /model picker only —
+    the aux and per-agent pickers choose a model and nothing else).
     """
     routes = list(routes or [])
     if not models and not routes:
@@ -7985,6 +8052,12 @@ def show_model_selector(models: list[dict], current: str = "", *,
     labels.append(f"{auto_mark}[cyan]{'auto-routing':30}[/cyan] {'':3} Auto-routing (embedding-based)")
     if current in ("auto", ""):
         sel_idx = 0
+    if routing_settings:
+        prefs = auto_routing.load()
+        state = "defaults" if auto_routing.is_default(prefs) else "customised"
+        labels.append(f"  [cyan]{'  auto-routing settings…':30}[/cyan] {'':3} "
+                      f"Models auto may pick, everyday/complex model [dim]({state})[/dim]")
+    model_start = len(labels)
     for i, model in enumerate(models):
         model_id = model.get("id", "")
         provider = model.get("supply") or model.get("description") or _model_supply_label(
@@ -7993,7 +8066,7 @@ def show_model_selector(models: list[dict], current: str = "", *,
         tier = model.get("tier") or ""
         labels.append(f"{mark}[cyan]{model_id:30}[/cyan] {tier:3} {provider}")
         if current and model_id == current:
-            sel_idx = i + 1  # +1 because auto occupies index 0
+            sel_idx = i + model_start  # rows above: auto, and its settings row
     route_start = len(labels)
     for route in routes:
         mark = " *" if route.name == active_route else "  "
@@ -8017,9 +8090,11 @@ def show_model_selector(models: list[dict], current: str = "", *,
     index = labels.index(chosen)
     if index == 0:
         return {"id": "auto", "provider": ""}
+    if index < model_start:
+        return {"routing_settings": True}
     if index >= route_start:
         return {"route": routes[index - route_start].name}
-    return models[index - 1]
+    return models[index - model_start]
 
 
 def choose_login_method() -> Optional[str]:
@@ -10375,6 +10450,12 @@ def _call_backend_stream_impl(
     thread (assistant tool_calls + role:tool results) instead of a re-synthesized
     state-dump user turn.
     """
+    import secret_guard
+    try:
+        secret_guard.require_safe_payload([message, system_prompt, history, messages])
+    except secret_guard.SecretInputError as exc:
+        return {"reply": str(exc), "tool_calls": [], "done": True, "error": True,
+                "code": "sensitive_input"}
     backend_profile = get_backend_profile()
     backend_url = backend_profile.base_url
 
@@ -10439,6 +10520,13 @@ def _call_backend_stream_impl(
         # model_override=="auto" → send empty model so the gateway triggers
         # embedding-based auto-routing (/api/chat/stream on the gateway side).
         payload["model"] = "" if model_override == "auto" else selected_model
+    # The auto model's preferences (/model routing). Only an auto request
+    # carries them: the gateway ignores the field for a named model anyway, and
+    # leaving it off keeps every other request byte-for-byte as it was.
+    if str(payload.get("model") or "").strip().lower() in ("", "auto"):
+        routing = auto_routing.request_field()
+        if routing:
+            payload["routing"] = routing
     if provider_override:
         payload["provider"] = provider_override
     # A pinned model without an explicitly paired provider is gateway-resolved.
@@ -11650,6 +11738,12 @@ class AgentRegistry:
         content = payload.get("message", "")
         if not isinstance(content, str):
             self._push_final(req_id, "fail", "'message' must be a string")
+            return
+
+        import secret_guard
+        error = secret_guard.input_error(content)
+        if error:
+            self._push_final(req_id, "fail", error)
             return
 
         console.print(Panel(
@@ -13933,6 +14027,8 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/usage", "buy"): _arg_rule(2, "/usage buy <calls|storage>"),
     ("/img", "list"): _arg_rule(1, "/img list"),
     ("/img", "help"): _arg_rule(1, "/img help"),
+    ("/video", "list"): _arg_rule(1, "/video list"),
+    ("/video", "help"): _arg_rule(1, "/video help"),
     ("/retask", "list"): _arg_rule(1, "/retask list"),
     ("/retask", "help"): _arg_rule(1, "/retask help"),
     ("/handoff", "list"): _arg_rule(1, "/handoff list"),
@@ -14008,6 +14104,8 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/detail",): _arg_rule(2, "/detail [on|off|trace [N]]"),
     ("/detail", "trace"): _arg_rule(2, "/detail trace [N]"),
     ("/model", "aux"): _arg_rule(2, "/model aux [id|reset]"),
+    ("/model", "routing"): _arg_rule(
+        3, "/model routing [everyday|complex <id|off> | candidates <id,…|all> | reset]"),
     ("/model", "reset"): _arg_rule(1, "/model reset"),
     ("/model", "clear"): _arg_rule(1, "/model clear"),
     ("/model", "default"): _arg_rule(1, "/model default"),
@@ -14202,7 +14300,7 @@ def _validate_slash_args(action: str, args: list[str]) -> None:
 #: is here rather than `/web`: only the alias turns an unknown subcommand into
 #: a query, and a query is prose — "what's the best http client" is an
 #: unclosed quote to shlex, not a mistake by the user.
-_FREE_TEXT_TAIL_COMMANDS = frozenset({"/img", "/search"})
+_FREE_TEXT_TAIL_COMMANDS = frozenset({"/img", "/video", "/search"})
 
 
 def _parse_slash_command(cmd: str) -> tuple[str, str, list[str]]:
@@ -16020,6 +16118,153 @@ def _cmd_img(raw_args: str) -> None:
     console.print(out["text"], markup=False, highlight=False)
 
 
+def _video_candidates(limit: int = 12) -> list:
+    """Videos in the working directory and Downloads, newest first."""
+    import glob as _glob
+    import video as _video
+    seen, found = set(), []
+    for folder in (os.getcwd(), os.path.expanduser("~/Downloads"),
+                   os.path.expanduser("~/Movies"), os.path.expanduser("~/Videos")):
+        for path in _glob.glob(os.path.join(folder, "*")):
+            if path in seen or not os.path.isfile(path):
+                continue
+            if os.path.splitext(path)[1].lower() not in _video.VIDEO_EXTENSIONS:
+                continue
+            seen.add(path)
+            try:
+                found.append((os.path.getmtime(path), path))
+            except OSError:
+                pass
+    found.sort(reverse=True)
+    return [path for _mtime, path in found[:limit]]
+
+
+def _confirm_video_cost(calls: dict) -> bool:
+    """Ask before a run that makes many paid calls; small ones just go."""
+    total = sum(calls.values())
+    if total <= 6:
+        return True
+    parts = [f"{n} {lane}" for lane, n in calls.items() if n]
+    console.print(f"[dim]This makes up to {total} model calls ({', '.join(parts)}); "
+                  f"finished parts are cached and never paid for twice.[/dim]")
+    if not sys.stdin.isatty():
+        return True
+    try:
+        answer = input("Continue? [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer in ("", "y", "yes")
+
+
+def _cmd_video(raw_args: str) -> None:
+    """/video — read a video: ask about it, index it, transcribe it."""
+    import video
+
+    args = (raw_args or "").strip()
+    verb, rest = _split_verb(
+        args, ("index", "text", "frames", "list", "help"),
+        lambda tok: os.path.splitext(tok)[1].lower() in video.VIDEO_EXTENSIONS)
+
+    if verb == "help":
+        console.print(r"[bold]/video[/bold] [dim]— read a video[/dim]")
+        console.print(r"  /video                               \[list] videos here and in Downloads")
+        console.print(r"  /video <path> \[start-end] \[question]  ask about it (≤2 min is watched natively)")
+        console.print(r"  /video index <path>                  timeline: keyframes, captions, speech")
+        console.print(r"  /video text <path> \[start-end]        the speech, word for word")
+        console.print(r"  /video frames <path> \[start-end]      save keyframes as images (no model call)")
+        console.print(r"[dim]Ranges look like 1:00-2:30, 90-, or -0:45. Needs ffmpeg.[/dim]")
+        return
+    if verb == "list" or not args:
+        candidates = _video_candidates()
+        if not candidates:
+            console.print(r"[yellow]Usage: /video <path> \[question]   ·   /video help[/yellow]")
+            console.print("[dim]No videos found in the working directory or Downloads.[/dim]")
+            return
+        console.print(r"[bold]Recent videos[/bold] [dim](run /video <path> \[question])[/dim]")
+        for path in candidates:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            shown = shlex.quote(path) if re.search(r"\s", path) else path
+            console.print(f"  [cyan]{escape(shown)}[/cyan] [dim]{size / 1e6:.1f} MB[/dim]")
+        return
+
+    path, tail = _leading_path_arg(rest)
+    if not path:
+        console.print(f"[yellow]/video {verb} <path>  —  a file path is required[/yellow]")
+        return
+    start = end = None
+    head, _, after = tail.partition(" ")
+    if head and video.RANGE_RE.match(head):
+        try:
+            start, end = video.parse_range(head)
+        except video.VideoError as e:
+            console.print(f"[red]{e}[/red]")
+            return
+        tail = after.strip()
+    question = tail
+
+    session = load_session()
+    lanes = tools_mod.video_transports(session, get_profile=get_backend_profile)
+    try:
+        info = video.probe(path)
+        s, e = video.clamp_range(info, start, end)
+        kind = {"": "describe", "index": "index", "text": "text", "frames": "frames"}[verb]
+        if kind == "index":
+            s, e = 0.0, info["duration"]
+        if not _confirm_video_cost(video.plan(info, kind, s, e)):
+            console.print("[yellow]Cancelled.[/yellow]")
+            return
+        with _safe_status("[dim]Reading video…[/dim]") as update:
+            progress = (lambda msg: update(f"[dim]{escape(msg)}[/dim]")) if update else None
+            if kind == "index":
+                out = video.index(path, call_vision=lanes["call_vision"],
+                                  call_audio=lanes["call_audio"], progress=progress)
+            elif kind == "text":
+                if question:
+                    console.print("[dim]`text` transcribes everything said; the "
+                                  "question is ignored.[/dim]")
+                out = video.to_text(path, call_audio=lanes["call_audio"],
+                                    start=start, end=end, progress=progress)
+            elif kind == "frames":
+                out = video.frames(path, start=start, end=end, progress=progress)
+            else:
+                out = video.describe(path, question, start=start, end=end,
+                                     progress=progress, **lanes)
+    except video.VideoError as e:
+        console.print(f"[red]{e}[/red]")
+        return
+    except Exception as e:
+        console.print(f"[red]{type(e).__name__}: {e}[/red]")
+        return
+
+    span = f"{video.fmt_time(s)}–{video.fmt_time(e)}"
+    if kind == "frames":
+        console.print(f"[bold]Keyframes of[/bold] [cyan]{escape(path)}[/cyan] [dim]{span}[/dim]")
+        for f in out["frames"]:
+            console.print(f"  {video.fmt_time(f['t'], precise=True):>9}  "
+                          f"[cyan]{escape(f['path'])}[/cyan]")
+        console.print("[dim]Read one with /img <frame path> [question].[/dim]")
+        return
+    if kind == "index":
+        header = f"[bold]Index of[/bold] [cyan]{escape(path)}[/cyan]"
+    elif kind == "text":
+        header = f"[bold]Speech in[/bold] [cyan]{escape(path)}[/cyan] [dim]{span}[/dim]"
+    else:
+        how = "watched" if out.get("mode") == "native" else "keyframes + transcript"
+        header = f"[bold]{escape(path)}[/bold] [dim]{span} · {how}"
+        header += f" · {escape(str(out.get('model', '?')))}"
+        header += " · cached[/dim]" if out.get("cached") else "[/dim]"
+        if out.get("fallback"):
+            console.print(f"[dim]Video model unavailable ({escape(out['fallback'])}); "
+                          f"read as keyframes instead.[/dim]")
+    if kind == "index" and out.get("cached"):
+        header += " [dim]· cached[/dim]"
+    console.print(header)
+    console.print(out["text"], markup=False, highlight=False)
+
+
 def _open_retask_view(path: str = "") -> None:
     """Open a checklist full screen: the given one, else the open one here."""
     import retask as retask_mod
@@ -16516,6 +16761,293 @@ def _cmd_model_agent_base(agent, args: list, session: dict) -> None:
                   f"[bold]{escape(model_id)}[/bold][/green]{_model_tier_suffix(model_id)}")
 
 
+#: Shown beside each task type, in /model routing and its status.
+_AUTO_ROUTING_SLOT_LABELS = {
+    "everyday": ("Everyday tasks", "questions, small edits, lookups"),
+    "complex": ("Complex tasks", 'design, architecture, debugging, refactoring, "think hard"'),
+}
+
+
+def _current_terminal_model() -> str:
+    """The model this REPL's own terminal runs ("" or "auto" = auto)."""
+    try:
+        terminal = get_terminal(agent_deployment_terminal(get_current_agent()) or "term0")
+        if terminal is not None and terminal.model_override is not None:
+            return str(terminal.model_override)
+    except Exception:
+        pass
+    return get_selected_model()
+
+
+def _auto_routing_catalogue(session: dict, *, fetch: bool = True):
+    """``(routes_to, supported)`` for the current backend, or None if unknown.
+
+    Uses the catalogue already fetched for this backend; otherwise fetches it
+    with the same spinner and Esc/Ctrl+C cancel as the /model picker.
+    """
+    key = _rprompt_backend_cache_key()
+    seen = auto_routing.catalogue(key)
+    if seen is not None or not fetch:
+        return seen
+    try:
+        with _safe_status(
+                f"[dim]Fetching available models… {symbols.BULLET} Esc/Ctrl+C cancel[/dim]"):
+            models, _endpoint = run_cancellable_blocking(
+                lambda cancel: fetch_available_models(session, cancel_event=cancel))
+    except BlockingOperationCancelled:
+        raise
+    except Exception as exc:
+        console.print(f"[red]Failed to fetch models: {escape(str(exc))}[/red]")
+        return None
+    _rprompt_refill_model_cache(models)
+    return auto_routing.catalogue(key)
+
+
+def _auto_routing_summary(prefs: dict, routes: list[str]) -> str:
+    """"all 12" / "3 of 12" — the candidate line, plain text."""
+    if not prefs["candidates"]:
+        return f"all {len(routes)}" if routes else "all"
+    return (f"{len(auto_routing.effective_pool(prefs, routes))} of {len(routes)}"
+            if routes else f"{len(prefs['candidates'])} chosen")
+
+
+def _print_auto_routing_status(prefs: dict, catalogue) -> None:
+    """What auto will do, and every reason a setting might not take effect."""
+    routes, supported = catalogue if catalogue is not None else ([], True)
+    table = Table(title="Auto-routing (used while the model is auto)",
+                  show_header=False, box=None, padding=(0, 2))
+    table.add_column(style="bold")
+    table.add_column(style="cyan")
+    table.add_column(style="dim")
+    for slot in auto_routing.SLOTS:
+        label, hint = _AUTO_ROUTING_SLOT_LABELS[slot]
+        table.add_row(label, escape(prefs[slot] or "auto picks"), hint)
+    detail = ""
+    if prefs["candidates"]:
+        # Name the shorter side: "all except glm-5.3" reads better than fifteen ids.
+        allowed = auto_routing.effective_pool(prefs, routes) if routes else prefs["candidates"]
+        excluded = [m for m in routes if m not in allowed]
+        detail = (f"all except {', '.join(excluded)}" if excluded and len(excluded) < len(allowed)
+                  else ", ".join(allowed))
+    table.add_row("Models auto may pick", escape(_auto_routing_summary(prefs, routes)),
+                  escape(detail))
+    console.print(table)
+    if catalogue is not None and not supported:
+        console.print("[yellow]This backend does not apply auto-routing preferences: "
+                      "they are kept and take effect on a backend that does.[/yellow]")
+    if routes:
+        stale = [m for m in (*prefs["candidates"], prefs["everyday"], prefs["complex"])
+                 if m and m not in routes]
+        if stale:
+            console.print(f"[yellow]Not offered to auto right now: "
+                          f"{escape(', '.join(dict.fromkeys(stale)))} — auto chooses "
+                          "without it.[/yellow]")
+    if model_route.selected_name() != model_route.DEFAULT_ROUTE:
+        console.print(f"[dim]Direct route {escape(model_route.selected_name())} is active; "
+                      "these apply once /model is back on the backend.[/dim]")
+    elif _current_terminal_model().strip().lower() not in ("", "auto"):
+        console.print(f"[dim]This terminal's model is "
+                      f"{escape(_current_terminal_model())}; these apply when /model is auto.[/dim]")
+
+
+def _auto_routing_model_label(model_id: str, current: str) -> str:
+    # Same columns as the /model picker: mark, id (30), tier.
+    mark = " *" if model_id == current else "  "
+    tier = _MODEL_TIERS.get(model_id, "")
+    return f"{mark}[cyan]{escape(model_id):30}[/cyan] {tier:3}"
+
+
+def _auto_routing_pick_slot(slot: str, prefs: dict, routes: list[str]) -> Optional[str]:
+    """Pick the model for one task type. Returns the id, "" for auto, None if cancelled."""
+    label, hint = _AUTO_ROUTING_SLOT_LABELS[slot]
+    pool = auto_routing.effective_pool(prefs, routes)
+    current = prefs[slot]
+    options = ["", *pool]
+    if current and current not in pool:
+        options.append(current)            # keep a stale pick visible, not silently gone
+    labels = []
+    for model_id in options:
+        if not model_id:
+            mark = " *" if not current else "  "
+            labels.append((f"{mark}[cyan]{'auto picks':30}[/cyan]    ",
+                           "rank the allowed models for each task"))
+        elif model_id in pool:
+            labels.append((_auto_routing_model_label(model_id, current), ""))
+        else:
+            labels.append((_auto_routing_model_label(model_id, current),
+                           "not offered to auto right now"))
+    chosen = select_dialog(
+        labels,
+        title=f"Auto-routing {symbols.BULLET} {label} — {hint}",
+        full_screen=True,
+        selected_index=options.index(current) if current in options else 0,
+        hint=(f"{symbols.ARROW_U}{symbols.ARROW_D}/wheel navigate  ↵ or click twice "
+              "select  Esc/q back"),
+    )
+    if chosen is None:
+        return None
+    return options[labels.index(chosen)]
+
+
+def _auto_routing_pick_candidates(prefs: dict, routes: list[str]):
+    """Tick the models auto may pick. Returns the ticked ids, or None if cancelled."""
+    pool = set(auto_routing.effective_pool(prefs, routes))
+    labels = [_auto_routing_model_label(model_id, "") for model_id in routes]
+    chosen = select_dialog(
+        labels,
+        title=f"Auto-routing {symbols.BULLET} Models auto may pick",
+        multi=True,
+        full_screen=True,
+        checked={i for i, model_id in enumerate(routes) if model_id in pool},
+        hint=(f"{symbols.ARROW_U}{symbols.ARROW_D}/wheel navigate  Space tick  "
+              "↵ save  Esc/q back"),
+    )
+    if chosen is None:
+        return None
+    return [routes[labels.index(item)] for item in chosen]
+
+
+def _cmd_model_routing_menu(session: dict) -> None:
+    """The interactive editor: one list, Enter changes the row under the cursor.
+
+    Every change is saved as it is made, so Esc at any point keeps what was
+    done; nothing is held back for a final confirm that could be lost.
+    """
+    try:
+        catalogue = _auto_routing_catalogue(session)
+    except BlockingOperationCancelled:
+        console.print("[dim]Cancelled.[/dim]")
+        return
+    routes = catalogue[0] if catalogue else []
+    if not routes:
+        console.print("[yellow]The backend did not list the models auto may pick, "
+                      "so there is nothing to choose from here.[/yellow]")
+        console.print("[dim]Type them instead: /model routing everyday <id>, "
+                      "/model routing candidates <id,…>.[/dim]")
+        _print_auto_routing_status(auto_routing.load(), catalogue)
+        return
+    notice, cursor = "", 0
+    while True:
+        prefs = auto_routing.load()
+        rows = [("everyday", *_AUTO_ROUTING_SLOT_LABELS["everyday"], prefs["everyday"] or "auto picks"),
+                ("complex", *_AUTO_ROUTING_SLOT_LABELS["complex"], prefs["complex"] or "auto picks"),
+                ("candidates", "Models auto may pick", "Space ticks, Enter saves",
+                 _auto_routing_summary(prefs, routes))]
+        if not auto_routing.is_default(prefs):
+            rows.append(("reset", "Reset", "auto picks for every task, from every model", ""))
+        rows.append(("done", "Done", "", ""))
+        # Value column padded to the /model picker's id width, so the hints line up.
+        labels = [(f"{label:22}[cyan]{escape(value):30}[/cyan]", hint)
+                  for _key, label, hint, value in rows]
+        title = "Auto-routing — used while the model is auto"
+        if catalogue is not None and not catalogue[1]:
+            title += f" {symbols.BULLET} this backend ignores these settings"
+        if notice:
+            title += f" {symbols.BULLET} {notice}"
+        chosen = select_dialog(
+            labels, title=title, full_screen=True,
+            selected_index=min(cursor, len(labels) - 1),
+            hint=(f"{symbols.ARROW_U}{symbols.ARROW_D}/wheel navigate  ↵ change  "
+                  "Esc/q done"),
+        )
+        if chosen is None:
+            break
+        cursor = labels.index(chosen)
+        action, notice = rows[cursor][0], ""
+        if action == "done":
+            break
+        if action == "reset":
+            auto_routing.save({})
+            notice, cursor = "reset to defaults", 0
+        elif action in auto_routing.SLOTS:
+            picked = _auto_routing_pick_slot(action, prefs, routes)
+            if picked is not None:
+                auto_routing.save(dict(prefs, **{action: picked}))
+        else:
+            ticked = _auto_routing_pick_candidates(prefs, routes)
+            if ticked is not None:
+                try:
+                    updated, cleared = auto_routing.set_candidates(prefs, ticked, routes)
+                except ValueError:
+                    notice = "keep at least one model — unchanged"
+                    continue
+                auto_routing.save(updated)
+                if cleared:
+                    names = " and ".join(_AUTO_ROUTING_SLOT_LABELS[s][0].lower() for s in cleared)
+                    notice = f"{names} back to auto picks (model no longer allowed)"
+    _print_auto_routing_status(auto_routing.load(), catalogue)
+
+
+def _cmd_model_routing(args: list, session: dict) -> None:
+    """`/model routing [everyday|complex <id|off> | candidates <id,…|all> | reset]`.
+
+    Bare at a terminal: the interactive editor. Bare elsewhere: the status.
+    The typed forms are for scripts and for backends that do not list auto's
+    models; an id the backend lists as not available to auto is refused, since
+    it would be skipped on every request and look like the setting was lost.
+    """
+    if not args:
+        if sys.stdin.isatty():
+            _cmd_model_routing_menu(session)
+            return
+        _print_auto_routing_status(auto_routing.load(),
+                                   _auto_routing_catalogue(session, fetch=False))
+        return
+    action = args[0].lower()
+    usage = ("[yellow]Usage: /model routing \\[everyday|complex <id|off> | "
+             "candidates <id,…|all> | reset][/yellow]")
+    if action == "reset" and len(args) == 1:
+        auto_routing.save({})
+        console.print("[green]Auto-routing reset: auto picks for every task, "
+                      "from every model.[/green]")
+        return
+    if action not in (*auto_routing.SLOTS, "candidates") or len(args) != 2:
+        console.print(usage)
+        return
+    value = args[1].strip()
+    clear = value.lower() in ("off", "none", "auto", "reset", "default")
+    try:
+        catalogue = _auto_routing_catalogue(session)
+    except BlockingOperationCancelled:
+        console.print("[dim]Cancelled; nothing changed.[/dim]")
+        return
+    routes = catalogue[0] if catalogue else []
+    prefs = auto_routing.load()
+    if action in auto_routing.SLOTS:
+        if clear:
+            prefs[action] = ""
+        else:
+            allowed = auto_routing.effective_pool(prefs, routes)
+            if routes and value not in allowed:
+                where = "auto may pick" if value in routes else "the backend offers to auto"
+                console.print(f"[red]{escape(value)} is not among the models {where}.[/red]")
+                console.print(f"[dim]Choose from: {escape(', '.join(allowed))}[/dim]")
+                return
+            prefs[action] = value
+        auto_routing.save(prefs)
+    else:
+        if value.lower() in ("all", "off", "none", "reset", "default"):
+            prefs = dict(prefs, candidates=[])
+            auto_routing.save(prefs)
+        else:
+            ticked = [m.strip() for m in value.split(",") if m.strip()]
+            unknown = [m for m in ticked if routes and m not in routes]
+            if unknown:
+                console.print(f"[red]Not offered to auto: {escape(', '.join(unknown))}[/red]")
+                console.print(f"[dim]Choose from: {escape(', '.join(routes))}[/dim]")
+                return
+            try:
+                prefs, cleared = auto_routing.set_candidates(prefs, ticked, routes)
+            except ValueError:
+                console.print("[red]Keep at least one model.[/red]")
+                return
+            auto_routing.save(prefs)
+            for slot in cleared:
+                console.print(f"[yellow]{_AUTO_ROUTING_SLOT_LABELS[slot][0]} back to auto "
+                              "picks: its model is no longer allowed.[/yellow]")
+    _print_auto_routing_status(auto_routing.load(), catalogue)
+
+
 def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
     """Manage deployment-model overrides without changing agent base models."""
     args = [_normalize_slash_arg(item) for item in parts[1:]]
@@ -16525,6 +17057,11 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
     # resolution below rather than pretending "aux" is a terminal name.
     if args and args[0].lower() == "aux":
         _cmd_model_aux(args[1:], session)
+        return
+    # The auto model's preferences: not a terminal's model either, so the same
+    # short-circuit. Not named `auto` — `/model auto` selects the auto model.
+    if args and args[0].lower() == "routing":
+        _cmd_model_routing(args[1:], session)
         return
     # Direct provider routes (model_route.py): who serves the chat model of
     # this CLI terminal. Also offered in the bare `/model` picker below.
@@ -16638,8 +17175,11 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
         if (models or direct_routes) and sys.stdin.isatty():
             selected = show_model_selector(
                 models, current, routes=direct_routes,
-                active_route=model_route.selected_name())
-            if selected and selected.get("route"):
+                active_route=model_route.selected_name(),
+                routing_settings=True)
+            if selected and selected.get("routing_settings"):
+                _cmd_model_routing_menu(session)
+            elif selected and selected.get("route"):
                 _use_model_route(selected["route"])
             elif selected:
                 model_id = selected.get("id", "") if isinstance(selected, dict) else selected
@@ -16702,6 +17242,9 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
             "Set with [bold]/model \\[terminal] <model-id>[/bold], reset with "
             "[bold]/model \\[terminal] reset[/bold]. This never changes the "
             "employee base model.")
+        console.print(
+            "[dim]Which models auto may pick, and one for everyday or complex "
+            "tasks: [bold]/model routing[/bold].[/dim]")
         if routes_apply:
             console.print(
                 "[dim]Your own provider key: [bold]/model add[/bold] (walks you "
@@ -25841,6 +26384,9 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
     elif action == "/img":
         _cmd_img(raw_args)
 
+    elif action == "/video":
+        _cmd_video(raw_args)
+
     elif action == "/help":
         _cmd_help(parts)
 
@@ -26964,6 +27510,11 @@ def _queue_supplementary(target_queue: queue.Queue, line: str,
                          source: str = "local") -> bool:
     line = str(line or "").strip()
     if not line:
+        return False
+    import secret_guard
+    error = secret_guard.input_error(line)
+    if error:
+        console.print(error, style="yellow", markup=False)
         return False
     if line.split(maxsplit=1)[0].lower() == "/progress":
         if line.lower() != "/progress":
@@ -28566,6 +29117,13 @@ def _run_execute_mode(task: str, session: dict, depth: int, session_id: str = No
     prints the result to stdout, and returns the exit code. Local subagents run
     in-process; this entry point remains for scripts, CI, and external callers.
     """
+    import secret_guard
+    error = secret_guard.input_error(task)
+    if error:
+        console.print(error, style="yellow", markup=False)
+        if report is not None:
+            report.update(success=False, result="", error=error)
+        return 1
     # Apply the active mode's auto-approve posture before the loop starts.
     # Interactive sessions reach this through /mode and /auto; --execute never
     # did, so a mode declaring auto_approve="writes" still stopped at the first
@@ -30059,6 +30617,17 @@ def main():
             # is queued, the next iteration will pick it up and process it
             # before setting injected_done.
             continue
+
+        # Gate before echo, event publication, history, session storage or routing.
+        # Explicit local credential-management commands use their own private UI.
+        import secret_guard
+        if _is_dialogue or not (_is_password_command(user_input) or _carries_model_key(user_input)):
+            _secret_error = secret_guard.input_error(user_input)
+            if _secret_error:
+                console.print(_secret_error, style="yellow", markup=False)
+                if injected_done is not None:
+                    injected_done.set()
+                continue
 
         # A task submitted through /agents may have completed after that view
         # closed.  Pull its CLI-owned PTY/session back into the foreground

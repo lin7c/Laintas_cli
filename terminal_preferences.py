@@ -26,7 +26,7 @@ _CACHE: dict | None = None
 #: the official backend rather than quietly inheriting an external one that
 #: was selected somewhere else. Anything with a blast radius beyond the
 #: user's own comfort stays strictly terminal-scoped.
-SEEDED_KEYS = frozenset({"model", "provider", "mode", "agent", "ui"})
+SEEDED_KEYS = frozenset({"model", "provider", "mode", "agent", "ui", "auto_routing"})
 
 PERSISTED_UI_KEYS = frozenset({
     "detail",
@@ -88,7 +88,7 @@ def preference_path() -> Path:
 #: so a new terminal must start on the official backend rather than quietly
 #: inheriting an external one selected somewhere else. Anything with a blast
 #: radius beyond the user's own comfort stays strictly terminal-scoped.
-SEEDED_KEYS = frozenset({"model", "provider", "mode", "agent", "ui"})
+SEEDED_KEYS = frozenset({"model", "provider", "mode", "agent", "ui", "auto_routing"})
 
 _SEED: dict | None = None
 

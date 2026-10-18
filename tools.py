@@ -128,7 +128,7 @@ def infer_capabilities(name: str) -> frozenset[str]:
         caps.add("process.exec")
     if name.startswith(("web.", "browser.")):
         caps.add("network")
-    if name.startswith("image."):
+    if name.startswith(("image.", "video.")):
         # Both labels, and the second one is the point: these read a local file
         # and send its CONTENTS to a model. `fs.read` alone would understate
         # that (it never leaves the machine) and `network` alone would
@@ -8646,8 +8646,11 @@ def _vision_backend(ctx: ToolCtx):
     return vision_call_backend(ctx.session)
 
 
-def vision_call_backend(default_session=None, get_profile=None):
+def vision_call_backend(default_session=None, get_profile=None, lane="vision"):
     """A non-streaming call to the gateway-owned vision model family.
+
+    `lane` picks the sibling endpoint (`video`, `audio`): same body, same
+    reply, a different administrator-ordered family behind it.
 
     The endpoint, rather than the CLI, selects the first live model in the
     administrator's image-understanding order.  This keeps CLI, Helpwo and
@@ -8663,7 +8666,7 @@ def vision_call_backend(default_session=None, get_profile=None):
 
     def call_backend(*, session=None, message="", system_prompt="",
                      current_path="", messages=None, tools_enabled=False,
-                     model_override=None, task_kind="vision", **_kwargs):
+                     model_override=None, task_kind=None, **_kwargs):
         profile = (get_profile or _default_backend_profile)()
         headers, cookies = backend_profiles.request_auth(
             profile, session if session is not None else default_session)
@@ -8673,12 +8676,12 @@ def vision_call_backend(default_session=None, get_profile=None):
             "currentPath": current_path,
             "systemPrompt": system_prompt,
             "source": "cli",
-            "taskKind": task_kind or "vision",
+            "taskKind": task_kind or lane,
             "injectToolGuide": False,
         }
         try:
             response = requests.post(
-                profile.base_url.rstrip("/") + "/api/chat/vision",
+                profile.base_url.rstrip("/") + f"/api/chat/{lane}",
                 headers=headers, cookies=cookies, json=body, timeout=420)
         except requests.RequestException as exc:
             return {"error": True, "reply": str(exc)}
@@ -8690,7 +8693,9 @@ def vision_call_backend(default_session=None, get_profile=None):
             detail = data.get("detail") or data.get("title") or response.reason
             return {"error": True, "reply": f"HTTP {response.status_code}: {detail}"}
         choices = data.get("choices") or []
-        content = ""
+        # A speech recognizer heading the audio lane answers {content} rather
+        # than a chat completion.
+        content = data.get("content") or ""
         if choices:
             content = (choices[0].get("message") or {}).get("content") or ""
         if isinstance(content, list):
@@ -8784,6 +8789,93 @@ def _bi_image_to_text(params: dict, ctx: ToolCtx) -> dict:
         head += f" ({out['pages']} page(s))"
     return {"ok": True, "result": f"{head}\n{out['text']}",
             "pages": out.get("pages"), "cached": out.get("cached", False)}
+
+
+def video_transports(session=None, get_profile=None) -> dict:
+    """The three gateway lanes a video is read through, for video.py."""
+    return {f"call_{lane}": vision_call_backend(session, get_profile, lane=lane)
+            for lane in ("video", "vision", "audio")}
+
+
+def _video_progress(ctx: ToolCtx):
+    """Between ffmpeg runs and paid calls: honour Esc instead of finishing."""
+    def progress(_message: str) -> None:
+        event = getattr(ctx, "interrupt_event", None)
+        if event is not None and event.is_set():
+            raise InterruptedError("interrupted")
+    return progress
+
+
+def _video_range(params: dict) -> dict:
+    return {"start": params.get("start"), "end": params.get("end")}
+
+
+def _video_tool(name: str, run):
+    """Shared error handling for the video.* tools."""
+    @private_files.guard(name)
+    def invoke(params: dict, ctx: ToolCtx) -> dict:
+        import video
+        try:
+            return run(video, params, ctx)
+        except InterruptedError:
+            return {"ok": False, "error": f"{name}: interrupted", "status": "interrupted"}
+        except video.VideoError as e:
+            return {"ok": False, "error": f"{name}: {e}"}
+        except Exception as e:
+            return {"ok": False, "error": f"{name}: {type(e).__name__}: {e}"}
+    invoke.__name__ = "_bi_" + name.replace(".", "_")
+    return invoke
+
+
+def _run_video_index(video, params, ctx):
+    lanes = video_transports(ctx.session)
+    out = video.index(_image_tool_path(params, ctx), call_vision=lanes["call_vision"],
+                      call_audio=lanes["call_audio"],
+                      captions=params.get("captions", True) is not False,
+                      progress=_video_progress(ctx))
+    head = f"[video index: {params.get('path')}]"
+    if out.get("model"):
+        head += f" (frames read by {out['model']})"
+    return {"ok": True, "result": f"{head}\n{out['text']}", "cached": out.get("cached", False)}
+
+
+def _run_video_describe(video, params, ctx):
+    lanes = video_transports(ctx.session)
+    out = video.describe(_image_tool_path(params, ctx), str(params.get("question") or ""),
+                         **lanes, **_video_range(params), progress=_video_progress(ctx))
+    s, e = out["range"]
+    how = ("watched natively" if out["mode"] == "native"
+           else "read as keyframes + transcript")
+    head = (f"[video: {params.get('path')} {video.fmt_time(s)}–{video.fmt_time(e)}] "
+            f"({how} by {out['model']})")
+    return {"ok": True, "result": f"{head}\n{out['text']}", "model": out["model"],
+            "mode": out["mode"], "cached": out.get("cached", False)}
+
+
+def _run_video_to_text(video, params, ctx):
+    lanes = video_transports(ctx.session)
+    out = video.to_text(_image_tool_path(params, ctx), call_audio=lanes["call_audio"],
+                        **_video_range(params), progress=_video_progress(ctx))
+    s, e = out["range"]
+    head = f"[speech in: {params.get('path')} {video.fmt_time(s)}–{video.fmt_time(e)}]"
+    return {"ok": True, "result": f"{head}\n{out['text']}"}
+
+
+def _run_video_frames(video, params, ctx):
+    out = video.frames(_image_tool_path(params, ctx), **_video_range(params),
+                       max_frames=params.get("max_frames") or video.DESCRIBE_MAX_FRAMES,
+                       progress=_video_progress(ctx))
+    lines = [f"{video.fmt_time(f['t'], precise=True)}  {f['path']}" for f in out["frames"]]
+    head = (f"[keyframes of: {params.get('path')}] {len(lines)} frame(s), picked where the "
+            f"picture changed. Read one with image.describe or image.to_text.")
+    return {"ok": True, "result": head + "\n" + "\n".join(lines),
+            "frames": out["frames"]}
+
+
+_bi_video_index = _video_tool("video.index", _run_video_index)
+_bi_video_describe = _video_tool("video.describe", _run_video_describe)
+_bi_video_to_text = _video_tool("video.to_text", _run_video_to_text)
+_bi_video_frames = _video_tool("video.frames", _run_video_frames)
 
 
 # ── Whiteboards ──────────────────────────────────────────────────────────
@@ -12216,6 +12308,84 @@ def register_builtin_tools() -> None:
                 "required": ["path"],
             },
             invoke=_bi_image_to_text,
+        ),
+        Tool(
+            name="video.index",
+            description=(
+                "Get a timeline of a video file: duration, keyframes picked "
+                "where the picture changed (each with a one-line caption and "
+                "an image path), and the speech transcribed per time window. "
+                "Start here with any video longer than a minute or two, then "
+                "use video.describe on the range that matters. Costs a few "
+                "vision calls plus one speech call per minute of audio; "
+                "results are cached per file."),
+            schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "path to an mp4/mov/webm/mkv/... file"},
+                    "captions": {"type": "boolean", "description": "caption keyframes (default true); false = timestamps, frame paths and speech only"},
+                },
+                "required": ["path"],
+            },
+            invoke=_bi_video_index,
+        ),
+        Tool(
+            name="video.describe",
+            description=(
+                "Ask a question about a video, or about one range of it. A "
+                "range of two minutes or less is watched natively by a video "
+                "model (motion and sound included); a longer one is read as "
+                "keyframes plus transcript. Ask something specific, and give "
+                "a range when you know where to look (video.index tells you). "
+                "For the spoken words verbatim, use video.to_text instead."),
+            schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "path to a video file"},
+                    "question": {"type": "string", "description": "what you need to know, e.g. 'what error appears after the save click?'"},
+                    "start": {"type": "string", "description": "range start, seconds or m:ss; omit for the beginning"},
+                    "end": {"type": "string", "description": "range end, seconds or m:ss; omit for the end"},
+                },
+                "required": ["path"],
+            },
+            invoke=_bi_video_describe,
+        ),
+        Tool(
+            name="video.to_text",
+            description=(
+                "Transcribe the speech in a video word for word, with "
+                "timestamps. Use for talks, meetings, tutorials — anything "
+                "where a summary would lose what was said. To ask what is "
+                "SHOWN, use video.describe instead."),
+            schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "path to a video file"},
+                    "start": {"type": "string", "description": "range start, seconds or m:ss; omit for the beginning"},
+                    "end": {"type": "string", "description": "range end, seconds or m:ss; omit for the end"},
+                },
+                "required": ["path"],
+            },
+            invoke=_bi_video_to_text,
+        ),
+        Tool(
+            name="video.frames",
+            description=(
+                "Extract a video's keyframes as image files, picked where the "
+                "picture changed, with their timestamps. No model call, so it "
+                "is free; read any frame afterwards with image.describe or "
+                "image.to_text (e.g. to copy exact text off a screen)."),
+            schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "path to a video file"},
+                    "start": {"type": "string", "description": "range start, seconds or m:ss; omit for the beginning"},
+                    "end": {"type": "string", "description": "range end, seconds or m:ss; omit for the end"},
+                    "max_frames": {"type": "integer", "description": "at most this many frames (default 12, max 24)"},
+                },
+                "required": ["path"],
+            },
+            invoke=_bi_video_frames,
         ),
         Tool(
             name="browser._debug_open",

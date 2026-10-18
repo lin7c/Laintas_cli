@@ -1,7 +1,10 @@
+import * as NavReact from 'react';
+import { createNavigationPreferences } from '../../../../laintas/src/components/navigation-preferences/react.js';
+const NavigationPreferences = createNavigationPreferences(NavReact);
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { AnimatePresence, motion } from 'framer-motion';
-import { ChevronDown, LogIn, LogOut, Moon, Settings, Sun, UserRound } from 'lucide-react';
+import { ChevronDown, LogIn, LogOut, Settings, UserRound } from 'lucide-react';
 import { useLanguage } from '../contexts/LanguageContext';
 import { useTheme } from '../contexts/ThemeContext';
 import { useAuth } from '../contexts/AuthContext';
@@ -59,8 +62,8 @@ export default function Header() {
         </nav>
         <div className="header-actions">
           <a className="pricing-link" href="https://laintas.com/pricing" target="_blank" rel="noreferrer">{lang === 'zh' ? '定价' : 'Pricing'}</a>
-          <button className="round-control text-control" onClick={toggleLang} aria-label={lang === 'zh' ? 'Switch to English' : '切换到中文'}>{lang === 'zh' ? 'EN' : '中'}</button>
-          <button className="round-control" onClick={toggleTheme} aria-label={theme === 'dark' ? t.theme.light : t.theme.dark}>{theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}</button>
+          <NavigationPreferences language={lang} theme={theme}
+            onLanguageChange={next => { if (next !== lang) toggleLang(); }} onThemeChange={toggleTheme} />
           <div className="user-control" ref={menuRef}>
             <button className="user-trigger" onClick={() => setUserOpen((open) => !open)} aria-label={t.user.guest} aria-expanded={userOpen}>
               {isPending ? <span className="loading-dot" /> : loggedIn ? <span className="user-initial">{(session.user?.name || session.user?.email || '?').charAt(0).toUpperCase()}</span> : <UserRound size={15} />}

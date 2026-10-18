@@ -3,7 +3,7 @@
 
 import json
 import os
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 _ROOT = os.path.abspath(os.path.join(SPECPATH, '..', '..'))
 with open(os.path.join(_ROOT, 'package_manifest.json'), encoding='utf-8') as _file:
@@ -17,6 +17,7 @@ for _name in _MANIFEST['packages'] + _MANIFEST['data_dirs']:
 _datas += collect_data_files('certifi')
 
 _hidden = list(_MANIFEST['modules']) + list(_MANIFEST['packages'])
+_hidden += collect_submodules('detect_secrets')
 _hidden += ['json', 'shlex', 'subprocess', 'platform', 'socket', 'urllib',
             'pathlib', 'datetime', 'uuid']
 

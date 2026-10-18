@@ -265,6 +265,11 @@ class LaintasAcpAgent(Agent):
         if not text:
             raise RequestError.invalid_params({"prompt": "no text content"})
 
+        import secret_guard
+        error = secret_guard.input_error(text)
+        if error:
+            raise RequestError.invalid_params({"reason": error})
+
         s.interrupt.clear()
         s.saw_ai_event = False
         s.chat_history.append(

@@ -28,7 +28,7 @@ _datas += collect_data_files('certifi')
 # hiddenimports: all top-level modules + sub-packages + frozen_deps (linux).
 _hidden = list(_PM['modules']) + list(_PM['packages']) + list(_PM['frozen_deps']['linux'])
 # Collect every submodule of the heavy deps so PyInstaller doesn't miss any.
-for _dep in ('websockets', 'aiortc', 'av', 'cffi'):
+for _dep in ('websockets', 'aiortc', 'av', 'cffi', 'detect_secrets'):
     try:
         _hidden += collect_submodules(_dep)
     except Exception:

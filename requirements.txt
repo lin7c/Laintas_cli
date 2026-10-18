@@ -6,6 +6,7 @@ rich>=13.0.0
 prompt_toolkit>=3.0.0
 pyte>=0.8.2,<0.9
 pysocks>=1.7
+detect-secrets==1.5.0
 
 # Optional extras - install via pip install .[<extra>]  (e.g. .[browser])
 #   [browser]  websockets, playwright  - headless-browser live-view + CDP tools

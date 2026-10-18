@@ -367,11 +367,14 @@ class ModelRouteTests(unittest.TestCase):
         with mock.patch.object(laintas_cli.sys.stdin, "isatty", return_value=True), \
                 mock.patch.object(laintas_cli, "select_dialog", side_effect=pick):
             self._run_model()
-        self.assertEqual(len(seen["labels"]), 3)          # auto, backend model, route
-        self.assertIn("deepseek-chat", seen["labels"][2])
-        self.assertEqual(seen["index"], 2)                # the active route is current
-        self.assertTrue(seen["labels"][2].startswith(" *"))
+        # auto, its settings row (/model routing), backend model, route
+        self.assertEqual(len(seen["labels"]), 4)
+        self.assertIn("auto-routing settings", seen["labels"][1])
+        self.assertIn("deepseek-chat", seen["labels"][3])
+        self.assertEqual(seen["index"], 3)                # the active route is current
+        self.assertTrue(seen["labels"][3].startswith(" *"))
         self.assertFalse(seen["labels"][0].startswith(" *"))
+        self.assertFalse(seen["labels"][1].startswith(" *"))
         self.assertEqual(store.get(model_route.PREF_KEY), "ds")
 
     def test_picker_offers_routes_when_the_backend_list_fails(self):

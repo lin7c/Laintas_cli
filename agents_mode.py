@@ -2021,6 +2021,12 @@ class AgentsModeController:
         text = str(raw or "").strip()
         if not text:
             return
+        import secret_guard
+        error = secret_guard.input_error(text)
+        if error:
+            self.notice = error
+            self.invalidate()
+            return
         if text.startswith("/"):
             self.notice = (
                 "Slash commands are handled by the main CLI; "

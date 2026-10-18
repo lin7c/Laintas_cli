@@ -54,6 +54,7 @@
     "auto_pilot",
     "backend_profiles",
     "model_route",
+    "auto_routing",
     "durable_rules",
     "trust_store",
     "paths",
@@ -125,11 +126,13 @@
     "context_snapshot",
     "prop_ui",
     "vision",
+    "video",
     "retask",
     "retask_view",
     "acp_agent",
     "private_files",
-    "runtime_host"
+    "runtime_host",
+    "secret_guard"
   ],
   "packages": [
     "agent_tools",
@@ -205,6 +208,7 @@
     "prompt_toolkit>=3.0.0",
     "pyte>=0.8.2,<0.9",
     "pysocks>=1.7",
-    "cryptography>=41.0"
+    "cryptography>=41.0",
+    "detect-secrets==1.5.0"
   ]
 }
