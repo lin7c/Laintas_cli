@@ -6,5 +6,5 @@ the version published in the release `manifest.json`.
 """
 
 __version__ = "1.32.5b5"  # PEP 440 package version for build tools.
-RELEASE_NAME = "laintas-cli-beta v4"
-RELEASE_TAG = "laintas-cli-beta-v4"
+RELEASE_NAME = "laintas-cli-beta v5"
+RELEASE_TAG = "laintas-cli-beta-v5"
