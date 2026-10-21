@@ -55,7 +55,7 @@ macOS. Commands run in the bundled bash environment, where drives appear as
 `/c/Users/...`; account data stays in `.laintas` in your user profile. The
 script verifies the installer's size and SHA-256 before running it, and
 `$env:LAINTAS_INSTALL_SILENT=1` skips the wizard. You can also download the
-[installer](https://cli.laintas.com/windows-cli/beta-v3-2/laintas-cli-windows_beta-v3-2_x64-setup.exe)
+[installer](https://cli.laintas.com/windows-cli/beta-v5/laintas-cli-windows_beta-v5_x64-setup.exe)
 directly. This first beta is not code-signed, so Windows may ask before
 running it: choose More info, then Run anyway. No administrator rights are
 needed. Ctrl+click opens a link, Ctrl+C copies when text is selected and
@@ -765,9 +765,9 @@ itself yet.
 signed updates; CLI releases must never overwrite that channel. Historical
 release notes below describe the builds shipped at the time.
 
-The current public release is [laintas-cli-beta v3](https://github.com/lin7c/Laintas_cli/releases/tag/laintas-cli-beta-v3)
-(tag `laintas-cli-beta-v3`). It is an ordinary GitHub Release, marked `latest`;
-its Python package version is `1.32.5b3`. The Mac package is an initial native
+The current public release is [laintas-cli-beta v5](https://github.com/lin7c/Laintas_cli/releases/tag/laintas-cli-beta-v5)
+(tag `laintas-cli-beta-v5`). It is an ordinary GitHub Release, marked `latest`;
+its Python package version is `1.32.5b5`. The Mac package is an initial native
 CLI build without Helpwo Kernel. See [the release guide](build/RELEASE.md) for
 build and verification details.
 

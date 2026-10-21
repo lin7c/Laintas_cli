@@ -101,7 +101,7 @@ export const GROUPS = [
           { t: 'h', ...L('Windows', 'Windows') },
           { t: 'code', label: 'PowerShell', code: 'irm https://cli.laintas.com/install.ps1 | iex' },
           { t: 'p', ...L('在 PowerShell 中执行以上指令，脚本会下载最新的 laintas-cli-windows 安装包、校验大小和 SHA-256，然后打开安装器。先执行 `$env:LAINTAS_INSTALL_SILENT=1` 可跳过安装向导。也可以直接下载。', 'Run the command in PowerShell to download the latest laintas-cli-windows installer, verify its size and SHA-256 and open it. Run `$env:LAINTAS_INSTALL_SILENT=1` first to skip the wizard. You can also download it directly.') },
-          { t: 'p', ...L('[下载 laintas-cli-windows beta v3](https://cli.laintas.com/windows-cli/beta-v3-2/laintas-cli-windows_beta-v3-2_x64-setup.exe)，双击安装（无需管理员权限），然后从开始菜单启动 laintas-cli-windows。', '[Download laintas-cli-windows beta v3](https://cli.laintas.com/windows-cli/beta-v3-2/laintas-cli-windows_beta-v3-2_x64-setup.exe), open the installer (no administrator rights needed), then launch laintas-cli-windows from Start.') },
+          { t: 'p', ...L('[下载 laintas-cli-windows beta v5](https://cli.laintas.com/windows-cli/beta-v5/laintas-cli-windows_beta-v5_x64-setup.exe)，双击安装（无需管理员权限），然后从开始菜单启动 laintas-cli-windows。', '[Download laintas-cli-windows beta v5](https://cli.laintas.com/windows-cli/beta-v5/laintas-cli-windows_beta-v5_x64-setup.exe), open the installer (no administrator rights needed), then launch laintas-cli-windows from Start.') },
           {
             t: 'p', ...L(
               'laintas-cli-windows 是同一个 Laintas CLI，运行在自带的终端窗口里：不需要 WSL，也不使用 Windows 自带的控制台，界面、配色和快捷操作与 Linux、macOS 上一致。命令在随附的 bash 环境中执行，磁盘路径写作 `/c/Users/...`。需要 Windows 10/11 x86_64 和 WebView2；安装器可联网安装 WebView2。',
@@ -110,8 +110,8 @@ export const GROUPS = [
           },
           {
             t: 'note', title: L('测试版与 SmartScreen 提示', 'Beta and SmartScreen'),
-            ...L('这是首个测试版，安装程序暂未代码签名，首次运行时 Windows 可能提示「已保护你的电脑」。选择「更多信息 → 仍要运行」；如需确认文件来源，请对照 [SHA-256 校验值](https://cli.laintas.com/windows-cli/beta-v3-2/SHA256SUMS.txt)。',
-              'This is the first beta and the installer is not code-signed yet, so Windows may say it protected your PC on first run. Choose "More info → Run anyway"; to be sure the file is ours, compare it with the [SHA-256 checksum](https://cli.laintas.com/windows-cli/beta-v3-2/SHA256SUMS.txt).'),
+            ...L('这是首个测试版，安装程序暂未代码签名，首次运行时 Windows 可能提示「已保护你的电脑」。选择「更多信息 → 仍要运行」；如需确认文件来源，请对照 [SHA-256 校验值](https://cli.laintas.com/windows-cli/beta-v5/SHA256SUMS.txt)。',
+              'This is the first beta and the installer is not code-signed yet, so Windows may say it protected your PC on first run. Choose "More info → Run anyway"; to be sure the file is ours, compare it with the [SHA-256 checksum](https://cli.laintas.com/windows-cli/beta-v5/SHA256SUMS.txt).'),
           },
           { t: 'p', ...L('登录页会在默认浏览器里打开；窗口里的链接可以按住 Ctrl 点击。Ctrl+C 在有选中文字时复制，否则中断当前命令；Ctrl+V 粘贴。账号数据保存在用户目录下的 `.laintas`，重装不会丢失。', 'The sign-in page opens in your default browser, and links in the window open with Ctrl+click. Ctrl+C copies when text is selected and interrupts otherwise; Ctrl+V pastes. Account data is kept in `.laintas` in your user profile and survives a reinstall.') },
           { t: 'h', ...L('源码包', 'Source package') },
