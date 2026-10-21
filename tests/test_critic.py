@@ -339,5 +339,74 @@ class CriticRubricTests(unittest.TestCase):
         self.assertLess(len(text), 240)
 
 
+class CriticUserReportTests(unittest.TestCase):
+    """v3: the verdict's optional user_report — the AUX-to-user channel."""
+
+    def _verdict(self, payload):
+        return critic.parse_verdict(json.dumps(payload))
+
+    def test_report_parsed_and_lines_preserved(self):
+        v = self._verdict({
+            "on_track": True, "score": 70, "issue": "", "suggestion": "",
+            "user_report": {"kind": "progress",
+                            "text": "- Done: migration script\n"
+                                    "- Now: index rebuild"}})
+        self.assertEqual(v["user_report"]["kind"], "progress")
+        self.assertIn("\n", v["user_report"]["text"])
+        self.assertIn("migration script", v["user_report"]["text"])
+
+    def test_missing_or_null_report_is_silence(self):
+        base = {"on_track": True, "score": 90, "issue": "", "suggestion": ""}
+        self.assertIsNone(self._verdict(base)["user_report"])
+        self.assertIsNone(
+            self._verdict({**base, "user_report": None})["user_report"])
+
+    def test_malformed_report_dropped_not_fatal(self):
+        base = {"on_track": False, "score": 30, "issue": "x",
+                "suggestion": "y"}
+        for bad in ({"kind": "rant", "text": "hello"},
+                    {"kind": "blocked", "text": "   "},
+                    {"kind": "blocked"},
+                    "just a string",
+                    42):
+            v = self._verdict({**base, "user_report": bad})
+            self.assertIsNotNone(v)              # verdict itself survives
+            self.assertIsNone(v["user_report"])  # the report does not
+
+    def test_report_text_is_bounded(self):
+        v = self._verdict({
+            "on_track": True, "score": 90, "issue": "", "suggestion": "",
+            "user_report": {"kind": "milestone",
+                            "text": "\n".join(
+                                f"line {i} " + "x" * 60 for i in range(9))}})
+        text = v["user_report"]["text"]
+        self.assertLessEqual(len(text), critic.REPORT_TEXT_LIMIT)
+        self.assertLessEqual(len(text.splitlines()), 4)
+
+    def test_kind_is_case_insensitive(self):
+        v = self._verdict({
+            "on_track": False, "score": 10, "issue": "stuck",
+            "suggestion": "stop",
+            "user_report": {"kind": "Blocked",
+                            "text": "API down three times."}})
+        self.assertEqual(v["user_report"]["kind"], "blocked")
+
+    def test_assess_detailed_carries_the_report(self):
+        reply = json.dumps({
+            "on_track": True, "score": 70, "issue": "", "suggestion": "",
+            "user_report": {"kind": "milestone",
+                            "text": "Phase one complete."}})
+        verdict, fail = critic.assess_detailed(
+            "goal", [], lambda messages: reply,
+            actions="user: goal\nassistant: worked")
+        self.assertIsNone(fail)
+        self.assertEqual(verdict["user_report"]["text"],
+                         "Phase one complete.")
+
+    def test_prompt_advertises_the_channel(self):
+        self.assertIn('"user_report": null', critic.SYSTEM_PROMPT)
+        self.assertIn("Silence is the default", critic.SYSTEM_PROMPT)
+
+
 if __name__ == "__main__":
     unittest.main()

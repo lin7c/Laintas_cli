@@ -25,6 +25,10 @@ v2 changes (root-cause fixes, see agent_loop critic section):
     nudge every interval teaches the model nothing and wastes the slot.
   * ``summarize_actions`` accepts an anchor message so the judge sees where the
     previous assessment left off, not just an amnesiac 14-message tail.
+  * v3: the verdict may carry a ``user_report`` - a short, evidence-backed
+    note the loop shows the USER directly (display-only, never injected
+    into the agent's context). The critic decides whether to speak; the
+    loop only rate-limits and de-duplicates what it says.
   * ``HOOK_SECTION`` is appended to the system prompt in thread mode so the
     model recognises ``<progress_check>`` as harness-authored (not adversarial
     tool output) — the Claude Code system-reminder pattern.
@@ -61,7 +65,7 @@ SYSTEM_PROMPT = (
     "work or failed verification.\n\n"
     "Return ONLY a JSON object, no prose:\n"
     '{"on_track": true|false, "score": 0-100, "issue": "one line or empty", '
-    '"suggestion": "one concrete corrective action or empty"}\n\n'
+    '"suggestion": "one concrete corrective action or empty", "user_report": null}\n\n'
     "Write issue and suggestion in concise English regardless of the user's "
     "language. Keep issue to at most 16 words and suggestion to at most 20 "
     "words. Do not include greetings, analysis, justification, headings, or "
@@ -80,7 +84,24 @@ SYSTEM_PROMPT = (
     "empty. When off track, name the single highest-impact issue and one "
     "immediately executable correction. Be tolerant of exploration that is "
     "still producing new evidence; flag narration, duplication, drift, or "
-    "unsupported completion rather than mere elapsed time."
+    "unsupported completion rather than mere elapsed time.\n\n"
+    "You may ALSO speak directly to the USER (the human waiting on this "
+    "task) by returning \"user_report\" as {\"kind\": \"progress\", "
+    "\"milestone\" or \"blocked\", \"text\": \"...\"} instead of null. "
+    "This is a separate channel: the user never sees issue/suggestion, and "
+    "the agent never sees the user_report. Silence is the default - leave "
+    "user_report null unless something happened the user would want to "
+    "know: progress = new verified evidence landed (say what finished, "
+    "with its evidence, and what is happening now); milestone = a whole "
+    "phase or sub-goal completed; blocked = a real blocker the user "
+    "should know about. Filler reports train the user to ignore you, so "
+    "never report intent, plans, or effort as if they were results. Two "
+    "duties override the default silence: file a blocked report when the "
+    "task cannot proceed without something only the user can provide, "
+    "and a milestone report when a completion claim is not supported by "
+    "the evidence (say what is missing). Write the text in the language "
+    "of the ORIGINAL GOAL, in plain user-facing words with no internal "
+    "jargon, at most 280 characters; short markdown lines are welcome."
 )
 
 PROFILE_INSTRUCTIONS = {
@@ -367,8 +388,34 @@ def _snap_to_band(score: int) -> int:
     return min(SCORE_BANDS, key=lambda b: (abs(score - b), -b))
 
 
+REPORT_KINDS = ("progress", "milestone", "blocked")
+REPORT_TEXT_LIMIT = 300
+
+
+def _clean_report_text(value) -> str:
+    """User-report text keeps its line breaks (the display renders it as
+    markdown) but is bounded: at most 4 lines, REPORT_TEXT_LIMIT chars."""
+    lines = [ln.strip() for ln in str(value or "").splitlines()]
+    lines = [ln for ln in lines if ln][:4]
+    return "\n".join(lines)[:REPORT_TEXT_LIMIT].strip()
+
+
+def _parse_user_report(value) -> Optional[dict]:
+    """Validate the optional user_report field; anything malformed is
+    dropped (treated as silence) rather than failing the whole verdict."""
+    if not isinstance(value, dict):
+        return None
+    kind = str(value.get("kind") or "").strip().lower()
+    if kind not in REPORT_KINDS:
+        return None
+    text = _clean_report_text(value.get("text"))
+    if not text:
+        return None
+    return {"kind": kind, "text": text}
+
+
 def parse_verdict(reply: str) -> Optional[dict]:
-    """Parse the critic reply into {on_track, score, issue, suggestion}, or None
+    """Parse the critic reply into {on_track, score, issue, suggestion, user_report}, or None
     if it can't be understood (caller then treats it as 'no verdict')."""
     if not reply or not isinstance(reply, str):
         return None
@@ -405,6 +452,7 @@ def parse_verdict(reply: str) -> Optional[dict]:
         "score": score,
         "issue": _compact_field(obj.get("issue", ""), 160),
         "suggestion": _compact_field(obj.get("suggestion", ""), 200),
+        "user_report": _parse_user_report(obj.get("user_report")),
     }
 
 

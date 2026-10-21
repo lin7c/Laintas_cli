@@ -132,7 +132,7 @@ class LocalTransport:
     def source(self, target):
         if target.startswith("remote:"):
             if not callable(self.remote_source):
-                raise LinkError("Connect this terminal with /helpwo and update its kernel to use remote terminal linking")
+                raise LinkError("Remote terminal linking is not active for this terminal")
             return valid_ref(self.remote_source())
         return self.ref
 

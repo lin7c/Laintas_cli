@@ -1127,12 +1127,57 @@ class SlashRegistryTests(unittest.TestCase):
             selected = laintas_cli.show_model_selector(models, "model-a")
         self.assertEqual(selected, models[1])
 
-    def test_model_catalog_uses_two_supply_labels_without_losing_routing_provider(self):
+    def test_model_selector_strips_key_prefix_for_display_only(self):
+        models = [
+            {"id": "key/deepseek/deepseek-flash", "provider": "my-keys"},
+            {"id": "model-b", "provider": "provider-b"},
+        ]
+        seen = {}
+
+        def choose_hosted(items, **_kwargs):
+            seen["items"] = items
+            return items[1]
+
+        with mock.patch.object(
+                laintas_cli, "select_dialog", side_effect=choose_hosted):
+            selected = laintas_cli.show_model_selector(models, "")
+        # The row shows the bare model name; the Activated tag carries the
+        # provenance the stripped prefix used to spell out.
+        self.assertIn("deepseek-flash", seen["items"][1])
+        self.assertNotIn("key/deepseek", seen["items"][1])
+        self.assertIn("Activated", seen["items"][1])
+        # Selection still returns the full gateway id.
+        self.assertEqual(selected["id"], "key/deepseek/deepseek-flash")
+
+    def test_model_selector_strips_prefix_despite_same_named_marketplace_row(self):
+        # A hosted model and a marketplace model can share a bare name;
+        # tier + supply keep the rows distinct, so both show the short name.
+        models = [
+            {"id": "deepseek-v4-pro", "provider": "openrouter",
+             "tier": "T2", "supply": "Third-party Supply"},
+            {"id": "key/deepseek/deepseek-v4-pro", "provider": "my-keys"},
+        ]
+        seen = {}
+
+        def choose_first(items, **_kwargs):
+            seen["items"] = items
+            return items[1]
+
+        with mock.patch.object(
+                laintas_cli, "select_dialog", side_effect=choose_first):
+            laintas_cli.show_model_selector(models, "")
+        self.assertIn("deepseek-v4-pro", seen["items"][1])
+        self.assertIn("deepseek-v4-pro", seen["items"][2])
+        self.assertIn("Activated", seen["items"][2])
+        self.assertNotIn("key/deepseek", seen["items"][2])
+
+    def test_model_catalog_uses_three_supply_labels_without_losing_routing_provider(self):
         rows = laintas_cli._extract_model_entries({
             "providers": [
                 {"id": "laintas", "label": "internal name", "models": ["self-model"]},
                 {"id": "openrouter", "label": "vendor name", "models": ["vendor-model"]},
                 {"id": "custom-account", "label": "custom name", "models": ["custom-model"]},
+                {"id": "my-keys", "label": "hosted name", "models": ["hosted-model"]},
             ],
         })
 
@@ -1142,6 +1187,7 @@ class SlashRegistryTests(unittest.TestCase):
                 ("self-model", "laintas", "Laintas Supply"),
                 ("vendor-model", "openrouter", "Third-party Supply"),
                 ("custom-model", "custom-account", "Third-party Supply"),
+                ("hosted-model", "my-keys", "Activated"),
             ],
         )
 

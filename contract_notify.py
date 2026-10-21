@@ -40,8 +40,8 @@ _last_push = 0.0
 _last_summary = ""
 
 
-#: The session registry shared with Helpwo through the machine's kernel, set
-#: by AgentRegistry when a share succeeds. Looked up rather than imported:
+#: The session registry shared with Helpwo, set by AgentRegistry when a
+#: share succeeds. Looked up rather than imported:
 #: this module must not pull the CLI's main module in.
 _shared_registry: Optional[Any] = None
 

@@ -750,7 +750,7 @@ class AgentsModeController:
         fits = max(1, (height - 2) // 3)
         if len(self._last_agents) <= fits:
             return fits
-        return max(1, (height - 4) // 3)
+        return max(1, (height - 8) // 4)
 
     def _right_width(self) -> int:
         width, _height = self._terminal_size()
@@ -1656,20 +1656,32 @@ class AgentsModeController:
         offset = self.focus_scroll[agent.id]
         if offset:
             chips += [("class:muted", f"{symbols.ARROW_U} {offset}"), ("", "  ")]
-        # Title bar keeps only identity (name + role). Model and deployment
-        # live in the profile panel; they are debug info, not conversation
-        # context.
-        chips = [("", "  ")] + chips + [("", " ")]
-        chips_w = cell_width("".join(t for _s, t in chips))
+        # Keep identity on the left and put the actionable chips on the right.
+        # The hit spans are derived from the painted line so mouse targets stay
+        # aligned with the labels even when the title is cropped.
+        buttons = self._title_buttons(agent)
+        button_parts = []
+        for name, label in buttons:
+            button_parts += [(self._title_button_style(name, profile), f" {label} "), ("", "  ")]
+        status = profile["deployment"].replace("home ", "")
+        right = button_parts + [("class:muted", status)]
         left = [("", " "), ("class:title.name", profile["name"])]
         if profile["title"]:
             left += [("class:dim", f"  {symbols.BULLET}  "),
                      ("class:title.role", profile["title"])]
-        if chips_w + 12 > width:
-            chips = []
-            chips_w = 0
-        line = self._spread(left, chips, width)
+        line = self._spread(left, right, width)
+        painted = "".join(t for _s, t, *_ in line)
         self._title_hits = []
+        cursor = 0
+        for style, text in line:
+            if "chip." in style:
+                label = text.strip()
+                if label in {name for name, _ in buttons} or any(label == value for _, value in buttons):
+                    lo = painted.find(label, cursor)
+                    if lo >= 0:
+                        name = next((n for n, v in buttons if v == label), label)
+                        self._title_hits.append((lo, lo + len(label), name))
+                        cursor = lo + len(label)
         return [line]
 
     def _title_buttons(self, agent) -> list:
@@ -1942,6 +1954,8 @@ class AgentsModeController:
         section("PROFILE")
         rows.append([("", "  "), ("class:profile.name", _crop_cells(profile["name"], inner - 2)),
                      ("class:muted", f"  {profile['role_label']}")])
+        text(f"/agent {profile['name']}", "class:muted")
+        text("/resume", "class:muted")
         if profile["title"]:
             text(profile["title"], "class:profile.title")
         if profile["description"]:
@@ -1954,16 +1968,20 @@ class AgentsModeController:
         model_line = profile["model"] or "backend default"
         availability = profile["model_available"]
         if availability is False:
-            model_line += f" {symbols.WARN} not offered"
+            model_line += f" {symbols.WARN} not offered by backend"
+        elif availability is True:
+            model_line += " · available"
         elif availability == "checking":
             model_line += " (checking…)"
-        text(f"model  {model_line}")
+        rows.append([("class:profile.value", f"  model  {model_line}")])
         deploy_icon = symbols.DOT if profile["deployed"] else symbols.DOT_OPEN
         deploy_style = "class:deploy.on" if profile["deployed"] else "class:deploy.off"
         # profile['deployment'] is like "not deployed · home term0";
         # compact it to "○ not deployed · term0".
         where = profile['deployment'].replace("home ", "")
         deploy_text = f"{deploy_icon} {where}"
+        if profile["deployed"] and availability is True:
+            deploy_text += " · available"
         rows.append(_fit([(deploy_style, f"  {deploy_text}")], inner))
         text(f"tools  {profile['tools']}")
 

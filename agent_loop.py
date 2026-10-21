@@ -222,6 +222,8 @@ _DEFAULT_CONFIG = {
     "critic_min_loop": 4,             # Don't run the critic before this loop index — no point critiquing the first few exploratory steps.
     "critic_score_threshold": 50,      # Critic progress score (0-100) below this — or an explicit on_track=false — triggers a corrective nudge.
     "critic_nudge_cooldown": 2,       # Minimum critic intervals between injections of a SIMILAR nudge (same issue); a different issue is injected immediately.
+    "critic_user_reports": "key-only",  # off / key-only / all = whether the critic (AUX) may also speak to the USER with progress / milestone / blocked reports (display-only, never injected into the agent context). key-only suppresses routine progress notes.
+    "critic_report_min_interval": 2,    # Minimum critic intervals between two progress-kind user reports; milestone/blocked reports bypass the interval but are still de-duplicated.
     "critic_max_failures": 3,         # Consecutive critic call failures (LLM error / unparseable reply) before the critic auto-disables for the rest of the task, with a visible warning.
     "intent_enabled": True,            # True = before working on a long thread-mode task, an independent LLM expands the request into an anchored spec (see intent.py) and pins it into the prompt. Complements the progress critic, which judges movement rather than direction.
     "intent_self_ask_rounds": 2,      # Self-questioning rounds used to build that spec (1-4). One auxiliary model call each, tool-less and cheap; they run in the background of the first turn.
@@ -1041,6 +1043,8 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "critic_min_loop": "Don't run the critic before this loop index",
     "critic_score_threshold": "Critic progress score (0-100) below this triggers a corrective nudge",
     "critic_nudge_cooldown": "Minimum critic intervals between injections of a similar (same-issue) nudge",
+    "critic_user_reports": "Let the critic (AUX) also report to the user: off / key-only (milestones + blockers) / all (also progress)",
+    "critic_report_min_interval": "Minimum critic intervals between two progress reports to the user",
     "critic_max_failures": "Consecutive critic failures before it auto-disables for the rest of the task",
     "intent_enabled": "Expand a long request into an anchored spec before working on it, and pin the agreed reading into the prompt",
     "intent_self_ask_rounds": "Self-questioning rounds used to build the intent spec (1-4)",
@@ -1118,6 +1122,7 @@ _RUNTIME_ENUM_CHOICES: dict[str, tuple[str, ...]] = {
     "theme": ("auto", "dark", "light", "mono"),
     "markdown_theme": ("default", "green-red", "custom"),
     "critic_profile": ("lenient", "balanced", "strict"),
+    "critic_user_reports": ("off", "key-only", "all"),
     "compact_review_effort": ("auto", "none", "low", "medium", "high", "max"),
     # search_engine is deliberately not enumerated here: the set of valid names
     # now depends on the user's own engine registry, and a fixed vocabulary
@@ -11702,6 +11707,93 @@ def run_agent_loop(
     _critic_thread = None                 # in-flight background assessment
     _critic_result: dict = {}             # filled by that thread
     _critic_launch_msg = None             # newest thread message when it was launched
+    _critic_last_report_loop = -1         # loop index of the last user report shown
+    _critic_last_report_text = ""         # its text (near-duplicate reports are suppressed)
+    _critic_report_count = 0              # user reports shown for this task
+
+    def _emit_critic_user_report(_verdict, _at_loop):
+        """Show the critic's optional user_report to the USER (AUX channel).
+
+        Display-only by construction: the text is printed via deps.console
+        and logged, and is NEVER appended to thread_messages, so the agent
+        neither sees it nor pays tokens for it. The critic decides whether
+        to speak (its prompt owns that judgment); this helper only enforces
+        the house discipline: config mode, a minimum interval between
+        progress notes, and near-duplicate suppression. Never raises."""
+        nonlocal _critic_last_report_loop, _critic_last_report_text, \
+            _critic_report_count
+        try:
+            _rep = (_verdict or {}).get("user_report")
+            if not isinstance(_rep, dict):
+                return False
+            _kind = str(_rep.get("kind") or "")
+            _text = str(_rep.get("text") or "").strip()
+            if _kind not in critic.REPORT_KINDS or not _text:
+                return False
+            _mode = str(get_runtime_config("critic_user_reports")
+                        or "key-only")
+            if _mode not in ("off", "key-only", "all"):
+                _mode = "key-only"
+            if _mode == "off":
+                return False
+            _interval = int(get_runtime_config("critic_interval") or 0)
+            _gap = (_at_loop - _critic_last_report_loop
+                    if _critic_last_report_loop >= 0 else 1 << 30)
+            if _mode == "key-only" and _kind == "progress":
+                event_log.append("critic_user_report_suppressed",
+                                 loop=_at_loop, kind=_kind, reason="mode",
+                                 agent_id=agent_id or "primary",
+                                 run_id=_run_id)
+                return False
+            if _kind == "progress" and _critic_last_report_loop >= 0:
+                _min_gap = _interval * max(
+                    1, int(get_runtime_config(
+                        "critic_report_min_interval") or 2))
+                if _gap < _min_gap:
+                    event_log.append("critic_user_report_suppressed",
+                                     loop=_at_loop, kind=_kind,
+                                     reason="interval",
+                                     agent_id=agent_id or "primary",
+                                     run_id=_run_id)
+                    return False
+            if (_critic_last_report_text
+                    and critic.similar_issues(_text, _critic_last_report_text)
+                    and _gap < 4 * max(1, _interval)):
+                event_log.append("critic_user_report_suppressed",
+                                 loop=_at_loop, kind=_kind,
+                                 reason="duplicate",
+                                 agent_id=agent_id or "primary",
+                                 run_id=_run_id)
+                return False
+            _labels = {"progress": "Progress", "milestone": "Milestone",
+                       "blocked": "Blocked"}
+            _title = (f"AUX {_labels[_kind]} · {agent_id or 'primary'} · "
+                      f"as of {time.strftime('%H:%M:%S')}")
+            _border = "warning" if _kind == "blocked" else "accent"
+            try:
+                from rich.markdown import Markdown as _ReportMarkdown
+                from rich.panel import Panel as _ReportPanel
+                deps.console.print(_ReportPanel(
+                    _ReportMarkdown(_text), title=_title,
+                    border_style=_border))
+            except Exception:
+                try:
+                    _style = "yellow" if _kind == "blocked" else "green"
+                    deps.console.print(f"[{_style}]{_title}[/{_style}]")
+                    deps.console.print(_text)
+                except Exception:
+                    pass
+            _critic_last_report_loop = _at_loop
+            _critic_last_report_text = _text
+            _critic_report_count += 1
+            event_log.append("critic_user_report", loop=_at_loop,
+                             kind=_kind, text=_text,
+                             score=(_verdict or {}).get("score"),
+                             agent_id=agent_id or "primary",
+                             run_id=_run_id)
+            return True
+        except Exception:
+            return False
     # ── Intent alignment per-task state (see intent.py) ──────────────────
     # The spec lives in `state` rather than a local, because the system prompt
     # is rebuilt from `state` on every iteration. It is declared turn-only on
@@ -13248,6 +13340,11 @@ def run_agent_loop(
                                          # 2026-08-28 batch, none attributable.
                                          agent_id=agent_id or "primary",
                                          run_id=_run_id, loop=_loop_id)
+                    # The verdict may also carry a report for the USER:
+                    # shown here, on the display channel only (see
+                    # _emit_critic_user_report) — never injected into the
+                    # thread the agent reads.
+                    _emit_critic_user_report(_verdict, loop)
                     _crit_thresh = int(get_runtime_config("critic_score_threshold") or 50)
                     if critic.is_off_track(_verdict, _crit_thresh):
                         _issue = _verdict.get("issue", "")
@@ -13381,6 +13478,31 @@ def run_agent_loop(
                             (state.get("_intent") or {}).get("spec"))
                 except Exception:
                     _crit_contract = ""
+
+                # Silence backstop for the user channel: on a long task the
+                # critic may go many passes without reporting to the user.
+                # Remind the CRITIC (never the user) on this pass; whether
+                # anything is worth saying stays its call.
+                try:
+                    if (str(get_runtime_config("critic_user_reports")
+                            or "key-only") != "off"
+                            and _crit_interval > 0
+                            and (loop - max(_critic_last_report_loop,
+                                            _crit_min)) >= 4 * _crit_interval):
+                        _backstop = (
+                            "NOTE TO THE CRITIC (not part of any contract): "
+                            "you have not sent the user a user_report in a "
+                            "long while on this long task. If the recent "
+                            "actions contain anything worth reporting - "
+                            "verified progress, a finished phase, a blocker "
+                            "- file the report in this verdict; if there is "
+                            "genuinely nothing worth saying, leave "
+                            "user_report null.")
+                        _crit_contract = ((_crit_contract + "\n\n")
+                                          if _crit_contract else "") \
+                            + _backstop
+                except Exception:
+                    pass
 
                 def _critic_worker(_actions=_crit_actions,
                                    _fn=_crit_llm_fn, _out=_critic_result,

@@ -42,10 +42,8 @@ import json_store
 import paths
 
 
-HELPWO_APP = "helpwo"
-# Names an /app manifest may not take: "helpwo" has its own command, and
-# term0 is the CLI's own terminal.
-RESERVED_APP_NAMES = frozenset({HELPWO_APP, "term0"})
+# Names an /app manifest may not take: term0 is the CLI's own terminal.
+RESERVED_APP_NAMES = frozenset({"term0"})
 APP_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,31}$")
 
 PERSISTENCE_NONE = "none"
@@ -69,8 +67,8 @@ SESSION_BASE_TOOLS = frozenset({"task.complete", "time.now"})
 SESSION_DEFAULT_TOOLS = ("shell.exec",)
 MAX_SESSIONS_LIMIT = 200
 
-# Prefix every app terminal's registry command carries, so /app and /helpwo can
-# tell their own sub-terminal from a user's /term of the same name.
+# Prefix every app terminal's registry command carries, so /app can
+# tell its own sub-terminal from a user's /term of the same name.
 TERMINAL_COMMAND_PREFIX = "laintas-cli app:"
 
 _MAX_PROMPT_CHARS = 8000
@@ -613,15 +611,6 @@ def revoke(name: str) -> bool:
 
 # ── the nested process's own identity ───────────────────────────────────
 
-HELPWO_AGENT_PROMPT = (
-    "You are the dedicated agent of the Helpwo sub-terminal. Every message "
-    "you receive comes from a person using the Helpwo web app, not from the "
-    "main laintas_cli terminal; that terminal has its own agent and its own "
-    "conversation, which you do not share. This sub-terminal's working "
-    "directory is the workspace Helpwo shows in its file tree, so files you "
-    "create or change appear there. Keep generated artifacts inside that "
-    "folder."
-)
 
 _active_lock = threading.Lock()
 _active: Optional[dict] = None

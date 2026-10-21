@@ -161,10 +161,26 @@ def trigger(token: str) -> str:
     dying takes the user's cd/venv/exports with it. The eval and the report
     therefore sit in ``&& :`` lists, where errexit is ignored, and a failing
     command leaves the shell up — unlike a real terminal, which closes.
+
+    A no-op ``trap ':' INT`` is set around the eval: interactive bash abandons
+    the rest of a line whose foreground command died of SIGINT — but only when
+    INT is untrapped. With the trap present the list continues and the
+    trailing ``__laintas_done`` reports the interrupt (exit 130), so a user
+    who overwrote PROMPT_COMMAND (killing the fallback marker) still gets the
+    prompt back instead of a hang. The handler is a no-op, not SIG_IGN, so
+    the command itself keeps the default disposition and Ctrl+C still kills it.
+    The trap stays installed afterwards: re-armed by every trigger line, and
+    ``trap - INT`` would reset $? to 0 between the eval and the report, which
+    both misreports the exit status and makes the NEXT command's $? wrong
+    (echo status=$? printed status=0 after a failing command). Traps reset on
+    exec, so an exec'd program keeps the normal Ctrl+C behaviour.
     """
     return (f' __LAINTAS_PREV=$?; __laintas_hook; __LAINTAS_TOK={token}; '
             '__LAINTAS_CMD=$(<"$__LAINTAS_CMDFILE"); __laintas_hist; printf %s "$__LAINTAS_START"; '
-            '__laintas_ret "$__LAINTAS_PREV" && :; eval "$__LAINTAS_CMD" && :; '
+            # The trap must be set BEFORE $? is restored: the trap builtin
+            # itself succeeds and would reset $? to 0, so the user's command
+            # would see the wrong $? (echo status=$? printed status=0).
+            'trap ":" INT; __laintas_ret "$__LAINTAS_PREV" && :; eval "$__LAINTAS_CMD" && :; '
             '__laintas_done && :')
 
 
@@ -582,8 +598,84 @@ def resume(session, *, hold, write=None, mirror=None,
                    mirror=mirror, lock_timeout=lock_timeout)
 
 
+def _debug(msg):
+    path = os.environ.get("LAINTAS_ATTACH_DEBUG")
+    if path:
+        with open(path, "a") as fh:
+            fh.write(f"{time.time():.3f} {msg}\n")
+
+
+
+# A Ctrl+C pressed in the sliver between the REPL prompt accepting a line
+# and the attach for that line starting: the terminal is still owned by the
+# exiting prompt_toolkit application then, which parks the key in its
+# typeahead buffer instead of delivering it anywhere. The prompt layer
+# records it here and _attach picks it up as a pending forwarder interrupt.
+_early_interrupt = False
+
+
+def note_early_interrupt() -> None:
+    global _early_interrupt
+    _early_interrupt = True
+
+
+def clear_early_interrupt() -> None:
+    global _early_interrupt
+    _early_interrupt = False
+
+
+def take_early_interrupt() -> bool:
+    global _early_interrupt
+    was = _early_interrupt
+    _early_interrupt = False
+    return was
+
+
 def _attach(session, *, command, hold, write, mirror, lock_timeout):
     write = write or _stdout_writer()
+    # Ctrl+C typed between the REPL prompt and the raw-mode hold below is not
+    # a byte yet: the user's terminal is still in cooked/ISIG mode, so the ^C
+    # becomes SIGINT for the CLI itself and is lost to term0 — the attached
+    # command never hears it and the attach waits for a done marker that an
+    # interrupted line will not print. For the whole attach, a SIGINT that
+    # does reach the CLI is forwarded to term0 as ^C instead (best effort at
+    # once; _attach_locked also flushes a pending one once the trigger line
+    # has been submitted, so an early ^C cannot land while bash is only at
+    # its prompt).
+    forwarder = None
+    old_sigint = None
+    early_interrupt = take_early_interrupt()
+    if threading.current_thread() is threading.main_thread():
+        fd_fwd = int(getattr(session, "master_fd", -1))
+        if fd_fwd >= 0:
+            def forwarder(signum, frame):   # noqa: E731 - closure over fd_fwd
+                _debug(f"SIGINT forwarded to fd {fd_fwd}")
+                try:
+                    os.write(fd_fwd, b"\x03")
+                except OSError:
+                    pass
+                forwarder.pending = True
+            forwarder.pending = False
+            if early_interrupt:
+                forwarder.pending = True
+            try:
+                old_sigint = signal.signal(signal.SIGINT, forwarder)
+            except (ValueError, OSError):
+                forwarder = None
+    try:
+        return _attach_fwd(session, command, hold, write, mirror,
+                           lock_timeout, forwarder)
+    finally:
+        if old_sigint is not None:
+            try:
+                signal.signal(signal.SIGINT,
+                              old_sigint if old_sigint else signal.SIG_DFL)
+            except (ValueError, OSError, TypeError):
+                pass
+
+
+def _attach_fwd(session, command, hold, write, mirror, lock_timeout,
+                forwarder):
     cmd_lock = getattr(session, "command_lock", None)
     out_lock = getattr(session, "output_lock", None)
     if cmd_lock is not None and not cmd_lock.acquire(timeout=lock_timeout):
@@ -592,7 +684,8 @@ def _attach(session, *, command, hold, write, mirror, lock_timeout):
         if out_lock is not None and not out_lock.acquire(timeout=lock_timeout):
             return None
         try:
-            return _attach_locked(session, command, hold, write, mirror)
+            return _attach_locked(session, command, hold, write, mirror,
+                                   forwarder)
         finally:
             if out_lock is not None:
                 out_lock.release()
@@ -601,7 +694,7 @@ def _attach(session, *, command, hold, write, mirror, lock_timeout):
             cmd_lock.release()
 
 
-def _attach_locked(session, command, hold, write, mirror):
+def _attach_locked(session, command, hold, write, mirror, forwarder=None):
     if not session.is_alive():
         return None
     integ = integration(session)
@@ -645,8 +738,17 @@ def _attach_locked(session, command, hold, write, mirror):
     _sync_winsize(fd)
 
     status = None
+    _debug(f"attach enter command={command!r}")
     try:
         with hold("term0", _raw_mode(), timeout=2.0, raw_bytes=True) as term:
+            _debug("hold acquired")
+            try:
+                _attr = termios.tcgetattr(sys.stdin.fileno())
+                _debug(f"stdin termios: isig={bool(_attr[3] & termios.ISIG)} "
+                       f"icanon={bool(_attr[3] & termios.ICANON)} "
+                       f"echo={bool(_attr[3] & termios.ECHO)} lflags={_attr[3]}")
+            except Exception as _exc:
+                _debug(f"stdin termios read failed: {_exc!r}")
             if command is not None:
                 # Ctrl+U first: anything typed into the shell's line editor
                 # after the last command must not become a prefix of this one.
@@ -655,6 +757,12 @@ def _attach_locked(session, command, hold, write, mirror):
                     # it: let the caller's path recover the shell first.
                     session._laintas_shell_dirty = True
                     return None
+                # A Ctrl+C that reached the CLI before the trigger line
+                # was submitted stays pending here: writing it into the
+                # pty now would still hit the shell's line editor and
+                # discard the trigger line itself. The attach loop below
+                # forwards it once the scanner has seen the start marker,
+                # when the command — not the editor — owns the terminal.
             if command is None:
                 # Back to a program that may be full-screen: restore its modes
                 # and have it redraw (SIGWINCH), rather than typing into it.
@@ -670,6 +778,7 @@ def _attach_locked(session, command, hold, write, mirror):
                     if not data:
                         status = "detached"    # our own stdin closed
                         break
+                    _debug(f"stdin bytes: {data[:40]!r}")
                     cut = data.find(DETACH_KEY)
                     if cut >= 0:
                         if cut:
@@ -701,6 +810,13 @@ def _attach_locked(session, command, hold, write, mirror):
                     break
                 session._record_output(chunk)
                 _show(scanner.feed(chunk), write, mirror)
+                if (forwarder is not None and forwarder.pending
+                        and scanner.phase == "run" and not scanner.finished):
+                    # The command owns the terminal now (the start marker
+                    # has passed): an early Ctrl+C lands on it, not on the
+                    # shell's line editor.
+                    forwarder.pending = False
+                    _write_all(fd, b"\x03")
                 if scanner.finished:
                     status = "done"
     finally:

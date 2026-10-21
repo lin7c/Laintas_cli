@@ -126,7 +126,13 @@ class IntegrationLineTests(unittest.TestCase):
     def test_the_trigger_reports_completion_itself(self):
         line = term_attach.trigger("T")
         self.assertTrue(line.startswith(" __LAINTAS_PREV=$?;"), "$? must be saved first")
-        self.assertTrue(line.endswith('eval "$__LAINTAS_CMD" && :; __laintas_done && :'))
+        # The eval is guarded by a no-op INT trap so a Ctrl+C'd command still
+        # reaches the trailing report (see trigger's docstring); the invariant
+        # is that the line itself ends by reporting completion, and that the
+        # trap is armed before $? is restored (a trap call would reset $?).
+        self.assertTrue(line.endswith(
+            'trap ":" INT; __laintas_ret "$__LAINTAS_PREV" && :; '
+            'eval "$__LAINTAS_CMD" && :; __laintas_done && :'))
         self.assertIn('__laintas_ret "$__LAINTAS_PREV" && :;', line)
 
 

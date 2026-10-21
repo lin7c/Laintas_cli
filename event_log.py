@@ -12,6 +12,10 @@ Event types:
   - tool_result       — tool name + ok/error, after tool execution
   - turn_ended        — exit reason, written when the loop exits
   - critic_assessment — periodic quality score + on_track flag
+  - critic_user_report — an AUX report shown to the user (progress /
+    milestone / blocked), display-only
+  - critic_user_report_suppressed — an AUX report withheld by the display
+    discipline (mode / interval / duplicate)
 
 The log lives in `.laintas/events.jsonl` (per-cwd). It is append-only and
 synchronously flushed. ``event_id`` is the durable identity; ``seq`` is an
@@ -124,6 +128,10 @@ REQUIRED_FIELDS: dict = {
     "turn_ended": ("reason",),
     # Anything that judges or supervises an agent must say WHICH agent.
     "critic_assessment": ("agent_id", "run_id"),
+    # An AUX report to the user: which agent it concerns, and what kind of
+    # report it was. A suppressed one must also say which rule withheld it.
+    "critic_user_report": ("agent_id", "run_id", "kind"),
+    "critic_user_report_suppressed": ("agent_id", "run_id", "kind", "reason"),
     "critic_failure": ("agent_id", "reason"),
     "contract_checked": ("agent_id", "ok"),
     "child_help_requested": ("agent_id", "request_id"),

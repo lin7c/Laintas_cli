@@ -155,20 +155,6 @@ class SpawnParallelWithoutAnAnswer(unittest.TestCase):
         self.assertIn("returned no final answer", json.dumps(result))
 
 
-class CanvasStartsHelpwoWhenNothingRuns(unittest.TestCase):
-    def test_launch_path_prints_the_url(self):
-        main = extension_package("canvas")
-        ctx = bind_context(main)
-        fake_server = mock.Mock(is_running=mock.Mock(return_value=False))
-        with mock.patch.dict(sys.modules, {"helpwo_server": fake_server}), \
-                mock.patch.object(laintas_cli, "_hosts_helpwo_here", return_value=False), \
-                mock.patch.object(laintas_cli, "_launch_app_subterminal",
-                                  return_value={"open_url": "http://127.0.0.1:1/x"}):
-            main._canvas_open("", mock.Mock(CANVAS_EXTENSION=".excalidraw"))
-        self.assertNotIn("NameError", ctx.console.text)
-        self.assertIn("http://127.0.0.1:1/x", ctx.console.text)
-
-
 class ScriptRunIsOneModule(unittest.TestCase):
     def test_main_registers_itself_under_its_name(self):
         source = (Path(laintas_cli.__file__).read_text(encoding="utf-8"))

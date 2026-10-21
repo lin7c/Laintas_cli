@@ -141,8 +141,6 @@ def _open_external_url(url: str) -> bool:
         return False
 
 
-
-
 def host_label() -> str:
     """Return the terminal host's operating system."""
     return SYSTEM
@@ -1758,8 +1756,6 @@ def pty_passthrough(command: str, timeout: int = 120) -> dict:
     }
 
 
-
-
 # How long a command may produce NOTHING before the terminal is presumed stuck.
 # There is deliberately no cap on how long a command may RUN: a build, a test
 # suite or an install legitimately takes as long as it takes, and the previous
@@ -2169,9 +2165,13 @@ def _run_attached_command(command: str) -> Optional[dict]:
     if term_attach.is_busy(session):
         _report_detached_finish()
         if term_attach.is_busy(session):
-            console.print(f"[yellow]{escape(term_attach.busy_message(session))}[/yellow]")
-            return {"stdout": "", "stderr": "", "returncode": -1,
-                    "success": False}
+            # As a prompt line, not a console.print: printed between prompts
+            # the notice lands where the prompt renderer is about to redraw,
+            # and the redraw scrolls it off the visible screen. Queued here,
+            # it is drawn as part of the next prompt and survives the redraw.
+            _queue_prompt_notice(term_attach.busy_message(session))
+            return {"stdout": "", "stderr": term_attach.busy_message(session),
+                    "returncode": -1, "success": False}
     import agent_loop as _al_attach
     _al_attach.pause_activity_status()
     try:
@@ -2741,9 +2741,9 @@ def _build_connected_subterminal_cmd(terminal_name: str,
                                      cwd: Optional[str] = None) -> str:
     """Command line for a user-facing sub-terminal running a nested CLI.
 
-    Carries the terminal's identity (name + remote parent agent id) so that
-    running /helpwo --remote inside it can hand exactly this terminal to Helpwo.
-    auto_connect=True (used by Helpwo's term-new) registers at startup.
+    Carries the terminal's identity (name + remote parent agent id).
+    auto_connect=True (used by Helpwo's term-new) registers at startup,
+    handing exactly this terminal to Helpwo.
     terminal_id overrides the id derived from the parent terminal — an app
     sub-terminal keeps one per folder, so its terminal preferences survive a
     new SSH login. extra_args are appended, each quoted. env adds variable
@@ -2780,17 +2780,6 @@ def connect_terminal_to_helpwo(agent_registry, session: dict, quiet=False, name=
     if workspace is not None:
         agent_registry.workspace_path = workspace
     return agent_registry.register(session, name=name, quiet=quiet)
-
-
-def _helpwo_web_app_url() -> Optional[str]:
-    """Return the hosted Helpwo web app URL for the current backend, or None
-    if the current backend has no known companion frontend (e.g. a custom/
-    local backend override). Used by /helpwo --remote to open a browser tab
-    without needing a local dist build."""
-    profile = get_backend_profile()
-    if profile.sends_laintas_credentials:
-        return "https://helpwo.laintas.com"
-    return None
 
 
 def _drain_fd(fd: int, chunks: list) -> None:
@@ -3864,7 +3853,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "Agent/terminal, PageUp/PageDown scrolls, and Esc exits."
         )),
     CommandSpec("/term", "Manage terminals and two-level adoption", "Agents & Terminals", "/term [name|peers|adopt <id> --name <name>|accept <invite>|release [name]|rename <old> <new>]", aliases=("/t",), subcommands=("peers", "adopt", "accept", "release", "rename")),
-    CommandSpec("/helpwo", "Start the local Helpwo companion in its own sub-terminal; /helpwo stop closes it", "Agents & Terminals", "/helpwo [stop]", subcommands=("stop",)),
     CommandSpec(
         "/app", "Run a registered application in its own sub-terminal with its own agent",
         "Agents & Terminals", "/app [list|start <name>|stop <name>|trust <name>|revoke <name>]",
@@ -3886,7 +3874,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "The manifest's command is started with LAINTAS_APP_BRIDGE_URL, "
             "LAINTAS_APP_TOKEN and LAINTAS_APP_AGENT_ID in its environment. "
             "A manifest must be trusted before it can start, and again after "
-            "it changes. Helpwo is not an /app; use /helpwo."
+            "it changes."
         )),
     CommandSpec(
         "/station", "Manage agents and terminals; route or assign work",
@@ -3948,8 +3936,8 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         help_text=(
             "Reads and writes the same per-account storage Helpwo mounts as its "
             "\"Laintas Storage\" cloud folder: push a file here and it is in the "
-            "Helpwo file tree, pull one that Helpwo wrote. Unlike /helpwo --remote, it "
-            "does not need a live link and it outlives this process — the files "
+            "Helpwo file tree, pull one that Helpwo wrote. It does not need a "
+            "live link and it outlives this process — the files "
             "sit on the server. Storage above the plan's free allowance is "
             "billed monthly; /shared usage shows where you stand."
         )),
@@ -4668,10 +4656,6 @@ _HIRE_FLAGS = {
     "--terminal": ("Deploy straight into a live terminal", _terminal_candidates(alive_only=True)),
 }
 
-#: /helpwo has no flags of its own any more (see _parse_helpwo_flags).
-_HELPWO_FLAGS: dict = {}
-
-
 #: System-detected shell subcommands. No hardcoded tree: the machine's own
 #: bash-completion definitions are the source of truth. The command's
 #: definition is sourced in a THROWAWAY bash subprocess (never term0 — probing
@@ -5018,14 +5002,11 @@ class MetaCompleter(Completer):
 
                 # Flag-shaped commands: after a flag that takes a value only
                 # its values are offered; otherwise the flags not yet used.
-                if head_lower in ("/hire", "/helpwo"):
+                if head_lower == "/hire":
                     words = partial.split()
                     trailing_space = not partial or partial.endswith(" ")
                     candidates, fragment = _flag_completions(
-                        words, trailing_space,
-                        _HIRE_FLAGS if head_lower == "/hire" else _HELPWO_FLAGS)
-                    if head_lower == "/helpwo" and len(words) <= (0 if trailing_space else 1):
-                        candidates = [("stop", "Close the Helpwo sub-terminal"), *candidates]
+                        words, trailing_space, _HIRE_FLAGS)
                     for value, meta in candidates:
                         if value.casefold().startswith(fragment.casefold()):
                             yield self._completion(value, fragment, meta)
@@ -5270,6 +5251,7 @@ def _build_prompt_style() -> Style:
         "prompt-caret": success,
         "prompt-agent": f"{agent} bold",
         "prompt-agent-sup": muted,
+        "prompt-notice": muted,
         "separator": accent,
         "paste-placeholder": f"bold {success}",
         # Slash-command completion menu keeps its established visual identity.
@@ -5575,6 +5557,26 @@ _first_prompt_started = threading.Event()
 _MAILBOX_SENTINEL = "\x00laintas-messages\x00"
 #: Alt+R leaves the prompt to open the .retask checklist, the same detour.
 _RETASK_SENTINEL = "\x00laintas-retask\x00"
+
+
+#: One-shot notice shown as an extra line of the NEXT prompt. Unlike a
+#: console.print between prompts (which the prompt redraw can scroll away —
+#: see _queue_prompt_notice's docstring), text inside the prompt message is
+#: part of the render itself and survives every redraw.
+_pending_prompt_notice = ""
+
+
+def _queue_prompt_notice(text: str) -> None:
+    """Show *text* as a line of the next prompt.
+
+    A dim message printed with console.print right before prompt_toolkit
+    draws the next prompt does not survive: the renderer reconciles its idea
+    of the screen with a cursor-position report and redraws/scrolls, pushing
+    the just-printed line off the visible screen. Embedded in the prompt
+    message, the notice is redrawn with the prompt until the next command.
+    """
+    global _pending_prompt_notice
+    _pending_prompt_notice = str(text)
 
 
 def _rprompt_queue_notice(text: str) -> None:
@@ -7211,6 +7213,7 @@ def pt_prompt(cwd: str) -> str:
     REPL never sees the sentinel.
     """
     while True:
+        term_attach.clear_early_interrupt()
         result = _pt_prompt_once(cwd)
         if result == _RETASK_SENTINEL:
             _open_retask_view()
@@ -7246,7 +7249,14 @@ def _pt_prompt_once(cwd: str) -> str:
     # A selection carried over from an aborted prompt must not leak into
     # the next one.
     _rprompt_modal_exit()
-    message = [
+    # A one-shot notice (e.g. "term0 is still running ...") rides on the
+    # prompt itself so the renderer redraws it together with the prompt.
+    global _pending_prompt_notice
+    prompt_notice, _pending_prompt_notice = _pending_prompt_notice, ""
+    message = []
+    if prompt_notice:
+        message += [("class:prompt-notice", "  " + prompt_notice), ("", "\n")]
+    message += [
         ("class:stbar-sep", "  "),
         ("class:prompt-path", disp),
         ("", "\n"),
@@ -7284,6 +7294,29 @@ def _pt_prompt_once(cwd: str) -> str:
                         rprompt=_render_rprompt,
                         complete_while_typing=True,
                     )
+            # Keys pressed after Enter but before prompt() finished
+            # exiting are parked in prompt_toolkit's typeahead, aimed at
+            # whatever runs next. For a submitted line that is the command
+            # about to run, not the next prompt: hand a Ctrl+C among them
+            # to the attach layer as an early interrupt (left in the
+            # typeahead it would resurface as a stray Ctrl+C at the next
+            # prompt instead), and put the remaining keys back.
+            try:
+                from prompt_toolkit.input.typeahead import (
+                    get_typeahead as _get_typeahead,
+                    store_typeahead as _store_typeahead)
+                from prompt_toolkit.application.current import (
+                    get_app_session as _get_app_session)
+                from prompt_toolkit.keys import Keys as _Keys
+                _typeahead = _get_typeahead(_get_app_session().input)
+                if _typeahead:
+                    _rest = [k for k in _typeahead
+                             if k.key != _Keys.ControlC]
+                    if len(_rest) != len(_typeahead):
+                        term_attach.note_early_interrupt()
+                        _store_typeahead(_get_app_session().input, _rest)
+            except Exception:
+                pass
             if user_input in (_MAILBOX_SENTINEL, _RETASK_SENTINEL):
                 _reset_paste_registry()
                 return user_input
@@ -7718,8 +7751,30 @@ def _normalize_model_entry(item) -> dict:
 
 
 def _model_supply_label(provider_id: str) -> str:
-    """Collapse routing providers into the two user-facing supply groups."""
-    return "Laintas Supply" if provider_id == "laintas" else "Third-party Supply"
+    """Collapse routing providers into the user-facing supply groups.
+
+    Mirrors Helpwo's modelSupplyGroupId (AIChat.tsx): the person's own
+    keys hosted by Laintas (provider "my-keys") are "Activated", not
+    third-party supply.
+    """
+    if provider_id == "laintas":
+        return "Laintas Supply"
+    if provider_id == "my-keys":
+        return "Activated"
+    return "Third-party Supply"
+
+
+def _model_display_name(model_id: str) -> str:
+    """Display name for a model id: ``key/<source>/<model>`` reads as just
+    the model — the supply tag already says whose key it is. Mirrors
+    Helpwo's modelDisplayName. Presentation only: the id itself is
+    unchanged everywhere it is stored or sent."""
+    model_id = str(model_id or "")
+    if model_id.startswith("key/"):
+        rest = "/".join(model_id.split("/")[2:])
+        if rest:
+            return rest
+    return model_id
 
 
 def _extract_model_entries(data) -> list[dict]:
@@ -8018,8 +8073,6 @@ def fetch_available_models(
     raise RuntimeError(last_error or "No model endpoint responded")
 
 
-
-
 def show_model_selector(models: list[dict], current: str = "", *,
                         routes: Optional[list] = None,
                         active_route: str = "",
@@ -8058,15 +8111,31 @@ def show_model_selector(models: list[dict], current: str = "", *,
         labels.append(f"  [cyan]{'  auto-routing settings…':30}[/cyan] {'':3} "
                       f"Models auto may pick, everyday/complex model [dim]({state})[/dim]")
     model_start = len(labels)
+    _rows = []
     for i, model in enumerate(models):
         model_id = model.get("id", "")
         provider = model.get("supply") or model.get("description") or _model_supply_label(
             str(model.get("provider") or ""))
         mark = " *" if current and model_id == current else "  "
         tier = model.get("tier") or ""
-        labels.append(f"{mark}[cyan]{model_id:30}[/cyan] {tier:3} {provider}")
+        _rows.append((model_id, provider, mark, tier))
         if current and model_id == current:
             sel_idx = i + model_start  # rows above: auto, and its settings row
+
+    def _row_label(row, shown):
+        _mid, provider, mark, tier = row
+        return f"{mark}[cyan]{shown:30}[/cyan] {tier:3} {provider}"
+
+    # A stripped name may coincide with another row's name (a hosted
+    # deepseek-v4-pro next to the marketplace one): the tier and supply
+    # columns still tell those rows apart, so only a fully identical
+    # label falls back to the unstripped id (the dialog maps a chosen
+    # label back by string).
+    _stripped = [_row_label(r, _model_display_name(r[0])) for r in _rows]
+    _dup_labels = {l for l in _stripped if _stripped.count(l) > 1}
+    for row, label in zip(_rows, _stripped):
+        labels.append(_row_label(row, row[0]) if label in _dup_labels
+                      else label)
     route_start = len(labels)
     for route in routes:
         mark = " *" if route.name == active_route else "  "
@@ -10305,7 +10374,6 @@ def _should_inject_gateway_tool_guide(system_prompt: str) -> bool:
 _EFFORT_PIN_VALUES = frozenset({"auto", "none", "low", "medium", "high", "max"})
 
 
-
 # Billing refusals the gateway codes (agent_gateway BILLING_REFUSAL_CODES). Each
 # gets its own headline so an empty wallet, a spent membership allowance and a
 # briefly busy ledger never read alike — all three used to arrive as "Payment
@@ -10451,11 +10519,22 @@ def _call_backend_stream_impl(
     state-dump user turn.
     """
     import secret_guard
-    try:
-        secret_guard.require_safe_payload([message, system_prompt, history, messages])
-    except secret_guard.SecretInputError as exc:
-        return {"reply": str(exc), "tool_calls": [], "done": True, "error": True,
-                "code": "sensitive_input"}
+    if messages is None:
+        # Legacy mode only: here `message` is the user's own turn, so gate
+        # it before transport (defense in depth; the input gates already
+        # checked it). In thread mode the user turn was gated at admission
+        # (REPL / agent_loop input checks), and `message`, `history` and
+        # `messages` also carry the system prompt and tool results, which
+        # are NOT user input. Credential-shaped strings in content the
+        # agent itself read or produced (a config dump, a token field in
+        # JSON) must not brick the session: an earlier version scanned the
+        # whole payload here, so one such string in the history blocked
+        # every later send, including /continue and plain questions.
+        try:
+            secret_guard.require_safe_input(message)
+        except secret_guard.SecretInputError as exc:
+            return {"reply": str(exc), "tool_calls": [], "done": True,
+                    "error": True, "code": "sensitive_input"}
     backend_profile = get_backend_profile()
     backend_url = backend_profile.base_url
 
@@ -11611,10 +11690,6 @@ class AgentRegistry:
     def start_heartbeat(self):
         """Local application requests require no network heartbeat."""
         return None
-
-
-
-
 
 
     def start_message_poll(self, agent_state_cb, chat_history_cb):
@@ -14062,8 +14137,6 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     # its rule is deliberately looser than its siblings'.
     ("/training", "local"): _arg_rule(
         3, "/training local [status|on|off|purge|export <file>]"),
-    ("/helpwo",): _arg_rule(1, "/helpwo [stop]", flag_start=0, allowed_flags=("stop",)),
-    ("/helpwo", "stop"): _arg_rule(1, "/helpwo stop"),
     ("/app",): _arg_rule(2, "/app [list|start <name>|stop <name>|trust <name>|revoke <name>]"),
     ("/app", "list"): _arg_rule(1, "/app list"),
     ("/app", "start"): _arg_rule(2, "/app start <name>"),
@@ -16725,7 +16798,7 @@ def _cmd_model_agent_base(agent, args: list, session: dict) -> None:
             return
         _apply(args[0])
         console.print(f"[green]Model for [bold]{label}[/bold] set to: "
-                      f"[bold]{escape(args[0])}[/bold][/green]"
+                      f"[bold]{escape(_model_display_name(args[0]))}[/bold][/green]"
                       f"{_model_tier_suffix(args[0])}")
         return
     if not sys.stdin.isatty():
@@ -17142,7 +17215,7 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
         _apply(model)
         console.print(
             f"[green]Model for [bold]{target_terminal}[/bold] set to: "
-            f"[bold]{model}[/bold][/green]{_model_tier_suffix(model)}")
+            f"[bold]{_model_display_name(model)}[/bold][/green]{_model_tier_suffix(model)}")
     else:
         current = str(terminal.model_override or "")
         current_provider = str(terminal.provider_override or "")
@@ -17185,7 +17258,7 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
                 model_id = selected.get("id", "") if isinstance(selected, dict) else selected
                 provider_id = selected.get("provider", "") if isinstance(selected, dict) else ""
                 _apply(model_id, provider_id)
-                info = f"[bold]{model_id}[/bold]{_model_tier_suffix(model_id)}"
+                info = f"[bold]{_model_display_name(model_id)}[/bold]{_model_tier_suffix(model_id)}"
                 if provider_id:
                     info += f" ([dim]{_model_supply_label(provider_id)}[/dim])"
                 console.print(
@@ -17216,7 +17289,7 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
                 table.add_row(
                     str(idx),
                     marker,
-                    m["id"],
+                    _model_display_name(m["id"]),
                     m.get("tier") or "—",
                     m.get("name", ""),
                     m.get("supply") or _model_supply_label(
@@ -17230,7 +17303,7 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
                     route.model or "(no model)", "",
                     f"direct route {route.name}", route.spec.label)
             console.print(table)
-            console.print(f"Terminal {target_terminal} override: [bold]{current or '(none)'}[/bold]" +
+            console.print(f"Terminal {target_terminal} override: [bold]{_model_display_name(current) if current else '(none)'}[/bold]" +
                           _model_tier_suffix(current) +
                           (f" ([dim]{_model_supply_label(current_provider)}[/dim])"
                            if current_provider else ""))
@@ -17586,8 +17659,6 @@ def _cmd_memory(parts: list) -> None:
                 )
     else:
         console.print("[yellow]Usage: /memory \\[global|local|persistent|project|show <id|name>][/yellow]")
-
-
 
 
 def _shared_storage_client(session: dict):
@@ -18677,18 +18748,6 @@ def _cmd_mode(raw_args: str, parts: list) -> bool:
             console.print(
                 f"[dim]Current mode: {'plan' if _in_plan else active['name']}[/dim]")
     return False
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def _cmd_trust(parts: list) -> None:
@@ -20332,7 +20391,6 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
                       "  [bold]/prompt publish <id>[/bold]        — Publish to community")
 
 
-
 def _cmd_work(parts: list) -> None:
     sub = parts[1].lower() if len(parts) > 1 else "status"
     if sub == "status":
@@ -20433,8 +20491,6 @@ def _cmd_work(parts: list) -> None:
                     f"[dim]{json.dumps(event['payload'], ensure_ascii=False)[:120]}[/dim]")
     else:
         console.print("[yellow]Usage: /work \\[status|list|resume <id>|history][/yellow]")
-
-
 
 
 @contextmanager
@@ -21113,7 +21169,6 @@ def _cmd_task(raw_args: str, parts: list) -> None:
                       "  [bold]/task del <id>[/bold]      — delete a task")
 
 
-
 def _cmd_workflow(raw_args: str, parts: list) -> None:
     import workflow_engine as _we
     sub = parts[1].lower() if len(parts) > 1 else "status"
@@ -21255,7 +21310,6 @@ def _cmd_workflow(raw_args: str, parts: list) -> None:
                       "  [bold]/workflow list[/bold]                  — List available workflows")
 
 
-
 def _cmd_debug(parts: list) -> None:
     if len(parts) > 1:
         sub = parts[1].lower()
@@ -21341,7 +21395,6 @@ def _cmd_debug(parts: list) -> None:
                 console.print("Use [bold]/debug[/bold] to browse entries. [bold]/debug <N> <file>[/bold] to save to file.")
     else:
         show_debug_browser_interactive()
-
 
 
 def _show_detail_trace_item(item: dict) -> None:
@@ -21705,7 +21758,6 @@ def _cmd_why(parts: list) -> None:
                         border_style="error", style="surface", expand=False))
 
 
-
 def _station_terminal_factory(name):
     if name != "term0":
         import terminal_link
@@ -21837,7 +21889,6 @@ def _cmd_terminate(parts: list) -> None:
                     f"[green]Terminated [bold]{name}[/bold] and its child resources[/green]")
         else:
             console.print(f"[red]Terminal '{name}' not found.[/red]")
-
 
 
 def _cmd_send(raw_args: str) -> bool:
@@ -22677,7 +22728,6 @@ def _cmd_spawn(raw_args: str, session: dict, agent_registry: AgentRegistry) -> N
                               f"[dim](parent={parent.id}, task={task[:60]})[/dim]")
 
 
-
 def _cmd_tell(raw_args: str) -> None:
     target_id, message_raw = _raw_tail_after_word(raw_args)
     if not target_id and sys.stdin.isatty():
@@ -22720,7 +22770,6 @@ def _cmd_tell(raw_args: str) -> None:
             console.print(f"[red]Agent '{target_id}' not found or inbox full.[/red]")
 
 
-
 def _cmd_abort(parts: list) -> None:
     target_id = parts[1] if len(parts) >= 2 else ""
     if not target_id and sys.stdin.isatty():
@@ -22759,7 +22808,6 @@ def _cmd_abort(parts: list) -> None:
             console.print(f"[red]Agent '{target_id}' not found.[/red]")
 
 
-
 def _cmd_tools() -> None:
     registry = tools_mod.get_registry()
     groups = registry.list_by_source()
@@ -22770,7 +22818,6 @@ def _cmd_tools() -> None:
             console.print(f"[bold]{src}[/bold]")
             for t in groups[src]:
                 console.print(f"  [cyan]{t.name}[/cyan] — {t.description}")
-
 
 
 def _safe_input_line(prompt: str = "") -> Optional[str]:
@@ -22893,7 +22940,6 @@ def _cmd_tool(raw_args: str, session: dict, agent_registry: AgentRegistry) -> No
             console.print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
         except (TypeError, ValueError):
             console.print(repr(result))
-
 
 
 def _cmd_skill(parts: list) -> bool:
@@ -23168,70 +23214,12 @@ def _cmd_mcp(parts: list) -> bool:
     return False
 
 
-def _disconnect_from_helpwo(agent_registry: AgentRegistry) -> None:
-    """Withdraw this CLI's runtime environment from Helpwo (internal helper for
-    /helpwo stop). Symmetric with connect_terminal_to_helpwo()."""
-    if agent_registry is None or not agent_registry.agent_id:
-        console.print("[dim]This CLI isn't connected to Helpwo.[/dim]")
-        return
-
-    if getattr(agent_registry, "depth", 0) == 0 or agent_registry.as_environment:
-        name = agent_registry.agent_name
-        agent_registry._last_agent_id = ""  # explicit — don't resurrect
-        agent_registry.workspace_path = None
-        agent_registry.unregister()
-        agent_registry.agent_id = None
-        agent_registry.agent_secret = ""
-        console.print(f"[yellow]Runtime environment [bold]{name}[/bold] withdrawn from Helpwo "
-                      f"(its terminal and files are no longer reachable there). "
-                      f"Run /helpwo to connect again.[/yellow]")
-    else:
-        name = (agent_registry.terminal_meta or {}).get("name", agent_registry.agent_name)
-        agent_registry._last_agent_id = ""  # explicit — don't resurrect
-        agent_registry.unregister()
-        agent_registry.agent_id = None
-        agent_registry.agent_secret = ""
-        console.print(f"[yellow]Sub-terminal [bold]{name}[/bold] withdrawn from Helpwo.[/yellow]")
-
-
-_HELPWO_USAGE = r"[dim]Usage: /helpwo \[stop][/dim]"
-
 # The application this process hosts, when it is an app sub-terminal
 # (--app). Empty in every ordinary CLI.
 _HOSTED_APP: dict = {}
 
 # Launches this process started, by application name: {"state_dir", "launch_id"}.
 _APP_LAUNCHES: dict = {}
-
-
-def _hosts_helpwo_here() -> bool:
-    """Whether /helpwo acts in THIS process rather than launching a sub-terminal.
-
-    The main terminal (depth 0) never serves Helpwo itself: Helpwo gets its
-    own sub-terminal and its own agent. Inside a sub-terminal — the Helpwo
-    one, or any other nested CLI — it runs where it is typed.
-    """
-    return _REPL_PROCESS_DEPTH > 0 or _HOSTED_APP.get("name") == app_host.HELPWO_APP
-
-
-def _parse_helpwo_flags(parts: list):
-    """Parse local companion application options."""
-    if len(parts) > 1:
-        console.print("[yellow]Unexpected argument. Usage: /helpwo [stop][/yellow]")
-        return None
-    return {"remote": False}
-
-
-def _helpwo_start_in_process(opts, agent_registry, session, *, state=None, state_dir=None, open_browser=True):
-    """Start the existing local companion API without a machine kernel."""
-    import helpwo_server
-    ok, message = helpwo_server.start_server(agent_registry, session=session,
-        agent_id=str((state or {}).get("local_agent_id") or "") or None)
-    url = helpwo_server.get_url(with_token=True) if ok else ""
-    if ok and open_browser:
-        _open_external_url(url)
-    return {"status": "ready" if ok else "error", "mode": "local",
-            "url": url, "open_url": url, "linked": ok, "message": message}
 
 
 def _can_open_graphical_browser() -> bool:
@@ -23242,7 +23230,7 @@ def _can_open_graphical_browser() -> bool:
 
 
 def _app_label(app: str) -> str:
-    return "Helpwo" if app == app_host.HELPWO_APP else app
+    return app
 
 
 def _report_app_runtime(app: str, runtime: dict, *, open_url: bool) -> None:
@@ -23270,8 +23258,7 @@ def _report_app_runtime(app: str, runtime: dict, *, open_url: bool) -> None:
             lines.append(f"App log: [dim]{escape(str(runtime['log']))}[/dim]")
         lines.append(
             "[dim]It has its own agent and its own conversation. "
-            f"/t opens the terminal list; /{'helpwo' if app == app_host.HELPWO_APP else 'app'} "
-            f"stop{'' if app == app_host.HELPWO_APP else ' ' + app} closes it.[/dim]")
+            f"/t opens the terminal list; /app stop {app} closes it.[/dim]")
         console.print(Panel("\n".join(lines), title=label, border_style="green"))
         browser_url = runtime.get("app_url") or runtime.get("open_url")
         if open_url and browser_url and _can_open_graphical_browser():
@@ -23598,13 +23585,7 @@ def _bootstrap_hosted_app(args, agent_registry: AgentRegistry, session: dict) ->
     _HOSTED_APP.update({"name": args.app, "state_dir": directory, "state": state,
                         "launch_id": args.app_launch_id or ""})
     try:
-        if args.app == app_host.HELPWO_APP:
-            app_host.activate(app_host.HELPWO_APP, app_host.HELPWO_AGENT_PROMPT,
-                              builtin=True)
-            result = _helpwo_start_in_process(
-                options, agent_registry, session, state=state,
-                state_dir=directory, open_browser=False)
-        elif options.get("session_user"):
+        if options.get("session_user"):
             result = _app_session_start_in_process(args.app, options, agent_registry,
                                                    session, state)
         else:
@@ -23792,52 +23773,6 @@ def _app_session_start_in_process(name: str, options: dict,
             "token": helpwo_server.auth_token(), "message": msg}
 
 
-def _cmd_helpwo(raw_args: str, parts: list, agent_registry: AgentRegistry,
-                session: dict) -> None:
-    """Start or stop the local Helpwo companion in its own sub-terminal."""
-    import helpwo_server
-
-    hosts_here = _hosts_helpwo_here()
-
-    # Subcommand: stop.
-    if len(parts) >= 2 and parts[1].lower() == "stop":
-        stopped_any = False
-        if not hosts_here and _close_app_subterminal(app_host.HELPWO_APP):
-            console.print("[yellow]Helpwo sub-terminal closed (its agent and local API "
-                          "with it).[/yellow]")
-            stopped_any = True
-        if helpwo_server.is_running():
-            helpwo_server.stop_server()
-            console.print("[yellow]Helpwo local API stopped.[/yellow]")
-            stopped_any = True
-        if agent_registry is not None and agent_registry.agent_id:
-            _disconnect_from_helpwo(agent_registry)
-            stopped_any = True
-        if stopped_any and _HOSTED_APP.get("state_dir"):
-            try:
-                app_host.write_runtime(_HOSTED_APP["state_dir"],
-                                       _HOSTED_APP.get("launch_id", ""), status="stopped")
-            except Exception:
-                pass
-        if not stopped_any:
-            console.print("[dim]Helpwo is not running and this CLI isn't connected.[/dim]")
-        return
-
-    opts = _parse_helpwo_flags(parts)
-    if opts is None:
-        return
-
-    if hosts_here:
-        _helpwo_start_in_process(
-            opts, agent_registry, session,
-            state=_HOSTED_APP.get("state") if _HOSTED_APP.get("name") == app_host.HELPWO_APP else None,
-            state_dir=_HOSTED_APP.get("state_dir") if _HOSTED_APP.get("name") == app_host.HELPWO_APP else None)
-        return
-
-    _launch_app_subterminal(app_host.HELPWO_APP, persistent=True, options=opts,
-                            agent_registry=agent_registry, open_url=True)
-
-
 def _cmd_app(parts: list, agent_registry: AgentRegistry) -> None:
     """/app list | start <name> | stop <name> | trust <name> | revoke <name>
 
@@ -23882,10 +23817,6 @@ def _cmd_app(parts: list, agent_registry: AgentRegistry) -> None:
     if not name:
         console.print(f"[yellow]Usage: /app {sub} <name>[/yellow]")
         return
-    if name == app_host.HELPWO_APP:
-        console.print("[yellow]Helpwo has its own command: /helpwo[/yellow]")
-        return
-
     if sub == "stop":
         if _close_app_subterminal(name):
             console.print(f"[yellow]Application [bold]{escape(name)}[/bold] stopped "
@@ -24085,7 +24016,6 @@ def _cmd_reload(raw_args: str) -> None:
         console.print("[yellow]Usage: /reload[/yellow]")
     else:
         reload_default_files()
-
 
 
 def _cmd_undo(action: str, raw_args: str, parts: list) -> bool:
@@ -24387,7 +24317,6 @@ def _cmd_config(parts: list) -> None:
             console.print(f"[dim]Run /config {key} to inspect the expected type.[/dim]")
     else:
         console.print("[yellow]Usage: /config [key \\[value]] | /config reset[/yellow]")
-
 
 
 def _web_modules():
@@ -24781,7 +24710,6 @@ def _cmd_max() -> None:
     for k, v in applied.items():
         console.print(f"  [cyan]{k}[/cyan] = {v}")
     console.print("[dim]Note: max_tokens may be capped lower by the provider. Revert with /config reset.[/dim]")
-
 
 
 def _persist_session_state(agent_state: dict, chat_history: list, cwd: str,
@@ -25723,7 +25651,6 @@ def _cmd_hwo(parts: list, session: dict) -> None:
         )
 
 
-
 def _cmd_hwg(parts: list, session: dict) -> None:
     import hwg_runner
     sub = parts[1].lower() if len(parts) > 1 else "status"
@@ -25816,7 +25743,6 @@ def _cmd_hwg(parts: list, session: dict) -> None:
         }
     if r is not None:
         _workflow_result("HWG", r)
-
 
 
 def _cmd_version(action: str, parts: list) -> None:
@@ -26547,9 +26473,6 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
 
     elif action == "/mcp":
         return _cmd_mcp(parts)
-
-    elif action == "/helpwo":
-        _cmd_helpwo(raw_args, parts, agent_registry, session)
 
     elif action == "/app":
         _cmd_app(parts, agent_registry)
@@ -28444,8 +28367,6 @@ def _prompt_for_approval(title: str, body: str, question: str, *,
 _APPROVAL_POLL_INTERVAL = 5  # seconds between status checks
 
 
-
-
 def request_command_approval(command: str, reason: str) -> bool:
     """Block and ask the user to approve a command that matched a needs_approval
     policy rule. Wired as LoopDeps.request_command_approval for the local REPL."""
@@ -29998,8 +29919,8 @@ def main():
         handle_meta_command._last_events_cb = None
         handle_meta_command._last_existing_session = None
 
-    # Stash REPL state callbacks + terminal identity so /helpwo (now or later)
-    # can register this instance with full context.
+    # Stash REPL state callbacks + terminal identity so this instance can
+    # register with full context when it links (monitor mode / --connect).
     agent_registry.depth = args.depth
     agent_registry._state_cb = lambda: agent_state
     agent_registry._chat_cb = lambda: chat_history
@@ -30011,10 +29932,6 @@ def main():
             "createdAt": time.time(),
             "createdBy": args.parent_terminal or "term0",
         }
-        # The Helpwo app sub-terminal is how the main terminal's /helpwo is
-        # implemented, not a terminal the user hands over: it goes online as
-        # a runtime environment.
-        agent_registry.as_environment = args.app == app_host.HELPWO_APP
 
     if session.get("userId") or not _active_backend.sends_laintas_credentials:
         if args.depth == 0 and args.monitor_only:
@@ -30028,17 +29945,9 @@ def main():
         elif args.connect:
             # --connect (any depth; used by Helpwo's term-new for sub-terminals).
             connect_terminal_to_helpwo(agent_registry, session)
-        elif args.depth == 0 and sys.platform != "darwin":
-            # Two-end handshake: NO auto-link. The primary CLI goes online in
-            # Helpwo only when the user runs /helpwo here.
-            startup_mail.post(
-                "helpwo", "Not connected to Helpwo",
-                "Start the local Helpwo companion with /helpwo.",
-                action="/helpwo")
-        else:
-            startup_mail.post(
-                "helpwo", "This sub-terminal isn't linked to Helpwo yet.",
-                action="/helpwo")
+        # Otherwise NO auto-link (two-end handshake): a terminal goes online
+        # only when linked deliberately — Helpwo's term-new (--connect) or
+        # monitor mode above.
 
     # PTY session managed at REPL level (must be before shutdown for nonlocal)
     interactive_session = None
@@ -30619,9 +30528,15 @@ def main():
             continue
 
         # Gate before echo, event publication, history, session storage or routing.
+        # Local slash commands are handled entirely by the CLI and never cross
+        # a model boundary, so the message-content guard must not block them.
         # Explicit local credential-management commands use their own private UI.
         import secret_guard
-        if _is_dialogue or not (_is_password_command(user_input) or _carries_model_key(user_input)):
+        _is_local_slash = (
+            not _is_dialogue and user_input.lstrip().startswith("/"))
+        if (not _is_local_slash
+                and not (_is_password_command(user_input)
+                         or _carries_model_key(user_input))):
             _secret_error = secret_guard.input_error(user_input)
             if _secret_error:
                 console.print(_secret_error, style="yellow", markup=False)

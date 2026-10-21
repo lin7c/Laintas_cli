@@ -12,8 +12,8 @@ _PRIVATE = re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")
 _JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
 _BEARER = re.compile(r"\b(?:authorization[\"']?\s*[:=]\s*[\"']?\s*)?Bearer\s+([A-Za-z0-9._~+/-]{8,}=*)", re.I)
 _FIELD = re.compile(
-    r"(?:\b(?:[a-z0-9]+[_-])*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|passwd|pwd|secret|token)\b|密码|口令|密钥|令牌)"
-    r"[\"']?\s*(?:[:=：]|\bis\b|是|为)\s*(?:\"([^\"\r\n]{4,})\"|'([^'\r\n]{4,})'|([^\s\"'`,;，；<>]{4,}))", re.I)
+    r"(?:\b(?:[a-z0-9]+[_-])*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|passwd|pwd|secret|token)\b|\u5bc6\u7801|\u53e3\u4ee4|\u5bc6\u94a5|\u4ee4\u724c)"
+    r"[\"']?\s*(?:[:=\uff1a]|\bis\b|\u662f|\u4e3a)\s*(?:\"([^\"\r\n]{4,})\"|'([^'\r\n]{4,})'|([^\s\"'`,;\uff0c\uff1b<>]{4,}))", re.I)
 _PLACEHOLDER = re.compile(r"^(?:\*+|x+|\[?redacted\]?|(?:your|example|sample|dummy|test)[_-](?:api[_-]?)?(?:key|token|password|secret)|password|secret|token|string|true|false|null|none|required|undefined)$", re.I)
 
 

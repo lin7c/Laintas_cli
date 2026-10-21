@@ -305,32 +305,16 @@ def _canvas_open(path: str, canvas_mod) -> None:
     try:
         import helpwo_server
     except ImportError:
-        _console().print("[red]The Helpwo gateway is not available in this build.[/red]")
+        _console().print("[red]The local application bridge is not available in this build.[/red]")
         return
 
     if helpwo_server.is_running():
         url = helpwo_server.get_url(with_token=True)
-    elif _cli()._hosts_helpwo_here():
-        _console().print("[yellow]Helpwo is not running in this sub-terminal. "
-                      "Run /helpwo here, then open the board from its file tree.[/yellow]")
-        return
     else:
-        # Helpwo lives in its own sub-terminal; wait for it, since the whole
-        # point of this command is the URL.
-        try:
-            import app_host
-            runtime = _cli()._launch_app_subterminal(
-                app_host.HELPWO_APP, persistent=True, options={},
-                agent_registry=None, open_url=False, wait=True) or {}
-        except Exception as e:
-            _console().print(f"[red]Could not start it: {type(e).__name__}: {e}[/red]")
-            _console().print("[dim]Run /helpwo yourself, then open the board from its file tree.[/dim]")
-            return
-        url = runtime.get("open_url") or ""
-        if not url:
-            if runtime.get("status") == "launching":
-                _console().print("[dim]Run /canvas open again once Helpwo reports ready.[/dim]")
-            return
+        _console().print("[yellow]The local application bridge is not running. "
+                         "Start a hosted application first (/app start <name>), "
+                         "then open the board from its file tree.[/yellow]")
+        return
 
     _console().print(f"[bold]Open:[/bold] [cyan]{url}[/cyan]")
     if path:

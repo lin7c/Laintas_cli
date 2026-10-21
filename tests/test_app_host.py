@@ -117,7 +117,7 @@ class ManifestTests(_Home):
 
     def test_invalid_manifests_are_refused_with_a_reason(self):
         cases = [
-            {"name": "helpwo"},
+            {"name": "term0"},
             {"name": "Bad Name"},
             {"name": "ok", "persistence": "forever"},
             {"name": "ok", "port": 70000},
@@ -216,7 +216,10 @@ class PromptSectionTests(unittest.TestCase):
         self.assertEqual(app_host.render_prompt_section(), "")
 
     def test_helpwo_section_uses_its_own_prompt(self):
-        app_host.activate("helpwo", app_host.HELPWO_AGENT_PROMPT, builtin=True)
+        app_host.activate("helpwo", "You are the dedicated agent of the "
+                          "Helpwo sub-terminal. Every message you receive "
+                          "comes from a person using the Helpwo web app.",
+                          builtin=True)
         section = app_host.render_prompt_section()
         self.assertIn('name="helpwo"', section)
         self.assertIn("Helpwo web app", section)
@@ -621,38 +624,6 @@ class CommandTests(_Home):
         depth.start()
         self.addCleanup(depth.stop)
 
-    def test_helpwo_in_the_main_terminal_launches_a_persistent_sub_terminal(self):
-        registry = mock.Mock(agent_id="host-1", workspace_path=None)
-        with _Capture(), \
-                mock.patch.object(laintas_cli, "_launch_app_subterminal") as launch, \
-                mock.patch("helpwo_server.start_server") as start:
-            laintas_cli._cmd_helpwo("", ["/helpwo"], registry, {})
-        start.assert_not_called()
-        launch.assert_called_once()
-        args, kwargs = launch.call_args
-        self.assertEqual(args[0], "helpwo")
-        self.assertTrue(kwargs["persistent"])
-
-    def test_the_local_server_flags_are_refused_with_the_reason(self):
-        registry = mock.Mock(agent_id="host-1", workspace_path=None)
-        with _Capture() as out, \
-                mock.patch.object(laintas_cli, "_launch_app_subterminal") as launch, \
-                mock.patch("helpwo_server.start_server") as start:
-            laintas_cli._cmd_helpwo("--port 9000", ["/helpwo", "--port", "9000"], registry, {})
-        launch.assert_not_called()
-        start.assert_not_called()
-        self.assertIn("Usage: /helpwo", out.text)
-
-    def test_helpwo_inside_a_sub_terminal_serves_in_place(self):
-        registry = mock.Mock(agent_id=None, workspace_path=None)
-        with _Capture(), \
-                mock.patch.object(laintas_cli, "_REPL_PROCESS_DEPTH", 1), \
-                mock.patch.object(laintas_cli, "_launch_app_subterminal") as launch, \
-                mock.patch.object(laintas_cli, "_helpwo_start_in_process") as here:
-            laintas_cli._cmd_helpwo("", ["/helpwo"], registry, {})
-        launch.assert_not_called()
-        here.assert_called_once()
-
     def test_launch_builds_an_app_sub_terminal_and_reports_readiness(self):
         started = []
 
@@ -736,16 +707,6 @@ class CommandTests(_Home):
         sub.assert_not_called()
         self.assertIn("already exists", out.text)
 
-    def test_helpwo_stop_closes_only_its_own_sub_terminal(self):
-        with _Capture() as out, \
-                mock.patch.object(laintas_cli, "get_terminal",
-                                  return_value=mock.Mock(command="laintas-cli app:helpwo")), \
-                mock.patch.object(laintas_cli, "unregister_terminal") as unregister, \
-                mock.patch("helpwo_server.is_running", return_value=False):
-            laintas_cli._cmd_helpwo("stop", ["/helpwo", "stop"], mock.Mock(agent_id=None), {})
-        unregister.assert_called_once_with("helpwo")
-        self.assertIn("sub-terminal closed", out.text)
-
     def test_app_start_refuses_an_untrusted_manifest(self):
         directory = app_host.user_manifest_dir()
         directory.mkdir(parents=True)
@@ -767,12 +728,6 @@ class CommandTests(_Home):
         launch.assert_called_once()
         self.assertTrue(launch.call_args.kwargs["persistent"])
 
-    def test_app_refers_helpwo_to_its_own_command(self):
-        with _Capture() as out, mock.patch.object(laintas_cli, "_launch_app_subterminal") as launch:
-            laintas_cli._cmd_app(["/app", "start", "helpwo"], mock.Mock())
-        launch.assert_not_called()
-        self.assertIn("/helpwo", out.text)
-
     def test_argument_contracts(self):
         for command in ("/app", "/app list", "/app start notes", "/app trust notes"):
             with self.subTest(command=command):
@@ -785,8 +740,6 @@ class CommandTests(_Home):
 
 if __name__ == "__main__":
     unittest.main()
-
-
 
 
 class SubterminalGracefulExitTests(unittest.TestCase):

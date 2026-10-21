@@ -73,6 +73,7 @@ import queue
 import select
 import sys
 import termios
+import time
 import threading
 import tty
 from dataclasses import dataclass, field
@@ -585,6 +586,12 @@ class TerminalArbiter:
     # ── reader ──────────────────────────────────────────────────────
 
     def _ensure_reader(self) -> None:
+        _dbg = os.environ.get("LAINTAS_ATTACH_DEBUG")
+        if _dbg:
+            with open(_dbg, "a") as fh:
+                fh.write(f"{time.time():.3f} ensure_reader alive="
+                         f"{self._reader_thread is not None and self._reader_thread.is_alive()} "
+                         f"fd={self._fd} wanted={self._reader_wanted.is_set()}\n")
         if self._reader_thread is not None and self._reader_thread.is_alive():
             return
         self._reader_thread = threading.Thread(
@@ -604,6 +611,10 @@ class TerminalArbiter:
             if self._fd < 0:
                 self._reader_wanted.clear()
                 continue
+            _dbg = os.environ.get("LAINTAS_ATTACH_DEBUG")
+            if _dbg:
+                with open(_dbg, "a") as fh:
+                    fh.write(f"{time.time():.3f} reader loop top eof={self._eof.is_set()}\n")
 
             try:
                 ready, _, _ = select.select([self._fd], [], [], 0.05)
@@ -628,6 +639,12 @@ class TerminalArbiter:
                 continue
 
             raw = self._raw_bytes_holder()
+
+            _dbg = os.environ.get("LAINTAS_ATTACH_DEBUG")
+            if _dbg:
+                with open(_dbg, "a") as fh:
+                    fh.write(f"{time.time():.3f} reader read {data[:20]!r} raw={raw} "
+                             f"holder={self._holder.owner if self._holder else None}\n")
 
             if not data:                       # EOF
                 self._eof.set()                # K2: sticky, see read_key

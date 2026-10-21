@@ -43,7 +43,6 @@ class ArgumentContractTests(unittest.TestCase):
                 "/extensions create demo --desc 'a demo'",
                 "/extensions pack demo --output demo.lext",
                 "/usage 7d local", "/usage buy calls",
-                "/helpwo", "/helpwo stop",
                 "/v update --overwrite-local",
                 "/version update --force --overwrite-local",
                 "/shared rm old --yes",
@@ -56,7 +55,6 @@ class ArgumentContractTests(unittest.TestCase):
         for command in (
                 "/prop sys 2 3", "/usage buy calls now", "/img list extra",
                 "/retask help me",
-                "/helpwo --remote", "/helpwo stpo",
                 "/v update --overwrite-remote",
                 "/handoff list mine", "/shared ls a b", "/shared delete a b",
                 "/web status now", "/web test google bing",
@@ -102,15 +100,6 @@ class HandlerEdgeCaseTests(unittest.TestCase):
                 laintas_cli._cmd_hwo(["/hwo", verb], {})
             editor.assert_not_called()
             self.assertIn(f"Usage: /hwo {verb}", out.text)
-
-    def test_helpwo_refuses_an_unknown_word(self):
-        registry = mock.Mock(workspace_path=None, agent_id=None)
-        with _Capture() as out, \
-                mock.patch("helpwo_server.is_running", return_value=False), \
-                mock.patch("helpwo_server.start_server") as start:
-            laintas_cli._cmd_helpwo("stpo", ["/helpwo", "stpo"], registry, {})
-        start.assert_not_called()
-        self.assertIn("Unexpected argument", out.text)
 
     def test_web_engines_refuses_anything_but_init(self):
         with _Capture() as out:

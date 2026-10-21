@@ -45,15 +45,39 @@ def test_history_never_persists_blocked_input(tmp_path):
     assert 'Please explain how password managers work.' in persisted
 
 
-def test_backend_gate_runs_before_capture_or_transport():
+def test_backend_gate_blocks_user_turn_in_legacy_mode():
+    # Legacy mode: `message` is the user's own turn — a credential in it is
+    # stopped before the profile/transport is even touched.
     import laintas_cli as cli
     with mock.patch.object(cli, 'get_backend_profile') as transport:
-        response = cli._call_backend_stream_impl({}, 'hello', 'safe system', '.',
-            messages=[{'role': 'tool', 'content': 'password=DemoPass42'}])
+        response = cli._call_backend_stream_impl(
+            {}, 'my password is DemoPass42', 'safe system', '.')
     transport.assert_not_called()
     assert response['error'] is True
     assert response['code'] == 'sensitive_input'
     assert 'DemoPass42' not in json.dumps(response)
+
+
+def test_backend_gate_ignores_tool_content_in_thread_mode():
+    # Regression: credential-shaped strings in tool results / history are
+    # NOT user input. Scanning the whole payload on every send bricked
+    # real sessions permanently — once any history entry matched, every
+    # later message (even a plain question) was refused.
+    import laintas_cli as cli
+    profile = mock.Mock()
+    profile.base_url = 'http://127.0.0.1:9'
+    with mock.patch.object(cli, 'get_backend_profile', return_value=profile), \
+            mock.patch.object(cli.backend_profiles, 'request_auth',
+                              return_value=({}, {})), \
+            mock.patch.object(cli.model_route, 'resolve',
+                              return_value=(None, '')), \
+            mock.patch('requests.sessions.Session.request',
+                       side_effect=cli.requests.ConnectionError('down')), \
+            mock.patch('time.sleep', lambda *a, **k: None):
+        response = cli._call_backend_stream_impl(
+            {}, 'hello', 'safe system', '.',
+            messages=[{'role': 'tool', 'content': 'password=DemoPass42'}])
+    assert response.get('code') != 'sensitive_input'
 
 
 def test_execute_and_supplementary_inputs_do_not_start_work():

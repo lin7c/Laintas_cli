@@ -1869,17 +1869,6 @@ def get_all_browser_sessions() -> List[BrowserSession]:
         return list(_browser_sessions.values())
 
 
-def screen_names() -> List[str]:
-    """Names of the sessions showing a live screen right now (x11vnc up).
-
-    What this CLI tells the Helpwo kernel it can show, so Helpwo offers the
-    screen as soon as it exists instead of the user having to know to ask.
-    """
-    with _browser_lock:
-        return [name for name, session in _browser_sessions.items()
-                if int(getattr(session, "rfb_port", 0) or 0) > 0]
-
-
 def get_latest_browser_session() -> Optional[BrowserSession]:
     """The most recently registered session, or None.
 
