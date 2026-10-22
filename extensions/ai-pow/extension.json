@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "name": "ai-pow",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "entrypoint": "main.py",
   "description": "AI-PoW: a process score and verifiable work journal for every Git commit, recorded from your sessions",
   "author": { "name": "laintas" },

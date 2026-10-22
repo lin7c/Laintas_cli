@@ -4,10 +4,10 @@
     {
       "id": "laintas/ai-pow",
       "name": "ai-pow",
-      "version": "0.8.1",
+      "version": "0.8.2",
       "description": "AI-PoW: a process score and verifiable work journal for every Git commit, recorded from your sessions",
-      "url": "https://cli.laintas.com/extensions/official/ai-pow-0.8.1.lext",
-      "sha256": "5a30cd1e5735c6247522ce713ac06a755aefc46130ac1a295398ead221c34c6b"
+      "url": "https://cli.laintas.com/extensions/official/ai-pow-0.8.2.lext",
+      "sha256": "68638c5b464d0a8e8f5a7ce06da138177080ec88d140c56e585a8f3382e480ef"
     },
     {
       "id": "laintas/blindpick",
