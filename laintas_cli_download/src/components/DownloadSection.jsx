@@ -15,6 +15,9 @@ const RELEASE_DATE = '2026-10-21';
 // beside the Unix releases, apart from the Helpwo desktop channel in /windows/.
 const WINDOWS_DOWNLOAD = 'https://cli.laintas.com/windows-cli/beta-v5/laintas-cli-windows_beta-v5_x64-setup.exe';
 const WINDOWS_RELEASE = { version: 'beta v5', installer: WINDOWS_DOWNLOAD };
+// The Windows channel publishes its own pointer file; read it live so this
+// page can never point at a superseded installer again.
+const WINDOWS_POINTER = 'https://cli.laintas.com/windows-cli/download.json';
 const INSTALL_COMMANDS = {
   linux: 'curl -fsSL https://cli.laintas.com/install.sh | bash',
   mac: 'curl -fsSL https://cli.laintas.com/install.sh | bash',
@@ -28,7 +31,7 @@ const PACKAGES = [
   { id: 'linux-arm64', icon: Package, file: 'laintas-cli_linux_arm64.tar.gz', size: '54 MB', names: { zh: 'Linux · arm64', en: 'Linux · arm64' }, details: { zh: 'tar.gz · glibc 64 位', en: 'tar.gz · 64-bit glibc' } },
   { id: 'mac-arm', icon: Laptop, file: 'laintas-cli_darwin_arm64.tar.gz', size: '25 MB', names: { zh: 'macOS · Apple Silicon', en: 'macOS · Apple Silicon' }, details: { zh: 'tar.gz', en: 'tar.gz' } },
   { id: 'mac-intel', icon: Laptop, file: 'laintas-cli_darwin_amd64.tar.gz', size: '24 MB', names: { zh: 'macOS · Intel', en: 'macOS · Intel' }, details: { zh: 'tar.gz', en: 'tar.gz' } },
-  { id: 'windows', icon: Monitor, href: WINDOWS_DOWNLOAD, size: '55 MB', date: '2026-10-21', names: { zh: 'laintas-cli-windows', en: 'laintas-cli-windows' }, details: { zh: '安装程序 · 自带终端窗口，无需 WSL', en: 'Installer · its own terminal window, no WSL' } },
+  { id: 'windows', icon: Monitor, href: WINDOWS_DOWNLOAD, size: '54 MB', date: '2026-10-22', names: { zh: 'laintas-cli-windows', en: 'laintas-cli-windows' }, details: { zh: '安装程序 · 自带终端窗口，无需 WSL', en: 'Installer · its own terminal window, no WSL' } },
   { id: 'source', icon: Code2, file: 'laintas-cli_source.zip', size: '2.1 MB', names: { zh: '源码包', en: 'Source package' }, details: { zh: 'Python 3.10+ · 审计与二次开发', en: 'Python 3.10+ · audit and extend' } },
 ];
 
@@ -187,6 +190,10 @@ export default function DownloadSection() {
       .then((response) => response.ok ? response.json() : Promise.reject(new Error('release lookup failed')))
       .then((data) => { if (data.tag_name) setRelease(data.tag_name); })
       .catch(() => {});
+    fetch(WINDOWS_POINTER)
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error('windows pointer lookup failed')))
+      .then((data) => { if (data.installer && data.label) setWindowsRelease({ version: data.label, installer: data.installer }); })
+      .catch(() => {});
   }, []);
 
   return (
@@ -307,7 +314,7 @@ export default function DownloadSection() {
           <p className="st-eco-title">{c.packages}</p>
           <div className="st-packages">
             {PACKAGES.map(({ id, icon: Icon, file, href, size, date, names, details }) => (
-              <a href={href || `${RELEASE_BASE}/${file}`} key={id}>
+              <a href={id === 'windows' ? windowsRelease.installer : href || `${RELEASE_BASE}/${file}`} key={id}>
                 <Icon size={18} strokeWidth={1.6} />
                 <span><strong>{names[lang] || names.en}</strong><small>{details[lang] || details.en}</small></span>
                 <code>{id === 'windows' ? windowsRelease.version : release} · {size} · {date || RELEASE_DATE}</code>

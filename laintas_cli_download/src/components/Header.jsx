@@ -11,8 +11,8 @@ import { useAuth } from '../contexts/AuthContext';
 import BrandMark from './BrandMark';
 
 const NAV = {
-  zh: [['为什么', '/#operations'], ['工作方式', '/#workflow'], ['安全边界', '/#security'], ['下载', '/#download'], ['文档', '/docs'], ['插件市场', '/plugins']],
-  en: [['Why', '/#operations'], ['How it works', '/#workflow'], ['Security', '/#security'], ['Download', '/#download'], ['Docs', '/docs'], ['Plugin Market', '/plugins']],
+  zh: [['为什么', '/#operations'], ['安全', '/#security'], ['价格', '/#pricing'], ['下载', '/#download'], ['文档', '/docs'], ['插件市场', '/plugins']],
+  en: [['Why', '/#operations'], ['Security', '/#security'], ['Pricing', '/#pricing'], ['Download', '/#download'], ['Docs', '/docs'], ['Plugin Market', '/plugins']],
 };
 
 export default function Header() {
@@ -22,7 +22,7 @@ export default function Header() {
   const { data: session, isPending } = auth.useSession();
   const [userOpen, setUserOpen] = useState(false);
   const [balance, setBalance] = useState(null);
-  const [version, setVersion] = useState('laintas-cli-beta-v3');
+  const [version, setVersion] = useState('laintas-cli-beta-v5');
   const menuRef = useRef(null);
 
   useEffect(() => {

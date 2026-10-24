@@ -610,6 +610,20 @@ execution lease after 30 seconds and requests cancellation of delegated work;
 the relationship remains reserved until explicitly released. Status updates
 carry bounded result summaries; full execution history stays with A.
 
+### Auxiliary AI: `/model aux`
+
+Control auxiliary AI with `/model aux off`, `/model aux on`, and
+`/model aux status`. Off preserves the selected model and each feature's settings
+and stops new auxiliary requests, including AI context compaction and review,
+critic checks, intent analysis, memory consolidation, progress reports, repair
+analysis, and auto-pilot AI decomposition. Requests already sent may finish.
+The main agent and local context pruning continue; when the context no longer
+fits, enable AUX and run `/compact`, choose a larger model, or start a new session
+with `/clear`. Auxiliary requests never fall back to the main model while off.
+The switch and selected AUX model are saved with the terminal's preferences.
+`/model aux reset` enables auxiliary AI using the main model; choosing a model
+also enables it. The `/model aux` picker includes an off option.
+
 ### Progress reports during a task: `/progress`
 
 Press **Alt+P**, or type **`/progress`** and Enter, while an AI task is running.

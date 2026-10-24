@@ -178,6 +178,7 @@ _DEFAULT_CONFIG = {
     # "reasoning" bill from the "context plumbing" bill.
     # Deliberately pinned, unlike the rest of the defaults that follow the
     # admin page's priority: compaction wants a cheap long-context model.
+    "aux_enabled": True,
     "aux_model": "google/gemma-4-26b-a4b-it",
     # Canonical model id only: the gateway resolves duplicate upstreams using
     # supplier priority/failover. Never pin compaction to OpenRouter here.
@@ -986,6 +987,7 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "compact_background_cooldown": "Minimum seconds between speculative compaction attempts",
     "compact_background_min_tokens": "Minimum estimated tokens reclaimed before committing a background summary",
     "compact_background_timeout": "Seconds a speculative summary may go without completing a chunk before it is abandoned (per chunk, not per job)",
+    "aux_enabled": "Allow auxiliary AI requests; off keeps local context pruning and pauses AI compaction, critic, intent, memory consolidation and progress reports",
     "aux_model": "Model for compaction / critic / memory-extraction (empty = use the main model)",
     "aux_provider": "Provider paired with aux_model",
     "compact_review_effort": "Thinking level for the summary-review step of context compaction (default none = no thinking, fastest compaction; auto/low/medium/high/max re-enable it — costs output tokens)",
@@ -6593,7 +6595,7 @@ def _llm_summarize(deps, session, current_path: str, head_text: str,
     `prev_summary`. Returns the summary text, or None on any failure so the
     caller can fall back to the cheap heuristic. Never raises.
     """
-    if ctxpol is None or not head_text.strip():
+    if not aux_calls_enabled() or ctxpol is None or not head_text.strip():
         return None
     try:
         sys_prompt = ctxpol.summary_prompt(lang)
@@ -6647,7 +6649,7 @@ def _llm_review_summary(deps, session, current_path: str, source_text: str,
                         trajectory_id: str = "",
                         interrupt_event: Optional[threading.Event] = None) -> str:
     """Review against the same bounded evidence as the draft; retain it on failure."""
-    if ctxpol is None or not source_text.strip() or not candidate.strip():
+    if not aux_calls_enabled() or ctxpol is None or not source_text.strip() or not candidate.strip():
         return candidate
     try:
         prompt = ctxpol.review_prompt(lang, previous_summary=prev_summary)
@@ -6880,6 +6882,8 @@ def _summarize_head_in_chunks(deps, session, head: list,
     dropping text. Review each fold against its source before trusting it in
     the next fold, keeping both generation and review source inputs bounded.
     """
+    if not aux_calls_enabled():
+        return None
     # Review includes both the previous summary and the new draft. Reserve
     # both before splitting source; validate the fully assembled calls as well.
     # A slice is whatever both windows still allow after their prompts, the
@@ -7228,6 +7232,14 @@ def _coordinate_compaction(messages, deps, session, lang, state, *,
     """Main-loop checkpoint: publish a ready prefix, speculate, or wait once."""
     state.pop("_compaction_wait_failed", None)
     coordinator = background_compaction.current.get()
+    if not aux_calls_enabled():
+        if coordinator is not None:
+            coordinator.adopt(_compaction_owner(state))
+            coordinator.close()
+        if finish_only:
+            return False
+        return _compact_thread_messages(messages, deps, session, lang, state,
+            force=force, announce=announce, interrupt_event=interrupt_event)
     if coordinator is None or ctxpol is None:
         if finish_only:
             return False
@@ -7430,6 +7442,9 @@ def _compact_thread_messages(thread_messages: list, deps, session, lang: str, st
                             and _drop_reasoning(m)):
                         shed = True
             return changed or shed
+
+        if not aux_calls_enabled():
+            return _shed_reasoning()
 
         # 2) Keep a bounded recent tail, including within one long user turn.
         # Never separate a tool result from its assistant tool-call batch.
@@ -7910,6 +7925,22 @@ def thread_share(name: str, thread_budget: int) -> int:
     return prompt_budget.allot(budget_trees()["thread"].children[name], thread_budget)
 
 
+def aux_calls_enabled() -> bool:
+    """Master permission for extra AI calls, independent of the chosen model.
+
+    Never express disabled as an empty model: that selects the main model.
+    Callers must check this before launching work or sending a request.
+    """
+    return bool(get_runtime_config("aux_enabled"))
+
+
+AUX_TASK_KINDS = frozenset({
+    "compaction", "compaction_review", "critic", "intent", "intent_compare",
+    "intent_judge", "mem_extract", "mem_review", "repair_signal",
+    "repair_reflection", "progress_report", "auto_pilot_decompose",
+})
+
+
 def aux_model_override() -> tuple[str, str]:
     """(model, provider) for auxiliary calls, or ("", "") to use the main model.
 
@@ -7937,6 +7968,8 @@ def _aux_backend_reply(deps, session, *, system_prompt: str, messages: list,
     and one copy had already drifted (tools attached, main model billed, no
     task_kind). A single definition keeps those arguments from diverging again.
     """
+    if not aux_calls_enabled():
+        return ""
     resp = deps.call_backend(
         session=session, message="", system_prompt=system_prompt,
         current_path=cwd or os.getcwd(), messages=messages,
@@ -8020,8 +8053,8 @@ def session_context_status(state: dict) -> dict:
                           if real_window else 0.0),
         "usable": budget["usable"],
         "summary": bool((state or {}).get("_thread_summary")),
-        "auto_enabled": bool(ctxpol is not None and ctxpol.load().get("auto", True)),
-        "background_enabled": bool(get_runtime_config("compact_background")),
+        "auto_enabled": bool(aux_calls_enabled() and ctxpol is not None and ctxpol.load().get("auto", True)),
+        "background_enabled": bool(aux_calls_enabled() and get_runtime_config("compact_background")),
         "background_at": int(budget["usable"] * thread_param("compact_background")),
         "auto_at": int(budget["usable"] * thread_param("compact_foreground")),
         "target_tokens": int(budget["usable"] * thread_param("compact_target")),
@@ -8035,7 +8068,7 @@ def _consolidate_memories_on_compact(deps, session: dict, working: dict) -> None
     is off by default): consolidation happens once per compaction, aggressively
     merging near-duplicates so the store stays small. Fully best-effort — any
     failure is swallowed and never disturbs compaction. See mem_extract.py."""
-    if not get_runtime_config("mem_extract_on_compact"):
+    if not aux_calls_enabled() or not get_runtime_config("mem_extract_on_compact"):
         return
     try:
         summary = str(working.get("_thread_summary") or "")
@@ -8239,7 +8272,7 @@ def _consolidate_memories_when_idle(deps, session: dict, state: dict,
     delay, block or fail the turn that just completed.
     """
     global _idle_consolidation_running
-    if not get_runtime_config("mem_extract_on_idle"):
+    if not aux_calls_enabled() or not get_runtime_config("mem_extract_on_idle"):
         return False
     try:
         messages = state.get("_thread_messages") or []
@@ -11984,7 +12017,7 @@ def run_agent_loop(
             original_input or "", thread_messages,
             session_id=_session_id or "", run_id=_run_id or "",
             agent_id=agent_id or "")
-        if _repair_row and repair_signals.enabled():
+        if _repair_row and aux_calls_enabled() and repair_signals.enabled():
             _launch_repair_classifier(
                 original_input or "", thread_messages, _repair_row,
                 deps=deps, session=session, run_id=_run_id or "")
@@ -12326,7 +12359,7 @@ def run_agent_loop(
             # "you should plan this" sentence competes with everything else in
             # the context. Only when the agent has not planned for itself —
             # two task lists for one job is worse than either.
-            if (_intent_st.get("phase") == intent.SPEC_READY
+            if (aux_calls_enabled() and _intent_st.get("phase") == intent.SPEC_READY
                     and not _intent_st.get("tasks_written")
                     and get_runtime_config("intent_inject_tasks")):
                 _intent_st["tasks_written"] = True
@@ -12496,7 +12529,7 @@ def run_agent_loop(
                 _intent_st["phase"] = intent.ALIGNED
                 state["_intent"] = _intent_st
 
-            if (_intent_judge_thread is None
+            if (aux_calls_enabled() and _intent_judge_thread is None
                     and _intent_st.get("phase") in (intent.CORRECTING, intent.DEBATING)
                     and not _intent_st.get("pending_injection")
                     and int(get_runtime_config("intent_debate_rounds") or 0) > 0):
@@ -12534,7 +12567,7 @@ def run_agent_loop(
                     _intent_judge_thread.start()
 
             # (e) Launch a comparison once there is something to compare.
-            if (_intent_cmp_thread is None
+            if (aux_calls_enabled() and _intent_cmp_thread is None
                     and _intent_st.get("phase") == intent.SPEC_READY
                     and _intent_st.get("questions_sent")
                     and loop >= int(get_runtime_config("intent_compare_loop") or 2)
@@ -12584,7 +12617,7 @@ def run_agent_loop(
                     and intent.should_start(
                         _intent_task,
                         thread_mode=_thread_mode,
-                        enabled=bool(get_runtime_config("intent_enabled")),
+                        enabled=bool(aux_calls_enabled() and get_runtime_config("intent_enabled")),
                         has_contract=bool(state.get("_contract")),
                         plan_mode=plan_mode.is_plan_mode(),
                         min_chars=int(get_runtime_config("intent_min_chars") or 0))):
@@ -12873,7 +12906,7 @@ def run_agent_loop(
             system_prompt = (
                 system_prompt.rstrip() + "\n\n" + _HARNESS_STATE_PROMPT
             )
-        if _thread_mode and get_runtime_config("critic_enabled"):
+        if _thread_mode and aux_calls_enabled() and get_runtime_config("critic_enabled"):
             system_prompt = (
                 system_prompt.rstrip() + "\n\n" + critic.HOOK_SECTION
             )
@@ -12885,7 +12918,7 @@ def run_agent_loop(
         # intent pass adds nothing to the prefix.
         _intent_section = ""
         _branch_section = ""
-        if _thread_mode and get_runtime_config("intent_enabled"):
+        if _thread_mode and aux_calls_enabled() and get_runtime_config("intent_enabled"):
             _intent_spec_now = (state.get("_intent") or {}).get("spec")
             # The workflow the decision path selects. Resolved BEFORE the
             # understanding is rendered, because it writes the path's label
@@ -13059,8 +13092,8 @@ def run_agent_loop(
                 "editable": False,
                 "content": "\n\n".join(filter(None, (
                     _RUNTIME_OWNERSHIP_PROMPT,
-                    critic.HOOK_SECTION if (_thread_mode and get_runtime_config("critic_enabled")) else "",
-                    intent.HOOK_SECTION if (_thread_mode and get_runtime_config("intent_enabled")) else "",
+                    critic.HOOK_SECTION if (_thread_mode and aux_calls_enabled() and get_runtime_config("critic_enabled")) else "",
+                    intent.HOOK_SECTION if (_thread_mode and aux_calls_enabled() and get_runtime_config("intent_enabled")) else "",
                     _intent_section,
                     _branch_section,
                     _PRODUCT_PROTOCOL_PROMPT,
@@ -13180,8 +13213,11 @@ def run_agent_loop(
                     deps.console.print("[yellow]Context compaction is still cancelling; retry this turn shortly.[/yellow]")
                 break
             if _thread_tokens(thread_messages) > compaction_budget(state)["usable"]:
+                detail = ("Run /model aux on then /compact, start a new session with /clear, "
+                          "or select a larger model." if not aux_calls_enabled() else
+                          "Retry /compact or select a larger model.")
                 deps.console.print("[yellow]Context still exceeds the model budget after compaction; "
-                                   "history was retained. Retry /compact or select a larger model.[/yellow]")
+                                   f"history was retained. {detail}[/yellow]")
                 _exit_reason = TRANSITION_BACKEND_ERROR
                 break
             _publish_context_headroom(thread_messages, state)
@@ -13226,7 +13262,7 @@ def run_agent_loop(
             # Persisted in `state`, not a local: a task that continues into
             # another run_agent_loop call must not be asked the same questions
             # a second time.
-            if (not _int_st.get("questions_sent")
+            if (aux_calls_enabled() and not _int_st.get("questions_sent")
                     and _thread_to_send is not None
                     and _int_st.get("phase") == intent.SPEC_READY):
                 _int_st["questions_sent"] = True
@@ -13247,7 +13283,7 @@ def run_agent_loop(
             # harvested (above the prompt build, so the pinned understanding is
             # current) and injected here, where the outgoing thread exists.
             _pending = _int_st.get("pending_injection")
-            if _pending and _thread_to_send is not None:
+            if aux_calls_enabled() and _pending and _thread_to_send is not None:
                 _int_st["pending_injection"] = ""
                 # Where the agent's answer to this block begins. Judging the
                 # whole thread would read its pre-correction work as a
@@ -13396,6 +13432,7 @@ def run_agent_loop(
             # critic_interval loops. Never on the final turn: nothing could act
             # on the answer.
             if (_thread_to_send is not None
+                    and aux_calls_enabled()
                     and get_runtime_config("critic_enabled")
                     and not _critic_disabled
                     and not _final_turn
@@ -15686,7 +15723,7 @@ def run_agent_loop(
     # extractor writes with overwrite=False (never clobbers curated memories),
     # dedups, and no-ops if nothing is worth remembering. Fully best-effort:
     # any failure is swallowed and the loop is unaffected. See mem_extract.py.
-    if (_exit_reason == TRANSITION_COMPLETED
+    if (_exit_reason == TRANSITION_COMPLETED and aux_calls_enabled()
             and get_runtime_config("mem_extract_on_complete")):
         try:
             _mem_convo = (

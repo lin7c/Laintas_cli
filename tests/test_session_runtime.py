@@ -1100,6 +1100,22 @@ class AgentTerminationTests(unittest.TestCase):
         self.assertEqual(agent_loop.aux_model_override(),
                          ("google/gemma-4-26b-a4b-it", ""))
 
+    def test_aux_off_keeps_main_task_running_without_auxiliary_calls(self):
+        agent_loop.set_runtime_config("aux_enabled", False)
+        agent_loop.set_runtime_config("use_message_thread", True)
+        agent_loop.set_runtime_config("critic_min_loop", 0)
+        pending_intent = {"phase": "spec_ready", "pending_injection": "STALE_AUX_NUDGE",
+                          "spec": {"task_breakdown": ["STALE_AUX_TASK"]}}
+        result, calls, _ = self._run(
+            [{"reply": "Finished the task.", "done": True}],
+            state={"_intent": pending_intent},
+            prompt="Please inspect this project and explain its architecture in detail.")
+        self.assertEqual(result["exit_reason"], agent_loop.TRANSITION_COMPLETED)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn(calls[0].get("task_kind"), agent_loop.AUX_TASK_KINDS)
+        self.assertNotIn("STALE_AUX_NUDGE", str(calls[0]["messages"]))
+        self.assertFalse(pending_intent.get("tasks_written"))
+
     def test_summary_review_failure_keeps_gemma_draft(self):
         draft = "## Goal\n- keep me\n## Progress\n### Done\n- none\n## Next Steps\n- continue\n## Critical Context\n- fact"
         deps, calls = _deps([{"reply": "not the required structure"}])

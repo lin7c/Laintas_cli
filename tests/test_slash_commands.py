@@ -1178,6 +1178,8 @@ class SlashRegistryTests(unittest.TestCase):
                 {"id": "openrouter", "label": "vendor name", "models": ["vendor-model"]},
                 {"id": "custom-account", "label": "custom name", "models": ["custom-model"]},
                 {"id": "my-keys", "label": "hosted name", "models": ["hosted-model"]},
+                {"id": "my-devices", "label": "My devices", "models": ["my/desk/qwen"]},
+                {"id": "org", "label": "Organization", "models": ["org-model"]},
             ],
         })
 
@@ -1188,6 +1190,8 @@ class SlashRegistryTests(unittest.TestCase):
                 ("vendor-model", "openrouter", "Third-party Supply"),
                 ("custom-model", "custom-account", "Third-party Supply"),
                 ("hosted-model", "my-keys", "Activated"),
+                ("my/desk/qwen", "my-devices", "Compute"),
+                ("org-model", "org", "Organization"),
             ],
         )
 

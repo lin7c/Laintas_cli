@@ -83,6 +83,21 @@ fn host_command(rows: u16, cols: u16) -> Result<Command, String> {
     if !launcher.is_file() {
         return Err(format!("the bundled CLI is missing ({})", launcher.display()));
     }
+    // The runtime expects its temporary directories to exist, but an
+    // installer does not carry empty directories, and the launcher that
+    // creates them only runs inside the shell spawned below — after the
+    // runtime has already started without them. Create them here, in the
+    // host, so the first launch after install starts with them present.
+    for dir in [
+        root.join("runtime").join("tmp"),
+        root.join("runtime").join("var").join("tmp"),
+    ] {
+        if !dir.is_dir() {
+            std::fs::create_dir_all(&dir).map_err(|e| {
+                format!("could not create the runtime directory ({}): {e}", dir.display())
+            })?;
+        }
+    }
     let mut command = Command::new(&bash);
     command.arg(&launcher).arg(rows.to_string()).arg(cols.to_string());
     command.env("MSYSTEM", "MSYS").env("CHERE_INVOKING", "1").env("LAINTAS_TERMINAL", "window");

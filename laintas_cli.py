@@ -1548,7 +1548,7 @@ from agent_loop import (
     next_debug_loop, get_debug_logs,
     run_agent_loop, LoopDeps, compaction_status_text,
     captured_system_prompt, lab_prompt_fallback,
-    aux_model_override, resolve_agent_model,
+    AUX_TASK_KINDS, aux_calls_enabled, aux_model_override, resolve_agent_model,
     register_terminal, unregister_terminal,
     get_terminal, get_all_terminals, close_all_terminals,
     rename_terminal,
@@ -3983,10 +3983,10 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     )),
     CommandSpec("/work", "Inspect or resume unified WorkGraph state", "Planning & Tasks", "/work [status|list|resume|history]", subcommands=("status", "list", "resume", "history")),
     CommandSpec("/workflow", "Run a multi-phase workflow", "Planning & Tasks", "/workflow {start|status|advance|approve|end|list}", subcommands=("start", "status", "advance", "approve", "end", "list")),
-    CommandSpec("/model", "Select the chat model: backend models or your own provider key", "Config & Tools", "/model [terminal|aux|@agent] [id|reset] | routing [everyday|complex <id|off>|candidates <id,…|all>|reset] | route [<route> [model] [window]|list] | add [provider] [key|$VAR] [model] [name] | remove <route>",
+    CommandSpec("/model", "Select the chat model: backend models or your own provider key", "Config & Tools", "/model [terminal|@agent] [id|reset] | aux [off|on|status|id|reset] | routing [everyday|complex <id|off>|candidates <id,…|all>|reset] | route [<route> [model] [window]|list] | add [provider] [key|$VAR] [model] [name] | remove <route>",
         subcommands=("aux", "routing", "reset", "clear", "default", "route", "add", "remove"),
         completion_descriptions=(
-            ("aux", "Pick the model for compaction, critic and memory extraction"),
+            ("aux", "Enable, disable or select the model for auxiliary AI calls"),
             ("routing", "Auto model: which models it may pick, and one for everyday or complex tasks"),
             ("reset", "Clear this terminal's model override (use gateway auto-routing)"),
             ("clear", "Clear this terminal's model override (use gateway auto-routing)"),
@@ -4389,7 +4389,11 @@ _ARG_COMPLETIONS: dict[str, tuple] = {
         # Every position after `add`, with a `<slot>` hint row in each.
         *((("add", *("*",) * depth), lambda f, p: _model_add_arg_candidates(f, p))
           for depth in range(6)),
-        (("aux",), _static_candidates(("reset", "Use the terminal's own model again"))),
+        (("aux",), _static_candidates(
+            ("off", "Stop auxiliary AI calls; keep the selected model for later"),
+            ("on", "Resume auxiliary AI calls with the saved model"),
+            ("status", "Show auxiliary AI state and saved model"),
+            ("reset", "Enable auxiliary AI using the terminal's own model"))),
         (("routing",), _static_candidates(
             ("everyday", "Model for everyday tasks"),
             ("complex", "Model for complex tasks: design, debugging, refactoring"),
@@ -7754,13 +7758,19 @@ def _model_supply_label(provider_id: str) -> str:
     """Collapse routing providers into the user-facing supply groups.
 
     Mirrors Helpwo's modelSupplyGroupId (AIChat.tsx): the person's own
-    keys hosted by Laintas (provider "my-keys") are "Activated", not
+    keys hosted by Laintas (provider "my-keys") are "Activated", their own
+    Laintas Compute machines ("my-devices") are "Compute" and their
+    organisation's account ("org") is "Organization" — none of those is
     third-party supply.
     """
     if provider_id == "laintas":
         return "Laintas Supply"
     if provider_id == "my-keys":
         return "Activated"
+    if provider_id == "my-devices":
+        return "Compute"
+    if provider_id == "org":
+        return "Organization"
     return "Third-party Supply"
 
 
@@ -10518,6 +10528,10 @@ def _call_backend_stream_impl(
     thread (assistant tool_calls + role:tool results) instead of a re-synthesized
     state-dump user turn.
     """
+    if task_kind in AUX_TASK_KINDS and not aux_calls_enabled():
+        return {"reply": "Auxiliary AI is off. Run /model aux on to enable it.",
+                "tool_calls": [], "done": True, "error": True,
+                "code": "aux_disabled"}
     import secret_guard
     if messages is None:
         # Legacy mode only: here `message` is the user's own turn, so gate
@@ -14176,7 +14190,7 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/undo",): _arg_rule(1, "/undo [sha]"),
     ("/detail",): _arg_rule(2, "/detail [on|off|trace [N]]"),
     ("/detail", "trace"): _arg_rule(2, "/detail trace [N]"),
-    ("/model", "aux"): _arg_rule(2, "/model aux [id|reset]"),
+    ("/model", "aux"): _arg_rule(2, "/model aux [off|on|status|id|reset]"),
     ("/model", "routing"): _arg_rule(
         3, "/model routing [everyday|complex <id|off> | candidates <id,…|all> | reset]"),
     ("/model", "reset"): _arg_rule(1, "/model reset"),
@@ -16712,7 +16726,7 @@ def _cmd_account_legacy(sub: str, args: list) -> bool:
 
 
 def _cmd_model_aux(args: list, session: dict) -> None:
-    """`/model aux [id|reset]` — pick the model for compaction/critic/memory.
+    """`/model aux [off|on|status|id|reset]` — control auxiliary AI.
 
     Shares the terminal picker deliberately: the auxiliary model is chosen from
     the same catalogue as any other, so anything the gateway serves is a valid
@@ -16721,18 +16735,44 @@ def _cmd_model_aux(args: list, session: dict) -> None:
     """
     current = str(get_runtime_config("aux_model") or "")
 
-    def _apply(model: str, provider: str = "") -> None:
-        set_runtime_config("aux_model", model)
-        set_runtime_config("aux_provider", provider)
+    def _apply(**values) -> None:
+        ui = terminal_preferences.get_ui_preferences()
+        ui.update(values)
+        terminal_preferences.update({"ui": ui})
+        for key, value in values.items():
+            set_runtime_config(key, value)
+
+    def _status() -> None:
+        state = "on" if aux_calls_enabled() else "off"
+        console.print(f"Auxiliary AI: [bold]{state}[/bold]; saved model: "
+                      f"[bold]{escape(current or 'same as terminal')}[/bold]")
+
+    def _off() -> None:
+        _apply(aux_enabled=False)
+        console.print(
+            "[green]Auxiliary AI off. No new auxiliary model requests; "
+            "AI compaction, critic, intent, memory consolidation and progress reports are paused. "
+            "Local context pruning stays active. Resume with /model aux on.[/green]")
+
+    if args and args[0].lower() == "status":
+        _status()
+        return
+    if args and args[0].lower() == "off":
+        _off()
+        return
+    if args and args[0].lower() == "on":
+        _apply(aux_enabled=True)
+        _status()
+        return
 
     if args and args[0].lower() in ("reset", "clear", "default"):
-        _apply("", "")
+        _apply(aux_enabled=True, aux_model="", aux_provider="")
         console.print(
             "[green]Auxiliary model cleared — compaction, the critic and memory "
             "extraction will use the terminal's own model again.[/green]")
         return
     if args:
-        _apply(args[0])
+        _apply(aux_enabled=True, aux_model=args[0], aux_provider="")
         console.print(f"[green]Auxiliary model set to: [bold]{args[0]}[/bold][/green]")
         return
 
@@ -16746,21 +16786,26 @@ def _cmd_model_aux(args: list, session: dict) -> None:
         return
     except Exception as exc:
         console.print(f"[red]Failed to fetch models: {exc}[/red]")
-        console.print(f"Current auxiliary model: [bold]{current or 'same as terminal'}[/bold]")
-        console.print("Usage: /model aux <model-id>  or  /model aux reset")
+        _status()
+        console.print("Usage: /model aux [off|on|status|<model-id>|reset]")
         return
 
     if not (models and sys.stdin.isatty()):
-        console.print(f"Current auxiliary model: [bold]{current or 'same as terminal'}[/bold]")
+        _status()
         return
-    selected = show_model_selector(models, current)
+    selected = show_model_selector(
+        [{"id": "off", "description": "Disable auxiliary AI calls"}, *models],
+        current if aux_calls_enabled() else "off")
     if not selected:
         console.print("[dim]Unchanged.[/dim]")
         return
     model_id = selected.get("id", "") if isinstance(selected, dict) else selected
+    if model_id == "off":
+        _off()
+        return
     # Store only the canonical model id. The gateway routes duplicate providers
     # by supplier priority and can fail over without changing this setting.
-    _apply(model_id, "")
+    _apply(aux_enabled=True, aux_model=model_id, aux_provider="")
     console.print(
         f"[green]Auxiliary model set to [bold]{model_id}[/bold] "
         "(supplier priority routing)[/green]")
@@ -24752,7 +24797,10 @@ def _cmd_compact(parts: list, session: dict) -> bool:
             f"{info['messages']} messages {symbols.BULLET} {ratio:.0f}% of "
             f"{_fmt_tokens(info['usable'])} usable"
             + (f" {symbols.BULLET} summarized" if info["summary"] else ""))
-        if not info["auto_enabled"]:
+        if not aux_calls_enabled():
+            console.print("[dim]Auxiliary AI is off; only local context pruning is active. "
+                          "Run /model aux on to enable AI compaction.[/dim]")
+        elif not info["auto_enabled"]:
             console.print("[dim]Automatic and background compaction are disabled by context policy.[/dim]")
         else:
             background = (f"background at {_fmt_tokens(info['background_at'])}"
@@ -24766,6 +24814,11 @@ def _cmd_compact(parts: list, session: dict) -> bool:
                     f"[dim]Model window {_fmt_tokens(info['provider_window'])}; "
                     f"compaction fires at ~{info['auto_at_share'] * 100:.0f}% of it "
                     f"(/config budget thread, /prop budget).[/dim]")
+        return False
+
+    if not aux_calls_enabled():
+        console.print("[yellow]AI compaction is paused while auxiliary AI is off. "
+                      "Run /model aux on, then /compact.[/yellow]")
         return False
 
     # Compact an isolated copy so cancelling a slow summarizer cannot let its
@@ -27393,6 +27446,14 @@ def _progress_notice(kind, text, snapshot):
 
 
 def _request_progress_report():
+    if not aux_calls_enabled():
+        notice = Text("Auxiliary AI is off. Run /model aux on to use /progress.", style="muted")
+        ui = append_input.current(console)
+        if ui is not None:
+            ui.print_notice(notice)
+        else:
+            console.print(notice)
+        return True
     reporter = _progress_reporter
     if reporter is not None and reporter.request():
         return True
@@ -30160,6 +30221,8 @@ def main():
     # ── Phase 2: Register LLM decomposition callback for auto-pilot ──
     def _decompose_cb(task: str, strategy: str, timeout: float):
         """Decompose a task into subtasks via backend LLM with timeout."""
+        if not aux_calls_enabled():
+            return None
         try:
             _session = load_session() or {}
             if strategy == auto_pilot.PARALLEL_HINT:
@@ -30175,6 +30238,7 @@ def main():
             result = call_backend_stream(
                 _session, message=task, system_prompt=system_prompt,
                 current_path=os.getcwd(), tools_enabled=False,
+                task_kind="auto_pilot_decompose",
                 max_tokens_override=int(get_runtime_config("auto_pilot_decompose_max_tokens") or 500),
             )
             reply = (result or {}).get("reply", "")

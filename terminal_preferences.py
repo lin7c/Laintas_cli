@@ -29,6 +29,9 @@ _CACHE: dict | None = None
 SEEDED_KEYS = frozenset({"model", "provider", "mode", "agent", "ui", "auto_routing"})
 
 PERSISTED_UI_KEYS = frozenset({
+    "aux_enabled",
+    "aux_model",
+    "aux_provider",
     "detail",
     "enable_mouse",
     "input_arrow_keys",

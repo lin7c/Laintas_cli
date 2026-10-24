@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build && node /root/tools/prerender.cjs dist / /docs /plugins",
+    "build": "node /root/laintas_cli/laintas_cli_download/scripts/refresh-community-snapshot.cjs && vite build && node /root/tools/prerender.cjs dist / /docs /plugins",
     "preview": "vite preview"
   },
   "dependencies": {

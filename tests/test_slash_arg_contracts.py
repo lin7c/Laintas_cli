@@ -194,7 +194,7 @@ class ArgumentCompletionTests(unittest.TestCase):
         with mock.patch.object(laintas_cli, "_prompt_session", None), \
                 mock.patch.object(laintas_cli, "_rprompt_model_cache", []), \
                 mock.patch.object(laintas_cli, "_rprompt_kick_model_fetch") as kick:
-            self.assertEqual(self._complete("/model aux "), ["reset"])
+            self.assertEqual(self._complete("/model aux "), ["off", "on", "status", "reset"])
         kick.assert_not_called()
 
     def test_unrelated_words_still_complete_to_nothing(self):

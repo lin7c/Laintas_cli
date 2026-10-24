@@ -352,41 +352,7 @@ html { scroll-behavior: smooth; }
 .button-ghost { background: var(--ops-surface); }
 .hero-proof-line { display: flex; flex-wrap: wrap; gap: 22px; margin-top: 31px; color: var(--ops-muted); font: 500 11px/1 var(--font-mono); }
 .hero-proof-line span { display: inline-flex; align-items: center; gap: 7px; }
-.hero-terminal { position: relative; z-index: 1; }
-.proof-label { position: absolute; z-index: 2; top: -34px; right: 2px; display: flex; align-items: center; gap: 8px; color: var(--ops-muted); font: 600 10px/1 var(--font-mono); letter-spacing: .12em; }
-.live-dot { width: 7px; height: 7px; border-radius: 50%; background: #18a266; box-shadow: 0 0 0 5px rgba(24,162,102,.11); }
 
-/* Terminal replay — a recorded laintas-cli session played back frame by frame.
-   The body is a fixed grid of terminal cells: every run is pinned to its own
-   column width in TerminalReplay.jsx, so the recording is never re-wrapped. */
-.termreplay { min-width: 0; overflow: hidden; border: 1px solid var(--ops-line-strong); border-radius: 13px; background: #0b0f0c; box-shadow: 0 40px 110px var(--ops-shadow); }
-.termreplay-bar { display: flex; align-items: center; gap: 12px; height: 38px; padding: 0 16px; border-bottom: 1px solid var(--ops-line); background: rgba(255,255,255,.02); }
-.termreplay-dots { display: flex; gap: 7px; }
-.termreplay-dots i { width: 11px; height: 11px; border-radius: 50%; background: #d83b32; }
-.termreplay-dots i:nth-child(2) { background: #d8a53a; }
-.termreplay-dots i:nth-child(3) { background: #3aa76a; }
-.termreplay-title { color: var(--ops-muted); font: 500 11px/1 var(--font-mono); letter-spacing: .02em; }
-.termreplay-rec { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; color: #d98b84; font: 600 9px/1 var(--font-mono); letter-spacing: .14em; }
-.termreplay-rec b { width: 7px; height: 7px; border-radius: 50%; background: #d83b32; box-shadow: 0 0 0 4px rgba(216,59,50,.14); animation: blink 1.9s ease-in-out infinite; }
-@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: .28; } }
-/* JetBrains Mono ships from Google Fonts without box drawing or the ● status
-   glyph, so the recording's banner and tool rows need a mono fallback that has
-   them: Menlo (macOS), Consolas/Cascadia (Windows), DejaVu/Noto Mono (Linux). */
-.termreplay-viewport { position: relative; overflow: hidden; font-family: 'JetBrains Mono', Menlo, Consolas, 'Cascadia Mono', 'DejaVu Sans Mono', 'Noto Sans Mono', 'Noto Sans SC', monospace; font-variant-ligatures: none; color: #c9d1d9; }
-/* The stage keeps the recording's own pixel width and is scaled into the
-   card, so it must not size the card: out of flow, or the fixed width would
-   push the page wider than the screen on a phone. */
-.termreplay-stage { position: absolute; top: 0; left: 18px; transform-origin: 0 0; }
-.tr-row { white-space: pre; }
-/* A blank screen row still occupies its line: the strut gives the empty div a
-   line box, so a row the session left empty keeps the grid from collapsing. */
-.tr-row::after { content: ''; display: inline-block; width: 0; }
-/* Each run is pinned to its own columns and may overflow them: a terminal
-   lets a too-wide glyph spill into the next cell as well, and clipping it
-   would cut the ● tool dots in half. */
-.tr-row span { display: inline-block; vertical-align: top; }
-
-.hero-terminal figcaption { display: flex; align-items: flex-start; gap: 28px; padding: 20px 4px 0; }.hero-terminal figcaption > div { display: flex; flex-direction: column; gap: 6px; }.hero-terminal figcaption strong { font-size: 13px; }.hero-terminal figcaption span { color: var(--ops-muted); font-size: 12px; line-height: 1.6; }
 
 .mini-graph { display: flex; align-items: center; margin-top: 29px; }.mini-graph span { display: inline-flex; align-items: center; gap: 5px; padding: 7px 8px; border: 1px solid var(--ops-line); border-radius: 5px; color: var(--ops-copy); font: 500 9px/1 var(--font-mono); }.mini-graph i { flex: 1; height: 1px; background: var(--ops-line-strong); }
 .policy-list { display: flex; gap: 5px; margin-top: 28px; }.policy-list span { padding: 6px 7px; border-radius: 4px; background: rgba(216,59,50,.12); color: #de6f68; font: 600 8px/1 var(--font-mono); }.policy-list span:nth-child(2) { background: rgba(189,138,46,.12); color: #c99b4a; }.policy-list span:last-child { background: rgba(24,162,102,.13); color: #62c58f; }
@@ -421,21 +387,24 @@ html { scroll-behavior: smooth; }
 .extensions-heading .section-kicker { margin-bottom: 23px; }
 .extensions-heading h2 { margin: 0; font-size: clamp(38px, 5vw, 68px); font-weight: 550; line-height: 1.02; letter-spacing: -.06em; }
 .extensions-heading > p { max-width: 650px; margin: 0; color: var(--ops-copy); font-size: 16px; line-height: 1.75; }
-.extension-lane { margin-top: 56px; padding: 28px; border: 1px solid var(--ops-line); border-radius: 10px; background: var(--ops-surface); }
-.extension-lane-community { margin-top: 0; }
+.extension-lane { margin-top: 56px; padding: 28px; border: 1px solid var(--ops-line); border-radius: var(--radius-card); background: var(--surface-1); }
+.extension-lane-community { margin-top: 0; background: transparent; }
 .extension-lane-label { display: flex; align-items: flex-start; gap: 11px; color: #63c58d; }
 .extension-lane-label > div { display: flex; flex-direction: column; gap: 5px; }
 .extension-lane-label strong { color: var(--ops-ink); font-size: 14px; }
 .extension-lane-label span { color: var(--ops-muted); font: 500 10px/1.4 var(--font-mono); }
 .extension-lane-community .extension-lane-label { color: #df8a5e; }
 .extension-card-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 24px; }
-.extension-card { min-height: 220px; display: flex; flex-direction: column; padding: 22px; border: 1px solid var(--ops-line); border-radius: 8px; background: var(--ops-bg); }
+.extension-card { min-height: 220px; display: flex; flex-direction: column; padding: 22px; border: 1px solid var(--ops-line); border-radius: var(--radius-card); background: var(--surface-0); transition: border-color var(--dur-2) ease; }
+.extension-card:hover { border-color: var(--ops-line-strong); }
 .extension-card.official { border-color: rgba(24,162,102,.3); }
 .extension-card.community { border-color: rgba(223,138,94,.28); }
 .extension-card-meta { display: flex; align-items: center; justify-content: space-between; }
-.extension-card-meta span { color: #62c58f; font: 650 9px/1 var(--font-mono); letter-spacing: .13em; }
+.extension-card-meta span { display: inline-flex; align-items: center; gap: 7px; color: #62c58f; font: 650 9px/1 var(--font-mono); letter-spacing: .13em; }
+.ext-dot { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: #5ec68c; box-shadow: 0 0 0 4px rgba(94, 198, 140, .15); }
+.extension-card.community .ext-dot { background: #df8a5e; box-shadow: 0 0 0 4px rgba(223, 138, 94, .14); }
 .extension-card.community .extension-card-meta span { color: #df8a5e; }
-.extension-card-meta code { color: var(--ops-muted); font-size: 10px; }
+.extension-card-meta code { color: var(--ops-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
 .extension-card h3 { margin: 36px 0 9px; font-size: 20px; font-weight: 550; }
 .extension-card > p { margin: 0 0 24px; color: var(--ops-copy); font-size: 13px; line-height: 1.65; }
 .extension-command { min-width: 0; display: flex; align-items: center; gap: 8px; margin-top: auto; padding: 9px 9px 9px 11px; border: 1px solid var(--ops-line); border-radius: 6px; background: var(--ops-surface); }
@@ -468,56 +437,62 @@ html { scroll-behavior: smooth; }
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
 
-/* ── Home page: the presenter story ─────────────────────────────────────────
-   A sticky stage holds five stacked photographs of one presenter, shot from
-   one camera; DownloadSection.jsx cross-fades them as the chapters on the
-   right scroll past. The stage and the chapters share one grid cell, so the
-   photograph runs full-bleed behind the text column. */
-.story-page { overflow: clip; }
-.story { position: relative; display: grid; }
-.story-stage { position: sticky; top: 0; z-index: 0; grid-area: 1 / 1; align-self: start; height: 100vh; height: 100svh; overflow: hidden; background: #0b0907; }
-.story-scene { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: 30% 40%; user-select: none; will-change: opacity, transform; }
-/* Fades the photograph into the page on the text side. The pointing hand in
-   scene 5 ends near 53% of the width, so the shade stays clear until then. */
-.story-dip { position: absolute; inset: 0; background: #050403; opacity: 0; pointer-events: none; }
-.story-shade { position: absolute; inset: 0; pointer-events: none; background:
-  linear-gradient(90deg, transparent 0, transparent 46%, color-mix(in srgb, var(--ops-bg) 38%, transparent) 54%, color-mix(in srgb, var(--ops-bg) 86%, transparent) 61%, var(--ops-bg) 71%),
-  linear-gradient(0deg, color-mix(in srgb, #070605 78%, transparent) 0, transparent 30%),
-  linear-gradient(180deg, color-mix(in srgb, #070605 55%, transparent) 0, transparent 18%); }
-[data-theme="light"] .story-shade { background:
-  linear-gradient(90deg, transparent 0, transparent 46%, color-mix(in srgb, var(--ops-bg) 55%, transparent) 52%, color-mix(in srgb, var(--ops-bg) 94%, transparent) 57%, var(--ops-bg) 64%),
-  linear-gradient(0deg, color-mix(in srgb, #070605 78%, transparent) 0, transparent 30%),
-  linear-gradient(180deg, color-mix(in srgb, #070605 55%, transparent) 0, transparent 18%); }
-/* The presenter's line for the current chapter, set like a film subtitle.
-   The photograph is dark in both themes, so its colours are fixed. */
-.story-say { position: absolute; left: 5vw; bottom: calc(9vh + 44px); z-index: 1; max-width: min(38vw, 520px); margin: 0; padding-left: 18px; border-left: 2px solid #c9953e; color: #f4efe6; font: italic 500 clamp(19px, 1.7vw, 26px)/1.45 var(--font-display); letter-spacing: -.01em; text-shadow: 0 2px 18px rgba(0,0,0,.7); animation: story-say-in .7s ease both; }
-@keyframes story-say-in { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
-.story-progress { position: sticky; z-index: 2; grid-area: 1 / 1; align-self: start; justify-self: start; top: calc(100vh - 9vh - 12px); top: calc(100svh - 9vh - 12px); display: flex; gap: 4px; margin-left: 5vw; }
-.story-progress button { display: flex; align-items: center; gap: 7px; height: 30px; padding: 0 10px; border: 1px solid rgba(244,239,230,.14); border-radius: 999px; background: rgba(10,9,8,.45); color: rgba(244,239,230,.55); font: 500 10px/1 var(--font-mono); letter-spacing: .06em; cursor: pointer; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); transition: color .25s ease, border-color .25s ease, background .25s ease; }
-.story-progress button em { display: none; font-style: normal; }
-.story-progress button:hover { color: #f4efe6; border-color: rgba(244,239,230,.3); }
-.story-progress button.active { border-color: rgba(201,149,62,.6); background: rgba(201,149,62,.16); color: #f1d9ad; }
-.story-progress button.active em { display: inline; }
-.story-progress button:focus-visible { outline: 2px solid #d4a853; outline-offset: 2px; }
+/* ── Home page (2026 redesign): one column, no stage, no scroll theatre ──
+   Shared design tokens live on .product-page so every page — home, plugin
+   market, docs — draws surfaces, radii and motion from the same ladder:
+   surface-0 page · surface-1 panes/cards · surface-2 raised · surface-3
+   overlays; motion is rationed to 120/200/300ms, ease-out, transform and
+   opacity only (frontier UI study, 2026-10-20). */
+.product-page {
+  --surface-0: var(--ops-bg);
+  --surface-1: var(--ops-surface);
+  --surface-2: var(--ops-surface-2);
+  --surface-3: #1c211c;
+  --radius-card: 10px;
+  --radius-overlay: 14px;
+  --dur-1: 120ms;
+  --dur-2: 200ms;
+  --dur-3: 300ms;
+}
+[data-theme="light"] .product-page { --surface-3: #e3e1d9; }
 
-.story-chapters { position: relative; z-index: 1; grid-area: 1 / 1; justify-self: end; width: min(44vw, 760px); padding-right: max(24px, 5vw); }
-.story-chapter { min-height: 100vh; min-height: 100svh; display: flex; flex-direction: column; justify-content: center; padding: 16vh 0; scroll-margin-top: 0; }
-.story-hero { justify-content: flex-start; padding-top: 128px; }
+.hp-hero { padding: 150px 0 8px; }
+.hp-display { font-size: clamp(42px, 5.4vw, 72px); line-height: 1.04; }
+.hp-display:lang(en) { font-size: clamp(40px, 5vw, 66px); }
+.hp-install { margin-top: 38px; }
+.hp-install .st-install { margin-top: 0; }
+
+.hp-video { margin: 46px 0 0; }
+.hp-video-frame { overflow: hidden; border: 1px solid var(--ops-line-strong); border-radius: var(--radius-overlay); background: #0b0f0c; box-shadow: 0 40px 110px var(--ops-shadow); }
+.hp-video-frame video { display: block; width: 100%; aspect-ratio: 16 / 9; background: #0b0f0c; }
+.hp-video figcaption { display: flex; flex-direction: column; gap: 6px; padding: 16px 2px 0; }
+.hp-video figcaption strong { color: var(--ops-ink); font-size: 13px; font-weight: 600; }
+.hp-video figcaption span { color: var(--ops-muted); font-size: 12px; line-height: 1.6; }
+
+.hp-section { padding: 96px 0 8px; scroll-margin-top: 84px; }
+
+.hp-flow-block { margin-top: 76px; scroll-margin-top: 84px; }
+.hp-flow { display: flex; flex-wrap: wrap; gap: 8px; margin: 30px 0 0; padding: 0; list-style: none; }
+.hp-flow li { display: flex; align-items: center; gap: 10px; padding: 11px 13px; border: 1px solid var(--ops-line); border-radius: var(--radius-card); background: var(--surface-1); }
+.hp-flow-num { color: var(--st-gold); font: 600 10px/1 var(--font-mono); }
+.hp-flow-title { color: var(--ops-ink); font-size: 12.5px; font-weight: 600; white-space: nowrap; }
+.hp-flow code { color: var(--ops-muted); font: 500 10.5px/1.4 var(--font-mono); white-space: nowrap; }
+.hp-flow-arrow { flex: 0 0 auto; margin-left: 2px; color: var(--ops-muted); }
 
 /* ── Chapter typography: the laintas.com voice ─────────────────────────────
    Serif display lines with a gold italic second half, mono kickers behind a
    short gold rule, and hairlines instead of boxes. The gold picks up the
    lamplight in the photographs; light mode uses a deeper bronze for contrast. */
-.story-page { --st-gold: #d4a853; --st-gold-soft: rgba(212, 168, 83, .14); --st-gold-line: rgba(212, 168, 83, .38); --st-allow: #5ec68c; --st-ask: #d9a94f; --st-deny: #e0766f; }
-[data-theme="light"] .story-page { --st-gold: #946623; --st-gold-soft: rgba(148, 102, 35, .1); --st-gold-line: rgba(148, 102, 35, .36); --st-allow: #1f8a55; --st-ask: #9a6a12; --st-deny: #b8423a; }
+.product-page { --st-gold: #d4a853; --st-gold-soft: rgba(212, 168, 83, .14); --st-gold-line: rgba(212, 168, 83, .38); --st-allow: #5ec68c; --st-ask: #d9a94f; --st-deny: #e0766f; }
+[data-theme="light"] .product-page { --st-gold: #946623; --st-gold-soft: rgba(148, 102, 35, .1); --st-gold-line: rgba(148, 102, 35, .36); --st-allow: #1f8a55; --st-ask: #9a6a12; --st-deny: #b8423a; }
 
 .st-kicker { display: flex; align-items: center; gap: 12px; margin: 0; color: var(--st-gold); font: 500 11px/1.4 var(--font-mono); letter-spacing: .16em; text-transform: uppercase; }
 .st-kicker i { flex: 0 0 28px; height: 1px; background: var(--st-gold); }
 .st-display { margin: 20px 0 0; color: var(--ops-ink); font-family: var(--font-display); font-weight: 600; letter-spacing: -.015em; }
 .st-display em { color: var(--st-gold); font-style: italic; font-weight: 500; }
 .st-display em:lang(zh) { font-style: normal; }
-.story-hero h1 { font-size: clamp(40px, 3.9vw, 64px); line-height: 1.06; }
-.story-hero h1:lang(en) { font-size: clamp(38px, 3.5vw, 58px); }
+
+
 .st-head h2 { font-size: clamp(32px, 3.1vw, 50px); line-height: 1.1; }
 .st-head > p:last-child { max-width: 600px; margin: 20px 0 0; color: var(--ops-copy); font-size: 15.5px; line-height: 1.8; }
 .st-head-small h2 { font-size: clamp(26px, 2.2vw, 36px); }
@@ -536,10 +511,6 @@ html { scroll-behavior: smooth; }
 .st-facts dt { color: var(--ops-ink); font: 600 19px/1.2 var(--font-display); }
 .st-facts dd { margin: 7px 0 0; color: var(--ops-copy); font-size: 12px; line-height: 1.6; }
 
-.st-replay { margin: 32px 0 28px; }
-.st-replay figcaption { display: flex; flex-direction: column; gap: 6px; padding: 16px 2px 0; }
-.st-replay figcaption strong { color: var(--ops-ink); font-size: 13px; font-weight: 600; }
-.st-replay figcaption span { color: var(--ops-muted); font-size: 12px; line-height: 1.5; }
 
 /* Why: chat window vs CLI, then four capabilities. */
 .st-compare { margin-top: 40px; border-top: 1px solid var(--ops-line-strong); }
@@ -630,12 +601,11 @@ html { scroll-behavior: smooth; }
 .st-packages a > span { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .st-packages strong { color: var(--ops-ink); font-size: 14.5px; font-weight: 600; }
 .st-packages small { color: var(--ops-muted); font-size: 12px; }
-.st-packages code { color: var(--ops-muted); font: 500 11px/1 var(--font-mono); }
+.st-packages code { color: var(--ops-muted); font: 500 11px/1 var(--font-mono); font-variant-numeric: tabular-nums; }
 .st-packages em { display: inline-flex; align-items: center; gap: 6px; color: var(--ops-copy); font-size: 12.5px; font-style: normal; font-weight: 600; }
 .st-packages a:hover em { color: var(--st-gold); }
 
 @media (max-width: 1180px) {
-  .story-chapters { width: 50vw; }
   .st-caps, .st-gates, .st-start { grid-template-columns: 1fr; }
   .st-gates, .st-start { gap: 10px; }
   .st-plan { grid-template-columns: minmax(0, 1fr) 20px; }
@@ -649,20 +619,13 @@ html { scroll-behavior: smooth; }
 /* Narrow screens: the stage becomes a sticky strip under the header and the
    chapters scroll beneath it. The progress pills and side shade go away. */
 @media (max-width: 960px) {
-  .story { display: block; }
-  .story-stage { z-index: 2; height: 50svh; min-height: 320px; box-shadow: 0 18px 40px rgba(0,0,0,.35); }
-  .story-scene { top: 84px; height: calc(100% - 84px); object-position: 22% 30%; }
-  .story-shade, [data-theme="light"] .story-shade { background: linear-gradient(0deg, rgba(7,6,5,.82) 0, transparent 42%), linear-gradient(180deg, rgba(7,6,5,.8) 0, transparent 26%); }
-  .story-say { left: 16px; right: 16px; bottom: 14px; max-width: none; padding-left: 12px; font-size: 15px; }
-  .story-progress { display: none; }
-  .story-chapters { justify-self: auto; width: auto; padding: 0 16px; }
-  .story-chapter { min-height: 0; padding: 72px 0 40px; }
-  .story-hero { padding-top: 40px; }
-  .st-replay { margin-top: 64px; }
+  .hp-hero { padding-top: 118px; }
+  .hp-section { padding-top: 72px; }
+  .hp-video { margin-top: 36px; }
+  .hp-flow li { flex: 1 1 46%; }
 }
 @media (max-width: 640px) {
-  .story-scene { top: 74px; height: calc(100% - 74px); }
-  .story-hero h1 { font-size: clamp(34px, 10vw, 46px); }
+  .hp-display { font-size: clamp(34px, 10vw, 46px); }
   .st-facts { grid-template-columns: 1fr; gap: 12px; }
   .st-compare-head { display: none; }
   .st-compare-row { grid-template-columns: 1fr; gap: 6px; }
@@ -675,6 +638,7 @@ html { scroll-behavior: smooth; }
   .st-packages a { grid-template-columns: 20px minmax(0, 1fr) auto; }
   .st-packages code { display: none; }
 }
-@media (prefers-reduced-motion: reduce) {
-  .story-say { animation: none; }
-}
+
+/* Plugin market heading shares the home display face (see .st-display). */
+.ext-display { font-size: clamp(38px, 5vw, 64px); line-height: 1.05; }
+.extensions-heading .st-kicker { margin-bottom: 2px; }
