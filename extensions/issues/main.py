@@ -9,8 +9,8 @@ posted it. This extension brings them back into the CLI:
     /issues <id>       one question's answers
 
 Picking the final answer is the model's tool, not a command: ask for it in
-the conversation ("pick answer 2 as final"). `issues.pick` settles the agreed reward —
-the host asks you before it does — and returns the answer, so the final
+the conversation ("pick answer 2 as final"). `issues.pick` selects an already-paid
+answer — the host asks you before it does — and returns it, so the picked
 answer lands in the conversation the way any tool result does.
 
 It calls Laintas as you through `ctx.laintas` (the `account` capability):
@@ -19,8 +19,6 @@ the host attaches your session; this code never sees it.
 from __future__ import annotations
 
 import re
-import threading
-import uuid
 
 from rich.markdown import Markdown
 from rich.text import Text
@@ -144,8 +142,7 @@ def _show_task(view):
         console.print(Text(_plain(a.get('note'))))
         console.print(Text('Squad: ' + ', '.join(s['name'] + ' (' + s['model'] + ')' for s in a['squad'])))
         credit = a.get('credit') or {}
-        console.print(Text(f"Accepted jobs: {credit.get('done', 0)} | quoted time: {a['deadline_hours']}h | unread: {a.get('unread', 0)}"))
-        console.print(Text(f"/issues chat {a['id']}"))
+        console.print(Text(f"Accepted jobs: {credit.get('done', 0)} | quoted time: {a['deadline_hours']}h"))
     run = task.get('execution') or {}
     if run:
         console.print(Text(f"\nRun: {run['id']} | {run['state']} | verified cost ${run['cost']['verified_usd']:.6f}"))
@@ -201,90 +198,12 @@ def _task_action(words):
     _show_task(result)
 
 
-def _chat(conversation_id):
-    """Live terminal conversation. The host retains credentials and approves sends.
-
-    Polls stay on the read-only account primitive. The worker is always joined
-    before returning to the CLI, including cancellation and failed requests.
-    """
-    from prompt_toolkit import PromptSession
-    from prompt_toolkit.patch_stdout import patch_stdout
-    base = f'/api/issues/conversations/{int(conversation_id)}'
-    initial = _get(base)
-    console = _ctx.console
-    stop, lock = threading.Event(), threading.Lock()
-    seen, cursor = set(), [0]
-
-    def display(view):
-        with lock:
-            for m in view['messages']:
-                if m['id'] in seen:
-                    continue
-                seen.add(m['id']); cursor[0] = max(cursor[0], m['id'])
-                peer = view.get('peer') or {}
-                who = 'You' if m['mine'] else peer.get('name') or peer.get('id') or 'Peer'
-                console.print(Text(_plain(f"{who}: {m['text']}")))
-
-    def poll():
-        failed = False
-        while not stop.wait(1):
-            try:
-                view = _get(base + f'?after={cursor[0]}')
-                if stop.is_set():
-                    break
-                display(view)
-                if failed:
-                    console.print(Text('Reconnected.'))
-                failed = False
-            except Exception:
-                if not failed and not stop.is_set():
-                    console.print(Text('Connection interrupted; retrying.'))
-                failed = True
-
-    console.print(Text(_plain(f"Private chat | {initial['title']} | /exit to leave. Messages do not call AI.")))
-    session = PromptSession()
-    retry = None
-    with patch_stdout():
-        display(initial)
-        worker = threading.Thread(target=poll, name='issues-private-chat', daemon=True)
-        worker.start()
-        try:
-            while True:
-                try:
-                    text = session.prompt('Message> ').strip()
-                except (EOFError, KeyboardInterrupt):
-                    break
-                if text == '/exit':
-                    break
-                if not text:
-                    continue
-                key = retry[1] if retry and retry[0] == text else uuid.uuid4().hex
-                retry = (text, key)
-                try:
-                    result = _post(base, {'text': text, 'client_id': key, 'seen_id': cursor[0]},
-                                   f"Send this private message to {(initial.get('peer') or {}).get('name') or 'the other participant'}: {text}")
-                    display(result); retry = None
-                except RuntimeError as exc:
-                    console.print(Text(_plain(f"Not sent: {exc}. Send the same text again to retry without duplication.")))
-        finally:
-            stop.set()
-            worker.join()  # account requests time out after 20 seconds
-
 def handle(argv: list) -> None:
     console = _ctx.console
     words = [w for w in argv if w.strip()]
     try:
         if words and words[0] in ('choose', 'accept', 'reject'):
             _task_action(words)
-            return
-        if words and words[0] == 'chat':
-            if len(words) != 2:
-                raise RuntimeError('Usage: /issues chat <application-id> (see /issues inbox)')
-            _chat(int(words[1]))
-            return
-        if words and words[0] == 'inbox':
-            for c in _get('/api/issues/conversations').get('conversations', []):
-                console.print(Text(_plain(f"{c['id']} | {c['title']} | {(c.get('peer') or {}).get('name')} | unread {c['unread']} | /issues chat {c['id']}")))
             return
         if words and words[0] == "list":
             issues = _get("/api/chat/issues").get("issues") or []
@@ -349,15 +268,13 @@ def setup(ctx) -> None:
             "issue_id": {"type": "string"}, "answer_id": {"type": "integer"}}}})
     ctx.register_command(
         "issues", handle,
-        description="Issues answers, task applicants, acceptance and private conversations",
+        description="Issues answers, task applicants and acceptance",
         subcommands=[("list", "Your latest questions asked from a chat"),
                      ("<id>", "Answers or task applicants and delivery"),
                      ("<id> <n>", "One answer in full"),
                      ("choose", "Choose an applicant: <issue-id> [application-id]"),
                      ("accept", "Accept delivered work: <issue-id>"),
-                     ("reject", "Reject delivery: <issue-id> <item> <reason>"),
-                     ("inbox", "Private conversations and unread counts"),
-                     ("chat", "Live private chat: <application-id>")])
+                     ("reject", "Reject delivery: <issue-id> <item> <reason>")])
 
 
 def teardown() -> None:

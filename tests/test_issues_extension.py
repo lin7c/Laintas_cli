@@ -238,13 +238,12 @@ class IssuesExtensionTests(unittest.TestCase):
         self.mod.handle([ISSUE, "1"])
         self.assertIn("THEEND", self.out.getvalue())
 
-    def test_task_display_shows_applicants_quotes_and_chat(self):
+    def test_task_display_shows_applicants_and_quotes(self):
         self.replies = [self.ok(self.task_view())]
         self.mod.handle([ISSUE])
         output = self.out.getvalue()
         self.assertIn('Application 7', output)
         self.assertIn('$1.00 human fee', output)
-        self.assertIn('/issues chat 7', output)
 
     def test_choose_is_explicit_approved_and_uses_task_endpoint(self):
         self.replies = [self.ok(self.task_view()), self.ok(self.task_view())]
@@ -271,21 +270,6 @@ class IssuesExtensionTests(unittest.TestCase):
         result = self.mod.tool_answers(ISSUE)
         self.assertFalse(result['can_pick'])
         self.assertIn('/issues choose', result['note'])
-
-    def test_live_chat_send_and_exit_stop_the_worker(self):
-        chat = {'id': 7, 'title': 'Task', 'peer': {'name': 'Worker'}, 'messages': []}
-        sent = {**chat, 'messages': [{'id': 1, 'text': 'Hello', 'mine': True}]}
-        self.replies = [self.ok(chat), self.ok(sent)]
-        session = mock.Mock()
-        session.prompt.side_effect = ['Hello', '/exit']
-        with mock.patch('prompt_toolkit.PromptSession', return_value=session), \
-                mock.patch('prompt_toolkit.patch_stdout.patch_stdout', return_value=nullcontext()):
-            self.mod._chat(7)
-        self.assertEqual(self.calls[-1][0:2], ('POST', '/api/issues/conversations/7'))
-        self.assertEqual(self.calls[-1][2]['text'], 'Hello')
-        self.assertTrue(self.calls[-1][2]['client_id'])
-        self.assertFalse(any(t.name == 'issues-private-chat' for t in threading.enumerate()))
-
 
 if __name__ == "__main__":
     unittest.main()
