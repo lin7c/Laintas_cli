@@ -27,11 +27,11 @@ ISSUE = "4cd0cbcb-1f5c-46f5-9ea5-ff1a7ebabeba"
 
 def view(**extra):
     return {"id": ISSUE, "url": f"https://issues.laintas.com/#/issue/{ISSUE}", "title": "Why?", "status": "open",
-            "open": True, "peopleOnly": False, "canAccept": True, "bountyCents": 100, "closedReason": None,
+            "open": True, "peopleOnly": False, "canSelect": True, "bountyCents": 100, "closedReason": None,
             "answers": [{"id": 1, "by": "ds", "solver": "ds", "trust": "provider", "body": "Because.", "version": 1.0,
-                         "accepted": False, "paid": False, "folded": False},
+                         "selected": False, "paidMicro": 0, "costMicro": 0, "folded": False},
                         {"id": 2, "by": "px", "solver": "px", "trust": "proxy", "body": "**Other** reason.",
-                         "version": 2.0, "accepted": False, "paid": False, "folded": False}], **extra}
+                         "version": 2.0, "selected": False, "paidMicro": 0, "costMicro": 0, "folded": False}], **extra}
 
 
 class ManifestTests(unittest.TestCase):
@@ -177,11 +177,11 @@ class IssuesExtensionTests(unittest.TestCase):
         self.assertTrue(out["can_pick"])
 
     def test_pick_asks_with_a_purpose_and_returns_the_final_answer(self):
-        self.replies = [self.ok(view()), self.ok(view(status="solved", open=False, canAccept=False))]
+        self.replies = [self.ok(view()), self.ok(view(status="solved", open=False, canSelect=False))]
         out = self.mod.tool_pick(ISSUE, 2)
         method, path, body, purpose = self.calls[1]
-        self.assertEqual((method, path, body), ("POST", f"/api/chat/issues/{ISSUE}/accept", {"answer_id": 2, "version": 2.0}))
-        self.assertIn("$1.00", purpose)
+        self.assertEqual((method, path, body), ("POST", f"/api/chat/issues/{ISSUE}/accept", {"answer_id": 2}))
+        self.assertIn("paid its Solver", purpose)
         self.assertEqual(out["final_answer"], "**Other** reason.")
 
     def test_pick_refused_by_the_person_is_an_error_not_a_pick(self):
@@ -189,19 +189,18 @@ class IssuesExtensionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "declined"):
             self.mod.tool_pick(ISSUE, 1)
 
-    def test_metered_budget_and_shared_reward_are_explained_in_english(self):
-        metered = view(paymentMode="verified_cost", costMicro=250000, remainingMicro=750000, rewardRule="split")
+    def test_metered_budget_is_explained_in_english(self):
+        metered = view(costMicro=250000, remainingMicro=750000)
         self.replies = [self.ok(metered)]
         self.mod.handle([ISSUE])
         text = self.out.getvalue()
         self.assertIn("Answer costs: $0.250000", text)
         self.assertIn("Remaining budget: $0.750000", text)
-        self.assertIn("shared equally", text)
+        self.assertIn("paid its Solver's quote", text)
         self.assertNotRegex(text, r"[\u3400-\u9fff]")
-        self.replies = [self.ok(metered), self.ok(view(status="solved", open=False, canAccept=False))]
+        self.replies = [self.ok(metered), self.ok(view(status="solved", open=False, canSelect=False))]
         self.mod.tool_pick(ISSUE, 2)
-        self.assertIn("$0.750000", self.calls[-1][3])
-        self.assertIn("shared equally", self.calls[-1][3])
+        self.assertIn("paid its Solver's quote", self.calls[-1][3])
 
     def test_command_lists_answers_and_points_to_the_conversation(self):
         self.replies = [self.ok({"issues": [{"id": ISSUE}]}), self.ok(view())]
@@ -218,20 +217,20 @@ class IssuesExtensionTests(unittest.TestCase):
         run = {'id': ISSUE, 'state': 'declared', 'cost': {'verified_usd': .2},
                'checklist': [{'index': 1, 'text': 'Works at 360px'}],
                'declaration': {'status': 'awaiting', 'items': [{'index': 1, 'evidence': 'Viewport checked'}]}}
-        return view(peopleOnly=True, canAccept=False, answers=[], task={
+        return view(peopleOnly=True, canSelect=False, answers=[], task={
             'escrow_usd': 5, 'applications_list': [offer], 'execution': run if awaiting else None})
 
     def _long_view(self):
         body = "start " + "filler " * 80 + "THEEND"
         return view(answers=[{"id": 1, "by": "ds", "solver": "ds", "trust": "provider", "body": body,
-                              "version": 1.0, "accepted": True, "paid": True, "folded": False}])
+                              "version": 1.0, "selected": True, "paidMicro": 0, "costMicro": 0, "folded": False}])
 
     def test_command_previews_long_answers_by_default(self):
         self.replies = [self.ok(self._long_view())]
         self.mod.handle([ISSUE])
         text = self.out.getvalue()
         self.assertNotIn("THEEND", text)
-        self.assertIn("FINAL", text)
+        self.assertIn("PICKED", text)
         self.assertIn("shows one in full", text)
 
     def test_command_expands_the_answer_named_by_number(self):

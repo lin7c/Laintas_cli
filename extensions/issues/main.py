@@ -54,7 +54,7 @@ def _issue(issue_id: str = "") -> dict:
 
 
 def _shown(view: dict) -> list:
-    return [a for a in view.get("answers") or [] if not a.get("folded") or a.get("accepted")]
+    return [a for a in view.get("answers") or [] if not a.get("folded") or a.get("selected")]
 
 
 def _state(view: dict) -> str:
@@ -69,12 +69,8 @@ def _state(view: dict) -> str:
 
 
 def _payment_rule(view: dict) -> str:
-    if view.get("paymentMode") != "verified_cost":
-        return "The accepted answer receives the bounty."
-    rule = {"accepted": "The remaining reward goes to the accepted answer.",
-            "split": "The remaining reward is shared equally among eligible answers.",
-            "time": "The remaining reward is shared by answer order among eligible answers."}
-    return "Verified answer costs are paid first. " + rule.get(view.get("rewardRule"), rule["accepted"])
+    return ("Every answer was paid its Solver's quote from the prepaid budget as it landed; "
+            "picking one pays nothing more, and unspent budget is refunded when the question closes.")
 
 
 # -- the model's tools ------------------------------------------------------------
@@ -87,13 +83,13 @@ def tool_answers(issue_id: str = "") -> dict:
                 'note': 'This is a personal task. The person uses /issues choose, /issues accept or /issues reject. '
                         'Choosing an ordinary answer with issues.pick does not apply.'}
     return {"issue_id": view["id"], "title": view.get("title"), "url": view.get("url"), "state": _state(view),
-            "can_pick": bool(view.get("canAccept")), "bounty_usd": int(view.get("bountyCents") or 0) / 100,
+            "can_pick": bool(view.get("canSelect")), "bounty_usd": int(view.get("bountyCents") or 0) / 100,
             "answer_cost_usd": int(view.get("costMicro") or 0) / 1e6,
             "remaining_usd": int(view.get("remainingMicro", int(view.get("bountyCents") or 0) * 10000)) / 1e6,
             "payment_rule": _payment_rule(view),
             "answers": [{"n": n, "answer_id": a["id"], "by": a.get("by") or "anonymous",
                          "unverified_upstream": bool(a.get("trust")) and a["trust"] not in ("official", "provider"),
-                         "final": bool(a.get("accepted")),
+                         "final": bool(a.get("selected")), "paid_usd": int(a.get("paidMicro") or 0) / 1e6,
                          "text": (a.get("body") or "")[:_ANSWER_CHARS]
                          + ("…(cut here; the whole answer comes back when it is picked)"
                             if len(a.get("body") or "") > _ANSWER_CHARS else "")}
@@ -105,18 +101,17 @@ def tool_pick(issue_id: str, answer_id: int) -> dict:
     answer = next((a for a in _shown(view) if a["id"] == int(answer_id)), None)
     if answer is None:
         raise RuntimeError("no such answer to this question; read them with issues.answers")
-    if not view.get("canAccept"):
+    if not view.get("canSelect"):
         raise RuntimeError(f"this question takes no pick now ({_state(view)})")
-    remaining = int(view.get("remainingMicro", int(view.get("bountyCents") or 0)*10000)) / 1e6
     out = _ctx.laintas.request(
-        "POST", f"/api/chat/issues/{view['id']}/accept", {"answer_id": answer["id"], "version": answer["version"]},
-        purpose=f"Pick the answer by {answer.get('by') or 'anonymous'} as final for “{view.get('title')}”: "
-                f"settles the remaining ${remaining:.6f} under the agreed rule. {_payment_rule(view)} This cannot be changed.")
+        "POST", f"/api/chat/issues/{view['id']}/accept", {"answer_id": answer["id"]},
+        purpose=f"Pick the answer by {answer.get('by') or 'anonymous'} for “{view.get('title')}”: "
+                f"it becomes the conversation's context. {_payment_rule(view)} The pick can be changed until the question closes.")
     if not out.get("ok"):
         raise RuntimeError(out.get("error") or "the pick failed")
     return {"picked": True, "issue_id": view["id"], "by": answer.get("by"),
             "final_answer": answer.get("body") or "",
-            "note": "This is now the question's final answer. Give it to the person as your reply."}
+            "note": "This is now the question's picked answer. Give it to the person as your reply."}
 
 
 # -- the person's command ---------------------------------------------------------
@@ -316,15 +311,14 @@ def handle(argv: list) -> None:
     answers = _shown(view)
     console.print(Text.assemble(("Issues", "bold"), f"  {view.get('title', '')}  ", (view.get("url", ""), "dim")))
     console.print(f"[dim]{len(answers)} answer(s) · {_state(view)}[/dim]")
-    if view.get("paymentMode") == "verified_cost":
-        console.print(f"[dim]Answer costs: ${int(view.get('costMicro') or 0)/1e6:.6f} · "
-                      f"Remaining budget: ${int(view.get('remainingMicro') or 0)/1e6:.6f}[/dim]")
-        console.print(Text(_payment_rule(view), style="dim"))
+    console.print(f"[dim]Answer costs: ${int(view.get('costMicro') or 0)/1e6:.6f} · "
+                  f"Remaining budget: ${int(view.get('remainingMicro') or 0)/1e6:.6f}[/dim]")
+    console.print(Text(_payment_rule(view), style="dim"))
     cut = False
     for n, a in enumerate(answers, 1):
         tags = [t for t in ("Solver" if a.get("solver") else "",
                             "unverified upstream" if a.get("trust") and a["trust"] not in ("official", "provider") else "",
-                            "FINAL" if a.get("accepted") else "", "paid for usage" if a.get("paid") else "") if t]
+                            "PICKED" if a.get("selected") else "", f"paid ${int(a.get('paidMicro') or 0)/1e6:.6f}" if a.get("paidMicro") else "") if t]
         console.print(Text.assemble("\n", (f"[{n}] ", "bold"), (a.get("by") or "anonymous", "bold"),
                                     (f"  {' · '.join(tags)}" if tags else "", "dim")))
         body = a.get("body") or ""
@@ -335,7 +329,7 @@ def handle(argv: list) -> None:
             console.print(Markdown(body[:_PREVIEW_CHARS].rstrip() + " ..."))
     if cut:
         console.print(f"\n[dim]Answers are previews; /issues {view['id']} <number> shows one in full.[/dim]")
-    if view.get("canAccept") and answers:
+    if view.get("canSelect") and answers:
         console.print("\n[dim]To pick the final answer, say so in the conversation, e.g. “pick answer 2 as final”.[/dim]")
 
 
@@ -348,9 +342,9 @@ def setup(ctx) -> None:
         "parameters": {"type": "object", "properties": {
             "issue_id": {"type": "string", "description": "The question's id, from its page link"}}}})
     ctx.register_tool("pick", tool_pick, {
-        "description": "Pick one answer as the question's final answer, ONLY when the person has said which one. "
-                       "It distributes the remaining reward under the question's agreed rule (with confirmation) and completes the "
-                       "question; the result carries the full final answer to give them.",
+        "description": "Pick one answer as the question's picked answer, ONLY when the person has said which one. "
+                       "It makes that answer the conversation's context (with confirmation); answers were already paid "
+                       "as they landed, so it moves no money. The result carries the full picked answer to give them.",
         "parameters": {"type": "object", "required": ["issue_id", "answer_id"], "properties": {
             "issue_id": {"type": "string"}, "answer_id": {"type": "integer"}}}})
     ctx.register_command(
