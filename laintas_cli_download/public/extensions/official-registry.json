@@ -26,6 +26,14 @@
       "sha256": "7b7287a6ba64c1a5a811c8b64a12710d41b9b264fcbb98efd586a924885b8a5e"
     },
     {
+      "id": "laintas/issues",
+      "name": "issues",
+      "version": "0.2.1",
+      "description": "Issues answers and personal tasks: choose applicants, accept delivery and chat privately in the CLI",
+      "url": "https://cli.laintas.com/extensions/official/issues-0.2.1.lext",
+      "sha256": "adff6f1908bd686856ecf0e96b49476bf7c706de2272757d866668e8063200af"
+    },
+    {
       "id": "laintas/swebench",
       "name": "swebench",
       "version": "1.0.0",

@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 2,
+  "name": "issues",
+  "version": "0.2.1",
+  "entrypoint": "main.py",
+  "description": "Issues answers and personal tasks: choose applicants, accept delivery and chat privately in the CLI",
+  "author": {
+    "name": "laintas"
+  },
+  "license": "MIT",
+  "toolPrefix": "issues.",
+  "capabilities": [
+    "account"
+  ],
+  "minCliVersion": "1.32.5b6"
+}
