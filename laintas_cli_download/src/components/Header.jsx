@@ -1,10 +1,14 @@
+import { createModalLayer } from '../../../../laintas/shared/ui-behavior.js';
+const ModalLayer = createModalLayer(NavReact);
+import { createUiHooks } from '../../../../laintas/shared/ui-behavior.js';
+const { useFocusScope } = createUiHooks(NavReact);
 import * as NavReact from 'react';
 import { createNavigationPreferences } from '../../../../laintas/src/components/navigation-preferences/react.js';
 const NavigationPreferences = createNavigationPreferences(NavReact);
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { AnimatePresence, motion } from 'framer-motion';
-import { ChevronDown, LogIn, LogOut, Settings, UserRound } from 'lucide-react';
+import { ChevronDown, LogIn, LogOut, Settings, UserRound, Menu, X } from 'lucide-react';
 import { useLanguage } from '../contexts/LanguageContext';
 import { useTheme } from '../contexts/ThemeContext';
 import { useAuth } from '../contexts/AuthContext';
@@ -21,9 +25,12 @@ export default function Header() {
   const auth = useAuth();
   const { data: session, isPending } = auth.useSession();
   const [userOpen, setUserOpen] = useState(false);
+  const [mobileOpen, setMobileOpen] = useState(false);
   const [balance, setBalance] = useState(null);
   const [version, setVersion] = useState('laintas-cli-beta-v5');
   const menuRef = useRef(null);
+  const userMenuRef = useRef(null);
+  useFocusScope(userOpen, userMenuRef, () => setUserOpen(false), false);
 
   useEffect(() => {
     const close = (event) => { if (menuRef.current && !menuRef.current.contains(event.target)) setUserOpen(false); };
@@ -61,6 +68,7 @@ export default function Header() {
             : <Link to={href} key={href}>{label}</Link>))}
         </nav>
         <div className="header-actions">
+          <button className="cli-menu-button" type="button" aria-expanded={mobileOpen} aria-controls="cli-mobile-nav" aria-label={lang === 'zh' ? '打开产品导航' : 'Open product navigation'} onClick={() => setMobileOpen(true)}><Menu size={20}/></button>
           <a className="pricing-link" href="https://laintas.com/pricing" target="_blank" rel="noreferrer">{lang === 'zh' ? '定价' : 'Pricing'}</a>
           <NavigationPreferences language={lang} theme={theme}
             onLanguageChange={next => { if (next !== lang) toggleLang(); }} onThemeChange={toggleTheme} />
@@ -70,7 +78,7 @@ export default function Header() {
               <ChevronDown size={12} />
             </button>
             <AnimatePresence>
-              {userOpen && <motion.div className="user-menu" initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 6 }} transition={{ duration: 0.15 }}>
+              {userOpen && <motion.div ref={userMenuRef} role="menu" className="user-menu" initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 6 }} transition={{ duration: 0.15 }}>
                 {loggedIn ? <>
                   <div className="user-meta"><strong>{session.user?.name || t.user.guest}</strong><span>{session.user?.email}</span>{balance != null && <code>${(balance / 100).toFixed(2)}</code>}</div>
                   <a href="https://laintas.com/settings" onClick={() => setUserOpen(false)}><Settings size={14} />{t.user.settings}</a>
@@ -85,6 +93,13 @@ export default function Header() {
           </div>
         </div>
       </div>
+      <ModalLayer open={mobileOpen} onClose={() => setMobileOpen(false)} className="cli-mobile-layer" label={lang === 'zh' ? '产品导航' : 'Product navigation'}>
+        <div className="cli-mobile-scrim" onClick={() => setMobileOpen(false)} />
+        <nav id="cli-mobile-nav" className="cli-mobile-drawer"><button type="button" aria-label={lang === 'zh' ? '关闭导航' : 'Close navigation'} onClick={() => setMobileOpen(false)}><X size={20}/></button>
+          <strong>Laintas CLI</strong>{NAV[lang].map(([label,href]) => <a key={href} href={href} onClick={() => setMobileOpen(false)}>{label}<span>↗</span></a>)}
+          <a href="https://laintas.com/products">{lang === 'zh' ? '全部 Laintas 产品' : 'All Laintas products'}<span>↗</span></a>
+        </nav>
+      </ModalLayer>
     </header>
   );
 }

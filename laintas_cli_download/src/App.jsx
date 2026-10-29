@@ -1,3 +1,4 @@
+import { MotionConfig } from 'framer-motion';
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import RouteMetadata from './components/RouteMetadata';
 import { ThemeProvider, useTheme } from './contexts/ThemeContext';
@@ -16,7 +17,7 @@ function AppContent() {
   const isDark = theme === 'dark';
 
   return (
-    <BrowserRouter>
+    <MotionConfig reducedMotion="user"><BrowserRouter>
       <RouteMetadata />
       <Routes>
         <Route path="/" element={
@@ -67,7 +68,7 @@ function AppContent() {
           </div>
         } />
       </Routes>
-    </BrowserRouter>
+    </BrowserRouter></MotionConfig>
   );
 }
 

@@ -1,3 +1,6 @@
+import * as UiReact from 'react';
+import { createModalLayer, scrollToSection } from '../../../../laintas/shared/ui-behavior.js';
+const ModalLayer = createModalLayer(UiReact);
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Check, Copy, Menu, X } from 'lucide-react';
@@ -163,7 +166,7 @@ export default function DocsPage() {
     const el = document.getElementById(id);
     if (!el) return;
     window.history.replaceState(null, '', `#${id}`);
-    el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    scrollToSection(el);
   }, []);
 
   const onContentClick = (event) => {
@@ -234,8 +237,7 @@ export default function DocsPage() {
         aria-label={zh ? '打开文档目录' : 'Open contents'}>
         <Menu size={15} /><span>{pick(activeSection?.title, lang)}</span>
       </button>
-      {drawer && (
-        <div className="cd-drawer-layer" role="dialog" aria-modal="true">
+      <ModalLayer open={drawer} onClose={() => setDrawer(false)} className="cd-drawer-layer" label={zh ? '文档目录' : 'Documentation contents'}>
           <div className="cd-drawer-backdrop" onClick={() => setDrawer(false)} />
           <div className="cd-drawer">
             <button type="button" className="cd-drawer-close" onClick={() => setDrawer(false)} aria-label={zh ? '关闭' : 'Close'}>
@@ -243,8 +245,7 @@ export default function DocsPage() {
             </button>
             {nav}
           </div>
-        </div>
-      )}
+        </ModalLayer>
 
       <SiteFooter />
     </main>
