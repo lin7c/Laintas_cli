@@ -5,6 +5,7 @@ import {
 } from 'lucide-react';
 import { useLanguage } from '@/contexts/LanguageContext';
 import SiteFooter from './SiteFooter';
+import { HELPWO_WINDOWS_NAME, HELPWO_WINDOWS_VERSION, HELPWO_WINDOWS_BYTES, HELPWO_WINDOWS_INSTALLER } from '../generated/helpwoWindowsDownload';
 
 const RELEASE_FALLBACK = 'laintas-cli-beta-v5';
 // The site mirrors the verified assets from the latest GitHub Release.
@@ -32,6 +33,7 @@ const PACKAGES = [
   { id: 'mac-arm', icon: Laptop, file: 'laintas-cli_darwin_arm64.tar.gz', size: '25 MB', names: { zh: 'macOS · Apple Silicon', en: 'macOS · Apple Silicon' }, details: { zh: 'tar.gz', en: 'tar.gz' } },
   { id: 'mac-intel', icon: Laptop, file: 'laintas-cli_darwin_amd64.tar.gz', size: '24 MB', names: { zh: 'macOS · Intel', en: 'macOS · Intel' }, details: { zh: 'tar.gz', en: 'tar.gz' } },
   { id: 'windows', icon: Monitor, href: WINDOWS_DOWNLOAD, size: '54 MB', date: '2026-10-22', names: { zh: 'laintas-cli-windows', en: 'laintas-cli-windows' }, details: { zh: '安装程序 · 自带终端窗口，无需 WSL', en: 'Installer · its own terminal window, no WSL' } },
+  { id: 'helpwo-windows', icon: Monitor, href: HELPWO_WINDOWS_INSTALLER, size: `${(HELPWO_WINDOWS_BYTES / 1024 / 1024).toFixed(1)} MB`, date: '2026-10-07', names: { zh: HELPWO_WINDOWS_NAME, en: HELPWO_WINDOWS_NAME }, details: { zh: 'Helpwo 桌面工作台 · 本地文件、编辑器、预览与终端', en: 'Helpwo desktop workbench · local files, editor, preview and terminals' } },
   { id: 'source', icon: Code2, file: 'laintas-cli_source.zip', size: '2.1 MB', names: { zh: '源码包', en: 'Source package' }, details: { zh: 'Python 3.10+ · 审计与二次开发', en: 'Python 3.10+ · audit and extend' } },
 ];
 
@@ -111,6 +113,8 @@ const COPY = {
     windowsSteps: [['安装', '在 PowerShell 执行指令，或直接下载安装包；无需管理员权限'], ['启动并登录', '从开始菜单打开 laintas-cli-windows，登录页会在默认浏览器里打开'], ['开始对话', '在默认工作区给 agent 一个任务']],
     packages: '安装包', download: '下载', checksums: '全部文件的 SHA256 校验和',
     requirements: 'Linux 需 64 位 glibc 系统；Mac 支持 Apple Silicon 和 Intel，暂不包含 Helpwo Kernel；laintas-cli-windows 需 x86_64、Windows 10/11 和 WebView2，安装器可联网安装 WebView2；无需 WSL。',
+    helpwoWindowsGuide: 'Helpwo windows：Windows 10/11（64 位）桌面版，使用同一个 Laintas 账户。安装与使用说明',
+    helpwoWindowsChecksum: 'Helpwo windows SHA-256 校验值',
   },
   en: {
     kicker: 'LAINTAS CLI · THE AI AGENT IN YOUR TERMINAL',
@@ -173,6 +177,8 @@ const COPY = {
     windowsSteps: [['Install', 'Run the command in PowerShell, or download the installer; no administrator rights needed'], ['Launch and sign in', 'Open laintas-cli-windows from Start; the sign-in page opens in your default browser'], ['Start a conversation', 'Give the agent a task in the default workspace']],
     packages: 'Packages', download: 'Download', checksums: 'SHA256 checksums for every file',
     requirements: 'Linux needs a 64-bit glibc system. Mac supports Apple Silicon and Intel without Helpwo Kernel. laintas-cli-windows needs Windows 10/11 x86_64 and WebView2; the installer can download WebView2. WSL is not needed.',
+    helpwoWindowsGuide: 'Helpwo windows: the desktop edition for Windows 10/11 (64-bit), using the same Laintas account. Install and use',
+    helpwoWindowsChecksum: 'Helpwo windows SHA-256 checksum',
   },
 };
 
@@ -314,16 +320,18 @@ export default function DownloadSection() {
           <p className="st-eco-title">{c.packages}</p>
           <div className="st-packages">
             {PACKAGES.map(({ id, icon: Icon, file, href, size, date, names, details }) => (
-              <a href={id === 'windows' ? windowsRelease.installer : href || `${RELEASE_BASE}/${file}`} key={id}>
+              <a id={id === 'helpwo-windows' ? id : undefined} href={id === 'windows' ? windowsRelease.installer : href || `${RELEASE_BASE}/${file}`} key={id}>
                 <Icon size={18} strokeWidth={1.6} />
                 <span><strong>{names[lang] || names.en}</strong><small>{details[lang] || details.en}</small></span>
-                <code>{id === 'windows' ? windowsRelease.version : release} · {size} · {date || RELEASE_DATE}</code>
+                <code>{id === 'windows' ? windowsRelease.version : id === 'helpwo-windows' ? `v${HELPWO_WINDOWS_VERSION}` : release} · {size} · {date || RELEASE_DATE}</code>
                 <em>{c.download}<ArrowDownToLine size={15} /></em>
               </a>
             ))}
           </div>
           <a className="st-link" href={`${RELEASE_BASE}/SHA256SUMS.txt`}>{c.checksums}<ArrowUpRight size={14} /></a>
           <p className="st-note">{c.requirements}</p>
+          <a className="st-link" href="https://helpwo.laintas.com/docs/#windows">{c.helpwoWindowsGuide}<ArrowUpRight size={14} /></a>
+          <a className="st-link" href={`${HELPWO_WINDOWS_INSTALLER}.sha256`}>{c.helpwoWindowsChecksum}<ArrowUpRight size={14} /></a>
         </section>
       </div>
 

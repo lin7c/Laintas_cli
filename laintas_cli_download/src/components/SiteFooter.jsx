@@ -1,3 +1,6 @@
+import * as LegalReact from 'react';
+import { createLegalLinks } from '../../../../laintas/shared/legal-links.js';
+const LegalLinks = createLegalLinks(LegalReact);
 import { useLanguage } from '../contexts/LanguageContext';
 import { Link } from 'react-router-dom';
 import BrandMark from './BrandMark';
@@ -25,6 +28,7 @@ export default function SiteFooter() {
         <a href="https://github.com/lin7c/Laintas_cli" target="_blank" rel="noreferrer">{c.source}</a>
         <a href="https://laintas.com/pricing" target="_blank" rel="noreferrer">{c.pricing}</a>
       </nav>
+      <LegalLinks product="cli" lang={lang} />
     </footer>
   );
 }

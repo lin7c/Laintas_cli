@@ -63,6 +63,9 @@ export const GROUPS = [
         id: 'install',
         title: L('安装', 'Install'),
         blocks: [
+          { t: 'note', title: L('Helpwo windows 桌面版', 'Helpwo windows desktop edition'),
+            ...L('想在 Windows 桌面使用 Helpwo 的对话、编辑器、预览和多个 Agent，请下载 [Helpwo windows](https://cli.laintas.com/#helpwo-windows)（原名 laintas-Helpwo-cli-for-windows）。它默认使用本机工作区的文件和终端；安装与使用见 [Helpwo windows 文档](https://helpwo.laintas.com/docs/#windows)。本节下面的 laintas-cli-windows 是独立的终端产品。',
+              'For Helpwo chat, editor, preview and agents in a Windows desktop window, download [Helpwo windows](https://cli.laintas.com/#helpwo-windows), formerly laintas-Helpwo-cli-for-windows. It uses local workspace files and terminals by default; see the [Helpwo windows guide](https://helpwo.laintas.com/docs/#windows). The laintas-cli-windows described below is a separate terminal product.') },
           { t: 'h', ...L('系统要求', 'Requirements') },
           {
             t: 'table',

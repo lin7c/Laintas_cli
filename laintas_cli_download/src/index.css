@@ -604,6 +604,11 @@ html { scroll-behavior: smooth; }
 .st-packages code { color: var(--ops-muted); font: 500 11px/1 var(--font-mono); font-variant-numeric: tabular-nums; }
 .st-packages em { display: inline-flex; align-items: center; gap: 6px; color: var(--ops-copy); font-size: 12.5px; font-style: normal; font-weight: 600; }
 .st-packages a:hover em { color: var(--st-gold); }
+#helpwo-windows { scroll-margin-top: 96px; }
+@media (max-width: 640px) {
+  .st-packages #helpwo-windows code { display: block; grid-column: 2 / -1; grid-row: 2; line-height: 1.5; }
+  .st-packages #helpwo-windows em { grid-column: 3; grid-row: 1; }
+}
 
 @media (max-width: 1180px) {
   .st-caps, .st-gates, .st-start { grid-template-columns: 1fr; }
