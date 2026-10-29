@@ -1,11 +1,10 @@
-import { readUiPreference, saveUiPreference } from '../../../../laintas/shared/ui-preferences.js';
 import { createContext, useContext, useState, useEffect } from 'react';
 
 const ThemeContext = createContext(null);
 
 export function ThemeProvider({ children }) {
   const [theme, setTheme] = useState(() => {
-    try { return readUiPreference('theme'); }
+    try { return localStorage.getItem('laintas-theme') || 'dark'; }
     catch { return 'dark'; }
   });
 
@@ -14,7 +13,7 @@ export function ThemeProvider({ children }) {
     try { localStorage.setItem('laintas-theme', theme); } catch {}
   }, [theme]);
 
-  const toggleTheme = () => setTheme(t => { const next=t === 'dark' ? 'light' : 'dark'; saveUiPreference('theme',next); return next; });
+  const toggleTheme = () => setTheme(t => t === 'dark' ? 'light' : 'dark');
 
   return (
     <ThemeContext.Provider value={{ theme, toggleTheme }}>

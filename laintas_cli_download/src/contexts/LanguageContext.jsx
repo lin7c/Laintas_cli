@@ -1,4 +1,3 @@
-import { readUiPreference, saveUiPreference } from '../../../../laintas/shared/ui-preferences.js';
 import { createContext, useContext, useState, useEffect } from 'react';
 
 const translations = {
@@ -232,7 +231,7 @@ const LanguageContext = createContext(null);
 
 export function LanguageProvider({ children }) {
   const [lang, setLang] = useState(() => {
-    try { return readUiPreference('lang'); }
+    try { return localStorage.getItem('laintas-lang') || 'en'; }
     catch { return 'en'; }
   });
 
@@ -240,7 +239,7 @@ export function LanguageProvider({ children }) {
     try { localStorage.setItem('laintas-lang', lang); } catch {}
   }, [lang]);
 
-  const toggleLang = () => setLang(l => { const next=l === 'zh' ? 'en' : 'zh'; saveUiPreference('lang',next); return next; });
+  const toggleLang = () => setLang(l => l === 'zh' ? 'en' : 'zh');
   const t = translations[lang];
 
   return (

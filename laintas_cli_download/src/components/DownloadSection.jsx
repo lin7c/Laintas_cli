@@ -370,13 +370,17 @@ function DemoVideo({ lang, c }) {
   useEffect(() => {
     const video = ref.current;
     if (!video) return;
-    const media=window.matchMedia('(prefers-reduced-motion: reduce)');
-    let visible=false;
-    const update=()=>{if(visible&&!document.hidden&&!media.matches)video.play().catch(()=>{});else video.pause();};
-    video.removeAttribute('autoplay');
-    const io=new IntersectionObserver(([entry])=>{visible=entry.isIntersecting;update();},{threshold:0.2});
-    io.observe(video);media.addEventListener('change',update);document.addEventListener('visibilitychange',update);update();
-    return ()=>{io.disconnect();media.removeEventListener('change',update);document.removeEventListener('visibilitychange',update);video.pause();};
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      video.pause();
+      video.removeAttribute('autoplay');
+      return;
+    }
+    const io = new IntersectionObserver(([entry]) => {
+      if (entry.isIntersecting) video.play().catch(() => {});
+      else video.pause();
+    }, { threshold: 0.2 });
+    io.observe(video);
+    return () => io.disconnect();
   }, [variant]);
 
   return (
@@ -389,10 +393,7 @@ function DemoVideo({ lang, c }) {
           <source src={`/media/laintas-cli-demo-${variant}.mp4`} type="video/mp4" />
         </video>
       </div>
-      <figcaption><strong>{c.videoTitle}</strong><span>{c.videoNote}</span>
-        <button type="button" className="st-button" onClick={() => { if (ref.current?.requestFullscreen) ref.current.requestFullscreen().catch(() => {}); else if (ref.current?.webkitEnterFullscreen) ref.current.webkitEnterFullscreen(); }}>{lang === 'zh' ? '放大演示' : 'Expand demo'}</button>
-        <ol className="cli-demo-summary"><li>{lang === 'zh' ? '读项目：先理解现有文件与约束。' : 'Inspect the project and its constraints.'}</li><li>{lang === 'zh' ? '执行与验证：运行命令、测试并检查产出。' : 'Run commands and tests, then verify the result.'}</li><li>{lang === 'zh' ? '检查结果：在终端中跟进每一步。' : 'Review each step directly in the terminal.'}</li></ol>
-      </figcaption>
+      <figcaption><strong>{c.videoTitle}</strong><span>{c.videoNote}</span></figcaption>
     </figure>
   );
 }
