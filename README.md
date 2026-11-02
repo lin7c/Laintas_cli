@@ -779,9 +779,9 @@ itself yet.
 signed updates; CLI releases must never overwrite that channel. Historical
 release notes below describe the builds shipped at the time.
 
-The current public release is [Laintas CLI v2.0.0](https://github.com/lin7c/Laintas_cli/releases/tag/v2.0.0)
-(tag `v2.0.0`). It is an ordinary GitHub Release, marked `latest`;
-its Python package version is `2.0.0`. The Mac package is an initial native
+The current public release is [Laintas CLI v2.0.1](https://github.com/lin7c/Laintas_cli/releases/tag/v2.0.1)
+(tag `v2.0.1`). It is an ordinary GitHub Release, marked `latest`;
+its Python package version is `2.0.1`. The Mac package is an initial native
 CLI build without Helpwo Kernel. See [the release guide](build/RELEASE.md) for
 build and verification details.
 
