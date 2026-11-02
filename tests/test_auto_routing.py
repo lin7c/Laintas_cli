@@ -108,25 +108,20 @@ class SelectorTest(_PrefsCase):
         with mock.patch.object(laintas_cli, "select_dialog", side_effect=fake):
             return laintas_cli.show_model_selector(self.MODELS, "", **kwargs)
 
-    def test_settings_row_shifts_models_by_one(self):
-        self.assertEqual(self._pick(0, routing_settings=True), {"id": "auto", "provider": ""})
-        self.assertEqual(self._pick(1, routing_settings=True), {"routing_settings": True})
-        self.assertEqual(self._pick(2, routing_settings=True)["id"], "glm-5.3")
-        self.assertEqual(self._pick(3, routing_settings=True)["id"], "gpt-6-luna")
-
-    def test_other_pickers_are_unchanged(self):
+    def test_picker_selects_auto_and_models(self):
+        self.assertEqual(self._pick(0), {"id": "auto", "provider": ""})
         self.assertEqual(self._pick(1)["id"], "glm-5.3")
         self.assertEqual(self._pick(2)["id"], "gpt-6-luna")
 
-    def test_current_model_is_preselected_below_the_settings_row(self):
+    def test_current_model_is_preselected_below_auto(self):
         seen = {}
 
         def fake(labels, **kw):
             seen["index"] = kw["selected_index"]
             return None
         with mock.patch.object(laintas_cli, "select_dialog", side_effect=fake):
-            laintas_cli.show_model_selector(self.MODELS, "gpt-6-luna", routing_settings=True)
-        self.assertEqual(seen["index"], 3)
+            laintas_cli.show_model_selector(self.MODELS, "gpt-6-luna")
+        self.assertEqual(seen["index"], 2)
 
 
 class MenuTest(_PrefsCase):

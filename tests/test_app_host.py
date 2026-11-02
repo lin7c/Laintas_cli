@@ -245,7 +245,7 @@ class ConversationAliasTests(unittest.TestCase):
                 self.assertTrue((Path(raw) / "app-helpwo-abc.json").exists())
                 self.assertFalse((Path(raw) / "primary.json").exists())
                 loaded = agent_persistence.load_agent_state("primary")
-                self.assertEqual(loaded["chat_history"][0]["content"], "hi")
+                self.assertEqual(loaded["chat_history"][0]["content"], [{"type": "text", "text": "hi"}])
             finally:
                 agent_persistence.set_storage_alias("primary", None)
             self.assertIsNone(agent_persistence.load_agent_state("primary"))

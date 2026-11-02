@@ -495,7 +495,10 @@ def fit(text: str, node: Node, budget: int, count: Callable[[str], int], *,
         body = fit(seg.inner, child, inner_budget, count, depth=depth + 1,
                    state=state, hysteresis=hysteresis, rows=rows,
                    enforce=is_over)
-        if is_over and count(body) > inner_budget:
+        # A structured child already distributed its budget recursively.
+        # Flattening and truncating it again can delete a protected grandchild
+        # (such as durable user rules) whose floor deliberately exceeds it.
+        if is_over and not child.children and count(body) > inner_budget:
             body = fit_text(body, inner_budget, child.shrink, count, child.path)
         if depth + 1 <= 2:
             if body or child.shrink != "drop":

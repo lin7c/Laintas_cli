@@ -37,7 +37,7 @@ fi
 if [ -n "$LAINTAS_TERMINAL_SHELL" ]; then
     set -- "${1:-30}" "${2:-100}" bash --norc --noprofile
 else
-    set -- "${1:-30}" "${2:-100}" python3 "$app/laintas_cli.py"
+    set -- "${1:-30}" "${2:-100}" python3 "$app/cli_entry.py"
 fi
 rows="$1"; cols="$2"; shift 2
 exec python3 "$app/build/windows/term_host.py" --rows "$rows" --cols "$cols" -- "$@"

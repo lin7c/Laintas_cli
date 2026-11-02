@@ -105,6 +105,9 @@ KNOWN_CAPABILITIES: frozenset = frozenset({
     # Subscribes to host lifecycle events (`ctx.on`): sees every prompt typed,
     # every reply and every tool call's arguments.
     "observe",
+    # Calls Laintas as the signed-in person (`ctx.laintas`): reads their data
+    # and, after they approve each one, makes changes that can spend balance.
+    "account",
 })
 
 
@@ -439,6 +442,7 @@ class ExtensionManager:
         Returns an :class:`InstallResult`.
         """
         kind = self.detect_source(source)
+        _set_bundled_declined(source, False)
         try:
             if kind == "local-dir":
                 return self._install_from_directory(
@@ -462,6 +466,7 @@ class ExtensionManager:
         """Remove an extension by name.  Returns True if something was removed."""
         if not _SAFE_NAME.fullmatch(name or ""):
             return False
+        _set_bundled_declined(name, True)
         if self._rt is not None:
             self._rt.unload(name)
         trust_store.revoke_extension(_TRUST_KIND, name)
@@ -1097,3 +1102,65 @@ class ExtensionManager:
 def _now_iso() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
+
+
+# ── Bundled official extensions ─────────────────────────────────────────
+# extension_runtime.BUNDLED_EXTENSIONS ship inside the CLI. Each start seeds
+# any missing (or older seeded) copy into the machine-wide extensions
+# directory, where "installed means enabled" loads it like any other. A copy
+# the person installed themselves is never touched, and `/extensions remove`
+# is remembered: a removed bundled extension stays removed until installed.
+
+def _declined_file() -> Path:
+    return paths.global_extensions_dir().parent / "bundled-extensions-removed.json"
+
+
+def _bundled_declined() -> set:
+    try:
+        value = json.loads(_declined_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    return {str(n) for n in value} if isinstance(value, list) else set()
+
+
+def _set_bundled_declined(name: str, declined: bool) -> None:
+    from extension_runtime import BUNDLED_EXTENSIONS
+    if name not in BUNDLED_EXTENSIONS:
+        return
+    names = _bundled_declined()
+    if (name in names) == declined:
+        return
+    names = names | {name} if declined else names - {name}
+    try:
+        _declined_file().parent.mkdir(parents=True, exist_ok=True)
+        _declined_file().write_text(json.dumps(sorted(names)), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def seed_bundled() -> list:
+    """Install or refresh the bundled extensions. Returns the names written."""
+    from extension_runtime import BUNDLED_EXTENSIONS, BUNDLED_ROOT
+    written = []
+    declined = _bundled_declined()
+    for name in BUNDLED_EXTENSIONS:
+        source = BUNDLED_ROOT / name
+        if name in declined or not (source / "extension.json").is_file():
+            continue
+        target = paths.global_extensions_dir() / name
+        try:
+            wanted = read_manifest(source)
+            if target.exists():
+                have = read_manifest(target)
+                seeded = (have.get("install") or {}).get("trustedBy") == "bundled"
+                if not seeded or have.get("version") == wanted.get("version"):
+                    continue
+                shutil.rmtree(target)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            stamped = {**wanted, "install": {"trustedBy": "bundled", "source": "laintas-cli"}}
+            (target / "extension.json").write_text(json.dumps(stamped, indent=2) + "\n", encoding="utf-8")
+            written.append(name)
+        except (OSError, ValueError):
+            continue
+    return written

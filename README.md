@@ -90,7 +90,7 @@ For unsupported native targets, development, or auditing, use the source package
 unzip laintas-cli_source.zip
 cd laintas-cli-source
 python3 -m pip install -r requirements.txt
-python3 laintas_cli.py
+python3 cli_entry.py
 ```
 
 Optional browser, MCP, and advanced web-fetch dependencies are documented in `requirements.txt`.
@@ -1461,3 +1461,8 @@ Laintas CLI is maintained by its contributors. Parts of the release packaging an
 </p>
 
 <p align="center"><sub>Laintas CLI is part of <a href="https://laintas.com">Laintas</a>.</sub></p>
+
+
+## Legal documents
+
+Hosted services use the [Laintas platform terms](https://laintas.com/policies/terms), [product terms](https://laintas.com/policies/products/cli), [privacy policy](https://laintas.com/policies/privacy), [data use and training notice](https://laintas.com/policies/data-use), and [billing and refund policy](https://laintas.com/policies/billing). Versioned, printable copies are available in the [legal centre](https://laintas.com/policies). The software licence supplied with the particular distribution remains separate; hosted-service terms do not expand software or third-party licences.

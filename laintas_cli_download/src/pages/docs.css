@@ -30,7 +30,7 @@
 /* article */
 .cd-article { min-width: 0; max-width: 780px; }
 .cd-hero { padding-bottom: 34px; border-bottom: 1px solid var(--ops-line); }
-.cd-hero h1 { margin: 20px 0 0; color: var(--ops-ink); font-size: clamp(34px, 4.6vw, 54px); font-weight: 550; line-height: 1.04; letter-spacing: -.05em; }
+.cd-hero h1 { margin: 0; color: var(--ops-ink); font-size: clamp(34px, 4.6vw, 54px); font-weight: 550; line-height: 1.15; letter-spacing: -.035em; }
 .cd-hero > p:last-child { max-width: 640px; margin: 18px 0 0; color: var(--ops-copy); font-size: 15px; line-height: 1.8; }
 
 .cd-section { scroll-margin-top: 104px; padding: 46px 0 6px; border-bottom: 1px solid var(--ops-line); }
@@ -74,7 +74,7 @@
 .cd-table td:first-child { color: var(--ops-ink); }
 .cd-table td:first-child code, .cd-table td:nth-child(2) > code:only-child { white-space: nowrap; }
 
-.cd-callout { margin: 0 0 18px; padding: 13px 16px; border: 1px solid rgba(24,162,102,.3); border-left-width: 3px; border-radius: 7px; background: rgba(24,162,102,.06); }
+.cd-callout { margin: 0 0 18px; padding: 13px 16px; border: 1px solid rgba(24,162,102,.3); border-left-width: 1px; border-radius: 7px; background: rgba(24,162,102,.06); }
 .cd-callout-warn { border-color: rgba(216,59,50,.32); background: rgba(216,59,50,.05); }
 .cd-callout-title { margin: 0 0 5px; color: #4fb883; font: 600 10.5px/1.4 var(--font-mono); letter-spacing: .12em; text-transform: uppercase; }
 .cd-callout-warn .cd-callout-title { color: #de6f68; }
@@ -107,3 +107,34 @@
   .cd-grid.page-shell { width: calc(100% - 32px); }
   .cd-section h2 { font-size: 23px; }
 }
+
+/* Search and the native, keyboard-contained mobile contents dialog. */
+.cd-search-area { position: relative; margin-top: 24px; }
+.cd-search { display: flex; align-items: center; gap: 12px; padding: 0 16px; min-height: 50px; border: 1px solid var(--ops-line-strong); border-radius: 9px; color: var(--ops-copy); background: var(--ops-surface); }
+.cd-search:focus-within { outline: 2px solid var(--color-accent); outline-offset: 3px; }
+.cd-search input { flex: 1; min-width: 0; min-height: 48px; border: 0; outline: none; background: transparent; color: var(--ops-ink); font: 14px var(--font-sans); }
+.cd-search input::placeholder { color: var(--ops-copy); }
+.cd-search-results { margin-top: 8px; padding: 16px; border: 1px solid var(--ops-line-strong); border-radius: 9px; background: var(--ops-surface); }
+.cd-search-results p { margin: 0 0 8px; color: var(--ops-copy); font-size: 12px; }
+.cd-search-results a { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 44px; padding: 8px; border-radius: 6px; color: var(--ops-ink); text-decoration: none; font-size: 14px; }
+.cd-search-results a:hover { background: var(--ops-surface-2); }
+.cd-search-results button { margin-top: 10px; min-height: 36px; padding: 0 8px; border: 0; color: var(--ops-copy); background: transparent; font: 12px var(--font-sans); }
+.cd-code-bar button { min-height: 44px; }
+.cd-copy-error { margin: 0; padding: 12px 16px; color: var(--ops-copy); font-size: 12px; border-top: 1px solid var(--ops-line); }
+.cd-callout-title { color: var(--st-allow); }
+.cd-callout-warn .cd-callout-title { color: var(--st-deny); }
+.cd-drawer-layer { width: 100%; height: 100dvh; max-width: none; max-height: none; margin: 0; padding: 0; border: 0; background: transparent; color: var(--ops-ink); }
+.cd-drawer-layer:not([open]) { display: none; }
+.cd-drawer-layer::backdrop { background: rgba(0,0,0,.6); }
+.cd-drawer-layer[open] .cd-drawer { animation: contents-enter 220ms var(--ui-ease); }
+.cd-drawer { width: min(340px, 88vw); padding: 24px 18px max(32px, env(safe-area-inset-bottom)); overscroll-behavior: contain; }
+.cd-drawer h2 { margin: 2px 0 28px 10px; font-size: 18px; font-weight: 600; }
+.cd-drawer .cd-nav a { min-height: 44px; display: flex; align-items: center; }
+.cd-drawer-close { width: 44px; height: 44px; }
+.cd-drawer-button { min-height: 48px; bottom: max(20px, env(safe-area-inset-bottom)); max-width: calc(100vw - 40px); }
+@keyframes contents-enter { from { opacity: .4; transform: translateX(-24px); } to { opacity: 1; transform: translateX(0); } }
+@media (max-width: 640px) {
+  .cd-search input { font-size: 16px; }
+  .cd-page .product-footer { padding-bottom: 92px; }
+}
+@media (prefers-reduced-motion: reduce) { .cd-drawer-layer[open] .cd-drawer { animation: none; } }

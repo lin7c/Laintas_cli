@@ -68,6 +68,53 @@ def _agent_file(agent_id: str) -> Path:
     return AGENTS_DIR / f"{_ID_ALIASES.get(agent_id, agent_id)}.json"
 
 
+def _canonical_history(history: list) -> list:
+    """The stored form of a snapshot is the kernel's canonical form
+    (Context Kernel SPEC §1) — the same items a context takes across
+    products. Items the kernel refuses (local roles, malformed calls)
+    are kept as they are: a snapshot must never lose a turn over a
+    formality, and the restore conversion is safe on both shapes."""
+    try:
+        import context_kernel as kernel
+    except Exception:
+        return history
+    out = []
+    for item in history:
+        if not isinstance(item, dict):
+            out.append(item)
+            continue
+        try:
+            converted = kernel.from_wire(item)
+            if (isinstance(converted, dict)
+                    and converted.get("reasoning_content")
+                    and not converted.get("reasoning")):
+                converted["reasoning"] = converted.pop("reasoning_content")
+            out.append(kernel.normalize_item(converted))
+        except Exception:
+            out.append(item)
+    return out
+
+
+def _restored_history(data: dict) -> list:
+    """Canonical snapshots go back through to_wire_lossless — the
+    same conversion a received context lands with. Files written
+    before the canonical form carry wire history and pass through."""
+    history = list(data["chat_history"])
+    if data.get("history_form") != "canonical":
+        return history
+    try:
+        import context_kernel as kernel
+    except Exception:
+        return history
+    out = []
+    for item in history:
+        try:
+            out.append(kernel.to_wire_lossless(item))
+        except Exception:
+            out.append(item)
+    return out
+
+
 def save_agent_state(agent: "AgentInfo") -> bool:
     """Atomically write agent state to disk. Returns True on success."""
     if getattr(agent, "remote_terminal", ""):
@@ -80,6 +127,7 @@ def save_agent_state(agent: "AgentInfo") -> bool:
     history = list(getattr(agent, "chat_history", []) or [])
     if len(history) > _MAX_HISTORY_TURNS:
         history = history[-_MAX_HISTORY_TURNS:]
+    history = _canonical_history(history)
 
     data = {
         "schema_version": 2,
@@ -95,6 +143,7 @@ def save_agent_state(agent: "AgentInfo") -> bool:
         "base_model": getattr(agent, "base_model", ""),
         "base_provider": getattr(agent, "base_provider", ""),
         "chat_history": history,
+        "history_form": "canonical",
         "state": dict(getattr(agent, "state", {}) or {}),
         "profile": _serialize_profile(getattr(agent, "profile", None)),
         "assignment_history": list(
@@ -223,7 +272,7 @@ def apply_persisted_state(agent: "AgentInfo", data: dict) -> None:
         agent.deployment_terminal = None
         agent.stationed_terminal = None
     if isinstance(data.get("chat_history"), list):
-        agent.chat_history = list(data["chat_history"])
+        agent.chat_history = _restored_history(data)
     if isinstance(data.get("state"), dict):
         merged = dict(agent.state or {})
         merged.update(data["state"])

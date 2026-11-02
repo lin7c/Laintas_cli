@@ -72,6 +72,17 @@ def test_floors_hold_even_past_the_budget():
     assert count(segs["a"].inner) >= 78
 
 
+def test_parent_compression_preserves_a_protected_nested_child():
+    node = tree(context={"share": 1.0, "children": {
+        "bulk": {"share": 0.9},
+        "rules": {"share": 0.1, "shrink": "none"},
+    }})
+    text = "<context>\n" + block("bulk", 200) + block("rules", 0, "always keep this rule") + "</context>"
+    out = pb.fit(text, node, 40, count, depth=1, state={})
+    assert "always keep this rule" in out
+    assert "<context>" in out and "</context>" in out
+
+
 def test_hysteresis_keeps_a_block_compressed_just_below_the_line():
     state = {}
     assert pb.triggered(state, "p", 110, 100, 0.9)
@@ -168,6 +179,13 @@ def test_an_oversized_prompt_cedes_the_gateway_first_then_compresses(input_budge
     assert not any("gateway" in row["path"] for row in rows)  # never shown
 
 
+def test_fallback_tokenizer_preserves_nested_durable_rules(input_budget, monkeypatch):
+    monkeypatch.setattr(loop.tokenizer, "_TIKTOKEN_AVAILABLE", False)
+    input_budget(10_000)
+    out = loop.fit_system_prompt(SYSTEM, {})
+    assert "- [r1] never deploy" in out
+
+
 def test_the_gateway_alone_can_tip_the_prompt_over(input_budget):
     input_budget(10_000)
     loop.set_runtime_config("budget.system.share", 0.9)
@@ -189,6 +207,29 @@ def test_tool_narrowing_keeps_the_core_surface(input_budget):
     assert kept < names
     input_budget(10_000_000)
     assert loop.fit_tool_names(names, {}) == names
+
+
+def test_tool_narrowing_keeps_recently_used_tools_over_name_order(input_budget):
+    # A Windows session lost every win.* schema the turn after tool.search
+    # found them: the cut went by name, so browser.* (b < w) stayed instead.
+    names = {"fs.read", "shell.exec", "browser.open", "browser.click", "hwo"}
+    cost = loop._tool_schema_tokens
+    room = cost("fs.read") + cost("shell.exec") + max(
+        cost("browser.open"), cost("browser.click"), cost("hwo"))
+    input_budget(room * 10 + 5)              # tools share 10%: core + one more
+    by_name = loop.fit_tool_names(names, {})
+    assert "hwo" not in by_name and len(by_name) > 2   # name order cuts it first
+    state = {}
+    loop.note_tool_recency(state, ["hwo"])
+    kept = loop.fit_tool_names(names, state)
+    assert "hwo" in kept and {"fs.read", "shell.exec"} <= kept
+
+
+def test_tool_recency_moves_newest_to_front():
+    state = {}
+    loop.note_tool_recency(state, ["win.launch", "win.click"])
+    loop.note_tool_recency(state, ["win.screenshot", "win.launch"])
+    assert state["_tool_recency"] == ["win.screenshot", "win.launch", "win.click"]
 
 
 def test_live_tail_compresses_bulky_blocks_and_keeps_the_task(input_budget):

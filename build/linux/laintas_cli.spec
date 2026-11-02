@@ -38,7 +38,7 @@ _hidden += ['json', 'shlex', 'subprocess', 'platform', 'socket', 'urllib',
             'pathlib', 'datetime', 'uuid']
 
 a = Analysis(
-    ['../../laintas_cli.py'],
+    [os.path.join(_PROJECT_DIR, 'cli_entry.py')],
     pathex=['../..'],
     binaries=[],
     datas=_datas,

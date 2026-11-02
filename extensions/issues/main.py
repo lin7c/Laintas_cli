@@ -200,6 +200,11 @@ def _task_action(words):
 
 def handle(argv: list) -> None:
     console = _ctx.console
+    # The host hands over the full command line, command name first (the
+    # convention every bundled extension follows); the unit tests call
+    # with the name already stripped. Accept both.
+    if argv and argv[0].strip().lstrip("/") == "issues":
+        argv = argv[1:]
     words = [w for w in argv if w.strip()]
     try:
         if words and words[0] in ('choose', 'accept', 'reject'):

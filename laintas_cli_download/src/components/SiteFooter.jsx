@@ -16,13 +16,13 @@ const COPY = {
         footer: 'Local runtime. Observable work. Controlled execution.' },
 };
 
-export default function SiteFooter() {
+export default function SiteFooter({ compact = false }) {
   const { lang } = useLanguage();
   const c = COPY[lang] || COPY.en;
   return (
-    <footer className="product-footer page-shell">
+    <footer className={`product-footer page-shell${compact ? ' is-compact' : ''}`}>
       <BrandMark compact />
-      <p>{c.footer}</p>
+      <p>{compact ? `© ${new Date().getFullYear()} Laintas` : c.footer}</p>
       <nav>
         <Link to="/docs">{c.docs}</Link>
         <a href="https://github.com/lin7c/Laintas_cli" target="_blank" rel="noreferrer">{c.source}</a>

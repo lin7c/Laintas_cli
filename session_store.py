@@ -276,8 +276,10 @@ def create_session(cwd: str, state: Optional[dict] = None,
         "last_exit_reason": "",
         "pending_continuation": False,
         "turn_count": 0,
-        "state": copy.deepcopy(state or {}),
-        "agent_state": copy.deepcopy(state or {}),
+        # save_session detaches both state views before writing. Do not copy
+        # the entire native thread again here and immediately discard it.
+        "state": state or {},
+        "agent_state": None,
         "tasks": [],
         # Last on purpose, and it must stay last: agent_loop._read_session_header
         # answers the session walk from a bounded head read, which only works
@@ -288,7 +290,6 @@ def create_session(cwd: str, state: Optional[dict] = None,
     }
     if isinstance(session["state"], dict):
         session["state"]["_session_id"] = session_id
-        session["agent_state"] = copy.deepcopy(session["state"])
     try:
         import workgraph
         active = workgraph.get_active_work(cwd=cwd, session_id=session_id)
@@ -448,8 +449,9 @@ def sync_runtime(session: dict, state: dict, chat_history: list, *, cwd: str = N
     if cwd:
         session["cwd"] = cwd
     if state is not None:
-        session["state"] = copy.deepcopy(state)
-        session["agent_state"] = copy.deepcopy(state)
+        # save_session owns detachment: after it returns, both views are
+        # independent snapshots, including when callers reuse this session.
+        session["state"] = state
         if state.get("_work_id"):
             session["active_work_id"] = str(state["_work_id"])
     if chat_history is not None:

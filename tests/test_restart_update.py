@@ -357,9 +357,13 @@ class UpdateChannelTests(unittest.TestCase):
             page)
         # Linux and Mac use the same architecture-detecting installer. Other
         # packages remain direct downloads.
-        self.assertIn("id: 'mac'", page)
-        self.assertIn("Apple Silicon / Intel", page)
-        for asset in ("laintas-cli_source.zip",):
+        for platform in ("linux", "mac"):
+            self.assertRegex(
+                page,
+                rf"\b{platform}\s*:\s*['\"]curl -fsSL "
+                r"https://cli\.laintas\.com/install\.sh \| bash['\"]")
+        for asset in ("laintas-cli_source.zip", "laintas-cli_darwin_arm64.tar.gz",
+                      "laintas-cli_darwin_amd64.tar.gz"):
             self.assertIn(asset, page)
 
 

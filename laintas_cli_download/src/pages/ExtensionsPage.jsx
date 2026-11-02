@@ -3,9 +3,9 @@ import SiteFooter from '../components/SiteFooter';
 
 export default function ExtensionsPage() {
   return (
-    <main className="product-page">
+    <main id="main-content" tabIndex={-1} className="product-page">
       <ExtensionsSection standalone />
-      <SiteFooter />
+      <SiteFooter compact />
     </main>
   );
 }

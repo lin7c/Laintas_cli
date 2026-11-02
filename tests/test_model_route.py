@@ -367,12 +367,12 @@ class ModelRouteTests(unittest.TestCase):
         with mock.patch.object(laintas_cli.sys.stdin, "isatty", return_value=True), \
                 mock.patch.object(laintas_cli, "select_dialog", side_effect=pick):
             self._run_model()
-        # auto, its settings row (/model routing), backend model, route
-        self.assertEqual(len(seen["labels"]), 4)
-        self.assertIn("auto-routing settings", seen["labels"][1])
-        self.assertIn("deepseek-chat", seen["labels"][3])
-        self.assertEqual(seen["index"], 3)                # the active route is current
-        self.assertTrue(seen["labels"][3].startswith(" *"))
+        # auto, backend model, route; settings stay under /model routing.
+        self.assertEqual(len(seen["labels"]), 3)
+        self.assertFalse(any("auto-routing settings" in label for label in seen["labels"]))
+        self.assertIn("deepseek-chat", seen["labels"][2])
+        self.assertEqual(seen["index"], 2)                # the active route is current
+        self.assertTrue(seen["labels"][2].startswith(" *"))
         self.assertFalse(seen["labels"][0].startswith(" *"))
         self.assertFalse(seen["labels"][1].startswith(" *"))
         self.assertEqual(store.get(model_route.PREF_KEY), "ds")

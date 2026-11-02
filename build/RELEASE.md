@@ -159,11 +159,11 @@ directory, prerender there, then `rsync -a` the result into `dist/`. The
 prerenderer, not to Vite.
 
 **Windows desktop releases are independent.** The product is named
-`laintas-Helpwo-cli-for-windows`. The private project
+`Helpwo windows`. The private project
 `lin7c/laintas-Helpwo-cli-agent-for-windows` owns its installer and signed
 `https://cli.laintas.com/windows/latest.json` update channel. This Unix release
 workflow must not build, publish or overwrite Windows assets. The download
-page links to `https://cli.laintas.com/windows/LaintasSetup.exe`; rebuilding
+page links to the verified immutable installer in `/windows/download.json`; rebuilding
 the Unix website must preserve `public/windows/` and `public/releases/`.
 `scripts/build_release_assets.py` writes both the durable `public/releases/`
 copy and the live `dist/releases/` copy after verifying the downloaded assets.

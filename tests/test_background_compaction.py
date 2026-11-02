@@ -82,6 +82,16 @@ def finish(e):
     assert e.coordinator.job.done.wait(2)
 
 
+def test_publishing_ready_summary_invalidates_checkpoint_tokens(env):
+    start(env)
+    finish(env)
+    counter = loop._ThreadTokenCounter(env.messages)
+    before = counter.count()
+    assert env.check(token_counter=counter)
+    assert counter.count() == loop._thread_tokens(env.messages)
+    assert counter.count() < before
+
+
 def test_background_does_not_block_or_mutate_and_commits_appended_messages(env):
     e = env
     original = copy.deepcopy(e.messages)

@@ -4,6 +4,8 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from unittest import mock
 
 import context_snapshot as snapshots
 
@@ -150,6 +152,90 @@ class ContextSnapshotStoreTests(unittest.TestCase):
         self.assertIsNone(call["metadata"])
         self.assertIsNone(call["system_sections"])
         self.assertIsNone(call["gateway_context_receipt"])
+
+    def test_unexpanded_append_avoids_blob_reads_and_remains_expandable(self):
+        with mock.patch.object(self.store, "_load_blob", side_effect=AssertionError("readback")):
+            raw = self.append("turn", expand=False)
+        self.assertNotIn("messages", raw)
+        self.assertEqual(self.store.expand_call(raw)["messages"],
+                         [{"role": "user", "content": "one"}])
+
+    def test_invalid_late_field_does_not_create_storage(self):
+        with self.assertRaises(snapshots.ContextSnapshotSerializationError):
+            self.store.append_call("session", "turn", "prompt", [], [],
+                                   gateway_context_receipt={"bad": object()}, expand=False)
+        self.assertFalse(self.root.exists())
+
+    def test_retention_cache_is_shared_by_short_lived_stores(self):
+        self.append("turn")
+        other = snapshots.ContextSnapshotStore(self.root)
+        with mock.patch.object(other, "_read_json", side_effect=AssertionError("reparse")):
+            other._apply_retention()
+
+    def test_retention_reloads_same_length_rewrite_even_with_restored_mtime(self):
+        self.append("turn")
+        path = self.store._manifest_path("session", "turn")
+        before = path.stat()
+        manifest = self.store._read_json(path)
+        old_digest = manifest["calls"][0]["messages_blob"]
+        replacement = self.store._put_blob([{"role": "user", "content": "new"}])
+        text = path.read_text()
+        path.write_text(text.replace(old_digest, replacement))
+        self.assertEqual(path.stat().st_size, before.st_size)
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.store._apply_retention()
+        self.assertEqual(self.store.load_call("session")["messages"][0]["content"], "new")
+        self.assertFalse((self.root / "blobs" / f"{old_digest}.json").exists())
+
+    def test_failed_manifest_deletion_preserves_its_blobs(self):
+        self.append("turn")
+        path = self.store._manifest_path("session", "turn")
+        self.store.max_conversations = 0
+        unlink = self.store._safe_unlink
+        with mock.patch.object(self.store, "_safe_unlink",
+                               side_effect=lambda p: False if p == path else unlink(p)):
+            self.store._apply_retention()
+        self.assertEqual(self.store.load_call("session")["messages"][0]["content"], "one")
+
+    def test_corrupt_cached_manifest_prevents_destructive_blob_cleanup(self):
+        self.append("old")
+        raw = self.store.load_conversation("session", expand=False)
+        digest = raw["calls"][0]["messages_blob"]
+        self.store._manifest_path("session", "old").write_text("not JSON")
+        self.append("new", marker="different")
+        assert (self.root / "blobs" / f"{digest}.json").is_file()
+
+    def test_byte_eviction_walks_store_once_and_preserves_shared_blobs(self):
+        for number in range(5):
+            self.append(f"turn-{number}", marker=str(number))
+        self.store.max_bytes = 1
+        with mock.patch.object(self.store, "_store_bytes", wraps=self.store._store_bytes) as walk:
+            self.store._apply_retention()
+        self.assertEqual(walk.call_count, 1)
+        self.assertEqual(self.store.list_conversations("session"), [])
+        self.assertLessEqual(self.store._store_bytes(), 1)
+
+    def test_concurrent_stores_keep_every_call_in_same_conversation(self):
+        def append(number):
+            store = snapshots.ContextSnapshotStore(self.root)
+            return store.append_call("session", "turn", "prompt",
+                                     [{"content": str(number)}], [],
+                                     call_id=f"call-{number}", expand=False)
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            list(executor.map(append, range(16)))
+        calls = self.store.load_conversation("session")["calls"]
+        self.assertEqual({call["call_id"] for call in calls},
+                         {f"call-{number}" for number in range(16)})
+
+    def test_symlink_write_lock_is_rejected_without_touching_target(self):
+        self.root.mkdir()
+        outside = Path(self._tmp.name) / "outside"
+        outside.write_text("preserve")
+        (self.root / ".write.lock").symlink_to(outside)
+        with self.assertRaises(snapshots.ContextSnapshotSecurityError):
+            self.append("turn")
+        self.assertEqual(outside.read_text(), "preserve")
 
 
 if __name__ == "__main__":

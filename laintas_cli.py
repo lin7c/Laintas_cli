@@ -80,6 +80,12 @@ if __name__ == "__main__" and sys.argv[1:2] in (["--version"], ["-V"]):
     print(f"laintas-cli {_v}")
     raise SystemExit(0)
 
+# Help shares the parser with the lightweight installed entry point.
+if __name__ == "__main__" and sys.argv[1:2] in (["--help"], ["-h"]):
+    from cli_args import build_parser
+    build_parser().parse_args()
+    raise SystemExit(0)
+
 import asyncio
 import copy
 import io
@@ -175,7 +181,7 @@ except OSError:
     # directory that no longer exists anyway.
     _LAUNCH_CWD = ""
 _LAUNCH_ARGV0 = sys.argv[0] if sys.argv else ""
-_LAUNCH_SCRIPT_PATH = os.path.abspath(__file__)
+_LAUNCH_SCRIPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cli_entry.py")
 
 
 def _resolve_launch_executable() -> str:
@@ -3891,9 +3897,9 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         "/handoff", "Create a task checkpoint for the next account",
         "Agents & Terminals",
-        "/handoff [list|new <title>|accept <id>|show <id>|claim <id>|release <id>|note <id> <text>|close <id>|reopen <id>|sync [id]|export <id> [file]|import <token|file>|remote|fetch <remote-path>]",
+        "/handoff [list|new <title>|accept <id>|show <id>|claim <id>|release <id>|note <id> <text>|close <id>|reopen <id>|sync [id]|send <helpwo|laintas-ai>|export <id> [file]|import <token|file>|remote|fetch <remote-path>]",
         subcommands=("list", "new", "show", "claim", "release", "note", "close",
-                     "reopen", "sync", "export", "import", "remote", "fetch", "accept"),
+                     "reopen", "sync", "send", "export", "import", "remote", "fetch", "accept"),
         completion_descriptions=(
             ("list", "Every handoff in this workspace and what is left on it"),
             ("new", "Write one before you stop for the day"),
@@ -3905,6 +3911,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             ("close", "Mark it handed over and done"),
             ("reopen", "Undo a close"),
             ("sync", "Merge with the shared copy through Laintas storage"),
+            ("send", "Hand this conversation to Helpwo or Laintas AI as a context envelope"),
             ("export", "Render it as one string to send over any channel"),
             ("import", "Take a handoff somebody pasted or mailed you"),
             ("remote", "List handoffs other machines shared for this repository"),
@@ -7760,8 +7767,9 @@ def _model_supply_label(provider_id: str) -> str:
     Mirrors Helpwo's modelSupplyGroupId (AIChat.tsx): the person's own
     keys hosted by Laintas (provider "my-keys") are "Activated", their own
     Laintas Compute machines ("my-devices") are "Compute" and their
-    organisation's account ("org") is "Organization" — none of those is
-    third-party supply.
+    organisation's account ("org") is "Organization" and their Laintas
+    Issues presets ("issues") are "Issues" — none of those is third-party
+    supply.
     """
     if provider_id == "laintas":
         return "Laintas Supply"
@@ -7771,12 +7779,15 @@ def _model_supply_label(provider_id: str) -> str:
         return "Compute"
     if provider_id == "org":
         return "Organization"
+    if provider_id == "issues":
+        return "Issues"
     return "Third-party Supply"
 
 
 def _model_display_name(model_id: str) -> str:
     """Display name for a model id: ``key/<source>/<model>`` reads as just
-    the model — the supply tag already says whose key it is. Mirrors
+    the model — the supply tag already says whose key it is — and
+    ``preset/<name>`` as just the name. Mirrors
     Helpwo's modelDisplayName. Presentation only: the id itself is
     unchanged everywhere it is stored or sent."""
     model_id = str(model_id or "")
@@ -7784,6 +7795,9 @@ def _model_display_name(model_id: str) -> str:
         rest = "/".join(model_id.split("/")[2:])
         if rest:
             return rest
+    # A Laintas Issues preset, preset/<name>: the "Issues" tag says what it is.
+    if model_id.startswith("preset/") and len(model_id) > len("preset/"):
+        return model_id[len("preset/"):]
     return model_id
 
 
@@ -7991,6 +8005,9 @@ def _remember_model_capabilities(payload) -> None:
 # Model id -> billing tier ("T1"…) from the last catalogue fetch, so /model can
 # label the current model even when it was set by id without opening the picker.
 _MODEL_TIERS: dict[str, str] = {}
+# People-only Laintas Issues presets (capability ``issuesManual``): the picker
+# tags them; picked in a chat, the gateway replies with their publish link.
+_MODEL_MANUAL: set[str] = set()
 
 
 def _attach_model_tiers(models: list[dict], payload) -> None:
@@ -8005,6 +8022,10 @@ def _attach_model_tiers(models: list[dict], payload) -> None:
             tier = spec.get("tier") if isinstance(spec, dict) else None
             if tier:
                 _MODEL_TIERS[str(model_id)] = str(tier).strip().upper()
+            if isinstance(spec, dict) and spec.get("issuesManual"):
+                _MODEL_MANUAL.add(str(model_id))
+            else:
+                _MODEL_MANUAL.discard(str(model_id))
     for model in models:
         if not model.get("tier"):
             model["tier"] = _MODEL_TIERS.get(model.get("id", ""), "")
@@ -8085,8 +8106,7 @@ def fetch_available_models(
 
 def show_model_selector(models: list[dict], current: str = "", *,
                         routes: Optional[list] = None,
-                        active_route: str = "",
-                        routing_settings: bool = False) -> Optional[dict]:
+                        active_route: str = "") -> Optional[dict]:
     """Interactive model selector. Returns the complete model row or None.
 
     Prepends an ``auto`` virtual entry at the start of the list. When the user
@@ -8097,9 +8117,7 @@ def show_model_selector(models: list[dict], current: str = "", *,
     picking one returns ``{"route": name}``. While one of them is
     *active_route*, it — not a backend model — carries the current mark.
 
-    *routing_settings* adds an "auto-routing settings" row under auto; picking
-    it returns ``{"routing_settings": True}`` (the bare /model picker only —
-    the aux and per-agent pickers choose a model and nothing else).
+    Auto-routing preferences are configured separately with /model routing.
     """
     routes = list(routes or [])
     if not models and not routes:
@@ -8115,22 +8133,19 @@ def show_model_selector(models: list[dict], current: str = "", *,
     labels.append(f"{auto_mark}[cyan]{'auto-routing':30}[/cyan] {'':3} Auto-routing (embedding-based)")
     if current in ("auto", ""):
         sel_idx = 0
-    if routing_settings:
-        prefs = auto_routing.load()
-        state = "defaults" if auto_routing.is_default(prefs) else "customised"
-        labels.append(f"  [cyan]{'  auto-routing settings…':30}[/cyan] {'':3} "
-                      f"Models auto may pick, everyday/complex model [dim]({state})[/dim]")
     model_start = len(labels)
     _rows = []
     for i, model in enumerate(models):
         model_id = model.get("id", "")
         provider = model.get("supply") or model.get("description") or _model_supply_label(
             str(model.get("provider") or ""))
+        if model_id in _MODEL_MANUAL:
+            provider = f"{provider} · By people"
         mark = " *" if current and model_id == current else "  "
         tier = model.get("tier") or ""
         _rows.append((model_id, provider, mark, tier))
         if current and model_id == current:
-            sel_idx = i + model_start  # rows above: auto, and its settings row
+            sel_idx = i + model_start  # auto precedes the model rows
 
     def _row_label(row, shown):
         _mid, provider, mark, tier = row
@@ -8169,8 +8184,6 @@ def show_model_selector(models: list[dict], current: str = "", *,
     index = labels.index(chosen)
     if index == 0:
         return {"id": "auto", "provider": ""}
-    if index < model_start:
-        return {"routing_settings": True}
     if index >= route_start:
         return {"route": routes[index - route_start].name}
     return models[index - model_start]
@@ -10132,6 +10145,8 @@ def _native_to_tool_calls(frags: dict, name_map: Optional[dict] = None,
         if not isinstance(args, dict):
             args = {"value": args}
         call = {"name": name, "arguments": args}
+        if slot.get("id"):
+            call["_source_call_id"] = slot["id"]
         if isinstance(slot.get("extra_content"), dict):
             # Provider state riding on the call (Gemini's thought signature);
             # it must go back on this same call next step.
@@ -10638,6 +10653,8 @@ def _call_backend_stream_impl(
     # completion (no tool schemas, no core-tool guide) so the model just writes
     # the requested summary instead of trying to act.
     tool_name_map: dict = {}
+    if tools_enabled and messages is not None and get_runtime_config("use_message_thread"):
+        payload["issuesSync"] = {"version": 2}
     if not tools_enabled:
         payload["injectToolGuide"] = False
     else:
@@ -14134,6 +14151,7 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/handoff", "close"): _arg_rule(2, "/handoff close <id>"),
     ("/handoff", "reopen"): _arg_rule(2, "/handoff reopen <id>"),
     ("/handoff", "sync"): _arg_rule(2, "/handoff sync [id]"),
+    ("/handoff", "send"): _arg_rule(2, "/handoff send <helpwo|laintas-ai>"),
     ("/handoff", "export"): _arg_rule(3, "/handoff export <id> [file]"),
     ("/handoff", "remote"): _arg_rule(1, "/handoff remote"),
     ("/handoff", "fetch"): _arg_rule(2, "/handoff fetch <remote-path>"),
@@ -15680,38 +15698,42 @@ def _show_usage_command(args: list, session: dict) -> None:
         headers, cookies = backend_profiles.request_auth(profile, session)
 
         def _fetch_backend_usage(cancel: threading.Event):
-            try:
-                resp = requests.get(
-                    f"{profile.base_url}/api/usage",
+            if cancel.is_set():
+                raise BlockingOperationCancelled("Usage fetch cancelled")
+            # Independent reads share no mutable HTTP session. Wait once for
+            # all three rather than paying each service's latency in sequence.
+            with ThreadPoolExecutor(max_workers=3, thread_name_prefix="usage-read") as pool:
+                usage_future = pool.submit(
+                    requests.get, f"{profile.base_url}/api/usage",
                     params={"range": rng, "product": "cli"},
                     headers=headers, cookies=cookies, timeout=10)
-                remote_usage = (
-                    resp.json() if resp.status_code == 200 else None)
-                remote_fail = (
-                    "" if remote_usage is not None
-                    else f"HTTP {resp.status_code}")
-                if cancel.is_set():
-                    raise BlockingOperationCancelled("Usage fetch cancelled")
-                bresp = requests.get(
-                    f"{profile.base_url}/api/balance",
+                balance_future = pool.submit(
+                    requests.get, f"{profile.base_url}/api/balance",
                     headers=headers, cookies=cookies, timeout=10)
-                remote_balance = (
-                    bresp.json() if bresp.status_code == 200 else {})
-                if cancel.is_set():
-                    raise BlockingOperationCancelled("Usage fetch cancelled")
-                # Call allowances live with the subscription, not the balance.
-                # Optional: without it the allowance lines are simply omitted
-                # rather than the whole panel failing.
+                subscription_future = pool.submit(
+                    requests.get, f"{profile.base_url}/api/subscription",
+                    headers=headers, cookies=cookies, timeout=10)
                 try:
-                    sresp = requests.get(
-                        f"{profile.base_url}/api/subscription",
-                        headers=headers, cookies=cookies, timeout=10)
-                    remote_sub = sresp.json() if sresp.status_code == 200 else {}
-                except requests.RequestException:
-                    remote_sub = {}
-                return remote_usage, remote_balance, remote_fail, remote_sub
-            except requests.RequestException as exc:
-                return None, {}, type(exc).__name__, {}
+                    resp = usage_future.result()
+                    remote_usage = resp.json() if resp.status_code == 200 else None
+                    remote_fail = "" if remote_usage is not None else f"HTTP {resp.status_code}"
+                    if cancel.is_set():
+                        raise BlockingOperationCancelled("Usage fetch cancelled")
+                    bresp = balance_future.result()
+                    remote_balance = bresp.json() if bresp.status_code == 200 else {}
+                    if cancel.is_set():
+                        raise BlockingOperationCancelled("Usage fetch cancelled")
+                    # Optional subscription failure does not hide usage.
+                    try:
+                        sresp = subscription_future.result()
+                        remote_sub = sresp.json() if sresp.status_code == 200 else {}
+                    except requests.RequestException:
+                        remote_sub = {}
+                    if cancel.is_set():
+                        raise BlockingOperationCancelled("Usage fetch cancelled")
+                    return remote_usage, remote_balance, remote_fail, remote_sub
+                except requests.RequestException as exc:
+                    return None, {}, type(exc).__name__, {}
 
         try:
             with _safe_status(
@@ -17293,11 +17315,8 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
         if (models or direct_routes) and sys.stdin.isatty():
             selected = show_model_selector(
                 models, current, routes=direct_routes,
-                active_route=model_route.selected_name(),
-                routing_settings=True)
-            if selected and selected.get("routing_settings"):
-                _cmd_model_routing_menu(session)
-            elif selected and selected.get("route"):
+                active_route=model_route.selected_name())
+            if selected and selected.get("route"):
                 _use_model_route(selected["route"])
             elif selected:
                 model_id = selected.get("id", "") if isinstance(selected, dict) else selected
@@ -18143,6 +18162,44 @@ def _cmd_handoff(parts: list, session: dict) -> None:
                 detail = (f"[green]+{gained} new event(s) from the shared copy[/green]"
                           if gained else "[dim]already in step[/dim]")
                 console.print(f"{escape(env['id'])} {symbols.BULLET} {detail}")
+            # A synced handoff is also announced in the account inbox,
+            # so it can be opened from Helpwo like any other hand.
+            import context_receive
+            for env in targets:
+                key = (env.get("repo") or {}).get("key") or "unkeyed"
+                if context_receive.announce_hand(
+                        session, LAINTAS_BASE, "handoff",
+                        f"{key}/{env['id']}", "helpwo",
+                        title=str(env.get("title") or "")):
+                    console.print("[dim]Announced in your Laintas inbox for Helpwo.[/dim]")
+            return
+
+        if sub == "send":
+            if len(args) != 1 or args[0].lower() not in ("helpwo", "laintas-ai"):
+                raise handoff.HandoffError(
+                    "Usage: /handoff send <helpwo|laintas-ai>")
+            target = args[0].lower()
+            history = getattr(handle_meta_command, "_last_chat_history", None)
+            if (not history or not any(
+                    isinstance(m, dict) and m.get("role") == "user"
+                    for m in history)):
+                console.print("[yellow]Nothing to send yet — this session "
+                              "has no conversation.[/yellow]")
+                return
+            import context_receive
+            try:
+                with _safe_status("[dim]Packing this conversation…[/dim]"):
+                    env_id = context_receive.send_context(
+                        session, LAINTAS_BASE, target, history)
+            except context_receive.SendError as exc:
+                console.print(f"[red]{escape(str(exc))}[/red]")
+                return
+            label = "Helpwo" if target == "helpwo" else "Laintas AI"
+            console.print(
+                f"[green]Handed this conversation to {label}.[/green] "
+                f"[dim]It waits in your Laintas inbox "
+                f"(laintas-cli:{env_id}) and opens there with its full "
+                f"context.[/dim]")
             return
 
         if sub == "export":
@@ -26255,7 +26312,44 @@ def _resolve_message(reference: str):
     return startup_mail.get(reference)
 
 
-def _cmd_messages(parts: list) -> None:
+def _offer_context_import(item, ref, session) -> None:
+    """A context_handed message names an envelope, not a reading task:
+    after the message itself, offer the import — one confirmation, and
+    the conversation lands here as a session (Context Kernel §14)."""
+    import context_receive
+    origin = ref[0]
+    label = {"helpwo": "Helpwo", "laintas-ai": "Laintas AI",
+             "issues": "Laintas Issues"}.get(origin, origin)
+    console.print(
+        f"  [dim]This message carries a conversation from {label}. "
+        "Importing it builds a new session here from that context; "
+        "the environment stays this machine's own.[/dim]")
+    try:
+        answer = input("  Import it as a new session? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer not in ("y", "yes"):
+        console.print("[dim]Left in the inbox. Read it again any time to import.[/dim]")
+        return
+    with _safe_status("[dim]Fetching the context…[/dim]"):
+        result = context_receive.land(session, LAINTAS_BASE, ref, paths.live_cwd())
+    if not result.get("ok"):
+        reason = result.get("reason")
+        text = {"not_found": "That context no longer exists or has expired.",
+                "empty": "That context has no conversation to import.",
+                "conflict": "That hand conflicts with a session already here.",
+                }.get(reason, "The import is unavailable right now.")
+        console.print(f"[red]{text}[/red]")
+        return
+    if result.get("activated"):
+        console.print(f"[green]Imported and switched to the new session:[/green] {escape(result['title'])}")
+        console.print("[dim]Just type to carry on from that context.[/dim]")
+    else:
+        console.print(f"[green]Imported as a new session:[/green] {escape(result['title'])}")
+        console.print("[dim]Open it with /resume to carry on from that context.[/dim]")
+
+
+def _cmd_messages(parts: list, session: dict = None) -> None:
     """``/messages`` — the same notices the L> mark holds, from the keyboard.
 
     The reader (Alt+0, or no argument here) is the good way to work through
@@ -26292,6 +26386,11 @@ def _cmd_messages(parts: list) -> None:
         console.print()
         _print_message(item, startup_mail.index_of(item.key) + 1)
         console.print()
+        if session is not None and item.key.startswith("official:sys-context_handed-"):
+            import context_receive
+            ref = context_receive.parse_context_ref(item.action)
+            if ref:
+                _offer_context_import(item, ref, session)
         return
 
     if action == "seen":
@@ -26376,7 +26475,7 @@ def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: 
         _cmd_new_session_notice()
 
     elif action in ("/messages", "/msg"):
-        _cmd_messages(parts)
+        _cmd_messages(parts, session)
 
     elif action == "/login":
         return _cmd_login(session, agent_registry)
@@ -29384,111 +29483,39 @@ def _startup_resume_blob(cwd: str, selector: Optional[str], agent_id: str) -> Op
     return None
 
 
+def _start_update_check():
+    """Post an update notice without holding up the first prompt."""
+    def check():
+        try:
+            import updater
+            remote = updater.check_update_available()
+            if remote:
+                checkout = updater.is_source_checkout()
+                startup_mail.post(
+                    "update", f"Update available: v{remote}",
+                    f"This session is running v{__version__}."
+                    + (" This install is a git checkout; update it with "
+                       "`git pull` (/v update will not touch it)."
+                       if checkout else ""),
+                    action="" if checkout else "/v update", level="good")
+        except Exception:
+            pass
+
+    worker = threading.Thread(target=check, name="startup-update", daemon=True)
+    try:
+        worker.start()
+    except RuntimeError:
+        return None
+    return worker
+
+
 def main():
     """Entry point."""
     if sys.argv[1:2] == ["pow"]:
         raise SystemExit(_run_pow_command(sys.argv[2:]))
-    import argparse
+    from cli_args import build_parser
 
-    parser = argparse.ArgumentParser(
-        description="Laintas CLI — Autonomous AI agent",
-        epilog="Options given at launch apply to this run only; nothing is "
-               "saved to your preferences.")
-    parser.add_argument(
-        "task", nargs="?", default=None,
-        help="Task to start with. At a terminal it becomes the first message "
-             "of an interactive session; with piped output it runs like "
-             "--execute. Use - to read the task from standard input.")
-    parser.add_argument("--version", "-V", action="version",
-                        version=RELEASE_NAME)
-    parser.add_argument("--name", type=str, help="Set agent name (shows in Helpwo AGENTS)")
-    parser.add_argument("--cwd", type=str, default=None, metavar="DIR",
-                        help="Work in DIR instead of the current directory")
-    parser.add_argument("--model", type=str, default=None, metavar="ID",
-                        help="Model to use for this run")
-    parser.add_argument("--route", type=str, default=None, metavar="NAME",
-                        help="Direct model route to use for this run (see /model route list)")
-    parser.add_argument("--mode", type=str, default=None, metavar="NAME",
-                        help="Working mode for this run (see /mode); plan starts in PLAN mode")
-    parser.add_argument("--plan", action="store_true", default=False,
-                        help="Start in PLAN mode (same as --mode plan)")
-    parser.add_argument("--auto-approve", type=str, default=None,
-                        choices=["none", "writes", "commands", "all"],
-                        help="What to approve without asking in this run")
-    parser.add_argument("--yes", "-y", action="store_true", default=False,
-                        help="Approve file writes and commands without asking "
-                             "(same as --auto-approve all); the command policy still applies")
-    parser.add_argument("--effort", type=str, default=None, metavar="LEVEL",
-                        help="Reasoning effort: auto, none, low, medium, high, max")
-    parser.add_argument("--max-loops", type=int, default=None, metavar="N",
-                        help="Maximum agent loop iterations per task")
-    parser.add_argument("--config", "-c", action="append", default=[], metavar="KEY=VALUE",
-                        help="Set a /config value for this run; repeat for several")
-    parser.add_argument("--theme", type=str, default=None,
-                        choices=list(terminal_theme.THEMES),
-                        help="Text colors for your terminal background")
-    parser.add_argument("--no-color", action="store_true", default=False,
-                        help="Print without color")
-    parser.add_argument("--verbose", "-v", action="store_true", default=False,
-                        help="Record tool calls and outputs for /detail trace")
-    parser.add_argument("--append-system-prompt", type=str, default=None, metavar="TEXT",
-                        help="Extra instructions added after the system prompt")
-    parser.add_argument("--append-system-prompt-file", type=str, default=None, metavar="FILE",
-                        help="Read extra system-prompt instructions from FILE")
-    parser.add_argument("--tools", type=str, default=None, metavar="LIST",
-                        help="Only offer these tools (comma-separated names or globs, e.g. file.*,web.search)")
-    parser.add_argument("--disallow-tools", type=str, default=None, metavar="LIST",
-                        help="Never offer these tools (comma-separated names or globs)")
-    parser.add_argument("--mcp-config", type=str, default=None, metavar="FILE",
-                        help="Load MCP servers from FILE instead of ~/.laintas/mcp.json")
-    parser.add_argument("--output-format", type=str, default="text",
-                        choices=["text", "json"],
-                        help="Result format for --execute: json prints one object "
-                             "on standard output and everything else on standard error")
-    parser.add_argument("--account", type=str, default=None,
-                        help="Use a saved account alias, email or userId")
-    parser.add_argument("--account-return", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument(
-        "--backend", type=str,
-        help="Custom backend URL (enters external/unmetered mode; Laintas credentials are stripped)",
-        default=None)
-    parser.add_argument("--laintas", type=str, help=argparse.SUPPRESS, default=None)
-    parser.add_argument("--acp", action="store_true", default=False,
-                        help="Serve the Agent Client Protocol (ACP) over stdio "
-                             "— lets ACP editors (Zed & friends) drive this CLI. "
-                             "Optional: pip install agent-client-protocol")
-    parser.add_argument("--execute", "-e", type=str, default=None, metavar="TASK",
-                        help="Execute a single task non-interactively and exit; "
-                             "- reads the task from standard input")
-    parser.add_argument("--session-id", type=str, default=None,
-                        help="Persist/resume --execute context under this logical session id")
-    # Internal: set by the CLI when it launches itself as a sub-terminal.
-    parser.add_argument("--depth", "-d", type=int, default=0, help=argparse.SUPPRESS)
-    parser.add_argument("--simple-prompt", action="store_true", default=False,
-                        help="Use plain input() instead of prompt_toolkit")
-    parser.add_argument("--monitor-only", action="store_true", default=False,
-                        help="Start as a remote executor only — register, heartbeat, "
-                             "and poll HelpwoAI for tasks. No local REPL.")
-    parser.add_argument("--resume", nargs="?", const=True, default=False, metavar="SESSION_ID",
-                        help="Resume the saved conversation for this directory on "
-                             "startup, or the one saved under SESSION_ID")
-    parser.add_argument("--continue", dest="continue_session", action="store_true", default=False,
-                        help="Alias for --resume (session continuation)")
-    parser.add_argument("--agent-id", type=str, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--agent-name", type=str, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--agent-role", type=str, default=None,
-                        choices=["pool", "deployed", "primary", "subagent"],
-                        help=argparse.SUPPRESS)
-    parser.add_argument("--terminal-name", type=str, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--parent-terminal", type=str, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--parent-agent-id", type=str, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--remote-parent-id", type=str, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--connect", action="store_true", default=False, help=argparse.SUPPRESS)
-    # Internal: this sub-terminal hosts an application (/helpwo, /app).
-    parser.add_argument("--app", type=str, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--app-state", type=str, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--app-launch-id", type=str, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--app-options", type=str, default=None, help=argparse.SUPPRESS)
+    parser = build_parser()
     args = parser.parse_args()
     try:
         _resolve_startup_task(args)
@@ -29744,10 +29771,41 @@ def main():
                      or agent_state.get("lastOutput") or "")
             return {"ok": True, "reply": str(reply), "error": ""}
 
+    def _extension_account_call(*, owner: str, method: str, path: str,
+                                body=None, purpose: str = "") -> dict:
+        """ctx.laintas.request: a Laintas API call as the signed-in person,
+        for an extension that declared `account`. The session is attached here
+        and never handed over; a POST runs only after the person says yes."""
+        profile = get_backend_profile()
+        if not (profile.sends_laintas_credentials and session.get("userId")):
+            return {"ok": False, "status": 0, "data": {},
+                    "error": "not signed in to Laintas (/login)"}
+        if method != "GET":
+            choice = _blocking_approval_prompt(
+                f"extension: {owner}", f"{purpose}\n{method} {path}",
+                "Allow this change to your Laintas account?")
+            if choice != "yes":
+                return {"ok": False, "status": 0, "data": {}, "error": "the person declined"}
+        headers, cookies = backend_profiles.request_auth(profile, session)
+        try:
+            resp = requests.request(method, f"{profile.base_url}{path}", json=body,
+                                    headers=headers, cookies=cookies, timeout=20)
+        except requests.RequestException as exc:
+            return {"ok": False, "status": 0, "data": {}, "error": type(exc).__name__}
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+        data = data if isinstance(data, dict) else {"value": data}
+        ok = 200 <= resp.status_code < 300
+        return {"ok": ok, "status": resp.status_code, "data": data,
+                "error": "" if ok else str(data.get("detail") or data.get("title") or f"HTTP {resp.status_code}")}
+
     _extension_runtime = extension_runtime.get_runtime()
     _extension_runtime.configure(
         console=console,
         task_callback=_run_extension_task,
+        account_callback=_extension_account_call,
         reserved_commands=[
             name for spec in COMMAND_SPECS for name in spec.all_names
         ],
@@ -29786,6 +29844,11 @@ def main():
     # their profile, names already loaded keep their registration, and each
     # load still passes the full trust gate.
     try:
+        # Official extensions that ship with the CLI are installed by default
+        # (and refreshed when the CLI brings a newer one), unless removed.
+        if args.depth == 0:
+            import extension_manager as _ext_manager
+            _ext_manager.seed_bundled()
         for _ext_name, _ext_ok, _ext_message in _extension_runtime.load_installed():
             if not _ext_ok and args.depth == 0:
                 startup_mail.post(
@@ -29818,24 +29881,7 @@ def main():
     # Show banner (skip in child terminals to avoid Rich output in PTY)
     if args.depth == 0:
         show_banner(agent_name, session if session else None)
-        # Best-effort, short-timeout update check — never blocks startup for
-        # more than ~1.5s and stays silent on any network/parse failure.
-        try:
-            import updater as _updater_check
-            _remote_ver = _updater_check.check_update_available()
-            if _remote_ver:
-                # On a git checkout the one-key action would be an offer to
-                # overwrite the working tree, so it says `git pull` instead.
-                _checkout = _updater_check.is_source_checkout()
-                startup_mail.post(
-                    "update", f"Update available: v{_remote_ver}",
-                    f"This session is running v{__version__}."
-                    + (" This install is a git checkout; update it with "
-                       "`git pull` (/v update will not touch it)."
-                       if _checkout else ""),
-                    action="" if _checkout else "/v update", level="good")
-        except Exception:
-            pass
+        _start_update_check()
     # Register as remote agent (only if authenticated)
     agent_registry = AgentRegistry()
     _session_start_cwd = os.getcwd()

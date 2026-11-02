@@ -48,6 +48,7 @@ docker run --rm \
       --distpath /tmp/d --workpath /tmp/b --specpath /tmp \
       --collect-data certifi \
       --runtime-hook /src/build/linux/hook_ssl.py \
+      --hidden-import laintas_cli \
       --hidden-import requests \
       --hidden-import certifi \
       --hidden-import rich.console \
@@ -65,7 +66,7 @@ docker run --rm \
       --hidden-import prompt_toolkit.layout \
       --hidden-import prompt_toolkit.styles \
       --hidden-import prompt_toolkit.auto_suggest \
-      /src/laintas_cli.py
+      /src/cli_entry.py
     cp /tmp/d/laintas-cli /out/laintas-cli
     chmod 755 /out/laintas-cli
     echo "== done =="

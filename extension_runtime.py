@@ -102,6 +102,44 @@ def _positional_arity(func: Callable) -> Optional[int]:
         return None
 
 
+#: Official extensions that ship inside the CLI and are installed by default
+#: (extension_manager.seed_bundled). Still extensions: listed, removable and
+#: disclosed like any other; removing one is remembered.
+BUNDLED_EXTENSIONS: tuple = ("issues",)
+BUNDLED_ROOT = Path(__file__).resolve().parent / "extensions"
+
+
+def bundled_copy_intact(name: str, directory: Path) -> bool:
+    """Is `directory` the CLI's own bundled `name`, byte for byte? Its
+    manifest may differ only in the `install` stamp seeding added. The
+    `bundled` provenance is trusted on that basis alone, so a copy anyone
+    edited afterwards goes back through the ordinary trust gate."""
+    source = BUNDLED_ROOT / name
+    if name not in BUNDLED_EXTENSIONS or not (source / "extension.json").is_file():
+        return False
+
+    def files(root: Path) -> dict:
+        return {str(p.relative_to(root)): p for p in root.rglob("*")
+                if p.is_file() and "__pycache__" not in p.parts}
+
+    want, have = files(source), files(directory)
+    if set(want) != set(have):
+        return False
+    for rel, path in want.items():
+        if rel == "extension.json":
+            try:
+                mine = json.loads(have[rel].read_text(encoding="utf-8"))
+                theirs = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return False
+            mine.pop("install", None)
+            if mine != theirs:
+                return False
+        elif have[rel].read_bytes() != path.read_bytes():
+            return False
+    return True
+
+
 def _extension_roots() -> list[Path]:
     """Where `load` looks for an extension, most specific first.
 
@@ -215,6 +253,44 @@ class BackendGateway:
             message=str(message), system_prompt=str(system_prompt), **allowed)
 
 
+class LaintasAccount:
+    """Laintas API calls made as the signed-in person, for an extension that
+    declares the `account` capability. The credentials stay in the host: the
+    extension names a path, the host attaches the session and makes the call.
+
+    Only paths under /api/ on the active Laintas backend. A call that changes
+    anything (POST) is shown to the person first, with the extension's own
+    words for what it does, and runs only on their yes: an extension acting on
+    an account can spend its balance.
+    """
+
+    METHODS = ("GET", "POST")
+
+    def __init__(self, callback: Optional[Callable[..., dict]] = None, owner: str = "",
+                 refusal: str = ""):
+        self._callback, self._owner, self._refusal = callback, owner, refusal
+
+    def request(self, method: str, path: str, body: Optional[dict] = None, *,
+                purpose: str = "") -> dict:
+        """{ok, status, data, error}. `purpose` is what the person is asked to
+        approve for a POST, in a sentence ("Pick answer 2 as final: pays the
+        $1.00 bounty to ds")."""
+        if self._callback is None:
+            return {"ok": False, "status": 0, "data": {},
+                    "error": self._refusal or "Laintas account calls are not available in this session"}
+        method = str(method or "").upper()
+        path = str(path or "")
+        if method not in self.METHODS:
+            return {"ok": False, "status": 0, "data": {}, "error": f"method must be one of {', '.join(self.METHODS)}"}
+        if not path.startswith("/api/") or ".." in path or "://" in path or "\\" in path:
+            return {"ok": False, "status": 0, "data": {}, "error": "path must be a Laintas /api/ path"}
+        if method != "GET" and not str(purpose or "").strip():
+            return {"ok": False, "status": 0, "data": {}, "error": "a POST needs a purpose to show the person"}
+        return self._callback(owner=self._owner, method=method, path=path,
+                              body=body if isinstance(body, dict) else None,
+                              purpose=str(purpose or "").strip())
+
+
 @dataclass
 class ExtensionContext:
     name: str
@@ -227,6 +303,8 @@ class ExtensionContext:
     #: Where this extension's own files live. `cwd` is the user's working
     #: directory and says nothing about the package.
     directory: Optional[Path] = None
+    #: The person's Laintas account (the `account` capability). See LaintasAccount.
+    laintas: LaintasAccount = field(default_factory=LaintasAccount)
 
     def register_command(self, name: str, handler: Callable, *,
                          description: str = "",
@@ -383,15 +461,18 @@ class ExtensionRuntime:
         self._console: Any = None
         self._backend = BackendGateway()
         self._tasks = TaskRunner()
+        self._account: Optional[Callable[..., dict]] = None
         self._reserved_commands: set[str] = set()
 
     def configure(self, console: Any = None,
                   backend_callback: Optional[Callable[..., dict]] = None,
                   reserved_commands: Optional[list[str]] = None,
-                  task_callback: Optional[Callable[..., dict]] = None) -> None:
+                  task_callback: Optional[Callable[..., dict]] = None,
+                  account_callback: Optional[Callable[..., dict]] = None) -> None:
         self._console = console
         self._backend = BackendGateway(backend_callback)
         self._tasks = TaskRunner(task_callback)
+        self._account = account_callback
         self._reserved_commands = {
             str(name).lower() for name in (reserved_commands or [])
         }
@@ -536,7 +617,9 @@ class ExtensionRuntime:
                 # are allowed through for backward compatibility.
                 install_meta = manifest.get("install") or {}
                 trusted_by = str(install_meta.get("trustedBy") or "")
-                if install_meta and trusted_by not in ("ed25519", "evolution-lab"):
+                if trusted_by == "bundled" and not bundled_copy_intact(name, directory):
+                    trusted_by = ""
+                if install_meta and trusted_by not in ("ed25519", "evolution-lab", "bundled"):
                     import trust_store as _ts
                     related = related_trust_paths(directory)
                     status = _ts.extension_status(
@@ -561,9 +644,12 @@ class ExtensionRuntime:
                 setup = getattr(module, "setup", None)
                 if not callable(setup):
                     raise ValueError("extension must define setup(ctx)")
+                account = (LaintasAccount(self._account, name) if "account" in self._capabilities[name]
+                           else LaintasAccount(refusal=f"{name} must declare the 'account' capability "
+                                                       "to call Laintas as the signed-in person"))
                 ctx = ExtensionContext(
                     name, self._console, self._backend, str(Path.cwd()), self,
-                    tasks=self._tasks, directory=directory)
+                    tasks=self._tasks, directory=directory, laintas=account)
                 setup(ctx)
                 self._loaded[name] = LoadedExtension(
                     name, directory, module_name, module,

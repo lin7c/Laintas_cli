@@ -3,7 +3,12 @@
   "version_source": "version.py",
   "modules": [
     "laintas_cli",
+    "cli_entry",
+    "cli_args",
     "agent_loop",
+    "context_kernel",
+    "context_receive",
+    "issues_tool_replay",
     "append_input",
     "progress_report",
     "account_store",
@@ -163,7 +168,8 @@
   "data_dirs": [
     "default_skills",
     "docs",
-    "shell_probe"
+    "shell_probe",
+    "extensions/issues"
   ],
   "extra_files": [
     "LICENSE",

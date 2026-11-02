@@ -1071,6 +1071,9 @@ def _bi_tool_search(params: dict, ctx: ToolCtx) -> dict:
     prior = set(ctx.state.get("_dynamic_tool_names") or [])
     prior.update(matches)
     ctx.state["_dynamic_tool_names"] = sorted(prior)
+    # Searched-for schemas outrank the rest when the tools budget has to cut.
+    import agent_loop as _al
+    _al.note_tool_recency(ctx.state, matches)
     return {
         "ok": True,
         "result": matches,
@@ -6534,11 +6537,15 @@ def _bi_terminal_create(params: dict, ctx: ToolCtx) -> dict:
     owner = ctx.get_agent(ctx.agent_id) if ctx.get_agent and ctx.agent_id else None
     import agent_loop as _al
     parent_terminal = _al.agent_deployment_terminal(owner) or "term0"
-    cli_entry = os.path.join(os.path.dirname(os.path.abspath(__file__)), "laintas_cli.py")
+    cli_entry = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cli_entry.py")
     terminal_id = paths.child_terminal_id(name, parent_terminal)
-    lain_cmd = " ".join([
+    launch = [
         f"LAINTAS_TERMINAL_ID={shlex.quote(terminal_id)}",
-        shlex.quote(sys.executable), shlex.quote(cli_entry),
+        shlex.quote(sys.executable),
+    ]
+    if not getattr(sys, "frozen", False):
+        launch.append(shlex.quote(cli_entry))
+    lain_cmd = " ".join(launch + [
         "--depth", str(ctx.depth + 1),
         "--terminal-name", shlex.quote(name),
         "--parent-terminal", shlex.quote(parent_terminal),

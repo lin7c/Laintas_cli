@@ -5,27 +5,29 @@ import json
 import time
 
 import account_store
+import context_kernel
 
 MAX_BYTES = 2 * 1024 * 1024
 STATE_FIELDS = ("objective", "shortTermMemory", "lastReply", "lastOutput",
                 "terminalHistory", "_thread_messages", "_thread_summary",
                 "_thread_call_seq", "_step_counter")
-SECRET_FIELDS = {"token", "session_token", "authorization", "cookies", "headers",
-                 "api_key", "apikey", "password", "passwd", "secret",
-                 "access_token", "refresh_token", "agent_secret"}
-
-
 def scrub(value):
-    if isinstance(value, dict):
-        return {str(key): scrub(item) for key, item in value.items()
-                if str(key).lower().replace("-", "_") not in SECRET_FIELDS}
-    if isinstance(value, list):
-        return [scrub(item) for item in value]
+    # Context Kernel v1 scrub contract (SPEC section 5) once over the whole
+    # value — it already walks every depth — then the local redactor makes
+    # its usual pass over every string.
+    return _redact(context_kernel.scrub(value))
+
+
+def _redact(value):
     if isinstance(value, str):
         import redactor
         spans = [span for span in redactor.scan_text(value)
                  if span["type"] in {"KEY", "JWT", "PRIVATE_KEY"}]
         return redactor.apply_spans(value, spans)
+    if isinstance(value, dict):
+        return {key: _redact(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact(item) for item in value]
     return value
 
 
@@ -65,11 +67,15 @@ def capture(state, history, tasks, user_id, *, older_summary="", rules=None):
     if not user_id:
         raise ValueError("Sign in before handing off a task")
     payload = {
-        "version": 1, "created_at": time.time(), "source_user_id": user_id,
+        "version": 1,
+        "created_at": time.time(), "source_user_id": user_id,
         "source_session_id": str(state.get("_session_id") or ""),
         "created_by": str(state.get("created_by", user_id)),
         "state": {key: copy.deepcopy(state[key]) for key in STATE_FIELDS if key in state},
-        "chat_history": copy.deepcopy(history), "tasks": copy.deepcopy(tasks or []),
+        # Wire form, as the model was sent it: the receiving CLI resends it
+        # (prompt cache) and Helpwo's importer reads wire form directly.
+        "chat_history": copy.deepcopy(history),
+        "tasks": copy.deepcopy(tasks or []),
         "older_summary": str(older_summary or ""), "rules": copy.deepcopy(rules or []),
         "recreate_resources": ["shell sessions", "browser sessions", "pending approvals"],
     }
@@ -97,6 +103,14 @@ def continuation(env, user_id, cwd, agent_id="primary"):
                                "user_id": checkpoint["source_user_id"]})
     account_store.stamp(state, user_id)
     history = copy.deepcopy(checkpoint["chat_history"])
+    if checkpoint.get("kernel"):  # the briefly-canonical handoffs
+        converted = []
+        for m in history:
+            try:
+                converted.append(context_kernel.to_wire_lossless(m))
+            except Exception:
+                converted.append(m)
+        history = converted
     notice = ("[accepted task handoff]\n"
               f"Objective: {state.get('objective') or env.get('title') or ''}\n"
               f"Workspace is now {cwd}. Source paths may refer to the previous machine. "

@@ -16,7 +16,7 @@
     New-Item -ItemType Directory -Path $directory -ErrorAction Stop | Out-Null
     try {
         $installer = Join-Path $directory 'LaintasSetup.exe'
-        Write-Host "Downloading Laintas Windows v$version..."
+        Write-Host "Downloading Helpwo windows v$version..."
         Invoke-WebRequest -Uri $release.installer -OutFile $installer -UseBasicParsing -ErrorAction Stop
         if ((Get-Item -LiteralPath $installer).Length -ne $size -or
             (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash -ine $checksum) {
@@ -25,7 +25,7 @@
         Write-Host 'Installer verified. Opening the installation wizard...'
         $process = Start-Process -FilePath $installer -Wait -PassThru -ErrorAction Stop
         if ($process.ExitCode -ne 0) { throw "The installer exited with code $($process.ExitCode)." }
-        Write-Host 'Installation completed. Start Laintas Windows from the Start menu.'
+        Write-Host 'Installation completed. Open Helpwo windows (older releases appear as Laintas Windows) from the Start menu.'
     } finally {
         Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction SilentlyContinue
     }

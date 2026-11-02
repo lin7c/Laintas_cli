@@ -1,17 +1,18 @@
 import { useEffect, useRef, useState } from 'react';
+import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import {
   ArrowDownToLine, ArrowRight, ArrowUpRight, Check, Code2, Copy, Layers3,
-  Laptop, Monitor, Package, ShieldCheck, TerminalSquare, Waypoints,
+  Laptop, Monitor, Package, ShieldCheck, TerminalSquare, Waypoints, Play, Pause, RotateCcw, BookOpen,
 } from 'lucide-react';
 import { useLanguage } from '@/contexts/LanguageContext';
 import SiteFooter from './SiteFooter';
-import { HELPWO_WINDOWS_NAME, HELPWO_WINDOWS_VERSION, HELPWO_WINDOWS_BYTES, HELPWO_WINDOWS_INSTALLER } from '../generated/helpwoWindowsDownload';
+import { Tabs, TabsList, TabsTrigger, TabsContent } from './ui/tabs';
+import { useClipboard } from '../hooks/useClipboard';
+import { useRelease } from '../hooks/useRelease';
+import { useMotionPreference } from '../hooks/useMotionPreference';
 
-const RELEASE_FALLBACK = 'laintas-cli-beta-v5';
 // The site mirrors the verified assets from the latest GitHub Release.
 const RELEASE_BASE = 'https://cli.laintas.com/releases/latest';
-const RELEASE_API = 'https://api.github.com/repos/lin7c/Laintas_cli/releases/latest';
-const RELEASE_DATE = '2026-10-21';
 // laintas-cli-windows: the CLI in its own terminal window. It is published
 // beside the Unix releases, apart from the Helpwo desktop channel in /windows/.
 const WINDOWS_DOWNLOAD = 'https://cli.laintas.com/windows-cli/beta-v5/laintas-cli-windows_beta-v5_x64-setup.exe';
@@ -25,16 +26,19 @@ const INSTALL_COMMANDS = {
   windows: 'irm https://cli.laintas.com/install.ps1 | iex',
 };
 
+// The three tabs are equal-width flex items, so the indicator position is
+// pure arithmetic on the active index -- no measurement, no spring.
+const PLATFORM_INDEX = { linux: 0, mac: 1, windows: 2 };
+
 // Direct packages, for people who do not pipe scripts into their shell.
-// Sizes and dates are those of the mirrored release assets.
+// The rolling release pointer owns version and asset metadata.
 const PACKAGES = [
-  { id: 'linux-amd64', icon: Package, file: 'laintas-cli_linux_amd64.tar.gz', size: '56 MB', names: { zh: 'Linux · x86_64', en: 'Linux · x86_64' }, details: { zh: 'tar.gz · glibc 64 位', en: 'tar.gz · 64-bit glibc' } },
-  { id: 'linux-arm64', icon: Package, file: 'laintas-cli_linux_arm64.tar.gz', size: '54 MB', names: { zh: 'Linux · arm64', en: 'Linux · arm64' }, details: { zh: 'tar.gz · glibc 64 位', en: 'tar.gz · 64-bit glibc' } },
-  { id: 'mac-arm', icon: Laptop, file: 'laintas-cli_darwin_arm64.tar.gz', size: '25 MB', names: { zh: 'macOS · Apple Silicon', en: 'macOS · Apple Silicon' }, details: { zh: 'tar.gz', en: 'tar.gz' } },
-  { id: 'mac-intel', icon: Laptop, file: 'laintas-cli_darwin_amd64.tar.gz', size: '24 MB', names: { zh: 'macOS · Intel', en: 'macOS · Intel' }, details: { zh: 'tar.gz', en: 'tar.gz' } },
-  { id: 'windows', icon: Monitor, href: WINDOWS_DOWNLOAD, size: '54 MB', date: '2026-10-22', names: { zh: 'laintas-cli-windows', en: 'laintas-cli-windows' }, details: { zh: '安装程序 · 自带终端窗口，无需 WSL', en: 'Installer · its own terminal window, no WSL' } },
-  { id: 'helpwo-windows', icon: Monitor, href: HELPWO_WINDOWS_INSTALLER, size: `${(HELPWO_WINDOWS_BYTES / 1024 / 1024).toFixed(1)} MB`, date: '2026-10-07', names: { zh: HELPWO_WINDOWS_NAME, en: HELPWO_WINDOWS_NAME }, details: { zh: 'Helpwo 桌面工作台 · 本地文件、编辑器、预览与终端', en: 'Helpwo desktop workbench · local files, editor, preview and terminals' } },
-  { id: 'source', icon: Code2, file: 'laintas-cli_source.zip', size: '2.1 MB', names: { zh: '源码包', en: 'Source package' }, details: { zh: 'Python 3.10+ · 审计与二次开发', en: 'Python 3.10+ · audit and extend' } },
+  { id: 'linux-amd64', icon: Package, file: 'laintas-cli_linux_amd64.tar.gz', names: { zh: 'Linux · x86_64', en: 'Linux · x86_64' }, details: { zh: 'tar.gz · glibc 64 位', en: 'tar.gz · 64-bit glibc' } },
+  { id: 'linux-arm64', icon: Package, file: 'laintas-cli_linux_arm64.tar.gz', names: { zh: 'Linux · arm64', en: 'Linux · arm64' }, details: { zh: 'tar.gz · glibc 64 位', en: 'tar.gz · 64-bit glibc' } },
+  { id: 'mac-arm', icon: Laptop, file: 'laintas-cli_darwin_arm64.tar.gz', names: { zh: 'macOS · Apple Silicon', en: 'macOS · Apple Silicon' }, details: { zh: 'tar.gz', en: 'tar.gz' } },
+  { id: 'mac-intel', icon: Laptop, file: 'laintas-cli_darwin_amd64.tar.gz', names: { zh: 'macOS · Intel', en: 'macOS · Intel' }, details: { zh: 'tar.gz', en: 'tar.gz' } },
+  { id: 'windows', icon: Monitor, href: WINDOWS_DOWNLOAD, names: { zh: 'laintas-cli-windows', en: 'laintas-cli-windows' }, details: { zh: '安装程序 · 自带终端窗口，无需 WSL', en: 'Installer · its own terminal window, no WSL' } },
+  { id: 'source', icon: Code2, file: 'laintas-cli_source.zip', names: { zh: '源码包', en: 'Source package' }, details: { zh: 'Python 3.10+ · 审计与二次开发', en: 'Python 3.10+ · audit and extend' } },
 ];
 
 // Capability icons, in the order of COPY[lang].caps.
@@ -53,16 +57,15 @@ const PLANS = [
 
 const COPY = {
   zh: {
-    kicker: 'LAINTAS CLI · 终端里的 AI agent',
     title: ['命令照常敲，', '其余交给 agent。'],
-    lead: 'Laintas CLI 是装进 shell 的自主 agent。ls、git、vim 这类命令照旧直接在真实 PTY 里运行，不经过模型；用一句话描述的任务，交给 agent 去读代码、跑命令、改文件 —— 每一步都摆在你眼前，关键操作等你点头。',
+    lead: '熟悉的 shell，多一个能动手的 agent。照常运行命令，也可以用一句话让它读代码、改文件、跑测试。执行过程看得见，权限由你掌握。',
     install: '安装 Laintas CLI', seeHow: '看它怎么工作',
     facts: [['免费', '运行时免费使用，可下载源码审计'], ['Linux · macOS · Windows', 'x86_64 / arm64，Windows 10 2004+ / 11'], ['一个账号', '与 Helpwo、插件市场共用 Laintas 账号']],
     videoTitle: '一段真实会话',
-    videoNote: '在真实机器上实跑录制：agent 读完整个项目、跑测试、自己验证产出，再动手写文件。没有脚本摆拍，等待模型的空白也没有剪掉。',
+    videoNote: '在真实机器上录制的终端会话，保留模型等待过程。你可以暂停、拖动进度，或从头观看。',
 
-    whyKicker: '01 · 为什么是它', whyTitle: ['离你的文件', '最近的那个 agent。'],
-    whyIntro: '聊天窗口里的 AI 只能给建议，复制、粘贴、执行、再把报错转述回去，这些活还是你在干。Laintas CLI 直接站在你的工作目录里。',
+    whyTitle: ['离你的文件', '最近的那个 agent。'],
+    whyIntro: '让 agent 直接在工作目录里读取上下文、执行任务、验证结果，减少在对话与终端之间来回切换。',
     compareHead: ['', '聊天窗口', 'Laintas CLI'],
     compare: [
       ['上下文', '你复制过去的几段代码', '整个工作目录、终端状态和项目记忆'],
@@ -77,7 +80,7 @@ const COPY = {
       ['一个工具面', '内置工具、Skills、MCP 服务器和插件市场里的扩展，走同一个注册表和授权管道。'],
     ],
 
-    howKicker: '02 · 一条指令的旅程', howTitle: ['一条指令进来，', '每一步都看得见。'],
+    howTitle: ['一条指令进来，', '每一步都看得见。'],
     howIntro: '以“修一下失败的测试”为例，运行时真实经过的路径是这样：',
     steps: [
       ['分流', '$ pytest → PTY'],
@@ -86,7 +89,7 @@ const COPY = {
       ['过闸', 'allow · ask · deny'],
       ['执行并留痕', 'trace: on'],
     ],
-    gateKicker: '安全边界', gateTitle: ['并行，', '但不失控。'],
+    gateTitle: ['并行，', '但不失控。'],
     gateIntro: 'Prompt 只负责表达意图，边界在运行时。模型再会说，也绕不过一条已经拒绝的策略。',
     gates: [
       ['放行', 'allow', ['读取项目文件', '运行测试', 'git status / diff']],
@@ -95,7 +98,7 @@ const COPY = {
     ],
     gateNote: '具体落在哪一档，取决于当前模式、项目策略与组织策略。',
 
-    priceKicker: '03 · 价格', priceTitle: ['先装上，', '再决定用多少。'],
+    priceTitle: ['先装上，', '再决定用多少。'],
     priceIntro: 'Laintas CLI 本身不收费。模型调用按量计费或订阅会员，会员额度在所有 Laintas 产品间共用。',
     perMonth: '/ 月', pricing: '查看完整定价与模型分档',
     ecoTitle: '同一个账号，也通向这些',
@@ -105,7 +108,7 @@ const COPY = {
       ['Laintas 账户', '余额、订阅、用量与订单，所有产品在同一处查看。', 'https://laintas.com/dashboard'],
     ],
 
-    downloadKicker: '04 · 下载', downloadTitle: ['现在，', '交给你的终端。'],
+    downloadTitle: ['现在，', '交给你的终端。'],
     downloadIntro: '推荐一行命令安装；也可以直接下载安装包，或拿源码包审计与二次开发。',
     platformLabel: '选择安装平台', linux: 'Linux', mac: 'macOS', windows: 'Windows', copied: '已复制', copy: '复制',
     windowsAlt: '或直接下载安装包',
@@ -113,20 +116,17 @@ const COPY = {
     windowsSteps: [['安装', '在 PowerShell 执行指令，或直接下载安装包；无需管理员权限'], ['启动并登录', '从开始菜单打开 laintas-cli-windows，登录页会在默认浏览器里打开'], ['开始对话', '在默认工作区给 agent 一个任务']],
     packages: '安装包', download: '下载', checksums: '全部文件的 SHA256 校验和',
     requirements: 'Linux 需 64 位 glibc 系统；Mac 支持 Apple Silicon 和 Intel，暂不包含 Helpwo Kernel；laintas-cli-windows 需 x86_64、Windows 10/11 和 WebView2，安装器可联网安装 WebView2；无需 WSL。',
-    helpwoWindowsGuide: 'Helpwo windows：Windows 10/11（64 位）桌面版，使用同一个 Laintas 账户。安装与使用说明',
-    helpwoWindowsChecksum: 'Helpwo windows SHA-256 校验值',
   },
   en: {
-    kicker: 'LAINTAS CLI · THE AI AGENT IN YOUR TERMINAL',
     title: ['Your shell, as usual.', 'Plus an agent.'],
-    lead: 'Laintas CLI is an autonomous agent that lives in your shell. Commands like ls, git and vim still run straight in a real PTY, never through the model. Describe a task in a sentence and the agent reads code, runs commands and edits files — every step in front of you, every risky one waiting for your yes.',
+    lead: 'Your familiar shell, with an agent that can act. Run commands as usual, or ask it to read code, edit files and run tests. Follow the work as it happens, with permissions you control.',
     install: 'Install Laintas CLI', seeHow: 'See how it works',
     facts: [['Free', 'Free runtime, source you can download and audit'], ['Linux · macOS · Windows', 'x86_64 / arm64, Windows 10 2004+ / 11'], ['One account', 'Shared with Helpwo and the plugin market']],
     videoTitle: 'A real session, recorded as it ran',
-    videoNote: 'Recorded on a real machine: the agent reads the whole project, runs the tests, verifies the output itself, and only then writes a file. Nothing is staged, and the model pauses are not cut.',
+    videoNote: 'A terminal session recorded on a real machine, with model waiting time included. Pause, seek, or watch again from the beginning.',
 
-    whyKicker: '01 · WHY IT EXISTS', whyTitle: ['The agent closest', 'to your files.'],
-    whyIntro: 'An AI in a chat window can only advise. Copying, pasting, running, and relaying the error back is still your job. Laintas CLI stands in your working directory instead.',
+    whyTitle: ['The agent closest', 'to your files.'],
+    whyIntro: 'Let the agent read context, do the work and verify results right in your working directory. Spend less time moving between a conversation and your terminal.',
     compareHead: ['', 'Chat window', 'Laintas CLI'],
     compare: [
       ['Context', 'The snippets you pasted in', 'The whole workspace, terminal state and project memory'],
@@ -141,7 +141,7 @@ const COPY = {
       ['One tool surface', 'Built-in tools, Skills, MCP servers and plugin-market extensions share one registry and one authorization pipeline.'],
     ],
 
-    howKicker: '02 · THE LIFE OF A REQUEST', howTitle: ['One request in.', 'Every step visible.'],
+    howTitle: ['One request in.', 'Every step visible.'],
     howIntro: 'Take “fix the failing test”. The path the runtime actually walks:',
     steps: [
       ['Route', '$ pytest → PTY'],
@@ -150,7 +150,7 @@ const COPY = {
       ['Pass the gate', 'allow · ask · deny'],
       ['Run and record', 'trace: on'],
     ],
-    gateKicker: 'SECURITY BOUNDARY', gateTitle: ['Parallel,', 'never out of hand.'],
+    gateTitle: ['Parallel,', 'never out of hand.'],
     gateIntro: 'Prompts express intent; the boundary lives in the runtime. No amount of model persuasion gets past a policy that already said no.',
     gates: [
       ['Allow', 'allow', ['Read project files', 'Run the tests', 'git status / diff']],
@@ -159,7 +159,7 @@ const COPY = {
     ],
     gateNote: 'Which tier an action lands in depends on the active mode, project policy and organization policy.',
 
-    priceKicker: '03 · PRICING', priceTitle: ['Install first.', 'Decide how much later.'],
+    priceTitle: ['Install first.', 'Decide how much later.'],
     priceIntro: "Laintas CLI itself is free. Model calls are pay-as-you-go or by membership, and every plan's allowance is shared across every Laintas product.",
     perMonth: '/ mo', pricing: 'Full pricing and model tiers',
     ecoTitle: 'The same account also opens',
@@ -169,7 +169,7 @@ const COPY = {
       ['Laintas account', 'Balance, subscription, usage and orders for every product, in one place.', 'https://laintas.com/dashboard'],
     ],
 
-    downloadKicker: '04 · DOWNLOAD', downloadTitle: ['Now,', 'hand it to your terminal.'],
+    downloadTitle: ['Now,', 'hand it to your terminal.'],
     downloadIntro: 'The one-line installer is recommended. You can also grab a package directly, or audit and extend the source.',
     platformLabel: 'Select install platform', linux: 'Linux', mac: 'macOS', windows: 'Windows', copied: 'Copied', copy: 'Copy',
     windowsAlt: 'Or download the installer',
@@ -177,41 +177,58 @@ const COPY = {
     windowsSteps: [['Install', 'Run the command in PowerShell, or download the installer; no administrator rights needed'], ['Launch and sign in', 'Open laintas-cli-windows from Start; the sign-in page opens in your default browser'], ['Start a conversation', 'Give the agent a task in the default workspace']],
     packages: 'Packages', download: 'Download', checksums: 'SHA256 checksums for every file',
     requirements: 'Linux needs a 64-bit glibc system. Mac supports Apple Silicon and Intel without Helpwo Kernel. laintas-cli-windows needs Windows 10/11 x86_64 and WebView2; the installer can download WebView2. WSL is not needed.',
-    helpwoWindowsGuide: 'Helpwo windows: the desktop edition for Windows 10/11 (64-bit), using the same Laintas account. Install and use',
-    helpwoWindowsChecksum: 'Helpwo windows SHA-256 checksum',
   },
 };
 
 export default function DownloadSection() {
   const { lang } = useLanguage();
   const c = COPY[lang] || COPY.en;
-  const [release, setRelease] = useState(RELEASE_FALLBACK);
+  const release = useRelease();
   const [windowsRelease, setWindowsRelease] = useState(WINDOWS_RELEASE);
-  const [installPlatform, setInstallPlatform] = useState('linux');
+  const [params] = useSearchParams();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const [detectedPlatform] = useState(() => /Windows/i.test(navigator.userAgent) ? 'windows' : /Macintosh|Mac OS X/i.test(navigator.userAgent) ? 'mac' : 'linux');
+  const platformParam = ['linux', 'mac', 'windows'].includes(params.get('platform')) ? params.get('platform') : detectedPlatform;
+  const [installPlatform, selectPlatform] = useState(platformParam);
+  useEffect(() => selectPlatform(platformParam), [platformParam]);
+  const setInstallPlatform = platform => {
+    selectPlatform(platform);
+    const next = new URLSearchParams(params);
+    next.set('platform', platform);
+    navigate({ search: `?${next}`, hash: location.hash }, { preventScrollReset: true });
+  };
 
   useEffect(() => {
-    if (/Windows/i.test(window.navigator.userAgent)) setInstallPlatform('windows');
-    else if (/Macintosh|Mac OS X/i.test(window.navigator.userAgent)) setInstallPlatform('mac');
-    fetch(RELEASE_API)
-      .then((response) => response.ok ? response.json() : Promise.reject(new Error('release lookup failed')))
-      .then((data) => { if (data.tag_name) setRelease(data.tag_name); })
-      .catch(() => {});
-    fetch(WINDOWS_POINTER)
+    const controller = new AbortController();
+    fetch(WINDOWS_POINTER, { signal: controller.signal })
       .then((response) => response.ok ? response.json() : Promise.reject(new Error('windows pointer lookup failed')))
-      .then((data) => { if (data.installer && data.label) setWindowsRelease({ version: data.label, installer: data.installer }); })
+      .then((data) => {
+        if (!controller.signal.aborted && typeof data.label === 'string' && typeof data.installer === 'string'
+          && data.installer.startsWith('https://cli.laintas.com/windows-cli/')) setWindowsRelease({ version: data.label, installer: data.installer });
+      })
       .catch(() => {});
+    return () => controller.abort();
   }, []);
 
   return (
-    <main className="product-page" lang={lang === 'zh' ? 'zh-CN' : 'en'}>
+    <main id="main-content" tabIndex={-1} className="product-page" lang={lang === 'zh' ? 'zh-CN' : 'en'}>
       <div className="page-shell">
         {/* ── Hero: one line, one command, one real session ─────────────── */}
         <section id="top" className="hp-hero">
-          <Kicker>{c.kicker}</Kicker>
-          <h1 className="st-display hp-display"><Title parts={c.title} /></h1>
-          <p className="st-lead">{c.lead}</p>
-
-          <InstallBar platform={installPlatform} setPlatform={setInstallPlatform} c={c} windowsRelease={windowsRelease} />
+          <div className="hp-intro-grid">
+            <div className="hp-intro">
+              <h1 className="st-display hp-display"><Title parts={c.title} /></h1>
+              <p className="st-lead">{c.lead}</p>
+              <div className="hp-hero-links"><a href="#demo"><Play size={15} aria-hidden="true" />{c.seeHow}</a><Link to="/docs#install"><BookOpen size={15} aria-hidden="true" />{lang === 'zh' ? '安装指南' : 'Installation guide'}</Link></div>
+            </div>
+            <div className="hp-quickstart">
+              <h2>{lang === 'zh' ? '从你的终端开始' : 'Start in your terminal'}</h2>
+              <p>{lang === 'zh' ? '选择系统，复制命令，然后粘贴到终端运行。' : 'Choose your system. Copy the command into your terminal.'}</p>
+              <InstallBar platform={installPlatform} setPlatform={setInstallPlatform} c={c} windowsRelease={windowsRelease} lang={lang} />
+              <Link className="hp-download-link" to={`/?platform=${installPlatform}#download`}>{lang === 'zh' ? '查看安装步骤与全部安装包' : 'Install steps & all packages'}<ArrowRight size={15} aria-hidden="true" /></Link>
+            </div>
+          </div>
 
           <DemoVideo lang={lang} c={c} />
 
@@ -222,7 +239,7 @@ export default function DownloadSection() {
 
         {/* ── Why, and the boundary that keeps it safe ──────────────────── */}
         <section id="operations" className="hp-section">
-          <ChapterHead kicker={c.whyKicker} title={c.whyTitle} intro={c.whyIntro} />
+          <ChapterHead title={c.whyTitle} intro={c.whyIntro} />
           <div className="st-compare" role="table">
             <div className="st-compare-row st-compare-head" role="row">
               {c.compareHead.map((label, index) => <span role="columnheader" key={index}>{label}</span>)}
@@ -249,7 +266,7 @@ export default function DownloadSection() {
           </div>
 
           <div id="workflow" className="hp-flow-block">
-            <ChapterHead kicker={c.howKicker} title={c.howTitle} intro={c.howIntro} small />
+            <ChapterHead title={c.howTitle} intro={c.howIntro} small />
             <ol className="hp-flow">
               {c.steps.map(([title, tag], index) => (
                 <li key={title}>
@@ -263,7 +280,7 @@ export default function DownloadSection() {
           </div>
 
           <div id="security" className="st-gate-block">
-            <ChapterHead kicker={c.gateKicker} title={c.gateTitle} intro={c.gateIntro} small />
+            <ChapterHead title={c.gateTitle} intro={c.gateIntro} small />
             <div className="st-gates">
               {c.gates.map(([label, tone, items]) => (
                 <div className={`st-gate st-gate-${tone}`} key={tone}>
@@ -278,7 +295,7 @@ export default function DownloadSection() {
 
         {/* ── Pricing ───────────────────────────────────────────────────── */}
         <section id="pricing" className="hp-section">
-          <ChapterHead kicker={c.priceKicker} title={c.priceTitle} intro={c.priceIntro} />
+          <ChapterHead title={c.priceTitle} intro={c.priceIntro} />
           <div className="st-plans">
             {PLANS.map((plan) => {
               const badge = plan.badge ? (plan.badge[lang] || plan.badge.en) : null;
@@ -310,8 +327,8 @@ export default function DownloadSection() {
 
         {/* ── Download ──────────────────────────────────────────────────── */}
         <section id="download" className="hp-section">
-          <ChapterHead kicker={c.downloadKicker} title={c.downloadTitle} intro={c.downloadIntro} />
-          <InstallBar platform={installPlatform} setPlatform={setInstallPlatform} c={c} windowsRelease={windowsRelease} />
+          <ChapterHead title={c.downloadTitle} intro={c.downloadIntro} />
+          <InstallBar platform={installPlatform} setPlatform={setInstallPlatform} c={c} windowsRelease={windowsRelease} lang={lang} />
           <ol className="st-start">
             {(installPlatform === 'windows' ? c.windowsSteps : c.startSteps).map(([title, detail], index) => (
               <li key={title}><span>0{index + 1}</span><strong>{title}</strong><p>{detail}</p></li>
@@ -319,19 +336,17 @@ export default function DownloadSection() {
           </ol>
           <p className="st-eco-title">{c.packages}</p>
           <div className="st-packages">
-            {PACKAGES.map(({ id, icon: Icon, file, href, size, date, names, details }) => (
-              <a id={id === 'helpwo-windows' ? id : undefined} href={id === 'windows' ? windowsRelease.installer : href || `${RELEASE_BASE}/${file}`} key={id}>
+            {PACKAGES.map(({ id, icon: Icon, file, href, names, details }) => (
+              <a href={id === 'windows' ? windowsRelease.installer : href || `${RELEASE_BASE}/${file}`} key={id}>
                 <Icon size={18} strokeWidth={1.6} />
                 <span><strong>{names[lang] || names.en}</strong><small>{details[lang] || details.en}</small></span>
-                <code>{id === 'windows' ? windowsRelease.version : id === 'helpwo-windows' ? `v${HELPWO_WINDOWS_VERSION}` : release} · {size} · {date || RELEASE_DATE}</code>
+                <code>{id === 'windows' ? windowsRelease.version : release}</code>
                 <em>{c.download}<ArrowDownToLine size={15} /></em>
               </a>
             ))}
           </div>
           <a className="st-link" href={`${RELEASE_BASE}/SHA256SUMS.txt`}>{c.checksums}<ArrowUpRight size={14} /></a>
           <p className="st-note">{c.requirements}</p>
-          <a className="st-link" href="https://helpwo.laintas.com/docs/#windows">{c.helpwoWindowsGuide}<ArrowUpRight size={14} /></a>
-          <a className="st-link" href={`${HELPWO_WINDOWS_INSTALLER}.sha256`}>{c.helpwoWindowsChecksum}<ArrowUpRight size={14} /></a>
         </section>
       </div>
 
@@ -340,84 +355,129 @@ export default function DownloadSection() {
   );
 }
 
-/* The one primary action on the page: platform tabs + the install command. */
-function InstallBar({ platform, setPlatform, c, windowsRelease }) {
-  return (
-    <div className="hp-install">
-      <div className="st-install">
-        <div className="st-install-tabs" role="group" aria-label={c.platformLabel}>
-          {['linux', 'mac', 'windows'].map((p) => (
-            <button type="button" key={p} className={platform === p ? 'active' : ''} onClick={() => setPlatform(p)} aria-pressed={platform === p}>{c[p]}</button>
-          ))}
-        </div>
+/* The two install entry points share platform state through the URL. */
+function InstallBar({ platform, setPlatform, c, windowsRelease, lang }) {
+  const { state, copy } = useClipboard(INSTALL_COMMANDS[platform]);
+  const zh = lang === 'zh';
+  return <div className="hp-install">
+    <Tabs className="st-install" value={platform} onValueChange={setPlatform}>
+      <TabsList variant="install" className="st-install-tabs" aria-label={c.platformLabel} style={{ '--tab-index': PLATFORM_INDEX[platform] ?? 0 }}>
+        <span className="install-tab-indicator" aria-hidden="true" />
+        {['linux', 'mac', 'windows'].map(p => <TabsTrigger variant="install" value={p} key={p}>
+          <span>{c[p]}</span>
+        </TabsTrigger>)}
+      </TabsList>
+      {['linux', 'mac', 'windows'].map(p => <TabsContent variant="install" value={p} key={p}>
         <div className="st-install-line">
-          <code><span aria-hidden="true">{platform === 'windows' ? 'PS>' : '$'}</span>{INSTALL_COMMANDS[platform]}</code>
-          <CopyButton key={platform} value={INSTALL_COMMANDS[platform]} labels={c} />
+          <code translate="no"><span aria-hidden="true">{p === 'windows' ? 'PS>' : '$'}</span>{INSTALL_COMMANDS[p]}</code>
+          <button type="button" className="st-copy" onClick={copy} disabled={state === 'pending'} data-state={state} aria-label={zh ? '复制安装命令' : 'Copy install command'}>
+            {state === 'copied' ? <Check size={15} aria-hidden="true" /> : <Copy size={15} aria-hidden="true" />}
+            {state === 'copied' ? c.copied : state === 'pending' ? (zh ? '复制中…' : 'Copying…') : c.copy}
+          </button>
         </div>
-      </div>
-      {platform === 'windows' && <a className="st-link" href={windowsRelease.installer}><ArrowDownToLine size={16} />{c.windowsAlt} · {windowsRelease.version}</a>}
-    </div>
-  );
+      </TabsContent>)}
+      <p className="install-feedback" role="status" data-state={state}>
+        {state === 'failed' ? (zh ? '无法自动复制，请选中上方命令后手动复制。' : 'Copy unavailable. Select the command above and copy it manually.')
+          : state === 'copied' ? (zh ? '已复制。粘贴到终端运行，然后按下方步骤启动。' : 'Copied. Paste into your terminal, then follow the launch steps below.')
+          : platform === 'windows' ? (zh ? '在 PowerShell 中运行 · 无需 WSL' : 'Run in PowerShell · No WSL needed')
+          : (zh ? '在终端中运行 · 自动识别 CPU 架构' : 'Run in your terminal · Detects your CPU architecture')}
+      </p>
+    </Tabs>
+    <a className={`st-link install-alt-link${platform === 'windows' ? '' : ' is-off'}`} href={windowsRelease.installer} aria-hidden={platform !== 'windows'} tabIndex={platform === 'windows' ? undefined : -1}><ArrowDownToLine size={16} aria-hidden="true" />{c.windowsAlt} · {windowsRelease.version}</a>
+  </div>;
 }
 
-/* A real laintas-cli session, recorded on a real machine (the daily series
-   footage, terminal layer only — no narration, no subtitles). Plays only
-   while on screen; under prefers-reduced-motion it stays on its poster. */
+/* Visibility may pause playback; only the visitor can undo a manual pause. */
 function DemoVideo({ lang, c }) {
   const ref = useRef(null);
+  const visible = useRef(false);
+  const wantsPlayback = useRef(true);
+  const automaticPause = useRef(false);
+  const [playing, setPlaying] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const reducedMotion = useMotionPreference();
   const variant = lang === 'zh' ? 'zh' : 'en';
+  const zh = lang === 'zh';
 
   useEffect(() => {
     const video = ref.current;
     if (!video) return;
-    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
-      video.pause();
-      video.removeAttribute('autoplay');
-      return;
-    }
-    const io = new IntersectionObserver(([entry]) => {
-      if (entry.isIntersecting) video.play().catch(() => {});
-      else video.pause();
+    wantsPlayback.current = !reducedMotion;
+    automaticPause.current = false;
+    setFailed(false);
+    setPlaying(false);
+    const pause = () => {
+      if (!video.paused) { automaticPause.current = true; video.pause(); }
+    };
+    const update = () => {
+      if (visible.current && !document.hidden && wantsPlayback.current) video.play().catch(() => {});
+      else pause();
+    };
+    const observer = new IntersectionObserver(([entry]) => {
+      visible.current = entry.isIntersecting;
+      update();
     }, { threshold: 0.2 });
-    io.observe(video);
-    return () => io.disconnect();
-  }, [variant]);
+    observer.observe(video);
+    document.addEventListener('visibilitychange', update);
+    return () => { observer.disconnect(); document.removeEventListener('visibilitychange', update); pause(); };
+  }, [variant, reducedMotion]);
 
-  return (
-    <figure className="hp-video">
-      <div className="hp-video-frame">
-        <video ref={ref} key={variant} muted loop playsInline autoPlay preload="metadata" controls
-          poster={`/media/laintas-cli-demo-${variant}.jpg`}
-          aria-label={c.videoTitle}>
-          <source src={`/media/laintas-cli-demo-${variant}.webm`} type="video/webm" />
-          <source src={`/media/laintas-cli-demo-${variant}.mp4`} type="video/mp4" />
-        </video>
-      </div>
-      <figcaption><strong>{c.videoTitle}</strong><span>{c.videoNote}</span></figcaption>
-    </figure>
-  );
-}
-
-function Kicker({ children }) {
-  return <p className="st-kicker"><i aria-hidden="true" />{children}</p>;
+  function toggle() {
+    const video = ref.current;
+    if (!video) return;
+    if (video.paused) {
+      wantsPlayback.current = true;
+      video.play().catch(() => setFailed(true));
+    } else {
+      wantsPlayback.current = false;
+      video.pause();
+    }
+  }
+  function restart() {
+    const video = ref.current;
+    if (!video) return;
+    if (failed) video.load();
+    setFailed(false);
+    video.currentTime = 0;
+    wantsPlayback.current = true;
+    video.play().catch(() => setFailed(true));
+  }
+  return <figure id="demo" className="hp-video" aria-labelledby="demo-title">
+    <div className="hp-video-toolbar">
+      <h2 id="demo-title"><TerminalSquare size={17} aria-hidden="true" />{c.videoTitle}</h2>
+      <div><button type="button" onClick={toggle} aria-label={zh ? (playing ? '暂停演示' : '播放演示') : (playing ? 'Pause demo' : 'Play demo')} aria-pressed={playing}>
+        {playing ? <Pause size={15} aria-hidden="true" /> : <Play size={15} aria-hidden="true" />}<span>{zh ? (playing ? '暂停' : '播放') : (playing ? 'Pause' : 'Play')}</span>
+      </button><button type="button" onClick={restart} aria-label={zh ? '重新播放' : 'Restart demo'}><RotateCcw size={15} aria-hidden="true" /><span>{zh ? '重播' : 'Restart'}</span></button></div>
+    </div>
+    <div className="hp-video-frame">
+      <video ref={ref} key={variant} muted loop playsInline preload="metadata" controls
+        onPlay={() => { wantsPlayback.current = true; setPlaying(true); }}
+        onPause={() => {
+          setPlaying(false);
+          if (automaticPause.current) automaticPause.current = false;
+          else wantsPlayback.current = false;
+        }}
+        onError={() => setFailed(true)}
+        poster={`/media/laintas-cli-demo-${variant}.jpg`} aria-label={c.videoTitle} aria-describedby="demo-description">
+        <source src={`/media/laintas-cli-demo-${variant}.webm`} type="video/webm" />
+        <source src={`/media/laintas-cli-demo-${variant}.mp4`} type="video/mp4" />
+      </video>
+    </div>
+    <figcaption id="demo-description">{c.videoNote}</figcaption>
+    {failed && <p className="demo-error" role="status">{zh ? '演示暂时无法播放。' : 'The demo could not play. '}
+      <a href={`/media/laintas-cli-demo-${variant}.mp4`}>{zh ? '打开视频文件' : 'Open the video file'}</a>
+      <button type="button" onClick={restart}>{zh ? '重新加载' : 'Try again'}</button>
+    </p>}
+  </figure>;
 }
 
 function Title({ parts: [plain, emphasised] }) {
   return <>{plain}<br /><em>{emphasised}</em></>;
 }
 
-function ChapterHead({ kicker, title, intro, small = false }) {
-  return (
-    <header className={`st-head${small ? ' st-head-small' : ''}`}>
-      <Kicker>{kicker}</Kicker>
-      <h2 className="st-display"><Title parts={title} /></h2>
-      <p>{intro}</p>
-    </header>
-  );
-}
-
-function CopyButton({ value, labels }) {
-  const [copied, setCopied] = useState(false);
-  async function copy() { await navigator.clipboard.writeText(value); setCopied(true); window.setTimeout(() => setCopied(false), 1600); }
-  return <button type="button" className="st-copy" onClick={copy} aria-label={labels.copy}>{copied ? <Check size={15} /> : <Copy size={15} />}{copied ? labels.copied : labels.copy}</button>;
+function ChapterHead({ title, intro, small = false }) {
+  return <header className={`st-head${small ? ' st-head-small' : ''}`}>
+    <h2 className="st-display"><Title parts={title} /></h2>
+    <p>{intro}</p>
+  </header>;
 }

@@ -2,6 +2,7 @@ import io
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -842,6 +843,11 @@ class SlashRegistryTests(unittest.TestCase):
         balance_response.json.return_value = balance
         subscription_response = mock.Mock(status_code=200)
         subscription_response.json.return_value = {}
+        barrier = threading.Barrier(3)
+        def read_usage(url, **kwargs):
+            barrier.wait(timeout=3)
+            return {"usage": usage_response, "balance": balance_response,
+                    "subscription": subscription_response}[url.rsplit("/", 1)[-1]]
         profile = backend_profiles.BackendProfile(
             "official", "official", "https://laintas.com")
         output = io.StringIO()
@@ -864,8 +870,7 @@ class SlashRegistryTests(unittest.TestCase):
                         return_value=({}, {})), \
                     mock.patch.object(
                         laintas_cli.requests, "get",
-                        side_effect=[usage_response, balance_response,
-                                     subscription_response]):
+                        side_effect=read_usage):
                 laintas_cli._show_usage_command([], {"userId": "u1"})
         finally:
             laintas_cli.console = old_console
@@ -1180,6 +1185,7 @@ class SlashRegistryTests(unittest.TestCase):
                 {"id": "my-keys", "label": "hosted name", "models": ["hosted-model"]},
                 {"id": "my-devices", "label": "My devices", "models": ["my/desk/qwen"]},
                 {"id": "org", "label": "Organization", "models": ["org-model"]},
+                {"id": "issues", "label": "Issues", "models": ["preset/claude"]},
             ],
         })
 
@@ -1192,8 +1198,12 @@ class SlashRegistryTests(unittest.TestCase):
                 ("hosted-model", "my-keys", "Activated"),
                 ("my/desk/qwen", "my-devices", "Compute"),
                 ("org-model", "org", "Organization"),
+                ("preset/claude", "issues", "Issues"),
             ],
         )
+        # A Laintas Issues preset reads as its name; the id is kept for routing.
+        self.assertEqual(laintas_cli._model_display_name("preset/claude"), "claude")
+        self.assertEqual(laintas_cli._model_display_name("preset/"), "preset/")
 
     def test_model_command_persists_selected_provider(self):
         models = [{

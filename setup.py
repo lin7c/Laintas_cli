@@ -36,7 +36,7 @@ setup(
     extras_require=_pm["extras_require"],
     entry_points={
         "console_scripts": [
-            "laintas-cli=laintas_cli:main",
+            "laintas-cli=cli_entry:main",
         ],
     },
     python_requires=">=3.10",

@@ -7,12 +7,16 @@ context inspector without importing or reconstructing provider requests.
 from __future__ import annotations
 
 import copy
+import fcntl
 import hashlib
 import json
 import os
 import stat
+import threading
 import time
 import uuid
+from collections import Counter, OrderedDict
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -24,6 +28,11 @@ DEFAULT_MAX_CONVERSATIONS = 200
 DEFAULT_MAX_BYTES = 100 * 1024 * 1024
 _SCHEMA_VERSION = 1
 _MISSING = object()
+# Retention only needs ordering and blob references, not full call metadata.
+# Share this bounded cache across the short-lived module-level store objects.
+_RETENTION_CACHE = OrderedDict()
+_RETENTION_CACHE_LOCK = threading.Lock()
+_RETENTION_CACHE_LIMIT = 512
 
 
 class ContextSnapshotError(Exception):
@@ -68,12 +77,6 @@ def _json_bytes(value: Any) -> bytes:
             f"context material is not JSON serializable: {exc}"
         ) from exc
     return text.encode("utf-8")
-
-
-def _json_copy(value: Any) -> Any:
-    """Copy a JSON value without retaining references to caller containers."""
-    data = _json_bytes(value)
-    return json.loads(data.decode("utf-8"))
 
 
 def _key(value: str) -> str:
@@ -128,6 +131,25 @@ class ContextSnapshotStore:
         self._ensure_dir(self.root)
         self._ensure_dir(self.blobs_dir)
         self._ensure_dir(self.sessions_dir)
+
+    @contextmanager
+    def _write_guard(self):
+        """Serialize append/GC across agents so uncommitted blobs survive."""
+        self._ensure_layout()
+        try:
+            fd = os.open(self.root / ".write.lock",
+                         os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                         0o600)
+        except OSError as exc:
+            raise ContextSnapshotSecurityError("cannot open snapshot write lock") from exc
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise ContextSnapshotSecurityError("unsafe snapshot write lock")
+            os.fchmod(fd, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
 
     def _session_dir(self, session_id: str, *, create: bool = False) -> Path:
         directory = self.sessions_dir / _key(session_id)
@@ -220,7 +242,9 @@ class ContextSnapshotStore:
                 pass
 
     def _put_blob(self, value: Any) -> str:
-        data = _json_bytes(value)
+        return self._put_blob_bytes(_json_bytes(value))
+
+    def _put_blob_bytes(self, data: bytes) -> str:
         digest = hashlib.sha256(data).hexdigest()
         path = self.blobs_dir / f"{digest}.json"
         if path.exists() or path.is_symlink():
@@ -284,11 +308,13 @@ class ContextSnapshotStore:
         tools: Any = _MISSING,
         structured_system_sections: Any = _MISSING,
         call_id: Optional[str] = None,
+        expand: bool = True,
     ) -> Dict[str, Any]:
-        """Append one model call and return its expanded, detached snapshot.
+        """Append one model call and return a detached snapshot.
 
         ``turn_id`` aliases ``conversation_id`` and ``tools`` aliases
-        ``tool_schemas`` to accommodate provider-facing call sites.
+        ``tool_schemas`` to accommodate provider-facing call sites. Set
+        ``expand=False`` to return references without reading blobs back.
         """
         session_id = self._check_identifier("session_id", session_id)
         if conversation_id is None:
@@ -312,18 +338,21 @@ class ContextSnapshotStore:
             call_id = uuid.uuid4().hex
         call_id = self._check_identifier("call_id", call_id)
 
-        # Validate and detach all values before touching storage. This also
-        # guarantees no partial write when one late field is unserializable.
-        material = {
-            "system_prompt": _json_copy(system_prompt),
-            "messages": _json_copy(messages),
-            "tool_schemas": _json_copy(tool_schemas),
-            "metadata": _json_copy(metadata),
-            "system_sections": _json_copy(system_sections),
-            "gateway_context_receipt": _json_copy(gateway_context_receipt),
+        # Encoding freezes and validates every field before touching storage.
+        # Keep large blobs encoded instead of decoding and re-encoding them.
+        encoded = {
+            "system_prompt": _json_bytes(system_prompt),
+            "messages": _json_bytes(messages),
+            "tool_schemas": _json_bytes(tool_schemas),
+            "metadata": _json_bytes(metadata),
+            "system_sections": _json_bytes(system_sections),
+            "gateway_context_receipt": _json_bytes(gateway_context_receipt),
         }
+        with self._write_guard():
+            return self._append_encoded(session_id, conversation_id, call_id,
+                                        encoded, expand=expand)
 
-        self._ensure_layout()
+    def _append_encoded(self, session_id, conversation_id, call_id, encoded, *, expand):
         session_dir = self._session_dir(session_id, create=True)
         path = session_dir / f"{_key(conversation_id)}.json"
         now = _utc_now()
@@ -349,20 +378,20 @@ class ContextSnapshotStore:
             "call_id": call_id,
             "created_at": now,
             "sequence": sequence,
-            "system_prompt_blob": self._put_blob(material["system_prompt"]),
-            "messages_blob": self._put_blob(material["messages"]),
-            "tool_schemas_blob": self._put_blob(material["tool_schemas"]),
-            "metadata": material["metadata"],
-            "system_sections": material["system_sections"],
-            "gateway_context_receipt": material["gateway_context_receipt"],
+            "system_prompt_blob": self._put_blob_bytes(encoded["system_prompt"]),
+            "messages_blob": self._put_blob_bytes(encoded["messages"]),
+            "tool_schemas_blob": self._put_blob_bytes(encoded["tool_schemas"]),
+            "metadata": json.loads(encoded["metadata"]),
+            "system_sections": json.loads(encoded["system_sections"]),
+            "gateway_context_receipt": json.loads(encoded["gateway_context_receipt"]),
         }
         manifest["calls"].append(call)
         manifest["updated_at"] = now
         manifest["updated_sequence"] = sequence
         self._atomic_write(path, _json_bytes(manifest))
-        expanded = self._expand_call(call)
+        result = self._expand_call(call) if expand else call
         self._apply_retention()
-        return expanded
+        return result
 
     def _manifest_paths(self, session_id: Optional[str] = None) -> List[Path]:
         base = self._session_dir(session_id) if session_id is not None else self.sessions_dir
@@ -531,20 +560,33 @@ class ContextSnapshotStore:
             return total
         return total
 
-    def _remove_unreferenced_blobs(self, manifests: List[Dict[str, Any]]) -> None:
-        referenced = set()
-        for manifest in manifests:
-            for call in manifest.get("calls", []):
-                for field in ("system_prompt_blob", "messages_blob", "tool_schemas_blob"):
-                    digest = call.get(field)
-                    if isinstance(digest, str):
-                        referenced.add(digest)
+    def _retention_metadata(self, path):
         try:
-            for path in self.blobs_dir.glob("*.json"):
-                if path.stem not in referenced:
-                    self._safe_unlink(path)
-        except OSError:
-            pass
+            info = path.lstat()
+        except OSError as exc:
+            raise ContextSnapshotCorrupt("cannot inspect retention record") from exc
+        if not stat.S_ISREG(info.st_mode):
+            raise ContextSnapshotSecurityError("unsafe retention record")
+        key = str(path.absolute())
+        signature = (info.st_dev, info.st_ino, info.st_size,
+                     info.st_mtime_ns, info.st_ctime_ns)
+        with _RETENTION_CACHE_LOCK:
+            cached = _RETENTION_CACHE.get(key)
+            if cached is not None and cached[0] == signature:
+                _RETENTION_CACHE.move_to_end(key)
+                return cached[1]
+        manifest = self._validate_manifest(self._read_json(path))
+        references = frozenset(
+            call[field] for call in manifest["calls"]
+            for field in ("system_prompt_blob", "messages_blob", "tool_schemas_blob")
+            if isinstance(call.get(field), str))
+        result = (manifest.get("updated_sequence", 0), references)
+        with _RETENTION_CACHE_LOCK:
+            _RETENTION_CACHE[key] = (signature, result)
+            _RETENTION_CACHE.move_to_end(key)
+            while len(_RETENTION_CACHE) > _RETENTION_CACHE_LIMIT:
+                _RETENTION_CACHE.popitem(last=False)
+        return result
 
     def _apply_retention(self) -> None:
         """Evict oldest conversations, never traversing outside ``root``."""
@@ -552,25 +594,60 @@ class ContextSnapshotStore:
         corrupt_seen = False
         for path in self._manifest_paths():
             try:
-                manifest = self._validate_manifest(self._read_json(path))
-                records.append((manifest.get("updated_sequence", 0), path, manifest))
+                sequence, references = self._retention_metadata(path)
+                records.append((sequence, path, references))
             except ContextSnapshotError:
                 corrupt_seen = True
         records.sort(key=lambda item: (item[0], str(item[1])))
 
         if self.max_conversations is not None:
-            while len(records) > self.max_conversations:
-                _, path, _ = records.pop(0)
-                self._safe_unlink(path)
+            for record in list(records):
+                if len(records) <= self.max_conversations:
+                    break
+                if self._safe_unlink(record[1]):
+                    records.remove(record)
+
+        # Count the store once, including unknown files. Track successful
+        # removals instead of walking the whole tree for every eviction.
+        total = self._store_bytes() if self.max_bytes is not None else 0
+        references = Counter(digest for _, _, refs in records for digest in refs)
+        blobs = {}
+        for path in self.blobs_dir.glob("*.json"):
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                blobs[path.stem] = (path, info.st_size)
+
+        def remove_blob(digest):
+            nonlocal total
+            blob = blobs.get(digest)
+            if blob is not None and self._safe_unlink(blob[0]):
+                total -= blob[1]
+                blobs.pop(digest, None)
+
         if not corrupt_seen:
-            self._remove_unreferenced_blobs([item[2] for item in records])
+            for digest in list(blobs):
+                if not references[digest]:
+                    remove_blob(digest)
 
         if self.max_bytes is not None:
-            while records and self._store_bytes() > self.max_bytes:
-                _, path, _ = records.pop(0)
-                self._safe_unlink(path)
+            for _, path, refs in records:
+                if total <= self.max_bytes:
+                    break
+                try:
+                    size = path.lstat().st_size
+                except OSError:
+                    continue
+                if not self._safe_unlink(path):
+                    continue
+                total -= size
                 if not corrupt_seen:
-                    self._remove_unreferenced_blobs([item[2] for item in records])
+                    for digest in refs:
+                        references[digest] -= 1
+                        if not references[digest]:
+                            remove_blob(digest)
 
 
 # Module-level helpers keep integration call sites small while preserving an

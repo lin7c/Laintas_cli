@@ -1235,9 +1235,30 @@ class PersistentOwnershipTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         terminal = agent_loop.get_terminal("worker-cli")
         self.assertEqual(terminal.parent_terminal, "term0")
-        self.assertIn("laintas_cli.py", terminal.session.command)
+        self.assertIn("cli_entry.py", terminal.session.command)
         self.assertIn("--terminal-name worker-cli", terminal.session.command)
         self.assertIn("LAINTAS_TERMINAL_ID=term-", terminal.session.command)
+
+    def test_frozen_terminal_create_launches_executable_without_python_script(self):
+        self._terminal("term0")
+        owner = agent_loop.register_agent(name="primary", role="primary")
+        owner.home_terminal = "term0"
+        deps = _deps()
+        deps.SubTerminalSession = _FakeInteractiveSession
+        ctx = tools.ToolCtx(
+            deps=deps, agent_id=owner.id, depth=0,
+            get_agent=agent_loop.get_agent, get_terminal=agent_loop.get_terminal,
+            register_terminal=agent_loop.register_terminal,
+            unregister_terminal=agent_loop.unregister_terminal,
+        )
+        with mock.patch.object(tools.sys, "frozen", True, create=True):
+            result = tools._bi_terminal_create({"name": "worker-cli"}, ctx)
+        self.assertTrue(result["ok"])
+        command = agent_loop.get_terminal("worker-cli").session.command
+        self.assertNotIn("cli_entry.py", command)
+        self.assertNotIn("laintas_cli.py", command)
+        self.assertIn(shlex.quote(tools.sys.executable), command)
+        self.assertIn("--terminal-name worker-cli", command)
 
 
 class EphemeralSessionTests(unittest.TestCase):
@@ -2999,6 +3020,32 @@ class FinalTurnWrapUpTests(unittest.TestCase):
         self.assertTrue(result["state"].get("_max_loops_exhausted"))
         self.assertIn("Turn limit reached",
                       str(result["state"].get("shortTermMemory") or ""))
+
+    def test_next_run_does_not_inherit_the_turn_limit_warning(self):
+        # Session memory crosses runs; the warning stayed in the present tense
+        # and the next run wrapped up early believing it was out of steps.
+        first = self._run_always_tooling(1)
+        self.assertIn("Turn limit reached", first["state"]["shortTermMemory"])
+        deps = _deps()
+        prompts = []
+
+        def backend(**kw):
+            prompts.append("\n".join(str(m.get("content") or "")
+                                      for m in (kw.get("messages") or [])))
+            return {"reply": "done", "finish_reason": "stop", "tool_calls": [],
+                    "done": True, "error": False}
+
+        deps.call_backend = backend
+        with tempfile.TemporaryDirectory() as tmp, _chdir(tmp), \
+                mock.patch.object(agent_persistence, "AGENTS_DIR", Path(tmp) / "agents"):
+            Path(".laintas").mkdir()
+            result = agent_loop.run_agent_loop(
+                deps, "next question", {}, dict(first["state"]), [],
+                max_loops_override=3)
+        self.assertTrue(prompts)
+        self.assertNotIn("Turn limit reached", prompts[0])
+        self.assertIn(agent_loop._RETIRED_TURN_LIMIT_NOTE, prompts[0])
+        self.assertIn("Step 1:", result["state"]["shortTermMemory"])
 
     def test_step_mode_pauses_without_exhaustion_markers(self):
         result = self._run_always_tooling(1, step_mode=True)

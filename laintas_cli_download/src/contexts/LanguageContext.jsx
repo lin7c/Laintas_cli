@@ -231,12 +231,14 @@ const LanguageContext = createContext(null);
 
 export function LanguageProvider({ children }) {
   const [lang, setLang] = useState(() => {
-    try { return localStorage.getItem('laintas-lang') || 'en'; }
+    try { const m = document.cookie.match(/(?:^|;\s*)laintas-lang=(zh|en)(?:;|$)/); const stored = (m ? m[1] : null) || localStorage.getItem('laintas-lang'); return stored === 'zh' ? 'zh' : 'en'; }
     catch { return 'en'; }
   });
 
   useEffect(() => {
+    document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
     try { localStorage.setItem('laintas-lang', lang); } catch {}
+    try { document.cookie = 'laintas-lang=' + lang + '; domain=.laintas.com; path=/; max-age=31536000; SameSite=Lax'; } catch {}
   }, [lang]);
 
   const toggleLang = () => setLang(l => l === 'zh' ? 'en' : 'zh');

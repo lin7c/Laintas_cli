@@ -44,6 +44,7 @@ import workgraph             # Unified objective/plan/steps/workflow authority
 import retask                # Work handed to the person (.retask checklists)
 import paths                 # Centralized path management
 import account_store
+import context_kernel
 import session_lifecycle
 import json_store            # atomic small-JSON read/write
 import peer_coordination     # Cross-instance file-conflict coordination
@@ -81,9 +82,9 @@ try:
 except Exception:  # pragma: no cover
     tokenizer = None  # type: ignore
 
-# Path to laintas_cli.py for spawning child terminals
+# Path to the lightweight entry for spawning child terminals.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_LAINTAS_CLI = os.path.join(_SCRIPT_DIR, "laintas_cli.py")
+_LAINTAS_CLI = os.path.join(_SCRIPT_DIR, "cli_entry.py")
 
 PLATFORM_SAFETY_POLICY = """<platform_safety_policy>
 This block is supplied by the runtime after loading user customization.
@@ -2371,6 +2372,36 @@ def normalize_fork_lineage(value) -> list:
     return names
 
 
+
+def _runtime_history(items):
+    """Canonical snapshot items back to the runtime (wire) form.
+
+    Snapshots are saved in wire form — exactly the bytes the model was
+    sent, so a resumed session reuses its upstream prompt-cache prefix
+    and keeps arguments a truncated stream left unparseable. Only the
+    kernel-stamped snapshots written for a short while in canonical form
+    need this. Items the kernel rejects (local roles such as "knowledge")
+    pass through unchanged."""
+    out = []
+    for m in items or []:
+        try:
+            out.append(context_kernel.to_wire_lossless(m))
+        except Exception:
+            out.append(m)
+    return out
+
+
+def _denormalize_payload(data):
+    """A kernel-stamped resume payload carries canonical chat_history;
+    hand consumers the runtime form. Unstamped payloads (wire form, the
+    format saved now and before the stamp) pass through untouched."""
+    if isinstance(data, dict) and data.get("kernel") \
+            and isinstance(data.get("chat_history"), list):
+        data = dict(data)
+        data["chat_history"] = _runtime_history(data["chat_history"])
+    return data
+
+
 def _build_resume_payload(state: dict, chat_history: list, cwd: str, kind: str,
                           *, agent_id: str = "primary") -> Optional[dict]:
     state = state if state is not None else {}
@@ -3161,12 +3192,12 @@ def load_resume_state(cwd: str, session_id: str = None,
                         and account_store.owns(data, paths.ACCOUNT_USER_ID)
                         and time.time() - data.get("timestamp", 0) <= 7 * 86400
                         and _resume_agent_of(data) == _resume_agent_of(agent_id)):
-                    return data
+                    return _denormalize_payload(data)
             return None
         states = list_resume_states(cwd, agent_id=agent_id)
         if not states:
             return None
-        return states[0]
+        return _denormalize_payload(states[0])
     except Exception:
         return None
 
@@ -6696,6 +6727,26 @@ def _thread_tokens(messages: list) -> int:
     return ctxpol.estimate_tokens(blob) if ctxpol is not None else (len(blob) + 3) // 4
 
 
+class _ThreadTokenCounter:
+    """Share one measurement within a synchronous compaction checkpoint.
+
+    Never retained across loop iterations. Compaction must invalidate it even
+    when it only rewrites messages in place without changing their count.
+    """
+
+    def __init__(self, messages: list):
+        self.messages = messages
+        self._tokens = None
+
+    def count(self) -> int:
+        if self._tokens is None:
+            self._tokens = _thread_tokens(self.messages)
+        return self._tokens
+
+    def invalidate(self) -> None:
+        self._tokens = None
+
+
 def _serialize_thread_msg(m: dict) -> str:
     """Flatten one thread message into plain text for the compaction summarizer."""
     role = m.get("role")
@@ -6975,7 +7026,8 @@ def _summarize_head_in_chunks(deps, session, head: list,
     return summary if completed_any else None
 
 
-def _publish_context_headroom(thread_messages: list, state: dict) -> None:
+def _publish_context_headroom(thread_messages: list, state: dict, *,
+                              tokens: Optional[int] = None) -> None:
     """Tell the pager how much context is free, in characters.
 
     A page is sized from the headroom at the moment a file is first opened
@@ -6984,7 +7036,8 @@ def _publish_context_headroom(thread_messages: list, state: dict) -> None:
     """
     try:
         budget = compaction_budget(state)
-        tokens = _thread_tokens(thread_messages)
+        if tokens is None:
+            tokens = _thread_tokens(thread_messages)
         state["_context_live_tokens"] = tokens
         state["_context_live_messages"] = len(thread_messages)
         # Per-item sizes are shares of the thread budget, not of what happens
@@ -7228,8 +7281,9 @@ def _compaction_job_key(state):
 
 def _coordinate_compaction(messages, deps, session, lang, state, *,
                            force=False, announce=True, interrupt_event=None,
-                           finish_only=False):
+                           finish_only=False, token_counter=None):
     """Main-loop checkpoint: publish a ready prefix, speculate, or wait once."""
+    token_counter = token_counter or _ThreadTokenCounter(messages)
     state.pop("_compaction_wait_failed", None)
     coordinator = background_compaction.current.get()
     if not aux_calls_enabled():
@@ -7238,11 +7292,13 @@ def _coordinate_compaction(messages, deps, session, lang, state, *,
             coordinator.close()
         if finish_only:
             return False
+        token_counter.invalidate()
         return _compact_thread_messages(messages, deps, session, lang, state,
             force=force, announce=announce, interrupt_event=interrupt_event)
     if coordinator is None or ctxpol is None:
         if finish_only:
             return False
+        token_counter.invalidate()
         return _compact_thread_messages(messages, deps, session, lang, state,
             force=force, announce=announce, interrupt_event=interrupt_event)
     auto = ctxpol.load().get("auto", True)
@@ -7270,7 +7326,7 @@ def _coordinate_compaction(messages, deps, session, lang, state, *,
     pending = coordinator.job
     if pending is not None and (not enabled or not matches(pending)):
         pending.cancel.set()
-    hard = not finish_only and (force or (auto and _thread_tokens(messages) >= foreground_at))
+    hard = not finish_only and (force or (auto and token_counter.count() >= foreground_at))
     if pending is not None and hard and not pending.done.is_set():
         status = (_compaction_status(deps, "Waiting for background context compaction… "
                   + symbols.BULLET + " Esc/Ctrl+C cancel") if announce else nullcontext())
@@ -7293,6 +7349,7 @@ def _coordinate_compaction(messages, deps, session, lang, state, *,
             reclaimed = _thread_tokens(ready.prefix) - _thread_tokens([summary_message])
             if reclaimed >= int(get_runtime_config("compact_background_min_tokens")):
                 messages[:] = [summary_message] + messages[len(ready.prefix):]
+                token_counter.invalidate()
                 state["_thread_summary"] = ready.summary
                 _consolidate_memories_on_compact(deps, session, {**state, "_thread_messages": messages})
                 changed = True
@@ -7300,13 +7357,14 @@ def _coordinate_compaction(messages, deps, session, lang, state, *,
     if finish_only:
         return changed
 
-    tokens = _thread_tokens(messages)
+    tokens = token_counter.count()
     if changed and tokens < foreground_at:
         return True
     if force or (auto and tokens >= foreground_at):
         if not background_compaction.cancel_owner(_compaction_owner(state)):
             state["_compaction_wait_failed"] = True
             return False
+        token_counter.invalidate()
         return _compact_thread_messages(messages, deps, session, lang, state,
             force=force, announce=announce, interrupt_event=interrupt_event) or changed
     if not enabled or coordinator.job is not None or len(messages) < 4:
@@ -7787,10 +7845,24 @@ def _tool_schema_tokens(name: str) -> int:
     return cost
 
 
+#: How many recently used / discovered tool names keep their priority.
+_TOOL_RECENCY_MAX = 64
+
+
+def note_tool_recency(state: dict, names) -> None:
+    """Move ``names`` (in order) to the front of the task's recency list."""
+    names = [str(n) for n in names if n]
+    rest = [n for n in state.get("_tool_recency") or [] if n not in names]
+    state["_tool_recency"] = list(dict.fromkeys(names + rest))[:_TOOL_RECENCY_MAX]
+
+
 def fit_tool_names(names, state: dict):
     """Apply the `tools` node: narrow the authorized schema set once it
     outgrows its share. The core surface (context_router.CORE_TOOLS) always
-    stays; the rest go in a fixed order so the same set is cut the same way."""
+    stays; the rest go most-recently-used first (`_tool_recency`: what the
+    agent just called or just asked tool.search for), then by name. Name order
+    alone cut `win.*` and kept the whole `browser.*` family — the tools the
+    agent had searched for one turn earlier were the first to go."""
     if names is None:
         return names
     trees = budget_trees()
@@ -7804,7 +7876,9 @@ def fit_tool_names(names, state: dict):
     kept = names
     if over:
         core = set(context_router.CORE_TOOLS) & names
-        ordered = sorted(names, key=lambda n: (n not in core, n))
+        recency = {n: i for i, n in enumerate(state.get("_tool_recency") or [])}
+        ordered = sorted(names, key=lambda n: (
+            n not in core, recency.get(n, len(recency)), n))
         kept = set(prompt_budget.fit_items(
             [(n, costs[n]) for n in ordered], allotted, core))
     listing = "\n".join(sorted(names))
@@ -8506,6 +8580,24 @@ def _trim_short_term_memory(text: str, limit: int | None = None) -> str:
     return prefix + "\n".join(kept)
 
 
+#: What a turn-limit warning becomes once the run that hit it is over.
+_RETIRED_TURN_LIMIT_NOTE = "(an earlier run stopped at its step limit)"
+
+
+def _retire_turn_limit_notes(text: str) -> str:
+    """Rewrite the previous run's "Turn limit reached (N/N)" warnings.
+
+    Session memory crosses the turn boundary, so the warning sat in every later
+    prompt in the present tense. The next run reads it as its own state and
+    wraps up at step 14 of 30 believing its budget is gone. Its step budget is
+    in <progress>; this keeps only the fact that an earlier run was cut short.
+    """
+    if "Turn limit reached (" not in str(text or ""):
+        return text
+    return "\n".join(f"  {_RETIRED_TURN_LIMIT_NOTE}" if "Turn limit reached (" in ln else ln
+                     for ln in str(text).splitlines())
+
+
 def _append_short_memory(state: dict, text: str) -> None:
     """Append one session-memory line and keep the buffer bounded."""
     state["shortTermMemory"] = _trim_short_term_memory(
@@ -8734,6 +8826,7 @@ STATE_KEYS_TURN_ONLY = frozenset({
     "_active_tool", "_agent_id", "_branch_completion_warned", "_capability_gaps",
     "_contract", "_contract_max_loops", "_contract_tools", "_ctx_page_chars", "_ctx_result_chars",
     "_dynamic_context_query", "_dynamic_tool_names", "_escalation_suggested",
+    "_tool_recency",
     "_exhaustion_loop_count", "_force_full_catalog_next", "_force_micro_keep",
     "_help_request", "_hwo_return", "_inbox", "_intent", "_keep_worktree",
     "_max_loops_exhausted", "_no_action_count", "_pending_history",
@@ -11178,6 +11271,7 @@ def _prepare_tool_call(tc: dict, idx: int, loop: int) -> Optional[dict]:
         "arguments": arguments,
         "display_name": display_name,
         "call_id": f"call_{loop+1:02d}_{idx+1:02d}",
+        "source_call_id": tc.get("_source_call_id"),
         "salient": _salient_arg(name, arguments),
         "is_shell_flavored": name in (
             "shell.exec", "terminal.create", "terminal.send", "terminal.exec",
@@ -11644,6 +11738,7 @@ def run_agent_loop(
     if not continue_thread:
         state.pop("_dynamic_tool_names", None)
         state.pop("_dynamic_context_query", None)
+        state.pop("_tool_recency", None)
     # New top-level task: shrink command outputs inherited from the previous
     # task so a stale large dump doesn't ride along in every prompt of an
     # unrelated question. Follow-ups keep a short tail for continuity. depth==0
@@ -11655,7 +11750,8 @@ def run_agent_loop(
         # task must fulfill recurring hooks again instead of inheriting a stale
         # success bit from an earlier run.
         state["_satisfied_rule_ids"] = []
-    state["shortTermMemory"] = _trim_short_term_memory(state.get("shortTermMemory", ""))
+    state["shortTermMemory"] = _trim_short_term_memory(
+        _retire_turn_limit_notes(state.get("shortTermMemory", "")))
     state["lastOutput"] = _trim_text(
         state.get("lastOutput", ""), tool_result_chars("", state) * 2)
     if chat_history is None:
@@ -13204,15 +13300,17 @@ def run_agent_loop(
                                    "and output reserve; reduce them or select a larger model.[/yellow]")
                 _exit_reason = TRANSITION_BACKEND_ERROR
                 break
+            _thread_token_counter = _ThreadTokenCounter(thread_messages)
             _coordinate_compaction(thread_messages, deps, session,
                                    _detect_lang(original_input), state,
-                                   announce=True, interrupt_event=_interrupt)
+                                   announce=True, interrupt_event=_interrupt,
+                                   token_counter=_thread_token_counter)
             if state.pop("_compaction_wait_failed", False):
                 _exit_reason = TRANSITION_INTERRUPTED if _interrupt.is_set() else TRANSITION_BACKEND_ERROR
                 if not _interrupt.is_set():
                     deps.console.print("[yellow]Context compaction is still cancelling; retry this turn shortly.[/yellow]")
                 break
-            if _thread_tokens(thread_messages) > compaction_budget(state)["usable"]:
+            if _thread_token_counter.count() > compaction_budget(state)["usable"]:
                 detail = ("Run /model aux on then /compact, start a new session with /clear, "
                           "or select a larger model." if not aux_calls_enabled() else
                           "Retry /compact or select a larger model.")
@@ -13220,7 +13318,8 @@ def run_agent_loop(
                                    f"history was retained. {detail}[/yellow]")
                 _exit_reason = TRANSITION_BACKEND_ERROR
                 break
-            _publish_context_headroom(thread_messages, state)
+            _publish_context_headroom(thread_messages, state,
+                                      tokens=_thread_token_counter.count())
             user_input = _live_state  # for debug display
             # Last-step wrap-up (opencode MAX_STEPS_PROMPT): on the final allowed
             # iteration, tell the model to stop calling tools and answer now, so it
@@ -13936,6 +14035,7 @@ def run_agent_loop(
             if _client_payload:
                 context_snapshot.append_call(
                     _session_id or "default", _run_id,
+                    expand=False,
                     system_prompt=_captured_system,
                     messages=_captured_messages,
                     tool_schemas=_captured_tools,
@@ -14462,7 +14562,8 @@ def run_agent_loop(
             # non-read-only call anywhere in the turn disqualifies the whole
             # turn, which is what keeps the agent's single PTY unshared and
             # every write ordered. Filled lazily below, once `tool_ctx` exists.
-            _ro_parallel = _can_batch_read_only(tool_calls, _interrupt.is_set())
+            _issue_replay = any(str(c.get("_source_call_id") or "").startswith("ic_") for c in tool_calls)
+            _ro_parallel = not _issue_replay and _can_batch_read_only(tool_calls, _interrupt.is_set())
             _ro_batch = None
             # pre_tool verdicts computed by the batch pre-pass, consumed by the
             # sequential pass so a user hook is never triggered twice for the
@@ -14527,6 +14628,17 @@ def run_agent_loop(
                 display_name = _call["display_name"]
                 call_id = _call["call_id"]
                 salient = _call["salient"]
+                _issue_source = str(_call.get("source_call_id") or "")
+                _issue_journal = None
+                if _issue_source.startswith("ic_"):
+                    from issues_tool_replay import journal
+                    _issue_journal = journal()
+                    cached = _issue_journal.claim(_issue_source,name,arguments)
+                    if cached is not None:
+                        cached = {**cached,"call_id":call_id}
+                        per_call_rows.append(cached)
+                        formatted_outputs.append(str(cached.get("output") or ""))
+                        continue
                 _tool_t0 = time.monotonic()
                 # In-flight marker: lets a supervisor tell "busy inside one long
                 # tool call" apart from "stalled". Without it, a legitimate
@@ -14639,6 +14751,8 @@ def run_agent_loop(
                                 f"`{name} {salient[:60]}` "
                                 f"(failed {result.get('_repeat_count')}× already).[/red]")
                     per_call_rows.append(_row)
+                    if _issue_journal is not None:
+                        _issue_journal.complete(_issue_source,_row)
                     continue
 
 
@@ -14993,6 +15107,8 @@ def run_agent_loop(
                     "call_id": call_id,
                     "elapsed_seconds": round(_tool_elapsed, 3),
                 })
+                if _issue_journal is not None:
+                    _issue_journal.complete(_issue_source,per_call_rows[-1])
                 # Progress is published per CALL, not per turn: a turn with six
                 # tool calls must not look motionless to a supervisor until the
                 # last one lands. The rows only join terminalHistory at the end
@@ -15286,6 +15402,8 @@ def run_agent_loop(
                 state,
                 f"\n  Step {_step_idx}: {_step_note}"
             )
+        if tool_names_for_log:
+            note_tool_recency(state, tool_names_for_log)
         state["terminalHistory"].extend(per_call_rows)
         state.pop("_pending_history", None)
         _publish_progress_state(self_info, state)
@@ -15307,6 +15425,7 @@ def run_agent_loop(
                 _row = _rows_by_id.get(_row_cid)
                 _thread_call_seq += 1
                 _cid = f"call_{state['_session_id'][:8]}_{_thread_call_seq:06d}"
+                _cid = _tc.get("_source_call_id") or _cid
                 # ── Paged read bookkeeping (part 2 of 2) ──
                 # Key the page map by the id the THREAD will carry, which is
                 # the only id _project_paged_reads can match on. Bounded so a

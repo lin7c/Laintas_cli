@@ -219,7 +219,7 @@ cycle detection, normalized progress/status, and an append-only event history.
 ### 12.1 Platform separation
 
 The terminal CLI targets Linux and macOS. The independent
-`laintas-Helpwo-cli-for-windows` desktop product owns the Windows kernel,
+`Helpwo windows` desktop product owns the Windows kernel,
 Helpwo chat UI, native installer and signed updater. Its private source
 repository is `lin7c/laintas-Helpwo-cli-agent-for-windows`.
 

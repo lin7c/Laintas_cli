@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "name": "issues",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "entrypoint": "main.py",
   "description": "Issues answers and personal tasks: choose applicants, accept delivery and chat privately in the CLI",
   "author": {

@@ -4,12 +4,14 @@ const ThemeContext = createContext(null);
 
 export function ThemeProvider({ children }) {
   const [theme, setTheme] = useState(() => {
-    try { return localStorage.getItem('laintas-theme') || 'dark'; }
+    try { return localStorage.getItem('laintas-theme') === 'light' ? 'light' : 'dark'; }
     catch { return 'dark'; }
   });
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
+    document.documentElement.style.colorScheme = theme;
+    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', theme === 'dark' ? '#090b09' : '#f3f2ed');
     try { localStorage.setItem('laintas-theme', theme); } catch {}
   }, [theme]);
 
