@@ -1,5 +1,6 @@
 """Offline credential gate. No samples, verification, logging, or raw findings."""
 from functools import lru_cache
+import importlib
 import json
 import re
 
@@ -27,26 +28,40 @@ def _placeholder(value: str) -> bool:
                 or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*\(\)", value))
 
 
+_DETECTOR_SPECS = (
+    ("aws", "AWSKeyDetector"),
+    ("azure_storage_key", "AzureStorageKeyDetector"),
+    ("github_token", "GitHubTokenDetector"),
+    ("gitlab_token", "GitLabTokenDetector"),
+    ("openai", "OpenAIDetector"),
+    ("private_key", "PrivateKeyDetector"),
+    ("slack", "SlackDetector"),
+    ("stripe", "StripeDetector"),
+    ("sendgrid", "SendGridDetector"),
+    ("npm", "NpmDetector"),
+    ("pypi_token", "PypiTokenDetector"),
+    ("telegram_token", "TelegramBotTokenDetector"),
+    ("basic_auth", "BasicAuthDetector"),
+)
+
+
 @lru_cache(maxsize=1)
 def _detectors():
     # analyze_string only: analyze_line/scan_line can perform network verification.
-    from detect_secrets.plugins.aws import AWSKeyDetector
-    from detect_secrets.plugins.azure_storage_key import AzureStorageKeyDetector
-    from detect_secrets.plugins.github_token import GitHubTokenDetector
-    from detect_secrets.plugins.gitlab_token import GitLabTokenDetector
-    from detect_secrets.plugins.openai import OpenAIDetector
-    from detect_secrets.plugins.private_key import PrivateKeyDetector
-    from detect_secrets.plugins.slack import SlackDetector
-    from detect_secrets.plugins.stripe import StripeDetector
-    from detect_secrets.plugins.sendgrid import SendGridDetector
-    from detect_secrets.plugins.npm import NpmDetector
-    from detect_secrets.plugins.pypi_token import PypiTokenDetector
-    from detect_secrets.plugins.telegram_token import TelegramBotTokenDetector
-    from detect_secrets.plugins.basic_auth import BasicAuthDetector
-    return tuple(cls() for cls in (AWSKeyDetector, AzureStorageKeyDetector,
-        GitHubTokenDetector, GitLabTokenDetector, OpenAIDetector, PrivateKeyDetector,
-        SlackDetector, StripeDetector, SendGridDetector, NpmDetector,
-        PypiTokenDetector, TelegramBotTokenDetector, BasicAuthDetector))
+    # The regex layer in input_error is self-contained and always runs. This
+    # deep-scan layer is additive: a detector that cannot be imported or
+    # constructed in this runtime (for example an install whose bundled
+    # environment is missing the detect-secrets package) is skipped, never
+    # fatal -- an unavailable optional detector must not block every message.
+    detectors = []
+    for module_name, class_name in _DETECTOR_SPECS:
+        try:
+            module = importlib.import_module(
+                "detect_secrets.plugins." + module_name)
+            detectors.append(getattr(module, class_name)())
+        except Exception:
+            continue
+    return tuple(detectors)
 
 
 def input_error(text: str) -> str:
@@ -71,7 +86,11 @@ def input_error(text: str) -> str:
                 if not _placeholder(value):
                     return BLOCKED
         for detector in _detectors():
-            if any(not _placeholder(value) for value in detector.analyze_string(text)):
+            try:
+                values = detector.analyze_string(text)
+            except Exception:
+                continue
+            if any(not _placeholder(value) for value in values):
                 return BLOCKED
         return ""
     except Exception:

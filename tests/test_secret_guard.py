@@ -16,9 +16,22 @@ def test_offline_corpus(case):
         assert bool(guard.input_error(case['text'])) == case['blocked']
 
 
-def test_fail_closed_without_exposing_input_or_exception():
-    with mock.patch.object(guard, '_detectors', side_effect=RuntimeError('private diagnostic')):
-        assert guard.input_error('Ordinary text') == guard.UNAVAILABLE
+def test_unavailable_detectors_degrade_to_the_regex_layer():
+    # The deep-scan layer is additive: with no detectors available (an
+    # install whose runtime lacks the detect-secrets package), ordinary
+    # text passes and the self-contained regex layer still blocks.
+    with mock.patch.object(guard, '_detectors', return_value=()):
+        assert guard.input_error('Ordinary text') == ''
+        assert guard.input_error('my password is DemoPass42') == guard.BLOCKED
+        assert guard.input_error(
+            '-----BEGIN RSA PRIVATE KEY-----') == guard.BLOCKED
+
+
+def test_core_layer_failure_still_fails_closed():
+    with mock.patch.object(guard, '_placeholder',
+                           side_effect=RuntimeError('private diagnostic')):
+        assert guard.input_error(
+            'my password is DemoPass42') == guard.UNAVAILABLE
     assert guard.input_error('a' * (guard.MAX_TEXT + 1)) == guard.UNAVAILABLE
 
 
