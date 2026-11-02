@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 
-const FALLBACK = 'laintas-cli-beta-v5';
+const FALLBACK = 'v2.0.0';
 let latest;
 
 // Header and download packages share one request, including in StrictMode.

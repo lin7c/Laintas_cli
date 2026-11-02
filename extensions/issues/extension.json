@@ -12,5 +12,5 @@
   "capabilities": [
     "account"
   ],
-  "minCliVersion": "1.32.5b6"
+  "minCliVersion": "2.0.0"
 }
