@@ -5,6 +5,7 @@ from unittest import mock
 
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.layout.controls import FormattedTextControl
 
 import laintas_cli
 
@@ -23,8 +24,12 @@ class ResumePickerDeleteTests(unittest.TestCase):
                 apps.append(app)
 
                 def rendered():
-                    control = app.layout.container.children[-1].content
-                    return str(control.text())
+                    # The footer owns a separate window. Inspect rendered
+                    # content rather than assuming the list is the last pane.
+                    return "\n".join(
+                        str(control.text() if callable(control.text) else control.text)
+                        for control in app.layout.find_all_controls()
+                        if isinstance(control, FormattedTextControl))
 
                 async def settle(predicate, timeout=2.0):
                     """Poll until predicate holds; fixed sleeps race the app."""

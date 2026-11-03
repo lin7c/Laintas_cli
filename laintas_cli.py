@@ -686,10 +686,12 @@ def _restore_typeahead() -> None:
 
 def _ui_theme_mode() -> str:
     """The resolved mode for prompt_toolkit styles: dark, light or mono."""
+    if _no_color_requested():
+        return "mono"
     return terminal_theme.resolve_quietly(get_runtime_config("theme"))
 
 
-def _ptk_fragments(pairs):
+def _ptk_fragments(pairs, *, color_mode=None):
     """Expand a list of (base_style, text) pairs into prompt_toolkit fragments.
 
     ``text`` may embed Rich markup (``[bold]``, ``[green]``, ``[dim]`` …).
@@ -728,12 +730,12 @@ def _ptk_fragments(pairs):
                     parts.append("underline")
                 if st.reverse:
                     parts.append("reverse")
-                if st.color is not None:
+                if st.color is not None and color_mode != "mono":
                     try:
                         parts.append("#" + st.color.get_truecolor().hex.lstrip("#"))
                     except Exception:
                         pass
-                if st.bgcolor is not None:
+                if st.bgcolor is not None and color_mode != "mono":
                     try:
                         parts.append("bg:#" + st.bgcolor.get_truecolor().hex.lstrip("#"))
                     except Exception:
@@ -787,17 +789,20 @@ def _apply_marquee(row_text: str, sel_idx: int,
     scroll away with the content.
     """
     term_w = _get_term_size()[0]
-    plain = re.sub(r"\[/?[^\]]+\]", "", row_text)
-    avail = term_w - 1  # leave 1-char right margin
+    try:
+        text = Text.from_markup(row_text)
+    except Exception:
+        text = Text(row_text)
+    avail = max(0, term_w - 1)
     # The fixed prefix is never scrolled; only the content after it marquees.
-    fixed_chars = max(0, min(fixed_chars, len(plain)))
-    fixed_part = plain[:fixed_chars]
-    scrollable = plain[fixed_chars:]
-    scroll_avail = avail - fixed_chars
+    fixed_chars = max(0, min(fixed_chars, len(text)))
+    fixed_part = text[:fixed_chars]
+    scrollable = text[fixed_chars:]
+    scroll_avail = avail - fixed_part.cell_len
     if scroll_avail < 1:
-        # Terminal too narrow to show anything beyond the fixed prefix.
-        return fixed_part[:avail - 1] + "…"
-    if len(scrollable) <= scroll_avail:
+        fixed_part.truncate(avail, overflow="ellipsis")
+        return fixed_part.markup
+    if scrollable.cell_len <= scroll_avail:
         return row_text
     now = time.monotonic()
     if last_sel[0] != sel_idx:
@@ -806,7 +811,7 @@ def _apply_marquee(row_text: str, sel_idx: int,
     elapsed = now - start_time[0]
     pause_start = 1.0
     scroll_speed = 0.2          # seconds per character
-    max_offset = len(scrollable) - scroll_avail + 2
+    max_offset = scrollable.cell_len - scroll_avail
     raw = max(0.0, elapsed - pause_start) / scroll_speed
     # Wrap: after scrolling to the end, pause 2 s, then reset.
     wrap_at = max_offset + 2.0 / scroll_speed
@@ -814,10 +819,37 @@ def _apply_marquee(row_text: str, sel_idx: int,
         start_time[0] = now
         raw = 0.0
     offset = int(min(raw, max_offset))
-    visible = scrollable[offset:offset + scroll_avail - 1]
-    if offset < max_offset:
-        visible += "…"
-    return fixed_part + visible
+    # Offsets and clipping are in terminal cells; keep Rich spans when the
+    # selected text moves. A wide filename must not wrap into the next row.
+    start = cells = 0
+    for char in scrollable.plain:
+        size = _cell_len(char)
+        if cells + size > offset:
+            break
+        cells += size
+        start += 1
+    visible = scrollable[start:]
+    visible.truncate(scroll_avail, overflow="ellipsis")
+    return (fixed_part + visible).markup
+
+
+def _build_dialog_style() -> Style:
+    """Use the same dark, light and monochrome choices as the REPL."""
+    mode = _ui_theme_mode()
+    foreground, background, selection = {
+        "dark": ("#c9d1d9", "#161b22", "#21262d"),
+        "light": ("#24292f", "#f6f8fa", "#d0d7de"),
+        "mono": ("", "", ""),
+    }[mode]
+    return Style.from_dict({
+        "title": f"bold {foreground}",
+        "selected": (f"bold {foreground} bg:{selection}" if selection else "bold reverse"),
+        "option": foreground,
+        "muted": terminal_theme.color("muted", mode),
+        "search-label": f"bold {terminal_theme.color('muted', mode)}",
+        "search-input": f"{foreground} bg:{background}" if background else "",
+        "auto-confirm": terminal_theme.color("warning", mode),
+    })
 
 
 # ── Reusable selection dialog ──────────────────────────────────────────
@@ -1017,14 +1049,15 @@ def select_dialog(
         (multi only) Pre-checked row indices.
     search : bool
         Show a fuzzy-filter input box above the list (typed text filters
-        items by subsequence match on the label).
+        items by subsequence match on the label or description).
     hint : str
         Footer hint line.  Auto-derived from mode when empty.
     action_keys : dict[str, str] | None
         Map of ``key → action_name``.  When a key is pressed the dialog exits
         returning ``(action_name, absolute_index)`` instead of an item.  The
         caller can loop and re-invoke for multi-step pickers, or use
-        on_action to handle an action without leaving the screen.
+        on_action to handle an action without leaving the screen. Searchable
+        pickers use Alt+letter so ordinary typing always edits the filter.
     enter_action : str
         When non-empty (and ``action_keys`` is also set), Enter returns
         ``(enter_action, idx)`` instead of the raw item.  Useful for pickers
@@ -1086,14 +1119,16 @@ def select_dialog(
 
     # Precompute plain-text labels once: _visible() runs on every frame
     # (20fps) and used to re-strip Rich markup from every label each time.
-    _plain_norm: list[str] = [
-        re.sub(r"\[/?[^\]]+\]", "", lab).lower() for lab, _ in norm
-    ]
+    def _search_text(label, description):
+        try:
+            return Text.from_markup(f"{label} {description}").plain.casefold()
+        except Exception:
+            return f"{label} {description}".casefold()
+
+    _plain_norm = [_search_text(*row) for row in norm]
 
     def _refresh_plain_norm():
-        _plain_norm[:] = [
-            re.sub(r"\[/?[^\]]+\]", "", lab).lower() for lab, _ in norm
-        ]
+        _plain_norm[:] = [_search_text(*row) for row in norm]
 
     sel = [max(0, min(selected_index, len(norm) - 1))]
     _auto_seconds = (float(auto_confirm_seconds)
@@ -1111,12 +1146,19 @@ def select_dialog(
     _marquee_last_sel = [-1]
     _marquee_start = [0.0]
 
+    def _user_interaction():
+        nonlocal _auto_deadline
+        _auto_deadline = None
+
+    if filter_buf is not None:
+        filter_buf.on_text_changed += lambda _buffer: _user_interaction()
+
     def _visible():
         """Return (list_of_(orig_idx, label, desc)) after filtering."""
         unfiltered = [(oi, lab, desc) for oi, (lab, desc) in enumerate(norm)]
         if not filter_buf:
             return unfiltered
-        f = filter_buf.text.strip().lower()
+        f = filter_buf.text.strip().casefold()
         if not f:
             return unfiltered
         out = []
@@ -1130,11 +1172,15 @@ def select_dialog(
         if not vis:
             sel[0] = 0
             return vis
-        if sel[0] >= vis[-1][0]:
-            sel[0] = vis[-1][0]
-        if sel[0] < vis[0][0]:
+        if not any(oi == sel[0] for oi, _, _ in vis):
             sel[0] = vis[0][0]
         return vis
+
+    def _page_size():
+        # Footer, search input, title and overflow indicators each own rows.
+        available = max(1, _get_term_size()[1] - 2 - (2 if search else 0)
+                        - (1 if title else 0))
+        return max(1, available - 2)
 
     # Screen line -> what a click there means: ("item", index) or
     # ("page", ±1). Rebuilt with every render so it matches what is drawn.
@@ -1148,18 +1194,14 @@ def select_dialog(
             return sum(text.count("\n") for _style, text in lines)
 
         if title:
-            lines.append(("bold #e6edf3", f"{title}\n"))
+            lines.append(("class:title", f"{title}\n"))
 
         vis = _clamp_sel()
 
         # ── Pagination (full-screen only) ──
         start, end = 0, len(vis)
-        if full_screen and vis:
-            import shutil
-            term_h = _get_term_size()[1]
-            # Reserve lines for title, search, header/footer hints
-            reserve = (3 if title else 0) + (3 if search else 0) + 3
-            list_h = max(4, term_h - reserve)
+        if vis:
+            list_h = _page_size()
             if len(vis) > list_h:
                 cur_pos = next((i for i, (oi, _, _) in enumerate(vis)
                                 if oi == sel[0]), 0)
@@ -1203,35 +1245,57 @@ def select_dialog(
                     row_text, oi, _marquee_last_sel, _marquee_start,
                     fixed_chars=_fixed)
             style = "class:selected" if is_sel else ""
+            # All items occupy one physical line, so pagination and mouse
+            # targets continue to match the display after a resize.
+            try:
+                fitted = Text.from_markup(row_text)
+            except Exception:
+                fitted = Text(row_text)
+            fitted.plain = fitted.plain.replace("\n", " ").replace("\r", " ")
+            fitted.truncate(max(0, _get_term_size()[0] - 1), overflow="ellipsis")
             _line_targets[_line_no()] = ("item", oi)
-            lines.append((style, row_text + "\n"))
+            lines.append((style, fitted.markup + "\n"))
 
         if end < len(vis):
             _line_targets[_line_no()] = ("page", 1)
             lines.append(("class:muted", f"  {symbols.ARROW_D} {len(vis) - end} more\n"))
 
-        # ── Footer hint ──
-        lines.append(("", "\n"))
+        return lines
+
+    def _footer_lines():
+        lines = []
+        vis = _clamp_sel()
+        position = next((i + 1 for i, (oi, _, _) in enumerate(vis)
+                         if oi == sel[0]), 0)
+        lines.append(("class:muted", f"  {position}/{len(vis)}"
+                      + (f" of {len(norm)}" if search and filter_buf.text else "")
+                      + (f"  {len(chk)} selected" if multi else "") + "\n"))
         if not hint:
             if multi:
-                parts = ["Space toggle", "Enter confirm", "Esc cancel"]
+                parts = ["Esc cancel", "Space toggle", "Enter confirm"]
             else:
-                parts = ["Enter select", "Esc cancel"]
+                parts = ["Esc cancel", "Enter select", "↑↓ move", "PgUp/PgDn page"]
             if search:
                 parts.insert(0, "Type to filter")
             if act_keys:
-                parts.insert(0, "  ".join(f"{k}={a}" for k, a in act_keys.items()))
+                parts.insert(0, "  ".join(
+                    f"{'Alt+' if search and len(k) == 1 else ''}{k}={a}"
+                    for k, a in act_keys.items()))
             lines.append((f"class:muted", "  " + f"  {symbols.BULLET}  ".join(parts)))
         else:
             lines.append(("class:muted", "  " + hint))
+        if _get_term_size()[0] < 60:
+            compact = ("Esc back  Space toggle" if multi else "Esc back  Enter select")
+            if _get_term_size()[0] < 28:
+                compact = "Esc back  Enter OK"
+            lines[-1] = ("class:muted", "  " + compact)
         if _auto_deadline is not None:
             remaining = max(0.0, _auto_deadline - time.monotonic())
-            total = _auto_seconds or 1.0
-            frac = max(0.0, min(1.0, remaining / total))
-            bar_w = 12
-            filled = int(frac * bar_w)
-            bar = "▓" * filled + "░" * (bar_w - filled)
-            lines.append(("class:auto-confirm", f"  {bar} {int(remaining + 0.999)}s"))
+            # Keep the timer alongside the count, including on narrow screens.
+            timer = f"  {int(remaining + 0.999)}s automatic"
+            lines.insert(1, ("class:auto-confirm", timer))
+            lines[0] = (lines[0][0], lines[0][1].rstrip("\n"))
+            lines[1] = (lines[1][0], lines[1][1] + "\n")
         return lines
 
     # ── Key bindings ──────────────────────────────────────────────
@@ -1249,7 +1313,8 @@ def select_dialog(
 
     @kb.add("up")
     def _(event):
-        vis = _visible()
+        _user_interaction()
+        vis = _clamp_sel()
         if not vis:
             return
         cur_vi = next((i for i, (oi, _, _) in enumerate(vis) if oi == sel[0]), 0)
@@ -1258,7 +1323,8 @@ def select_dialog(
 
     @kb.add("down")
     def _(event):
-        vis = _visible()
+        _user_interaction()
+        vis = _clamp_sel()
         if not vis:
             return
         cur_vi = next((i for i, (oi, _, _) in enumerate(vis) if oi == sel[0]), 0)
@@ -1267,12 +1333,14 @@ def select_dialog(
 
     @kb.add("home")
     def _(event):
+        _user_interaction()
         vis = _visible()
         if vis:
             sel[0] = vis[0][0]
 
     @kb.add("end")
     def _(event):
+        _user_interaction()
         vis = _visible()
         if vis:
             sel[0] = vis[-1][0]
@@ -1280,6 +1348,9 @@ def select_dialog(
     if multi:
         @kb.add("space")
         def _(event):
+            _user_interaction()
+            if not _clamp_sel():
+                return
             if sel[0] in chk:
                 chk.discard(sel[0])
             else:
@@ -1290,12 +1361,6 @@ def select_dialog(
             return
         vis = _clamp_sel()
         if not vis:
-            if on_action is not None:
-                return
-            if act_keys:
-                running_app.exit(result=(None, -1))
-            else:
-                running_app.exit(result=None)
             return
         if multi:
             checked_items = [items[oi] for oi in sorted(chk)
@@ -1311,20 +1376,30 @@ def select_dialog(
         _confirm(event.app)
 
     def _move(delta: int) -> None:
-        vis = _visible()
+        _user_interaction()
+        vis = _clamp_sel()
         if not vis:
             return
         cur_vi = next((i for i, (oi, _, _) in enumerate(vis) if oi == sel[0]), 0)
         sel[0] = vis[max(0, min(len(vis) - 1, cur_vi + delta))][0]
 
+    @kb.add("pageup")
+    def _(event):
+        _move(-_page_size())
+
+    @kb.add("pagedown")
+    def _(event):
+        _move(_page_size())
+
     # Action keys (e.g. d=details, x=delete in resume picker)
     for _key, _action in list(act_keys.items()):
 
-        @kb.add(_key)
+        @kb.add(*(("escape", _key) if search and len(_key) == 1 else (_key,)))
         def _ak(event, _a=_action):
             nonlocal hint
             if _in_grace():
                 return
+            _user_interaction()
             vis = _clamp_sel()
             if on_action is not None:
                 if not vis:
@@ -1350,7 +1425,7 @@ def select_dialog(
                 event.app.exit(result=(_a, -1))
 
     # Letter shortcuts (y/n/a for approval gates)
-    if letter_shortcuts and not multi:
+    if letter_shortcuts and not multi and not search:
         # Collect the first letter of each label (lowercased).
         _first_letters = set()
         for lab, _desc in norm:
@@ -1365,6 +1440,7 @@ def select_dialog(
             def _lk(event, _l=_letter):
                 if _in_grace():
                     return
+                _user_interaction()
                 for i, (lab, _desc) in enumerate(norm):
                     if lab.strip()[:1].lower() == _l:
                         sel[0] = i
@@ -1407,6 +1483,7 @@ def select_dialog(
             if not full_screen:
                 return NotImplemented
             kind = mouse_event.event_type
+            _user_interaction()
             if kind == MouseEventType.SCROLL_UP:
                 _move(-1)
             elif kind == MouseEventType.SCROLL_DOWN:
@@ -1416,8 +1493,7 @@ def select_dialog(
                 if target is None:
                     return None
                 if target[0] == "page":
-                    import shutil
-                    _move(target[1] * max(1, shutil.get_terminal_size().lines - 8))
+                    _move(target[1] * _page_size())
                 elif target[1] == sel[0]:
                     if multi:
                         chk.symmetric_difference_update({sel[0]})
@@ -1430,29 +1506,30 @@ def select_dialog(
             get_app().invalidate()
             return None
 
-    list_ctrl = _ListControl(lambda: _ptk_fragments(_build_lines()))
+    mode = _ui_theme_mode()
+    list_ctrl = _ListControl(lambda: _ptk_fragments(_build_lines(), color_mode=mode))
     if full_screen:
-        layout_panes.append(Window(content=list_ctrl))
+        layout_panes.append(Window(content=list_ctrl, wrap_lines=False))
     else:
         # Rows + optional title + spacer + footer. The old ``height=len(items)``
         # clipped the hint and sometimes the final choices, making inline
         # selectors look like a plain, incomplete box.
-        inline_height = len(norm) + 2 + (1 if title else 0)
         layout_panes.append(Window(
             content=list_ctrl,
             always_hide_cursor=True,
-            height=max(3, inline_height),
+            height=lambda: min(len(norm) + (1 if title else 0) + 2,
+                               _page_size() + (1 if title else 0) + 2),
+            wrap_lines=False,
         ))
 
+    # The footer owns its rows rather than competing with list content. Long
+    # labels can no longer push cancellation instructions off the screen.
+    layout_panes.append(Window(
+        content=FormattedTextControl(lambda: _ptk_fragments(
+            _footer_lines(), color_mode=mode)), height=2, wrap_lines=False))
+
     layout = Layout(HSplit(layout_panes))
-    style = Style.from_dict({
-        "selected": "bold #f0f6fc bg:#21262d",
-        "option": "#e6edf3",
-        "muted": "#8b949e",
-        "search-label": "bold #8b949e",
-        "search-input": "#e6edf3 bg:#161b22",
-        "auto-confirm": "#e3b341",
-    })
+    style = _build_dialog_style()
 
     app = Application(
         layout=layout,
@@ -1464,11 +1541,12 @@ def select_dialog(
         mouse_support=full_screen,
         refresh_interval=refresh_interval,
     )
+    app.ttimeoutlen = 0.1
     async def _auto_confirm():
         await asyncio.sleep(max(0.0, _auto_seconds or 0.0))
-        if app.is_done:
+        if app.is_done or _auto_deadline is None or not items:
             return
-        sel[0] = _auto_index
+        sel[0] = min(_auto_index, len(items) - 1)
         if multi:
             result = [items[oi] for oi in sorted(chk) if oi < len(items)]
         elif enter_action and act_keys:
@@ -1495,7 +1573,8 @@ def select_dialog(
     _clear_stale_running_loop()
     for _attempt in (0, 1):
         try:
-            result = app.run(pre_run=_pre_run)
+            with terminal_arbiter.hold("selector", TermMode.EXTERNAL, timeout=10.0):
+                result = app.run(pre_run=_pre_run)
             return result
         except (KeyboardInterrupt, EOFError):
             return (None, -1) if act_keys else None
@@ -3659,7 +3738,7 @@ class CommandSpec:
                 item,
                 descriptions.get(item)
                 or _SUBCOMMAND_HINTS.get(item)
-                or f"{self.name} option {symbols.BULLET} {self.usage or self.description}",
+                or f"Use {item} with {self.name}",
             )
             for item in self.subcommands
         )
@@ -3677,7 +3756,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         )),
     CommandSpec("/fg", "Return to the command detached from term0 with Ctrl+]", "Basics"),
     CommandSpec(
-        "/messages", "Read the notices behind the L> mark", "Basics",
+        "/messages", "Read notifications and startup notices", "Basics",
         "/messages [list|read <n>|seen|dismiss <n>|clear]",
         aliases=("/msg",),
         subcommands=("list", "read", "seen", "dismiss", "clear"),
@@ -3786,7 +3865,8 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             ("latest", "Restore the newest session without the picker"),
             ("all", "Echo the whole conversation after restoring"),
         )),
-    CommandSpec("/fork", "Fork current context into a named branch, or start a new session from current context", "Account & Session", "/fork [name]"),
+    CommandSpec("/fork", "Branch the current conversation", "Account & Session", "/fork [name]",
+        help_text="With a name, save a branch of the current context. Without a name, start a new live session that inherits this conversation. The original stays available in /resume."),
     CommandSpec("/new", "Start a new live session", "Account & Session", "/new",
                 aliases=("/clear", "/new-session", "/reset-session")),
     CommandSpec("/exit", "Log out and exit", "Account & Session"),
@@ -3821,18 +3901,20 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         )),
     CommandSpec("/name", "Show or set the current agent name", "Agents & Terminals", "/name [new-name]"),
     CommandSpec(
-        "/hire", "Hire an undeployed employee; does not start an assignment",
+        "/hire", "Create an agent profile without starting work",
         "Agents & Terminals",
         "/hire [name] [--profile role] [--prompt file] [--tools name,...|inherit] [--model [id]] [--terminal name]",
         subcommands=("--profile", "--prompt", "--tools", "--model", "--terminal"),
         help_text=(
             "Creates a persistent employee identity with its own prompt and tool policy, "
-            "base model, and logical home terminal. It is not auto-deployed. Use "
+            "base model, and logical home terminal.\n"
+            "Creating it does not start an assignment.\n"
+            "It is not auto-deployed. Use "
             "/station <agent> --task <work> for a private temporary terminal, or "
             "/station <agent> <terminal> to deploy it explicitly."
         )),
     CommandSpec(
-        "/agent", "Switch the REPL's current Agent focus without redeploying",
+        "/agent", "Switch the agent you are talking to",
         "Agents & Terminals", "/agent [agent-id-or-name]",
         help_text=(
             "Switches the main REPL's current Agent conversation/execution "
@@ -3845,7 +3927,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "view; /agent only changes which Agent the main REPL drives."
         )),
     CommandSpec(
-        "/agents", "Open the full-screen multi-Agent focus and activity view",
+        "/agents", "Browse agents, assignments and live activity",
         "Agents & Terminals", "/agents [agent-id|tree|--plain]",
         subcommands=("tree", "--plain"),
         help_text=(
@@ -3856,7 +3938,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "routing, Tab opens the Agent rail, Alt+arrow switches "
             "Agent/terminal, PageUp/PageDown scrolls, and Esc exits."
         )),
-    CommandSpec("/term", "Manage terminals and two-level adoption", "Agents & Terminals", "/term [name|peers|adopt <id> --name <name>|accept <invite>|release [name]|rename <old> <new>]", aliases=("/t",), subcommands=("peers", "adopt", "accept", "release", "rename")),
+    CommandSpec("/term", "Create, enter and link terminals", "Agents & Terminals", "/term [name|peers|adopt <id> --name <name>|accept <invite>|release [name]|rename <old> <new>]", aliases=("/t",), subcommands=("peers", "adopt", "accept", "release", "rename")),
     CommandSpec(
         "/app", "Run a registered application in its own sub-terminal with its own agent",
         "Agents & Terminals", "/app [list|start <name>|stop <name>|trust <name>|revoke <name>]",
@@ -4062,7 +4144,8 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
                 "/told [agent-id [reply [N]|all]|N|all|reply [N]|log [N]]",
                 subcommands=("all", "reply", "log")),
     # Keep /reload discoverable, but its existing handler and behavior stay untouched.
-    CommandSpec("/reload", "Reload default files and restart", "History"),
+    CommandSpec("/reload", "Reset project overrides and restart the CLI", "History",
+        help_text="Restores the generated project files in .laintas/ and restarts this process. Custom edits to those overrides are removed; save a copy before running this command."),
 )
 
 _NEW_SESSION_COMMANDS = ("/new", "/clear", "/new-session", "/reset-session")
@@ -14429,6 +14512,22 @@ def _parse_slash_command(cmd: str) -> tuple[str, str, list[str]]:
     return action, raw_args, [action, *args]
 
 
+def _slash_help_target(cmd: str) -> str:
+    """Recognize only a standalone help flag, never an argument's contents."""
+    parts = (cmd or "").strip().split()
+    if (len(parts) == 2 and parts[0].startswith("/")
+            and parts[1] in {"--help", "-h"}):
+        name = parts[0].lower()
+        if _find_command_spec(name) is not None:
+            return name
+        try:
+            if extension_runtime.get_runtime().command_description(name):
+                return name
+        except Exception:
+            pass
+    return ""
+
+
 def _raw_tail_after_word(text: str) -> tuple[str, str]:
     """Consume one whitespace-delimited identifier and preserve the raw tail."""
     stripped = (text or "").lstrip()
@@ -24365,7 +24464,7 @@ def _cmd_config(parts: list) -> None:
     elif len(parts) == 2 and parts[1].lower() == "reset":
         reset_runtime_config()
         terminal_preferences.clear_ui_preferences()
-        _apply_ui_theme("dark")
+        _apply_ui_theme(str(get_runtime_config("theme") or "auto"))
         console.print("[green]Runtime config reset to defaults.[/green]")
     elif len(parts) == 2:
         # /config <key> — show one; /config <prefix> — show the group.
@@ -26449,6 +26548,10 @@ def _show_mailbox() -> None:
 
 def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: dict, interactive_session=None) -> bool:
     """Handle meta commands. Returns True if should exit."""
+    help_target = _slash_help_target(cmd)
+    if help_target:
+        show_help(help_target)
+        return False
     action, raw_args, parts = _parse_slash_command(cmd)
     _validate_slash_args(action, parts[1:])
 
@@ -26763,7 +26866,8 @@ def handle_meta_command(cmd: str, agent_registry: AgentRegistry, session: dict,
         except Exception:
             action = "/"
         console.print(
-            f"[red]{action or '/'} failed: {type(exc).__name__}: {exc}[/red]")
+            f"[red]{escape(action or '/')} failed: "
+            f"{escape(type(exc).__name__)}: {escape(str(exc))}[/red]")
         try:
             add_debug_log(DebugEntry(
                 timestamp=datetime.now().isoformat(timespec="seconds"),
@@ -26794,7 +26898,17 @@ def show_command_palette():
 
     Returns the selected command string (e.g. \"/help\") or None if cancelled.
     """
-    items = [(f"[cyan]{name}[/cyan]", desc) for name, desc in _COMMANDS]
+    entries = list(_COMMANDS)
+    seen = {name for name, _ in entries}
+    try:
+        runtime = extension_runtime.get_runtime()
+        for name in runtime.command_names():
+            if name not in seen:
+                entries.append((name, runtime.command_description(name)))
+                seen.add(name)
+    except Exception:
+        pass
+    items = [(f"[cyan]{escape(name)}[/cyan]", escape(desc)) for name, desc in entries]
     chosen = select_dialog(
         items,
         title="Commands — type to filter",
@@ -26804,13 +26918,14 @@ def show_command_palette():
     )
     if chosen is None:
         return None
-    return chosen[0]
+    return Text.from_markup(chosen[0]).plain
 
 
 def show_help(command: str = ""):
     """Display generated command help, optionally for one command."""
     from rich.markup import escape
     if command:
+        command = "/" + command.lstrip("/").lower()
         spec = _find_command_spec(command)
         if spec is None:
             # Extension-registered commands (e.g. /org) are not in
@@ -26848,8 +26963,18 @@ def show_help(command: str = ""):
             f"[dim]Aliases: {escape(aliases)}[/dim]",
             title=escape(spec.name), border_style="cyan",
         ))
+        if spec.subcommands:
+            choices = RichTable.grid(padding=(0, 2))
+            choices.add_column(style=console.get_style("accent", default="cyan"), no_wrap=True)
+            choices.add_column(style=console.get_style("muted", default="dim"), ratio=1)
+            for item in spec.contextual_completions:
+                choices.add_row(Text(item.value), Text(item.description))
+            console.print(choices)
         return
 
+    console.print()
+    console.print("  [muted]/help <command> or /<command> --help for details. "
+                  "Type / to open the searchable command list.[/muted]")
     console.print()
     group_order = list(dict.fromkeys(spec.group for spec in COMMAND_SPECS))
 
@@ -26859,6 +26984,13 @@ def show_help(command: str = ""):
         # from the longest one pushed every description past the wrap column
         # onto unindented continuation lines. A borderless Table wraps both
         # columns with a hanging indent and keeps descriptions aligned.
+        if console.width < 72:
+            console.print(f"  [accent]{title}[/accent]")
+            for cmd, desc in rows:
+                console.print(Padding(Text(cmd, style="accent.dim"), (0, 0, 0, 4)))
+                console.print(Padding(Text(desc, style="muted"), (0, 0, 0, 6)))
+            console.print()
+            return
         table = RichTable.grid(padding=(0, 2))
         # Long usage strings (/helpwo, /usage …) may exceed any sane column
         # width; let them fold within the column rather than overflow="ignore",
@@ -26885,7 +27017,7 @@ def show_help(command: str = ""):
         for spec in COMMAND_SPECS:
             if spec.group != title:
                 continue
-            label = spec.usage or spec.name
+            label = spec.name
             if spec.aliases:
                 label += f"  ({', '.join(spec.aliases)})"
             rows.append((label, spec.description))
@@ -30439,6 +30571,12 @@ def main():
             except Exception:
                 pass
             _kill_owned_processes()
+            # This branch skips the prompt's finally and atexit handlers.
+            # Restore the shell before leaving the sub-terminal's PTY.
+            try:
+                terminal_arbiter.reset_to_pristine()
+            except Exception:
+                pass
             os._exit(0)
         console.print("\n[yellow]Shutting down...[/yellow]")
         if args.depth == 0 and not _quit_checkpoint_saved:
@@ -30675,6 +30813,14 @@ def main():
                 and _runtime_owner.status not in {
                     "queued", "running", "thinking", "waiting"}):
             interactive_session = _runtime_owner.runtime_session
+
+        # Help must precede the session commands intercepted by the REPL.
+        # /fork --help must never create a branch named "--help".
+        if not _is_dialogue and _slash_help_target(user_input):
+            show_help(_slash_help_target(user_input))
+            if injected_done is not None:
+                injected_done.set()
+            continue
 
         # Ctrl+D → exit
         if user_input.strip() == "/exit" and not _is_dialogue:

@@ -665,6 +665,30 @@ def _render_status(error_msg: str, notice_msg: str, executing: bool,
 
 # ── Style ─────────────────────────────────────────────────────────────────
 
+def _navigation_hints(mode: StudioMode, *, width: int, successful: bool = False) -> list:
+    """Keep escape and help visible before secondary actions on small screens."""
+    if mode == StudioMode.HELP:
+        heading, style = "HELP", "class:violet"
+        rows = ["Esc Close  Up/Down Scroll  PgUp/PgDn"]
+    elif mode == StudioMode.INSPECTOR:
+        heading, style = "INSPECTOR", "class:violet"
+        rows = ["Esc Back  Runtime and validation detail"]
+    elif mode == StudioMode.RUNNING:
+        heading, style = "RUNNING", "class:running"
+        rows = ["Esc Cancel options  i Inspect  Up/Down Select"]
+    elif mode == StudioMode.RESULT:
+        heading = "RESULT"
+        style = "class:task.done" if successful else "class:task.err"
+        rows = ["Esc Back  r Run again  s Save  i Inspect"]
+    else:
+        heading, style = "NAVIGATION", "class:pane.title.focus"
+        rows = ["Esc Exit  ? Help  Enter Expand",
+                "a Task  A Agent  e Edit  d Delete  : Command"]
+    budget = max(0, width - 1)
+    return [(style, ("  " + heading)[:budget])] + [
+        ("class:dim", "\n" + ("  " + row)[:budget]) for row in rows]
+
+
 _STYLE = Style.from_dict({
     "root":            "bg:#0d1117 #e6edf3",
     "header":          "bold #4ade80",
@@ -1349,6 +1373,11 @@ def run_hwo_ui(root_agent_name: str,
         return [("class:dim", "  Enter confirm  ·  Esc cancel")]
 
     def _navigation_actions():
+        width = shutil.get_terminal_size((100, 30)).columns
+        if width < 72:
+            return _navigation_hints(
+                studio.mode, width=width,
+                successful=bool(run_result[0] and run_result[0].get("ok")))
         if studio.mode == StudioMode.HELP:
             return [
                 ("class:violet", "  HELP"),

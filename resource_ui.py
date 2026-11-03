@@ -12,6 +12,7 @@ The presentation layer deliberately supports three product-specific idioms:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 import re
 import shutil
 import threading
@@ -30,6 +31,8 @@ from prompt_toolkit.layout.processors import BeforeInput
 from prompt_toolkit.mouse_events import MouseEventType
 from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
+
+import terminal_arbiter
 
 
 _MARKUP_RE = re.compile(r"\[/?[^\]]+\]")
@@ -223,6 +226,34 @@ _PANE_LABELS = {
     "document": ("LIBRARY", "DOCUMENT"),
     "operations": ("RESOURCES", "INSPECTOR"),
 }
+
+
+def _browser_style() -> Style:
+    """Keep resource screens readable with the terminal's active theme."""
+    import terminal_theme
+    mode = "mono" if "NO_COLOR" in os.environ else terminal_theme.active()
+    if mode == "dark":
+        return _STYLE
+    colors = {
+        "#0d1117": "#ffffff", "#161b22": "#f6f8fa", "#21262d": "#d0d7de",
+        "#e6edf3": "#24292f", "#f0f6fc": "#24292f", "#c9d1d9": "#24292f",
+        "#8b949e": "#57606a", "#30363d": "#8c959f", "#31533a": "#8c959f",
+        "#4ade80": "#176f2c", "#3fb950": "#176f2c", "#2ea043": "#176f2c",
+        "#a78bfa": "#6e40a8", "#d2a8ff": "#6e40a8", "#e3b341": "#8a5a00",
+        "#f85149": "#cf222e", "#ff7b72": "#cf222e", "#102619": "#dafbe1",
+        "#2d1518": "#ffebe9", "#3b275f": "#e8d9ff",
+    }
+    rules = []
+    for name, value in _STYLE.style_rules:
+        if mode == "mono":
+            value = re.sub(r"(?:bg:)?#[0-9a-fA-F]{6}", "", value)
+            if name in {"list.selected", "search.match", "search.match.current"}:
+                value += " bold reverse"
+        else:
+            value = re.sub(r"#[0-9a-fA-F]{6}",
+                           lambda match: colors.get(match.group(), match.group()), value)
+        rules.append((name, value))
+    return Style(rules)
 
 
 class _MouseControl(FormattedTextControl):
@@ -976,7 +1007,7 @@ class ResourceBrowser:
         self._assistant_thread.start()
 
     def _footer_fragments(self):
-        width = max(24, shutil.get_terminal_size((100, 30)).columns)
+        width = max(1, shutil.get_terminal_size((100, 30)).columns)
         if not self.is_wide and self.mode == "detail":
             parts = [("Esc", "Back"), ("↑↓", "Scroll"),
                      ("[/]", "Section"), ("Pg", "Page")]
@@ -1005,6 +1036,11 @@ class ResourceBrowser:
                      ("x", "Expand/Collapse all"), ("Esc", "Back")]
         if self.assistant_handler is not None and not self.assistant_active:
             parts.insert(-1, ("a", "Ask AI"))
+        if width < 100:
+            # Closing the view must remain visible when optional actions no
+            # longer fit. The full key list remains one ? away.
+            exits = [part for part in parts if part[0] == "Esc"]
+            parts = exits + [part for part in parts if part[0] != "Esc"]
         fragments = []
         if self.status:
             # A one-line footer must never wrap over the body. While feedback
@@ -1340,11 +1376,12 @@ class ResourceBrowser:
             io_options["output"] = self._output
         self.app = Application(
             layout=Layout(root, focused_element=self.list_window),
-            key_bindings=kb, style=_STYLE, full_screen=True,
+            key_bindings=kb, style=_browser_style(), full_screen=True,
             # Static browsers repaint only on input/invalidation. Live managers
             # use the explicit reload task below, avoiding duplicate timers.
             mouse_support=True, refresh_interval=None,
             **io_options)
+        self.app.ttimeoutlen = 0.1
 
     def _refresh_live(self) -> None:
         """Refresh data without pulling a reader back to the first line."""
@@ -1380,7 +1417,9 @@ class ResourceBrowser:
         except Exception:
             pass
         try:
-            outcome = self.app.run(pre_run=self._pre_run)
+            with terminal_arbiter.hold(
+                    "resource-browser", terminal_arbiter.Mode.EXTERNAL, timeout=10.0):
+                outcome = self.app.run(pre_run=self._pre_run)
             return outcome if isinstance(outcome, UIOutcome) else UIOutcome("cancel")
         except (KeyboardInterrupt, EOFError):
             return UIOutcome("cancel")

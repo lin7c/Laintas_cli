@@ -457,6 +457,18 @@ See [`SECURITY_CUSTOMIZATION.md`](SECURITY_CUSTOMIZATION.md) for the threat mode
 
 Run `/help` for the authoritative list for your installed version, including extension commands.
 
+Use `/help <command>` or `/<command> --help` for usage and subcommand
+descriptions. A standalone `--help` or `-h` shows help without running the
+command, including session commands such as `/fork` and `/new`.
+
+Type `/` and press Enter to open the command palette. Search by command name
+or description; registered extension commands appear there too. In shared
+pickers, arrows move, PageUp/PageDown skip a page, Enter selects, and Esc
+returns. If a filter has no matches, edit it or press Esc. Searchable pickers
+use Alt+letter for action shortcuts so normal typing stays in the filter.
+Moving or typing cancels an automatic confirmation countdown. Pickers and
+resource browsers follow `/theme` and `NO_COLOR`.
+
 Context compaction starts silently in the background at 70% of the usable
 message budget. At 90%, the agent waits for that result or uses foreground
 compaction. `/compact` still forces compaction; `/compact status` shows the
