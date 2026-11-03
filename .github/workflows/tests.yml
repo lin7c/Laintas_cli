@@ -40,7 +40,7 @@ jobs:
       # Undefined names only. Every one this found was a real bug that no
       # test caught, because each sat behind an `except` that turned the
       # NameError into a fallback: a parent() command run twice, file_push
-      # failing on every call, /canvas unable to start Helpwo. Zero false
+      # failing on every call, /canvas unable to start Helpwow. Zero false
       # positives across the tree, so it can gate.
       - name: Undefined names (ruff F821)
         run: |

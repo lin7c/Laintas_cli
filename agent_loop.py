@@ -138,11 +138,11 @@ _DEFAULT_CONFIG = {
     # invalid ids are rejected and omitted valid ids follow in default order.
     "rprompt_slot_order": "",
     # `/helpwo` is the local opt-in that exposes this CLI as a runtime
-    # environment in the user's Helpwo account. The environment's terminal is
+    # environment in the user's Helpwow account. The environment's terminal is
     # available by default; security-conscious hosts can opt out with this.
     "disable_remote_terminal": False,
     # Every AI command/delegation in this environment requires an explicit
-    # Helpwo approval by default. Advanced users may opt out locally, never
+    # Helpwow approval by default. Advanced users may opt out locally, never
     # from the remote UI.
     "allow_remote_exec_without_approval": False,
     "remote_max_workers": 8,      # concurrently running remote tasks
@@ -163,7 +163,7 @@ _DEFAULT_CONFIG = {
     "message_truncate": 1200,      # chars per history message sent to backend
     "short_memory_max_chars": 2000, # session memory budget, line-aware
     "show_billing": False,          # show cost/balance after each reply
-    "use_message_thread": True,     # native OpenAI message thread (assistant tool_calls + role:tool results) — reads stay in context like opencode/Helpwo, no re-read amnesia. Compacted by _compact_thread_messages.
+    "use_message_thread": True,     # native OpenAI message thread (assistant tool_calls + role:tool results) — reads stay in context like opencode/Helpwow, no re-read amnesia. Compacted by _compact_thread_messages.
     "use_unified_catalog": True,    # emit shared agent_tools canonical tool names (fs.read->read) to the model — unified taxonomy is the default; set False to fall back to legacy dotted names
     "compact_background": True,
     "compact_background_cooldown": 60,
@@ -1004,8 +1004,8 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "shell_attach": "Run commands you type in term0 with the real terminal attached: live output, keyboard input, Ctrl+C interrupts the command, Ctrl+] detaches (/fg returns). Off = capture output and print it when the command ends",
     "shell_idle_timeout": "Seconds of silence before a terminal command is presumed stuck (idle budget, not a runtime cap)",
     "shell_command_completion": "Show shell commands (PATH + builtins) in the completion menu while typing the first word; off = Tab-only",
-    "disable_remote_terminal": "Opt this runtime environment out of Helpwo's interactive terminal (P2P shell)",
-    "allow_remote_exec_without_approval": "Let Helpwo's AI run commands in this environment without local approval (P2P exec)",
+    "disable_remote_terminal": "Opt this runtime environment out of Helpwow's interactive terminal (P2P shell)",
+    "allow_remote_exec_without_approval": "Let Helpwow's AI run commands in this environment without local approval (P2P exec)",
     "remote_max_workers": "Maximum concurrently running remote tasks",
     "remote_queue_size": "Maximum queued remote tasks beyond active workers",
     "remote_control_workers": "Maximum concurrently running remote control messages",
@@ -1395,7 +1395,7 @@ def get_user_message_queue() -> queue.Queue:
 
 @dataclass
 class DebugEntry:
-    """Single agent interaction record, mirrors Helpwo's DebugLogEntry."""
+    """Single agent interaction record, mirrors Helpwow's DebugLogEntry."""
     timestamp: str = ""
     loop: int = 0
     user_input: str = ""
@@ -7071,7 +7071,7 @@ def _chars_per_token() -> float:
 
 #: Marker `context_policy.truncate_tool_output` leaves on a pruned tool result.
 #: A pruned message is no longer a copy of what it delivered, so whatever it
-#: held stops counting as visible — this is the exact condition Helpwo's read
+#: held stops counting as visible — this is the exact condition Helpwow's read
 #: gate cannot see, and the reason its "already fully read" refusal outlives
 #: the content it refers to.
 _PRUNED_TOOL_MARKER = "chars for compaction]"
@@ -7970,7 +7970,7 @@ def _prune_policy(usable: Optional[int] = None) -> dict:
 
     `tool_output_max_chars` was a flat 2000 characters on every window; it is
     now the thread's `pruned_output` share (the vendored policy.json value is
-    left for Helpwo, which still reads it).
+    left for Helpwow, which still reads it).
     """
     if usable is None:
         key = (_provider_context_window, id(budget_trees()))
@@ -9840,7 +9840,7 @@ def _build_user_message(original_input: str, state: dict, memory_entries: list,
     files_seen = state.get("_files_seen", [])
 
     # Files this agent edited after reading them: the copy it holds no longer
-    # matches disk, so an `edit` anchored on it will not match. Helpwo injects
+    # matches disk, so an `edit` anchored on it will not match. Helpwow injects
     # the same reminder ([STALE FILES]); we had nothing.
     try:
         import file_pager as _fp
@@ -11674,7 +11674,7 @@ def run_agent_loop(
     """Run the autonomous agent loop (mirrors AutonomousKernel.ts).
 
     If events_cb is provided, all outputs are collected as structured events
-    and pushed via the callback for real-time streaming to Helpwo UI.
+    and pushed via the callback for real-time streaming to Helpwow UI.
 
     If existing_session is provided, it is reused instead of creating a new
     PTY session. The caller (REPL) manages its lifecycle.
@@ -13853,7 +13853,7 @@ def run_agent_loop(
                         _publish_progress_state(self_info, state, "writing")
                     stream_state["reply"] += value
                     # Event delivery is independent of local terminal
-                    # ownership: silent children must still stream to Helpwo
+                    # ownership: silent children must still stream to Helpwow
                     # and /agents.
                     events_cb([{"type": "ai_stream", "content": value}])
                 elif field == "command":
@@ -15064,7 +15064,7 @@ def run_agent_loop(
                 _page_ref = (result.pop("_read_ref", None)
                              if isinstance(result, dict) else None)
                 # Our own writes move line numbers, so a file we edited stops
-                # blocking reads of it and is announced as stale (Helpwo's
+                # blocking reads of it and is announced as stale (Helpwow's
                 # [STALE FILES] reminder, which we had no equivalent of).
                 if (isinstance(result, dict) and result.get("ok")
                         and name in _FILE_MUTATING_TOOLS):
@@ -15658,7 +15658,7 @@ def run_agent_loop(
         add_debug_log(debug_entry)
 
         if done:
-            # Input may arrive from the outer REPL, Agents Mode, or Helpwo
+            # Input may arrive from the outer REPL, Agents Mode, or Helpwow
             # while the provider is producing its final chunk. Give that
             # shared queue one refresh tick and continue the same run instead
             # of declaring completion with an accepted message stranded.
@@ -15795,7 +15795,7 @@ def run_agent_loop(
         # markers, and let the REPL pre-fill /continue.
         #
         # Keyed on the caller SAYING it is a step run, not on
-        # `max_loops_override is not None`: Helpwo's chat and delegate paths
+        # `max_loops_override is not None`: Helpwow's chat and delegate paths
         # pass an override for ordinary runs (their own max_loops), and would
         # have had genuine exhaustion reported to a remote user as "press
         # Enter to run the next step" — with `_max_loops_exhausted` never set.

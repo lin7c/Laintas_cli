@@ -771,7 +771,7 @@ Both example lines are rendered by `handle_version_command`. The local version c
 
 | Line | Category | Context | Template / source expression |
 |---|---|---|---|
-| [375](/root/laintas_cli/helpwo_server.py:375) | message candidate | _HelpwoHandler._trusted_host / error | `local Helpwo bridge: host not allowed` |
+| [375](/root/laintas_cli/helpwo_server.py:375) | message candidate | _HelpwoHandler._trusted_host / error | `local Helpwow bridge: host not allowed` |
 | [421](/root/laintas_cli/helpwo_server.py:421) | message candidate | _HelpwoHandler._require_auth / error | `authentication required` |
 | [467](/root/laintas_cli/helpwo_server.py:467) | message candidate | _HelpwoHandler._guard_write / error | `cross-site request refused` |
 | [471](/root/laintas_cli/helpwo_server.py:471) | message candidate | _HelpwoHandler._guard_write / error | `Content-Type must be application/json` |
@@ -1117,7 +1117,7 @@ Both example lines are rendered by `handle_version_command`. The local version c
 | [3755](/root/laintas_cli/laintas_cli.py:3755) | command/help | <module> / /term:usage | `/term [name\|peers\|adopt <id> --name <name>\|accept <invite>\|release [name]\|rename <old> <new>]` |
 | [3756](/root/laintas_cli/laintas_cli.py:3756) | command/help | <module> / /helpwo:category | `Agents & Terminals` |
 | [3756](/root/laintas_cli/laintas_cli.py:3756) | command/help | <module> / /helpwo:command | `/helpwo` |
-| [3756](/root/laintas_cli/laintas_cli.py:3756) | command/help | <module> / /helpwo:description | `Start the local Helpwo companion in its own sub-terminal; /helpwo stop closes it` |
+| [3756](/root/laintas_cli/laintas_cli.py:3756) | command/help | <module> / /helpwo:description | `Start the local Helpwow companion in its own sub-terminal; /helpwo stop closes it` |
 | [3756](/root/laintas_cli/laintas_cli.py:3756) | command/help | <module> / /helpwo:usage | `/helpwo [stop]` |
 | [3758](/root/laintas_cli/laintas_cli.py:3758) | command/help | <module> / /app:command | `/app` |
 | [3758](/root/laintas_cli/laintas_cli.py:3758) | command/help | <module> / /app:description | `Run a registered application in its own sub-terminal with its own agent` |
@@ -1128,7 +1128,7 @@ Both example lines are rendered by `handle_version_command`. The local version c
 | [3764](/root/laintas_cli/laintas_cli.py:3764) | command/help | <module> / /app:completion | `Stop an application and close its sub-terminal` |
 | [3765](/root/laintas_cli/laintas_cli.py:3765) | command/help | <module> / /app:completion | `Trust an application (required before first start)` |
 | [3766](/root/laintas_cli/laintas_cli.py:3766) | command/help | <module> / /app:completion | `Revoke an application's trust` |
-| [3769](/root/laintas_cli/laintas_cli.py:3769) | command/help | <module> / /app:help_text | `Applications are described by manifests in ~/.laintas/apps/*.json or ./.laintas/apps/*.json: name, description, command, prompt, persistence (none\|workspace), port. Starting one creates a sub-terminal of the same name whose agent serves only that application, and a loopback bridge that exposes nothing but the conversation (send chat/abort/approval-response, poll updates). The manifest's command is started with LAINTAS_APP_BRIDGE_URL, LAINTAS_APP_TOKEN and LAINTAS_APP_AGENT_ID in its environment. A manifest must be trusted before it can start, and again after it changes. Helpwo is not an /app; use /helpwo.` |
+| [3769](/root/laintas_cli/laintas_cli.py:3769) | command/help | <module> / /app:help_text | `Applications are described by manifests in ~/.laintas/apps/*.json or ./.laintas/apps/*.json: name, description, command, prompt, persistence (none\|workspace), port. Starting one creates a sub-terminal of the same name whose agent serves only that application, and a loopback bridge that exposes nothing but the conversation (send chat/abort/approval-response, poll updates). The manifest's command is started with LAINTAS_APP_BRIDGE_URL, LAINTAS_APP_TOKEN and LAINTAS_APP_AGENT_ID in its environment. A manifest must be trusted before it can start, and again after it changes. Helpwow is not an /app; use /helpwo.` |
 | [3781](/root/laintas_cli/laintas_cli.py:3781) | command/help | <module> / /station:command | `/station` |
 | [3781](/root/laintas_cli/laintas_cli.py:3781) | command/help | <module> / /station:description | `Manage agents and terminals; route or assign work` |
 | [3782](/root/laintas_cli/laintas_cli.py:3782) | command/help | <module> / /station:category | `Agents & Terminals` |
@@ -1154,7 +1154,7 @@ Both example lines are rendered by `handle_version_command`. The local version c
 | [3812](/root/laintas_cli/laintas_cli.py:3812) | command/help | <module> / /handoff:completion | `Take a handoff somebody else created` |
 | [3815](/root/laintas_cli/laintas_cli.py:3815) | command/help | <module> / /handoff:help_text | `An envelope in .laintas/handoff/. During a signed-in task, new captures its context and plan. --to selects a saved account; --to-user-id names a remote recipient. Export/import crosses accounts; sync uses only the current account's cloud storage. accept creates a separate receiving session and continues it. Sync code and environment separately; credentials and live processes are never transferred.` |
 | [3823](/root/laintas_cli/laintas_cli.py:3823) | command/help | <module> / /shared:command | `/shared` |
-| [3823](/root/laintas_cli/laintas_cli.py:3823) | command/help | <module> / /shared:description | `Share files with Helpwo through Laintas storage` |
+| [3823](/root/laintas_cli/laintas_cli.py:3823) | command/help | <module> / /shared:description | `Share files with Helpwow through Laintas storage` |
 | [3824](/root/laintas_cli/laintas_cli.py:3824) | command/help | <module> / /shared:category | `Agents & Terminals` |
 | [3825](/root/laintas_cli/laintas_cli.py:3825) | command/help | <module> / /shared:usage | `/shared [list [path]\|push <local> [remote]\|pull <remote> [local]\|rm <path>\|mkdir <path>\|mv <from> <to>\|cp <from> <to>\|usage]` |
 | [3828](/root/laintas_cli/laintas_cli.py:3828) | command/help | <module> / /shared:completion | `List what is in shared storage` |
@@ -1165,7 +1165,7 @@ Both example lines are rendered by `handle_version_command`. The local version c
 | [3833](/root/laintas_cli/laintas_cli.py:3833) | command/help | <module> / /shared:completion | `Move or rename a stored entry` |
 | [3834](/root/laintas_cli/laintas_cli.py:3834) | command/help | <module> / /shared:completion | `Copy a stored entry` |
 | [3835](/root/laintas_cli/laintas_cli.py:3835) | command/help | <module> / /shared:completion | `Show storage used, free allowance and cost` |
-| [3838](/root/laintas_cli/laintas_cli.py:3838) | command/help | <module> / /shared:help_text | `Reads and writes the same per-account storage Helpwo mounts as its "Laintas Storage" cloud folder: push a file here and it is in the Helpwo file tree, pull one that Helpwo wrote. Unlike /helpwo --remote, it does not need a live link and it outlives this process — the files sit on the server. Storage above the plan's free allowance is billed monthly; /shared usage shows where you stand.` |
+| [3838](/root/laintas_cli/laintas_cli.py:3838) | command/help | <module> / /shared:help_text | `Reads and writes the same per-account storage Helpwow mounts as its "Laintas Storage" cloud folder: push a file here and it is in the Helpwow file tree, pull one that Helpwow wrote. Unlike /helpwo --remote, it does not need a live link and it outlives this process — the files sit on the server. Storage above the plan's free allowance is billed monthly; /shared usage shows where you stand.` |
 | [3845](/root/laintas_cli/laintas_cli.py:3845) | command/help | <module> / /terminate:category | `Agents & Terminals` |
 | [3845](/root/laintas_cli/laintas_cli.py:3845) | command/help | <module> / /terminate:command | `/terminate` |
 | [3845](/root/laintas_cli/laintas_cli.py:3845) | command/help | <module> / /terminate:description | `Close a terminal and all child resources` |
@@ -1453,9 +1453,9 @@ Both example lines are rendered by `handle_version_command`. The local version c
 | [10429](/root/laintas_cli/laintas_cli.py:10429) | error candidate | _call_backend_stream_impl | `interrupted during retry delay` |
 | [10466](/root/laintas_cli/laintas_cli.py:10466) | error candidate | _call_backend_stream_impl | `interrupted during retry delay` |
 | [11134](/root/laintas_cli/laintas_cli.py:11134) | output | TerminalSession._run / 0 | `Terminal relay connect failed after retries: {last_err}` |
-| [11393](/root/laintas_cli/laintas_cli.py:11393) | output | AgentRegistry.start_message_poll / 0 | `Listening for remote messages from Helpwo...` |
+| [11393](/root/laintas_cli/laintas_cli.py:11393) | output | AgentRegistry.start_message_poll / 0 | `Listening for remote messages from Helpwow...` |
 | [11482](/root/laintas_cli/laintas_cli.py:11482) | output | AgentRegistry._handle_remote_message / 0 | `Error handling remote message: {e}` |
-| [11502](/root/laintas_cli/laintas_cli.py:11502) | resolved output candidate | AgentRegistry._handle_chat | `Remote message from {'the application' if self.app_mode is not None else 'Helpwo'}: ⏎ {escape(content)}` |
+| [11502](/root/laintas_cli/laintas_cli.py:11502) | resolved output candidate | AgentRegistry._handle_chat | `Remote message from {'the application' if self.app_mode is not None else 'Helpwow'}: ⏎ {escape(content)}` |
 | [11506](/root/laintas_cli/laintas_cli.py:11506) | title/menu/help | AgentRegistry._handle_chat / title | `Incoming` |
 | [11532](/root/laintas_cli/laintas_cli.py:11532) | output | AgentRegistry._handle_chat / 0 | `user_message` |
 | [11573](/root/laintas_cli/laintas_cli.py:11573) | output | AgentRegistry._handle_chat / 0 | `user_message` |
@@ -1469,12 +1469,12 @@ Both example lines are rendered by `handle_version_command`. The local version c
 | [12228](/root/laintas_cli/laintas_cli.py:12228) | resolved output candidate | AgentRegistry._handle_term_open | `Browser opened a terminal ⏎ session {session_id} {symbols.BULLET} {cols}×{rows} ⏎ relay: {backend_url}` |
 | [12230](/root/laintas_cli/laintas_cli.py:12230) | title/menu/help | AgentRegistry._handle_term_open / title | `Remote Terminal` |
 | [12243](/root/laintas_cli/laintas_cli.py:12243) | output | AgentRegistry._handle_term_open / 0 | `Failed to open remote terminal: {e}` |
-| [12301](/root/laintas_cli/laintas_cli.py:12301) | resolved output candidate | AgentRegistry._handle_term_new | `Helpwo created sub-terminal {name} ⏎ It will hand itself over to Helpwo once it finishes starting.` |
+| [12301](/root/laintas_cli/laintas_cli.py:12301) | resolved output candidate | AgentRegistry._handle_term_new | `Helpwow created sub-terminal {name} ⏎ It will hand itself over to Helpwow once it finishes starting.` |
 | [12304](/root/laintas_cli/laintas_cli.py:12304) | title/menu/help | AgentRegistry._handle_term_new / title | `Remote Terminal` |
-| [12321](/root/laintas_cli/laintas_cli.py:12321) | output | AgentRegistry._handle_term_close / 0 | `Helpwo closed this sub-terminal.` |
-| [12367](/root/laintas_cli/laintas_cli.py:12367) | resolved output candidate | AgentRegistry._handle_term_close | `Helpwo closed sub-terminal {name}` |
+| [12321](/root/laintas_cli/laintas_cli.py:12321) | output | AgentRegistry._handle_term_close / 0 | `Helpwow closed this sub-terminal.` |
+| [12367](/root/laintas_cli/laintas_cli.py:12367) | resolved output candidate | AgentRegistry._handle_term_close | `Helpwow closed sub-terminal {name}` |
 | [12369](/root/laintas_cli/laintas_cli.py:12369) | title/menu/help | AgentRegistry._handle_term_close / title | `Remote Terminal` |
-| [12401](/root/laintas_cli/laintas_cli.py:12401) | resolved output candidate | AgentRegistry._handle_disconnect | `Helpwo disconnected this terminal. ⏎ The CLI keeps running locally. Run /helpwo to connect again.` |
+| [12401](/root/laintas_cli/laintas_cli.py:12401) | resolved output candidate | AgentRegistry._handle_disconnect | `Helpwow disconnected this terminal. ⏎ The CLI keeps running locally. Run /helpwo to connect again.` |
 | [12404](/root/laintas_cli/laintas_cli.py:12404) | title/menu/help | AgentRegistry._handle_disconnect / title | `Disconnected` |
 | [12458](/root/laintas_cli/laintas_cli.py:12458) | resolved output candidate | AgentRegistry._handle_delegate | `delegate {goal[:200]} ⏎ maxLoops={max_loops_val}, context={len(context)} chars` |
 | [12458](/root/laintas_cli/laintas_cli.py:12458) | resolved output candidate | AgentRegistry._handle_delegate | `delegate {goal[:200]} ⏎ maxLoops={max_loops_val}` |
@@ -1802,7 +1802,7 @@ Both example lines are rendered by `handle_version_command`. The local version c
 | [16922](/root/laintas_cli/laintas_cli.py:16922) | label/render | _shared_print_listing | `Path` |
 | [16923](/root/laintas_cli/laintas_cli.py:16923) | label/render | _shared_print_listing | `Size` |
 | [16924](/root/laintas_cli/laintas_cli.py:16924) | label/render | _shared_print_listing | `Modified` |
-| [16949](/root/laintas_cli/laintas_cli.py:16949) | output | _cmd_shared / 0 | `Usage: /shared [list [path]\|push <local> [remote]\|pull <remote> [local]\|rm <path>\|mkdir <path>\|mv <from> <to>\|cp <from> <to>\|usage] ⏎ Files land in the same storage Helpwo mounts as "Laintas Storage" — push here, open it there.` |
+| [16949](/root/laintas_cli/laintas_cli.py:16949) | output | _cmd_shared / 0 | `Usage: /shared [list [path]\|push <local> [remote]\|pull <remote> [local]\|rm <path>\|mkdir <path>\|mv <from> <to>\|cp <from> <to>\|usage] ⏎ Files land in the same storage Helpwow mounts as "Laintas Storage" — push here, open it there.` |
 | [16960](/root/laintas_cli/laintas_cli.py:16960) | status/prompt | _cmd_shared | `Reading storage…` |
 | [16969](/root/laintas_cli/laintas_cli.py:16969) | status/prompt | _cmd_shared | `Listing…` |
 | [16976](/root/laintas_cli/laintas_cli.py:16976) | output | _cmd_shared / 0 | `Usage: /shared push <local-path> [remote-path]` |
@@ -1812,7 +1812,7 @@ Both example lines are rendered by `handle_version_command`. The local version c
 | [16997](/root/laintas_cli/laintas_cli.py:16997) | output | _cmd_shared / 0 | `Pushed {len(files)} files ({ss.human_bytes(total)}) to {escape(base)}/` |
 | [17002](/root/laintas_cli/laintas_cli.py:17002) | status/prompt | _cmd_shared | `Pushing {escape(os.path.basename(local))}…` |
 | [17005](/root/laintas_cli/laintas_cli.py:17005) | output | _cmd_shared / 0 | `Pushed {escape(remote)} ({ss.human_bytes(size)}).` |
-| [17006](/root/laintas_cli/laintas_cli.py:17006) | output | _cmd_shared / 0 | `Open it in Helpwo under Laintas Storage.` |
+| [17006](/root/laintas_cli/laintas_cli.py:17006) | output | _cmd_shared / 0 | `Open it in Helpwow under Laintas Storage.` |
 | [17011](/root/laintas_cli/laintas_cli.py:17011) | output | _cmd_shared / 0 | `Usage: /shared pull <remote-path> [local-path]` |
 | [17017](/root/laintas_cli/laintas_cli.py:17017) | status/prompt | _cmd_shared | `Pulling {escape(remote)}…` |
 | [17020](/root/laintas_cli/laintas_cli.py:17020) | output | _cmd_shared / 0 | `Pulled {escape(remote)} → {escape(local)} ({ss.human_bytes(size)}).` |
@@ -2515,9 +2515,9 @@ Both example lines are rendered by `handle_version_command`. The local version c
 | [22406](/root/laintas_cli/laintas_cli.py:22406) | output | _cmd_mcp / 0 | `{msg}` |
 | [22408](/root/laintas_cli/laintas_cli.py:22408) | output | _cmd_mcp / 0 | `Edit the file, enable a server, then /mcp reload` |
 | [22412](/root/laintas_cli/laintas_cli.py:22412) | output | _cmd_mcp / 0 | `Usage: /mcp {list\|trust <n>\|revoke <n>\|connect <n>\|disconnect <n>\|reload\|tools <n>\|init\|config}` |
-| [22421](/root/laintas_cli/laintas_cli.py:22421) | output | _disconnect_from_helpwo / 0 | `This CLI isn't connected to Helpwo.` |
-| [22431](/root/laintas_cli/laintas_cli.py:22431) | output | _disconnect_from_helpwo / 0 | `Runtime environment {name} withdrawn from Helpwo (its terminal and files are no longer reachable there). Run /helpwo to connect again.` |
-| [22440](/root/laintas_cli/laintas_cli.py:22440) | output | _disconnect_from_helpwo / 0 | `Sub-terminal {name} withdrawn from Helpwo.` |
+| [22421](/root/laintas_cli/laintas_cli.py:22421) | output | _disconnect_from_helpwo / 0 | `This CLI isn't connected to Helpwow.` |
+| [22431](/root/laintas_cli/laintas_cli.py:22431) | output | _disconnect_from_helpwo / 0 | `Runtime environment {name} withdrawn from Helpwow (its terminal and files are no longer reachable there). Run /helpwo to connect again.` |
+| [22440](/root/laintas_cli/laintas_cli.py:22440) | output | _disconnect_from_helpwo / 0 | `Sub-terminal {name} withdrawn from Helpwow.` |
 | [22466](/root/laintas_cli/laintas_cli.py:22466) | output | _parse_helpwo_flags / 0 | `Unexpected argument. Usage: /helpwo [stop]` |
 | [22527](/root/laintas_cli/laintas_cli.py:22527) | output | _report_app_runtime / 0 | `{escape(label)} could not start in sub-terminal {escape(app)}: {escape(str(runtime.get('message') or 'unknown error'))}` |
 | [22529](/root/laintas_cli/laintas_cli.py:22529) | output | _report_app_runtime / 0 | `/t to look at the sub-terminal; running the command again replaces it.` |
@@ -2549,15 +2549,15 @@ Both example lines are rendered by `handle_version_command`. The local version c
 | [23019](/root/laintas_cli/laintas_cli.py:23019) | output | _app_session_start_in_process._close_when_idle / 0 | `Idle for {idle_minutes} min — closing session.` |
 | [23026](/root/laintas_cli/laintas_cli.py:23026) | resolved output candidate | _app_session_start_in_process | `Session of {escape(name)} for user {escape(user)} ⏎ Tools: {', '.join(allowed) if allowed is not None else 'all'} ⏎ Approvals: {agent_registry.app_mode['approval']}` |
 | [23031](/root/laintas_cli/laintas_cli.py:23031) | title/menu/help | _app_session_start_in_process / title | `App session` |
-| [23049](/root/laintas_cli/laintas_cli.py:23049) | output | _cmd_helpwo / 0 | `Helpwo sub-terminal closed (its agent and local API with it).` |
-| [23054](/root/laintas_cli/laintas_cli.py:23054) | output | _cmd_helpwo / 0 | `Helpwo local API stopped.` |
-| [23066](/root/laintas_cli/laintas_cli.py:23066) | output | _cmd_helpwo / 0 | `Helpwo is not running and this CLI isn't connected.` |
+| [23049](/root/laintas_cli/laintas_cli.py:23049) | output | _cmd_helpwo / 0 | `Helpwow sub-terminal closed (its agent and local API with it).` |
+| [23054](/root/laintas_cli/laintas_cli.py:23054) | output | _cmd_helpwo / 0 | `Helpwow local API stopped.` |
+| [23066](/root/laintas_cli/laintas_cli.py:23066) | output | _cmd_helpwo / 0 | `Helpwow is not running and this CLI isn't connected.` |
 | [23098](/root/laintas_cli/laintas_cli.py:23098) | output | _cmd_app / 0 | `No applications registered. Add a manifest to {app_host.user_manifest_dir()} or ./.laintas/apps/.` |
 | [23100](/root/laintas_cli/laintas_cli.py:23100) | output | _cmd_app / 0 | `  {"name": "myapp", "description": "…", "command": "node server.js", "prompt": "…", "persistence": "none"}` |
 | [23118](/root/laintas_cli/laintas_cli.py:23118) | output | _cmd_app / 0 | `Skipped {escape(problem)}` |
 | [23122](/root/laintas_cli/laintas_cli.py:23122) | output | _cmd_app / 0 | `Usage: /app [list\|start <name>\|stop <name>\|trust <name>\|revoke <name>]` |
 | [23126](/root/laintas_cli/laintas_cli.py:23126) | output | _cmd_app / 0 | `Usage: /app {sub} <name>` |
-| [23129](/root/laintas_cli/laintas_cli.py:23129) | output | _cmd_app / 0 | `Helpwo has its own command: /helpwo` |
+| [23129](/root/laintas_cli/laintas_cli.py:23129) | output | _cmd_app / 0 | `Helpwow has its own command: /helpwo` |
 | [23134](/root/laintas_cli/laintas_cli.py:23134) | output | _cmd_app / 0 | `Application {escape(name)} stopped (sub-terminal, agent and its process).` |
 | [23137](/root/laintas_cli/laintas_cli.py:23137) | output | _cmd_app / 0 | `'{escape(name)}' is not running.` |
 | [23141](/root/laintas_cli/laintas_cli.py:23141) | output | _cmd_app / 0 | `Trust for {escape(name)} revoked.` |
@@ -2937,7 +2937,7 @@ Both example lines are rendered by `handle_version_command`. The local version c
 | [28065](/root/laintas_cli/laintas_cli.py:28065) | output | _run_agent_loop_with_interrupt / 0 | `{symbols.FAIL} Agent runtime error: {escape(run_error)} ⏎ The session was preserved. Use /continue to retry from the latest checkpoint.` |
 | [28094](/root/laintas_cli/laintas_cli.py:28094) | output | _run_agent_loop_with_interrupt / 0 | `Stopped {_stopped} sub-agent{'s' if _stopped != 1 else ''} started by this turn.` |
 | [28288](/root/laintas_cli/laintas_cli.py:28288) | title/menu/help | main / description | `Laintas CLI — Autonomous AI agent` |
-| [28291](/root/laintas_cli/laintas_cli.py:28291) | title/menu/help | main / help | `Set agent name (shows in Helpwo AGNETS)` |
+| [28291](/root/laintas_cli/laintas_cli.py:28291) | title/menu/help | main / help | `Set agent name (shows in Helpwow AGNETS)` |
 | [28293](/root/laintas_cli/laintas_cli.py:28293) | title/menu/help | main / help | `Use a saved account alias, email or userId` |
 | [28297](/root/laintas_cli/laintas_cli.py:28297) | title/menu/help | main / help | `Custom backend URL (enters external/unmetered mode; Laintas credentials are stripped)` |
 | [28301](/root/laintas_cli/laintas_cli.py:28301) | title/menu/help | main / help | `Serve the Agent Client Protocol (ACP) over stdio — lets ACP editors (Zed & friends) drive this CLI. Optional: pip install agent-client-protocol` |
@@ -2954,8 +2954,8 @@ Both example lines are rendered by `handle_version_command`. The local version c
 | [28327](/root/laintas_cli/laintas_cli.py:28327) | title/menu/help | main / help | `Name of the terminal this sub-process represents` |
 | [28329](/root/laintas_cli/laintas_cli.py:28329) | title/menu/help | main / help | `Name of the parent terminal that spawned this sub-process` |
 | [28331](/root/laintas_cli/laintas_cli.py:28331) | title/menu/help | main / help | `Agent id of the parent process that spawned this sub-process` |
-| [28333](/root/laintas_cli/laintas_cli.py:28333) | title/menu/help | main / help | `Helpwo backend agent id of the primary CLI that owns this sub-terminal` |
-| [28335](/root/laintas_cli/laintas_cli.py:28335) | title/menu/help | main / help | `Hand this sub-terminal over to Helpwo at startup (internal; used by term-new)` |
+| [28333](/root/laintas_cli/laintas_cli.py:28333) | title/menu/help | main / help | `Helpwow backend agent id of the primary CLI that owns this sub-terminal` |
+| [28335](/root/laintas_cli/laintas_cli.py:28335) | title/menu/help | main / help | `Hand this sub-terminal over to Helpwow at startup (internal; used by term-new)` |
 | [28432](/root/laintas_cli/laintas_cli.py:28432) | output | main / 0 | `Migrating to new directory layout (~/.laintas/)...` |
 | [28456](/root/laintas_cli/laintas_cli.py:28456) | output | main / 0 | `Reclaimed {len(_reaped['reaped'])} orphaned sub-agent worktree(s); any uncommitted work is saved as a patch under .laintas/worktrees/.reaped/.` |
 | [28462](/root/laintas_cli/laintas_cli.py:28462) | output | main / 0 | `Worktree sweep incomplete: {_reaped['error']}` |
@@ -2982,9 +2982,9 @@ Both example lines are rendered by `handle_version_command`. The local version c
 | [28758](/root/laintas_cli/laintas_cli.py:28758) | startup/notice | main._close_stale_admission | `Its recovery journal entry has been closed.` |
 | [28781](/root/laintas_cli/laintas_cli.py:28781) | output | main / 0 | `Resumed saved session.` |
 | [28784](/root/laintas_cli/laintas_cli.py:28784) | output | main / 0 | `No saved session for this directory.` |
-| [28835](/root/laintas_cli/laintas_cli.py:28835) | startup/notice | main | `Not connected to Helpwo` |
-| [28836](/root/laintas_cli/laintas_cli.py:28836) | startup/notice | main | `Start the local Helpwo companion with /helpwo.` |
-| [28840](/root/laintas_cli/laintas_cli.py:28840) | startup/notice | main | `This sub-terminal isn't linked to Helpwo yet.` |
+| [28835](/root/laintas_cli/laintas_cli.py:28835) | startup/notice | main | `Not connected to Helpwow` |
+| [28836](/root/laintas_cli/laintas_cli.py:28836) | startup/notice | main | `Start the local Helpwow companion with /helpwo.` |
+| [28840](/root/laintas_cli/laintas_cli.py:28840) | startup/notice | main | `This sub-terminal isn't linked to Helpwow yet.` |
 | [28858](/root/laintas_cli/laintas_cli.py:28858) | output | main / 0 | `Application state unreadable: {_app_state_exc}` |
 | [28947](/root/laintas_cli/laintas_cli.py:28947) | startup/notice | main | `'{DEFAULT_SUB_AGENT_NAME}' and '{DECOMPOSER_SUB_AGENT_NAME}' are registered and undeployed` |
 | [28949](/root/laintas_cli/laintas_cli.py:28949) | startup/notice | main | `{DEFAULT_SUB_AGENT_NAME} works one job carefully. {DECOMPOSER_SUB_AGENT_NAME} is the one to give work that may divide: it is asked whether the request splits into parts that can run at once, and builds a workflow graph when it does. Neither owns a terminal or does anything until you address it.` |
@@ -3973,7 +3973,7 @@ Both example lines are rendered by `handle_version_command`. The local version c
 | [5861](/root/laintas_cli/tools.py:5861) | message candidate | _bi_file_push / error | `cannot resolve backend: {backend_url}` |
 | [5865](/root/laintas_cli/tools.py:5865) | message candidate | _bi_file_push / error | `missing 'paths' — list of local file paths` |
 | [5869](/root/laintas_cli/tools.py:5869) | message candidate | _bi_file_push / error | `'paths' must be a list of file paths` |
-| [5873](/root/laintas_cli/tools.py:5873) | message candidate | _bi_file_push / error | `missing 'target_agent_id' — the Helpwo agent to notify` |
+| [5873](/root/laintas_cli/tools.py:5873) | message candidate | _bi_file_push / error | `missing 'target_agent_id' — the Helpwow agent to notify` |
 | [5937](/root/laintas_cli/tools.py:5937) | message candidate | _bi_file_push / error | `no files uploaded` |
 | [5974](/root/laintas_cli/tools.py:5974) | message candidate | _bi_terminal_send / error | `missing 'name'` |
 | [5976](/root/laintas_cli/tools.py:5976) | message candidate | _bi_terminal_send / error | `missing 'input' (or legacy 'command')` |
@@ -4283,20 +4283,20 @@ Both example lines are rendered by `handle_version_command`. The local version c
 | [11287](/root/laintas_cli/tools.py:11287) | tool/help | register_builtin_tools / description | `Recent tool failures in this CLI process, newest first, with the command, the error and a tail of the output. Your own failures are already in this conversation — reach for this when a CHILD agent or another terminal failed and you need to know what it actually hit. Filter by agent_id, terminal or tool name.` |
 | [11309](/root/laintas_cli/tools.py:11309) | title/menu/help | register_builtin_tools / description | `How full the account's Laintas Storage is: tier, bytes used, free allowance, overage and the per-file size limit. Check this before uploading anything large — an upload over the allowance is rejected by the gateway, and overage is billed.` |
 | [11309](/root/laintas_cli/tools.py:11309) | tool/help | register_builtin_tools / description | `How full the account's Laintas Storage is: tier, bytes used, free allowance, overage and the per-file size limit. Check this before uploading anything large — an upload over the allowance is rejected by the gateway, and overage is billed.` |
-| [11320](/root/laintas_cli/tools.py:11320) | title/menu/help | register_builtin_tools / description | `List a folder in Laintas Storage — the same cloud folder Helpwo mounts as "Laintas Storage" and the user manages with /shared. Omit 'path' for the root. This is remote storage, not this machine: use fs.ls for local files.` |
-| [11320](/root/laintas_cli/tools.py:11320) | tool/help | register_builtin_tools / description | `List a folder in Laintas Storage — the same cloud folder Helpwo mounts as "Laintas Storage" and the user manages with /shared. Omit 'path' for the root. This is remote storage, not this machine: use fs.ls for local files.` |
+| [11320](/root/laintas_cli/tools.py:11320) | title/menu/help | register_builtin_tools / description | `List a folder in Laintas Storage — the same cloud folder Helpwow mounts as "Laintas Storage" and the user manages with /shared. Omit 'path' for the root. This is remote storage, not this machine: use fs.ls for local files.` |
+| [11320](/root/laintas_cli/tools.py:11320) | tool/help | register_builtin_tools / description | `List a folder in Laintas Storage — the same cloud folder Helpwow mounts as "Laintas Storage" and the user manages with /shared. Omit 'path' for the root. This is remote storage, not this machine: use fs.ls for local files.` |
 | [11337](/root/laintas_cli/tools.py:11337) | title/menu/help | register_builtin_tools / description | `Download one file from Laintas Storage to this machine. Writes to 'local_path' (a directory keeps the remote name), or to the remote file's name in the working directory.` |
 | [11337](/root/laintas_cli/tools.py:11337) | tool/help | register_builtin_tools / description | `Download one file from Laintas Storage to this machine. Writes to 'local_path' (a directory keeps the remote name), or to the remote file's name in the working directory.` |
-| [11355](/root/laintas_cli/tools.py:11355) | title/menu/help | register_builtin_tools / description | `Upload one local file to Laintas Storage, where the user and their Helpwo sessions can open it. 'path' is the remote destination (defaults to the file's own name). To hand files to a specific Helpwo agent instead, use file_push.` |
-| [11355](/root/laintas_cli/tools.py:11355) | tool/help | register_builtin_tools / description | `Upload one local file to Laintas Storage, where the user and their Helpwo sessions can open it. 'path' is the remote destination (defaults to the file's own name). To hand files to a specific Helpwo agent instead, use file_push.` |
+| [11355](/root/laintas_cli/tools.py:11355) | title/menu/help | register_builtin_tools / description | `Upload one local file to Laintas Storage, where the user and their Helpwow sessions can open it. 'path' is the remote destination (defaults to the file's own name). To hand files to a specific Helpwow agent instead, use file_push.` |
+| [11355](/root/laintas_cli/tools.py:11355) | tool/help | register_builtin_tools / description | `Upload one local file to Laintas Storage, where the user and their Helpwow sessions can open it. 'path' is the remote destination (defaults to the file's own name). To hand files to a specific Helpwow agent instead, use file_push.` |
 | [11373](/root/laintas_cli/tools.py:11373) | title/menu/help | register_builtin_tools / description | `Create a folder in Laintas Storage.` |
 | [11373](/root/laintas_cli/tools.py:11373) | tool/help | register_builtin_tools / description | `Create a folder in Laintas Storage.` |
 | [11385](/root/laintas_cli/tools.py:11385) | title/menu/help | register_builtin_tools / description | `Move or rename a file or folder inside Laintas Storage.` |
 | [11385](/root/laintas_cli/tools.py:11385) | tool/help | register_builtin_tools / description | `Move or rename a file or folder inside Laintas Storage.` |
-| [11399](/root/laintas_cli/tools.py:11399) | title/menu/help | register_builtin_tools / description | `Delete a file or folder from Laintas Storage. Always asks the user first, in every policy mode: this store is shared with Helpwo and nothing here is covered by the local checkpoint.` |
-| [11399](/root/laintas_cli/tools.py:11399) | tool/help | register_builtin_tools / description | `Delete a file or folder from Laintas Storage. Always asks the user first, in every policy mode: this store is shared with Helpwo and nothing here is covered by the local checkpoint.` |
-| [11415](/root/laintas_cli/tools.py:11415) | title/menu/help | register_builtin_tools / description | `Push local files to Laintas shared cloud storage (R2) and notify a Helpwo agent. Files are uploaded via presigned URLs — the gateway never touches the bytes. After upload, a 'file_push' message is sent to the target agent so it can download the files into its workspace.` |
-| [11415](/root/laintas_cli/tools.py:11415) | tool/help | register_builtin_tools / description | `Push local files to Laintas shared cloud storage (R2) and notify a Helpwo agent. Files are uploaded via presigned URLs — the gateway never touches the bytes. After upload, a 'file_push' message is sent to the target agent so it can download the files into its workspace.` |
+| [11399](/root/laintas_cli/tools.py:11399) | title/menu/help | register_builtin_tools / description | `Delete a file or folder from Laintas Storage. Always asks the user first, in every policy mode: this store is shared with Helpwow and nothing here is covered by the local checkpoint.` |
+| [11399](/root/laintas_cli/tools.py:11399) | tool/help | register_builtin_tools / description | `Delete a file or folder from Laintas Storage. Always asks the user first, in every policy mode: this store is shared with Helpwow and nothing here is covered by the local checkpoint.` |
+| [11415](/root/laintas_cli/tools.py:11415) | title/menu/help | register_builtin_tools / description | `Push local files to Laintas shared cloud storage (R2) and notify a Helpwow agent. Files are uploaded via presigned URLs — the gateway never touches the bytes. After upload, a 'file_push' message is sent to the target agent so it can download the files into its workspace.` |
+| [11415](/root/laintas_cli/tools.py:11415) | tool/help | register_builtin_tools / description | `Push local files to Laintas shared cloud storage (R2) and notify a Helpwow agent. Files are uploaded via presigned URLs — the gateway never touches the bytes. After upload, a 'file_push' message is sent to the target agent so it can download the files into its workspace.` |
 | [11441](/root/laintas_cli/tools.py:11441) | title/menu/help | register_builtin_tools / description | `BLOCKING. Spawn ONE sub-agent and hold your loop until it finishes — you can do nothing else meanwhile. Use it only when the very next thing you do needs that result; otherwise use agent.spawn, which is the non-blocking form of this same mechanism. If the concurrency cap is reached the sub-agent queues and starts when a slot frees. Give COMPLETE instructions in goal: file paths, conventions, constraints.` |
 | [11441](/root/laintas_cli/tools.py:11441) | tool/help | register_builtin_tools / description | `BLOCKING. Spawn ONE sub-agent and hold your loop until it finishes — you can do nothing else meanwhile. Use it only when the very next thing you do needs that result; otherwise use agent.spawn, which is the non-blocking form of this same mechanism. If the concurrency cap is reached the sub-agent queues and starts when a slot frees. Give COMPLETE instructions in goal: file paths, conventions, constraints.` |
 | [11461](/root/laintas_cli/tools.py:11461) | title/menu/help | register_builtin_tools / description | `NON-BLOCKING by default. Spawn multiple TEMPORARY sub-agents in PARALLEL for one-off tasks: returns batch_id and child_ids immediately while results continue to arrive through your inbox, so continue useful independent work — whichever child finishes first reaches you first, without waiting for the slowest. For persistent long-lived employees, use agent.hire instead. Set wait=true only for a real barrier that requires ALL results before the next action; that BLOCKING mode returns a combined structured report. Max 6 agents per batch. Each member must work on DIFFERENT files — decompose by file boundaries. Agents beyond the concurrency cap queue automatically. In wait=true barrier mode there is no batch time budget; its live supervisor stops an individual child after several minutes without observable progress. The default asynchronous mode does not keep this tool call open to supervise the batch. Still scope each task to a reviewable slice (roughly <=300-400 lines of code, or an equivalently bounded unit): an oversized slice returns a shallower review, not a better one. Inside a child, prefer fs.read/fs.grep for reading code over shell one-liners that slice files — each distinct ad-hoc command re-triggers a policy approval and burns the same budget waiting on it.` |
@@ -4472,7 +4472,7 @@ Both example lines are rendered by `handle_version_command`. The local version c
 | [755](/root/laintas_cli/updater.py:755) | error candidate | fetch_helpwo_manifest | `{HELPWO_MANIFEST_ASSET} has no index.html` |
 | [758](/root/laintas_cli/updater.py:758) | error candidate | fetch_helpwo_manifest | `unsafe path in {HELPWO_MANIFEST_ASSET}: {name!r}` |
 | [761](/root/laintas_cli/updater.py:761) | error candidate | fetch_helpwo_manifest | `manifest entry '{name}' is missing a valid sha256` |
-| [809](/root/laintas_cli/updater.py:809) | output | install_helpwo_dist / 0 | `Downloading Helpwo UI {version} ({len(changed)} file(s) differ)…` |
+| [809](/root/laintas_cli/updater.py:809) | output | install_helpwo_dist / 0 | `Downloading Helpwow UI {version} ({len(changed)} file(s) differ)…` |
 
 ### usage_tracker.py
 

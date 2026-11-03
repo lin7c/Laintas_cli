@@ -6,7 +6,7 @@ Three classes of failure are pinned here, because all three are silent:
     misbehaves when somebody edits or undoes it in Excalidraw;
   * a deletion that removes the entry instead of tombstoning it — the element
     comes back the next time an older copy of the scene is merged in;
-  * a write that lands on a file somebody else changed — Helpwo holds an open
+  * a write that lands on a file somebody else changed — Helpwow holds an open
     board in its editor, and overwriting it loses what they just drew.
 """
 
@@ -209,7 +209,7 @@ class BatchDrawing(unittest.TestCase):
         self.assertEqual(arrow["endBinding"]["elementId"], names["wk"])
 
     def test_an_agents_work_is_tagged_for_review(self):
-        """Helpwo's Show / Keep / Undo banner groups by author and turn; work
+        """Helpwow's Show / Keep / Undo banner groups by author and turn; work
         tagged anything else lands on the board with no way to review it."""
         self.editor.draw_batch([{"kind": "rectangle", "label": "x"}])
         scene = canvas.read_scene(self.path)
@@ -294,7 +294,7 @@ class BoardEditorTests(unittest.TestCase):
         self.assertEqual([e["type"] for e in self._live()], ["ellipse"])
 
     def test_a_board_changed_underneath_is_refused_not_overwritten(self):
-        """Helpwo has it open and just saved. Their work stays; ours does
+        """Helpwow has it open and just saved. Their work stays; ours does
         not land silently on top of it."""
         theirs = canvas.empty_scene()
         theirs["elements"] = [canvas_edit.shape("ellipse", 5, 5, 20, 20)]

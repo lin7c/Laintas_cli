@@ -16,7 +16,7 @@ What moved, unchanged in behaviour:
   canvas.list/read/draw/update    the four tools the model uses
 
 The command still leans on the CLI for the things the CLI owns: argument
-splitting, the Helpwo sub-terminal launcher, the console. An extension runs
+splitting, the Helpwow sub-terminal launcher, the console. An extension runs
 in-process with the same permissions, so it imports them directly — the same
 arrangement the blindpick extension uses, and the reason the host's context is
 documented as a convenience rather than a boundary.
@@ -54,7 +54,7 @@ def _cmd_canvas(raw_args: str) -> None:
     are still one keystroke away — `b` inside the viewer, `/canvas list`
     outside it.
 
-    Reads and creates; it does not edit. A board Helpwo has open lives in the
+    Reads and creates; it does not edit. A board Helpwow has open lives in the
     editor with the file trailing behind it, so a write from here would be
     overwritten by its next autosave without either side noticing. Editing
     waits for the two to agree on who holds a board — see canvas.py.
@@ -72,11 +72,11 @@ def _cmd_canvas(raw_args: str) -> None:
         _console().print(r"  /canvas list              list the boards under this directory")
         _console().print(r"  /canvas text <path>       show what is on it, as text")
         _console().print(r"  /canvas new <path>        create a named board and open it")
-        _console().print(r"  /canvas open \[path]       open the board in Helpwo, where you draw")
+        _console().print(r"  /canvas open \[path]       open the board in Helpwow, where you draw")
         _console().print(r"[dim]In the view: w draws — r/o/d shapes, a arrow, l line, "
                       r"p pencil, t text; c colour, f fill, 1-3 width; "
                       r"x deletes, u undoes, b switches board.[/dim]")
-        _console().print(r"[dim]`open` starts the local Helpwo gateway for the full editor — "
+        _console().print(r"[dim]`open` starts the local Helpwow gateway for the full editor — "
                       r"a board changed there while this is open makes the next edit here "
                       r"refuse rather than overwrite it.[/dim]")
         return
@@ -124,7 +124,7 @@ def _cmd_canvas(raw_args: str) -> None:
         if _canvas_can_view():
             _canvas_view(path, canvas_mod.read_scene(path), canvas_mod)
         else:
-            _console().print("[dim]Open it in Helpwo to draw: "
+            _console().print("[dim]Open it in Helpwow to draw: "
                           f"/canvas open {path}[/dim]")
         return
 
@@ -153,7 +153,7 @@ def _cmd_canvas(raw_args: str) -> None:
                 canvas_mod.write_scene(expanded, canvas_mod.empty_scene())
                 scene = canvas_mod.empty_scene()
                 _console().print(f"[green]Created {path}[/green] "
-                              f"[dim]— draw on it in Helpwo with /canvas open {path}[/dim]")
+                              f"[dim]— draw on it in Helpwow with /canvas open {path}[/dim]")
             except (canvas_mod.CanvasError, OSError) as create_err:
                 _console().print(f"[red]{create_err}[/red]")
                 return
@@ -174,7 +174,7 @@ def _cmd_canvas(raw_args: str) -> None:
     if pending:
         total = sum(t["count"] for t in pending)
         _console().print(f"[yellow]{total} element(s) added by the AI are still "
-                      f"unreviewed — accept or undo them in Helpwo.[/yellow]")
+                      f"unreviewed — accept or undo them in Helpwow.[/yellow]")
 
 
 def _canvas_can_view() -> bool:
@@ -221,7 +221,7 @@ def _canvas_quick_start(canvas_mod) -> None:
     # No terminal to take over (piped stdin, a test, a dumb terminal): say
     # what exists instead of opening nothing.
     _console().print(canvas_mod.describe_scene(scene), markup=False, highlight=False)
-    _console().print(f"[dim]Draw on it in Helpwo: /canvas open "
+    _console().print(f"[dim]Draw on it in Helpwow: /canvas open "
                   f"{os.path.relpath(path)}[/dim]")
     if others:
         _console().print(f"[dim]{len(others)} other board(s) — /canvas list[/dim]")
@@ -267,7 +267,7 @@ def _canvas_view(path: str, scene: dict, canvas_mod) -> bool:
               if os.path.abspath(b) != os.path.abspath(os.path.expanduser(path))]
     hints = [f"w — draw here (r rect · o ellipse · d diamond · t text)"
              if editor else
-             f"draw on it in Helpwo:  /canvas open {os.path.relpath(path)}",
+             f"draw on it in Helpwow:  /canvas open {os.path.relpath(path)}",
              "b — open another board" if boards else "",
              "q — close"]
     try:
@@ -291,7 +291,7 @@ def _canvas_open(path: str, canvas_mod) -> None:
 
     A whiteboard cannot be shown in a terminal, and the gap between "the file
     exists" and "I can draw on it" is exactly where this feature was invisible.
-    The local Helpwo gateway mounts the working directory as a workspace, so a
+    The local Helpwow gateway mounts the working directory as a workspace, so a
     board created here is already in its file tree — all that was missing was
     somebody saying so.
     """
@@ -634,7 +634,7 @@ def setup(ctx) -> None:
             ("list", "List the boards under this directory"),
             ("text <path>", "Show what is on it, as text"),
             ("new <path>", "Create a named board and open it"),
-            ("open [path]", "Open the board in Helpwo, where you draw"),
+            ("open [path]", "Open the board in Helpwow, where you draw"),
         ],
         arg_rules=_ARG_RULES,
         file_arguments=_FILE_ARGUMENTS)

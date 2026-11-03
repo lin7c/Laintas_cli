@@ -8,7 +8,7 @@ indentation — the #1 cause of exact-edit failures.
 
 This is the ONE edit-related piece that is pure algorithm (no I/O, no runtime),
 so it lives in the gateway as the single source of truth and is vendored into
-each product (laintas_cli now; a TS mirror for Helpwo later). The file read/write
+each product (laintas_cli now; a TS mirror for Helpwow later). The file read/write
 stays in each client; only the matching is shared.
 
 Strategies tried in order (first UNIQUE match wins), mirroring opencode:

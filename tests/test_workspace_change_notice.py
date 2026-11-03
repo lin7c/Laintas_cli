@@ -184,7 +184,7 @@ class WorkspaceChangeNoticeTestCase(unittest.TestCase):
         self.assertNotIn("note", res)
 
     def test_another_actors_view_is_not_reported_as_ours(self):
-        """An attached Helpwo keeps a separate fingerprint namespace; its stale
+        """An attached Helpwow keeps a separate fingerprint namespace; its stale
         reads are its own to resolve."""
         f = self._file()
         self.coord.note_read(f, actor="helpwo-bridge")

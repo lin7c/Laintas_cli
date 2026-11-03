@@ -1,4 +1,4 @@
-"""Tests for the loopback half of the Helpwo ⇄ laintas_cli transports.
+"""Tests for the loopback half of the Helpwow ⇄ laintas_cli transports.
 
 These cover the three surfaces that used to be P2P-only — command execution,
 the interactive PTY and the HTTP tunnel — plus the cross-writer coordination
@@ -10,7 +10,7 @@ The bug being guarded against in each case is a real one that shipped:
   * a local /helpwo session negotiated ICE with itself to run `ls`, and failed
     outright when the optional aiortc extra was absent — on the very machine
     that was serving the page;
-  * Helpwo's writes reached the disk *through* this process, so the peer
+  * Helpwow's writes reached the disk *through* this process, so the peer
     scanner (which counts processes) never saw a second writer and the later
     write won with no error on either side.
 """
@@ -340,7 +340,7 @@ class LoopbackRuntimeTests(unittest.TestCase):
 
 
 class CrossWriterCoordinationTests(unittest.TestCase):
-    """Helpwo and the CLI's agent loop must not silently clobber each other."""
+    """Helpwow and the CLI's agent loop must not silently clobber each other."""
 
     def setUp(self):
         self._previous_cwd = os.getcwd()
@@ -378,7 +378,7 @@ class CrossWriterCoordinationTests(unittest.TestCase):
         target = self.root / "shared.ts"
         target.write_text("v1", encoding="utf-8")
 
-        # Helpwo reads, the CLI writes underneath, Helpwo must not overwrite.
+        # Helpwow reads, the CLI writes underneath, Helpwow must not overwrite.
         peer_coordination.note_external_read(str(target), actor)
         self.coord.note_read(str(target))
         target.write_text("v2 by cli", encoding="utf-8")
@@ -389,7 +389,7 @@ class CrossWriterCoordinationTests(unittest.TestCase):
         peer_coordination.note_external_read(str(target), actor)
         self.assertIsNone(peer_coordination.guard_external_write(str(target), actor))
 
-        # And the mirror image: Helpwo writes, the CLI is the one blocked.
+        # And the mirror image: Helpwow writes, the CLI is the one blocked.
         target.write_text("v3 by helpwo", encoding="utf-8")
         peer_coordination.note_external_write(str(target), "put", actor)
         self.assertIsNotNone(self.coord.assert_unchanged(str(target)))

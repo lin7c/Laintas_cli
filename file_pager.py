@@ -76,7 +76,7 @@ MAX_TRACKED_FILES = 64
 #: Delivered bodies, keyed by (path, fingerprint, page, GEOMETRY). Process-local
 #: and deliberately NOT part of the agent's persisted state: it is a cache, and
 #: a cache in the resume file is just a bigger resume file. Serving a re-read
-#: from here is Helpwo's `tryServeCachedView` (AutonomousKernel.ts): it saves
+#: from here is Helpwow's `tryServeCachedView` (AutonomousKernel.ts): it saves
 #: the disk round-trip and, more importantly, guarantees that one page number
 #: never yields two different bodies inside a turn.
 #:
@@ -438,7 +438,7 @@ def stub_for(state: dict, path: str, page: int) -> str:
 
 # ── Visible-range ledger (what the model can still SEE) ────────────────────
 #
-# Helpwo (toolRuntimeState.ts) refuses a read whose range it has already
+# Helpwow (toolRuntimeState.ts) refuses a read whose range it has already
 # served. That is the right instinct and it has one blind spot: the gate knows
 # what was READ, not what is still in the context. After its compaction trims
 # an old `cat` result, the model is told "already fully read" about content it
@@ -496,7 +496,7 @@ def visible_ranges(state: dict, path: str) -> list:
 def mark_edited(state: dict, path: str) -> None:
     """Record that our own tools changed this file.
 
-    Coverage is cleared for the same reason Helpwo clears it: after an edit the
+    Coverage is cleared for the same reason Helpwow clears it: after an edit the
     line numbers have moved, so an old range must never block a fresh read.
     """
     entry = _store(state).get(path)

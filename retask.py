@@ -8,8 +8,8 @@ was actually done. A ``.retask`` file is that shape, written down.
 
 The file is the whole state
 ---------------------------
-There is no database and no second copy. Helpwo and this CLI read and write the
-same file (Helpwo's parser is ``src/tools/retask-core.ts`` and must stay
+There is no database and no second copy. Helpwow and this CLI read and write the
+same file (Helpwow's parser is ``src/tools/retask-core.ts`` and must stay
 behaviourally identical — ``tests/fixtures/retask_vectors.json`` pins both), so
 a list made in one is the list shown in the other, and the list survives
 context compaction, a refresh, and a new session because it was never in the
@@ -203,10 +203,10 @@ _VIDEO_FILE_RE = re.compile(r"\.(mp4|webm|mov|m4v|ogv)(?:[?#]|$)", re.IGNORECASE
 
 
 def strip_media(text: str) -> str:
-    """Images and videos are a Helpwo affordance; a terminal shows a placeholder.
+    """Images and videos are a Helpwow affordance; a terminal shows a placeholder.
 
-    A list made in Helpwo may carry `![alt](path-or-url)` references. The file
-    keeps them (Helpwo still renders them); what this side shows and hands its
+    A list made in Helpwow may carry `![alt](path-or-url)` references. The file
+    keeps them (Helpwow still renders them); what this side shows and hands its
     own model is `[image: alt]` / `[video: alt]`.
     """
     def _placeholder(match):
@@ -399,7 +399,7 @@ def claim_block(doc: Retask, task: Task) -> str:
     one is still open — including one that is only `submitted`, because until
     the AI has checked it, it may come back. The AI's own transitions are not
     bound by this; only the "I've done this" claim is. Mirrors claimBlock in
-    Helpwo's retask-core.ts, messages included.
+    Helpwow's retask-core.ts, messages included.
     """
     waiting = [d for d in task.after
                if (doc.task(d) is None or doc.task(d).status not in CLOSED)]

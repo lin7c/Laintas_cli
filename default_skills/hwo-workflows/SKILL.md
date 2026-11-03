@@ -208,7 +208,7 @@ Rules worth knowing:
   hung, not contained.
 - Entries are exact names or globs (`fs.*`). `tools: []` is a compile error —
   omit the key to inherit the full set.
-- **laintas_cli only.** Helpwo has no way to hold an agent to a scope, so it
+- **laintas_cli only.** Helpwow has no way to hold an agent to a scope, so it
   refuses to *run* a graph whose nodes declare one rather than running it
   unrestricted. Compiling and visualising still work.
 

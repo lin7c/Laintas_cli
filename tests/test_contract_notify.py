@@ -1,6 +1,6 @@
 """Regression cover for contract_notify.py.
 
-The module is the CLI→Helpwo doorbell: a dropped notification must never
+The module is the CLI→Helpwow doorbell: a dropped notification must never
 raise, never retry, and cost at most one round of staleness. These tests pin
 that contract — silent-failure semantics, the 1s dedup window, local-bridge
 priority — none of which had any coverage before (grep found zero references

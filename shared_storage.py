@@ -1,7 +1,7 @@
-"""Laintas shared storage — the file channel between this CLI and Helpwo.
+"""Laintas shared storage — the file channel between this CLI and Helpwow.
 
-Helpwo mounts the same storage as a cloud folder ("Laintas Storage"), so a file
-pushed from here appears in the Helpwo file tree, and anything Helpwo writes
+Helpwow mounts the same storage as a cloud folder ("Laintas Storage"), so a file
+pushed from here appears in the Helpwow file tree, and anything Helpwow writes
 there can be pulled back down. It is per-account, server-side and persistent —
 unlike ``/helpwo --remote``, which shares a live folder only while the CLI is running
 and streams it peer-to-peer.
@@ -25,7 +25,7 @@ import requests
 
 # The gateway that serves /api/storage for the official backend. A custom or
 # self-hosted backend serves it from its own origin.
-OFFICIAL_STORAGE_ORIGIN = "https://helpwo.laintas.com"
+OFFICIAL_STORAGE_ORIGIN = "https://helpwow.laintas.com"
 
 TIMEOUT = 30
 TRANSFER_TIMEOUT = 600

@@ -21,7 +21,7 @@ x11vnc, one stack per session, streamed to the user's live view over WebRTC).
 
 This browser is a dedicated agent session, separate from an existing browser
 profile. Windows desktop automation belongs to the independent
-`Helpwo windows` application.
+`Helpwow windows` application.
 
 It is heavier and slower than fetching a page, and every action happens for
 real on the open internet under the user's own IP.

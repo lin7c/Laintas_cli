@@ -1,6 +1,6 @@
 ---
 name: cloud-storage
-description: Laintas Storage - the cloud folder shared with the user's Helpwo sessions. How to list, read back, upload and hand over files that must outlive this process or reach the user on another machine, and how the allowance is spent. Load when a task involves the cloud folder, an upload or download, a file handed to Helpwo, or a storage quota question; not needed for ordinary local files.
+description: Laintas Storage - the cloud folder shared with the user's Helpwow sessions. How to list, read back, upload and hand over files that must outlive this process or reach the user on another machine, and how the allowance is spent. Load when a task involves the cloud folder, an upload or download, a file handed to Helpwow, or a storage quota question; not needed for ordinary local files.
 version: 1.0.0
 triggers:
   - cloud storage
@@ -17,7 +17,7 @@ triggers:
 
 One folder per Laintas account, on the account — not on this machine. The user
 sees the same folder three ways: `/shared` in this CLI, the "Laintas Storage"
-mount inside Helpwo, and the web account page. Anything put there is visible to
+mount inside Helpwow, and the web account page. Anything put there is visible to
 the user immediately and survives this process, this workspace, and this
 machine.
 
@@ -31,13 +31,13 @@ copied over when they are finished.
 | see what is there | `storage.list({ path? })` |
 | read a stored file | `storage.get({ path, local_path? })`, then `fs.read` |
 | publish a finished file | `storage.put({ local_path, path? })` |
-| hand files to a Helpwo agent | `file_push({ paths, target_agent_id })` |
+| hand files to a Helpwow agent | `file_push({ paths, target_agent_id })` |
 | room left / per-file limit | `storage.usage()` |
 | organise | `storage.mkdir`, `storage.move` |
 | remove | `storage.delete` — asks the user every time |
 
 `storage.put` publishes to the folder. `file_push` uploads *and* notifies one
-Helpwo agent so it pulls the files into its workspace — use it only when a
+Helpwow agent so it pulls the files into its workspace — use it only when a
 specific agent is waiting for them; it needs that agent's id.
 
 ## Paths
@@ -71,7 +71,7 @@ the file lands, and a contract-scoped child cannot drop it outside its scope.
 
 `storage.delete` asks the user in every policy mode, including modes where
 ordinary writes are auto-approved. That is deliberate: this store is shared
-with Helpwo, the local checkpoint the loop takes before a mutation does not
+with Helpwow, the local checkpoint the loop takes before a mutation does not
 cover it, and there is no undo. Expect the call to block, and never loop on a
 denial — a refusal is an answer.
 

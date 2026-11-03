@@ -133,7 +133,7 @@ class ChannelTaskExecutionTests(unittest.TestCase):
     history so it shared only a directory with the conversation the user can
     see. What a channel should do is what the user does -- put the text in the
     prompt and press enter -- and `_inject_input` is already exactly that, the
-    queue `/agents` and the Helpwo bridge hand lines to the single executor
+    queue `/agents` and the Helpwow bridge hand lines to the single executor
     through."""
 
     def setUp(self):

@@ -1,4 +1,4 @@
-"""Local gateway for /helpwo: serves Helpwo's static dist + a minimal
+"""Local gateway for /helpwo: serves Helpwow's static dist + a minimal
 in-process API that bridges the frontend to the running laintas_cli.
 
 Design:
@@ -11,7 +11,7 @@ Design:
 - Authentication follows Jupyter: the token arrives once in the URL, is
   exchanged for a cookie, and is not needed again. The frontend needs no
   change — its calls are same-origin with credentials already.
-- Three API endpoints mirror Helpwo's gateway contract:
+- Three API endpoints mirror Helpwow's gateway contract:
     GET  /api/agents                       - list registered agents
     POST /api/agents/<id>/send             - dispatch a message to the CLI
     GET  /api/agents/<id>/updates?since=N  - poll buffered events
@@ -28,6 +28,7 @@ import hmac
 import json
 import mimetypes
 import os
+import functools
 import re
 import time
 import secrets
@@ -333,6 +334,30 @@ def _resolve_dist_path(dist_dir: Path, path: str) -> Optional[Path]:
 # HTTP request handler
 # ---------------------------------------------------------------------------
 
+def _serialized_local_access(function):
+    @functools.wraps(function)
+    def handle(self, body):
+        import peer_coordination
+        request = body if isinstance(body, dict) else {"path": body}
+        source = _resolve_local_path(str(request.get("path") or ""), follow_leaf=False)
+        filenames = [source] if source is not None else []
+        if source is not None and request.get("newName"):
+            target = _resolve_local_path(str(source.parent / str(request["newName"])),
+                                         follow_leaf=False)
+            if target is not None:
+                filenames.append(target)
+        if source is not None and "newParentPath" in request:
+            parent = _resolve_local_path(str(request.get("newParentPath") or ""))
+            if parent is not None:
+                filenames.append(parent / source.name)
+        try:
+            with peer_coordination.write_guard(*filenames):
+                return function(self, body)
+        except OSError as exc:
+            self._json(500, {"error": str(exc)})
+    return handle
+
+
 class _HelpwoHandler(BaseHTTPRequestHandler):
     """Handles API + static file requests for /helpwo.
 
@@ -372,13 +397,13 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         host = (self.headers.get("Host") or "").split(":", 1)[0].strip().lower()
         if host in _allowed_hosts():
             return True
-        self._json(421, {"error": "local Helpwo bridge: host not allowed"})
+        self._json(421, {"error": "local Helpwow bridge: host not allowed"})
         return False
 
     # -- authentication (Jupyter's model) --
     #
     # The token arrives once in the URL, is exchanged for a cookie, and is not
-    # needed again. The browser carries the cookie on its own, so the Helpwo
+    # needed again. The browser carries the cookie on its own, so the Helpwow
     # frontend needs no change: every one of its /api calls is already
     # same-origin with credentials: 'include'.
     #
@@ -987,7 +1012,7 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         The cloud backend serves both /api/chat and /api/chat/stream and the
         frontend uses both — streaming for conversation, the plain endpoint for
         one-shot answers it just wants a value from. Only the streaming one was
-        proxied here, so against a locally served Helpwo every non-streaming
+        proxied here, so against a locally served Helpwow every non-streaming
         call 404'd: language detection fell back with "AI analysis failed", and
         HelpwoBridge.query (which previewed pages use to ask the model
         something) failed outright. Observed as `POST /api/chat -> 404` while
@@ -1269,7 +1294,7 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         """`/api/local-proxy/<port>/<rest>` → 127.0.0.1:<port>/<rest>.
 
         The same-machine counterpart of the P2P service-worker tunnel: a dev
-        server running on this host, rendered inside Helpwo's preview iframe
+        server running on this host, rendered inside Helpwow's preview iframe
         without a service worker, a DataChannel or an ICE negotiation.
         """
         import local_runtime
@@ -1326,7 +1351,7 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
     # the browser inherits *this machine's* view of the web: its engine list
     # (including cn.bing, which is what works from inside China), its per-host
     # proxy routing, the challenge clearance it has already earned, and its
-    # saved logins. A page the CLI can read is now a page Helpwo can read.
+    # saved logins. A page the CLI can read is now a page Helpwow can read.
     #
     # It also fixes a plain break: the frontend calls /api/helpwo/search, which
     # this server had no route for at all, so search 404'd in local mode.
@@ -1504,6 +1529,7 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
             return
         self._json(200, self._entry_meta(p))
 
+    @_serialized_local_access
     def _handle_local_fs_read(self, path: str) -> None:
         if not self._private_access(path, "read"):
             return
@@ -1520,7 +1546,7 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         except OSError as e:
             self._json(500, {"error": str(e)})
             return
-        # Same bookkeeping the P2P read does: remember the version Helpwo now
+        # Same bookkeeping the P2P read does: remember the version Helpwow now
         # holds, so a later write can tell an intentional overwrite from a
         # blind one. Without it the loopback path would be the unprotected
         # half of a pair that is supposed to behave identically.
@@ -1532,6 +1558,7 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
             "size": len(data),
         })
 
+    @_serialized_local_access
     def _handle_local_fs_write(self, body: dict) -> None:
         if not self._private_access(str(body.get("path") or ""), "write", recursive=False):
             return
@@ -1553,7 +1580,8 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
             if len(data) > _MAX_LOCAL_FILE_BYTES:
                 self._json(413, {"error": f"content too large (cap {_MAX_LOCAL_FILE_BYTES})"})
                 return
-            p.write_bytes(data)
+            import peer_coordination
+            peer_coordination.write_bytes_atomically(p, data)
         except (OSError, ValueError) as e:
             self._json(500, {"error": str(e)})
             return
@@ -1574,6 +1602,7 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
             return
         self._json(200, {"ok": True})
 
+    @_serialized_local_access
     def _handle_local_fs_delete(self, body: dict) -> None:
         if not self._private_access(str(body.get("path") or ""), "write", recursive=True):
             return
@@ -1603,6 +1632,7 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         _peer_note_write(str(p), "delete")
         self._json(200, {"ok": True})
 
+    @_serialized_local_access
     def _handle_local_fs_rename(self, body: dict) -> None:
         if not self._private_access(str(body.get("path") or ""), "read", recursive=True):
             return
@@ -1635,6 +1665,7 @@ class _HelpwoHandler(BaseHTTPRequestHandler):
         _peer_note_write(str(target), "rename")
         self._json(200, {"ok": True})
 
+    @_serialized_local_access
     def _handle_local_fs_move(self, body: dict) -> None:
         if not self._private_access(str(body.get("path") or ""), "read", recursive=True):
             return
@@ -1682,8 +1713,8 @@ _session_ref: Optional[dict] = None  # CLI session dict (for backend auth)
 # server are on the same machine, so a plain HTTP file API is sufficient.
 _local_root_ref: Optional[Path] = None
 _local_agent_id_ref: str = ""
-# Set when the bridge serves a registered application rather than Helpwo:
-# {"name": str, "allowed_kinds": frozenset}. None = the full Helpwo bridge.
+# Set when the bridge serves a registered application rather than Helpwow:
+# {"name": str, "allowed_kinds": frozenset}. None = the full Helpwow bridge.
 _app_profile: Optional[dict] = None
 # Monotonic time of the last request that reached a route (idle detection for
 # per-user session sub-terminals).
@@ -1725,7 +1756,7 @@ _MAX_BODY_BYTES = 2 * _MAX_LOCAL_FILE_BYTES  # raw request body cap (base64 infl
 def _peer_note_read(path: str) -> None:
     """Mirror of webrtc_channel's helper for the loopback filesystem path.
 
-    Helpwo writes this machine's disk through this process either way, so both
+    Helpwow writes this machine's disk through this process either way, so both
     transports must register the same external actor with peer_coordination —
     otherwise the CLI's agent loop and the browser's agent silently overwrite
     each other whenever the user happens to be in local mode.
@@ -1741,8 +1772,8 @@ def _peer_guard_write(path: str):
     try:
         import peer_coordination
         return peer_coordination.guard_external_write(path, peer_coordination.HELPWO_BRIDGE_ACTOR)
-    except Exception:
-        return None
+    except Exception as exc:
+        return f"file coordination unavailable: {exc}"
 
 
 def _peer_note_write(path: str, op: str) -> None:
@@ -1791,12 +1822,12 @@ def _resolve_local_path(path_str: str, *, follow_leaf: bool = True) -> Optional[
 
 
 def _find_dist() -> Optional[Path]:
-    """Locate the Helpwo dist directory.
+    """Locate the Helpwow dist directory.
 
     Search order:
     1. LAINTAS_HELPWO_DIST env var
     2. A sibling checkout (development layout) — a developer's own build wins
-       over the downloaded one, so editing Helpwo shows up immediately
+       over the downloaded one, so editing Helpwow shows up immediately
     3. The dist downloaded by the updater into ~/.laintas/helpwo/dist
     """
     env = os.environ.get("LAINTAS_HELPWO_DIST")
@@ -1831,7 +1862,7 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
                  token: Optional[str] = None,
                  agent_id: Optional[str] = None,
                  app_profile: Optional[dict] = None) -> tuple[bool, str]:
-    """Start the local Helpwo gateway server.
+    """Start the local Helpwow gateway server.
 
     LOOPBACK ONLY, by design. A browser grants Web Crypto, Service Workers,
     File System Access and the clipboard only in a secure context — HTTPS or
@@ -1846,11 +1877,11 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
     token defaults to a fresh random one. Pass "" to disable authentication;
     only sensible for a throwaway sandbox.
 
-    agent_id replaces the per-process ``local-<pid>`` alias. Helpwo stores its
+    agent_id replaces the per-process ``local-<pid>`` alias. Helpwow stores its
     conversations under that id, so a sub-terminal that persists passes the
     same one every launch.
 
-    app_profile serves a registered application instead of the static Helpwo
+    app_profile serves a registered application instead of the static Helpwow
     build, using the same authenticated runtime routes.
 
     Returns (success, message).
@@ -1867,7 +1898,7 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
     # Resolve dist directory
     resolved_dist = None if app_profile is not None else (dist_dir or _find_dist())
     if resolved_dist is None and app_profile is None:
-        return False, ("Helpwo dist directory not found. Set LAINTAS_HELPWO_DIST "
+        return False, ("Helpwow dist directory not found. Set LAINTAS_HELPWO_DIST "
                        "or ensure /root/Helpwo/dist exists.")
 
     _registry_ref = agent_registry
@@ -1878,7 +1909,7 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
         if app_profile is not None else None)
     _server_port_val = port
     # Local mode never requires cloud registration. The stable-for-process
-    # alias lets the same Helpwo frontend use the existing agent request
+    # alias lets the same Helpwow frontend use the existing agent request
     # contract while all traffic remains on loopback.
     _local_agent_id_ref = agent_id or f"local-{os.getpid():x}"
     global _last_request_at
@@ -1929,11 +1960,11 @@ def start_server(agent_registry: Any, dist_dir: Optional[Path] = None,
     except Exception:
         pass
 
-    return True, f"Helpwo gateway running at {get_url()}"
+    return True, f"Helpwow gateway running at {get_url()}"
 
 
 def stop_server() -> None:
-    """Stop the local Helpwo gateway server."""
+    """Stop the local Helpwow gateway server."""
     global _server, _server_thread, _registry_ref, _dist_dir_ref, _session_ref, _local_root_ref, _local_agent_id_ref
     global _app_profile
 
@@ -1982,7 +2013,7 @@ def get_url(with_token: bool = False, *, path: str = "") -> str:
 
     with_token appends the one the browser needs on its first visit; after
     that the cookie carries it. Apps use /api/local-runtime as their login
-    destination because they do not serve the static Helpwo page at /.
+    destination because they do not serve the static Helpwow page at /.
     """
     if not is_running():
         return ""

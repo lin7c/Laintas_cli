@@ -24,4 +24,4 @@ Personal tasks stay in the terminal:
 - `/issues reject <id> <item> <reason>` rejects a specific checklist item and opens the appeal window.
 Private chat lives on the Issues site only; this extension has no chat
 commands. Applying for tasks and working a run also happen on the Issues
-site or in Helpwo - the extension covers the asker's side.
+site or in Helpwow - the extension covers the asker's side.

@@ -124,7 +124,7 @@ not add `win32` branches, native Windows modules, WSL launchers or kernel
 discovery to the CLI; fix Windows behaviour in `build/windows/` or by making
 the code more portable POSIX. Windows work is tested only through the manual
 `windows-probe.yml` and `windows-build.yml` workflows (billed at twice the
-Linux rate - never a retry loop). The Helpwo desktop application remains the
+Linux rate - never a retry loop). The Helpwow desktop application remains the
 independent `lin7c/laintas-Helpwo-cli-agent-for-windows` project.
 `runtime_host.py` is a generic injectable host boundary with no desktop
 dependencies.
@@ -249,7 +249,7 @@ All tunable parameters are accessible via `get_runtime_config()`/`set_runtime_co
 
 `AgentRegistry` retains local session identity and the generic host adapter
 boundary. The default runtime does not register with a gateway or relay
-through Helpwo Kernel. `runtime_host.py` accepts an explicitly supplied host;
+through Helpwow Kernel. `runtime_host.py` accepts an explicitly supplied host;
 without one, remote machine sharing stays unavailable. The local application
 bridge and file sharing are separate from Windows desktop integration.
 

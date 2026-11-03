@@ -1,6 +1,6 @@
 """HWG flowchart language — canonical grammar (parser + validation).
 
-Source of truth for the HWG DSL shared by laintas_cli (Python) and Helpwo (TS).
+Source of truth for the HWG DSL shared by laintas_cli (Python) and Helpwow (TS).
 This module is PURE: it turns a ``.hwg`` source string into a JSON-serialisable
 AST and validates it. NO I/O, NO graph runtime — each product keeps its own
 executor that walks this AST.
@@ -10,7 +10,7 @@ behaviourally identical.
 
 Distribution (vendored):
   laintas_cli -> hwg_core.py                (this file)
-  Helpwo      -> src/tools/hwg-core.ts      (the TS canonical source)
+  Helpwow      -> src/tools/hwg-core.ts      (the TS canonical source)
 
 Canonical AST (JSON):
   node     : {"type": "node",     "id": str, "file": str, "manual": bool, "policy"?: dict}

@@ -114,7 +114,7 @@
 | 1 | grep 漏扫伪装成无匹配 | 显式指定的文件不限大小；目录遍历默认上限 1 MB→8 MB，跳过/读失败的文件列入 `skipped_files` 并置 `truncated`+`incomplete`；schema 暴露 `max_file_size`；结果带 `paths_relative_to` | `tools.py:_bi_fs_grep` |
 | 2 | `include=*.ts` 只搜一层 | 不含 `/` 的模式按任意深度匹配（同 ripgrep）；含 `/` 的保持锚定；schema 写明 | 同上 |
 | 3 | 持久 shell 被 `set -e` 污染 | 开启 errexit 的命令在子 shell 里跑（本次仍按 set -e 中止、退出码真实，但 cd/export 不持久）；每次调用前后快照并恢复 errexit/nounset/pipefail/xtrace 等选项及 ERR/RETURN/DEBUG trap，兜住 `source x.sh` 这类识别不到的情况 | `tools.py:shell_payload_for_pty` |
-| 4 | `--format` 被当成磁盘格式化 | 规则只匹配程序位置；`_migrate_config` 从已保存的 `~/.laintas/policy.json` 移除旧规则；已 sync 到 Helpwo kernel vendor | `policy.py` |
+| 4 | `--format` 被当成磁盘格式化 | 规则只匹配程序位置；`_migrate_config` 从已保存的 `~/.laintas/policy.json` 移除旧规则；已 sync 到 Helpwow kernel vendor | `policy.py` |
 | 5 | Cloudflare 日额度耗尽被当拥堵 | 加 `daily free allocation` 标记：不再退避重试，直接 park（上限 30 分钟）并 failover；ai-gateway 已重启上线 | `agent_gateway/gateway.py` |
 | 6a | grep 无匹配 exit 1 算失败 | 最后一段是 grep/rg/git grep 且 exit 1、无输出 → `ok=true, outcome=no_match`，保留 `returncode=1` | `tools.py:_classify_shell_result` |
 | 6b | "已可见"重复拒绝形成循环 | 同一范围只拒一次，第二次直接返回内容 | `tools.py:_read_already_visible` |

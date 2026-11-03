@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -57,24 +59,61 @@ def _connect(cwd: Optional[str] = None) -> sqlite3.Connection:
     path = db_path(cwd)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=15, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=15000")
-    _init_schema(conn, path)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=15000")
+        _init_schema(conn, path)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
-# Track which db paths have already had their schema initialized in this
-# process, so we skip the CREATE TABLE IF NOT EXISTS overhead on repeat opens.
-_schema_initialized: set[str] = set()
+_SCHEMA_VERSION = 1
+_transactions = threading.local()
+
+
+def _active_connections() -> dict:
+    # A fork must never reuse the parent's SQLite connection.
+    if getattr(_transactions, "pid", None) != os.getpid():
+        _transactions.pid = os.getpid()
+        _transactions.connections = {}
+    return _transactions.connections
+
+
+@contextmanager
+def _read_connection(cwd: Optional[str] = None) -> Iterator[sqlite3.Connection]:
+    active = _active_connections().get(str(db_path(cwd)))
+    if active is not None:
+        yield active
+    else:
+        conn = _connect(cwd)
+        try:
+            yield conn
+        finally:
+            conn.close()
 
 
 def _init_schema(conn: sqlite3.Connection, db_path: Optional[Path] = None) -> None:
-    if db_path is not None:
-        key = str(db_path)
-        if key in _schema_initialized:
-            return
+    # The version belongs to the database, not its pathname. A replacement
+    # database at the same path must be initialized again. BEGIN serializes
+    # additive migrations across processes as well as first-time creation.
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= _SCHEMA_VERSION:
+        return
+    try:
+        _create_schema(conn)
+        conn.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+
+
+def _create_schema(conn: sqlite3.Connection) -> None:
     conn.executescript("""
+    BEGIN IMMEDIATE;
     CREATE TABLE IF NOT EXISTS work_items (
       id TEXT PRIMARY KEY,
       objective TEXT NOT NULL,
@@ -158,24 +197,38 @@ def _init_schema(conn: sqlite3.Connection, db_path: Optional[Path] = None) -> No
         "CREATE INDEX IF NOT EXISTS idx_work_session ON work_items(session_id, updated_at)")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_steps_owner ON steps(work_id, owner_agent_id)")
-    if db_path is not None:
-        _schema_initialized.add(str(db_path))
 
 
 @contextmanager
 def transaction(cwd: Optional[str] = None) -> Iterator[sqlite3.Connection]:
+    connections = _active_connections()
+    key = str(db_path(cwd))
+    active = connections.get(key)
+    if active is not None:
+        savepoint = "nested_" + uuid.uuid4().hex
+        active.execute(f"SAVEPOINT {savepoint}")
+        try:
+            yield active
+        except BaseException:
+            active.execute(f"ROLLBACK TO {savepoint}")
+            raise
+        finally:
+            active.execute(f"RELEASE {savepoint}")
+        return
     conn = _connect(cwd)
     try:
         conn.execute("BEGIN IMMEDIATE")
+        connections[key] = conn
         yield conn
         conn.execute("COMMIT")
-    except Exception:
+    except BaseException:
         try:
             conn.execute("ROLLBACK")
         except sqlite3.Error:
             pass
         raise
     finally:
+        connections.pop(key, None)
         conn.close()
 
 
@@ -261,7 +314,7 @@ def set_active_work(work_id: Optional[str], cwd: Optional[str] = None, *,
 def get_project_value(key: str, *, cwd: Optional[str] = None) -> Any:
     if not db_path(cwd).exists():
         return None
-    with _connect(cwd) as conn:
+    with _read_connection(cwd) as conn:
         row = conn.execute("SELECT value FROM project_state WHERE key=?", (key,)).fetchone()
     return _decode(row[0], None) if row else None
 
@@ -302,7 +355,7 @@ def get_work(work_id: str, *, cwd: Optional[str] = None,
              session_id: Optional[str] = None) -> Optional[dict]:
     if not db_path(cwd).exists():
         return None
-    with _connect(cwd) as conn:
+    with _read_connection(cwd) as conn:
         query = "SELECT * FROM work_items WHERE id=?"
         args: list[Any] = [work_id]
         if session_id is not None:
@@ -315,7 +368,7 @@ def get_active_work(*, cwd: Optional[str] = None,
                     session_id: Optional[str] = None) -> Optional[dict]:
     if not db_path(cwd).exists():
         return None
-    with _connect(cwd) as conn:
+    with _read_connection(cwd) as conn:
         work_id = _active_id(conn, session_id)
         if not work_id:
             return None
@@ -329,23 +382,23 @@ def get_active_work(*, cwd: Optional[str] = None,
 
 def ensure_active_work(objective: str = "Project tasks", *, cwd: Optional[str] = None,
                        session_id: Optional[str] = None) -> dict:
-    active = get_active_work(cwd=cwd, session_id=session_id)
-    if active and active.get("status") not in {"COMPLETED", "CANCELLED", "FAILED"}:
-        return active
-    work = create_work(objective, cwd=cwd, session_id=session_id)
-    # Ad-hoc task collections execute immediately and do not require a plan review.
     with transaction(cwd) as conn:
+        active = get_active_work(cwd=cwd, session_id=session_id)
+        if active and active.get("status") not in {"COMPLETED", "CANCELLED", "FAILED"}:
+            return active
+        work = create_work(objective, cwd=cwd, session_id=session_id)
+        # Ad-hoc task collections execute immediately and do not require a plan review.
         conn.execute("UPDATE work_items SET status='EXECUTING',updated_at=? WHERE id=?",
                      (time.time(), work["id"]))
         _event(conn, work["id"], "work.adhoc_started")
-    return get_work(work["id"], cwd=cwd, session_id=session_id) or work
+        return get_work(work["id"], cwd=cwd, session_id=session_id) or work
 
 
 def list_work(*, cwd: Optional[str] = None,
               session_id: Optional[str] = None) -> list[dict]:
     if not db_path(cwd).exists():
         return []
-    with _connect(cwd) as conn:
+    with _read_connection(cwd) as conn:
         query = "SELECT * FROM work_items"
         args: list[Any] = []
         if session_id is not None:
@@ -359,7 +412,7 @@ def list_events(work_id: str, *, cwd: Optional[str] = None,
                 limit: int = 50) -> list[dict]:
     if not db_path(cwd).exists():
         return []
-    with _connect(cwd) as conn:
+    with _read_connection(cwd) as conn:
         rows = conn.execute(
             "SELECT * FROM work_events WHERE work_id=? ORDER BY id DESC LIMIT ?",
             (work_id, max(1, min(int(limit), 500)))).fetchall()
@@ -397,7 +450,7 @@ def get_revision(work_id: str, revision: Optional[int] = None,
                  *, cwd: Optional[str] = None) -> Optional[dict]:
     if not db_path(cwd).exists():
         return None
-    with _connect(cwd) as conn:
+    with _read_connection(cwd) as conn:
         if revision is None:
             row = conn.execute(
                 "SELECT r.* FROM plan_revisions r JOIN work_items w ON w.id=r.work_id "
@@ -637,7 +690,7 @@ def get_step(work_id: str, step_id: str, *, cwd: Optional[str] = None,
              owner_agent_id: Optional[str] = None) -> Optional[dict]:
     if not db_path(cwd).exists():
         return None
-    with _connect(cwd) as conn:
+    with _read_connection(cwd) as conn:
         query = ("SELECT s.*,w.session_id AS session_id FROM steps s "
                  "JOIN work_items w ON w.id=s.work_id "
                  "WHERE s.work_id=? AND s.id=?")
@@ -720,7 +773,7 @@ def list_steps(work_id: str, *, cwd: Optional[str] = None,
                owner_agent_id: Optional[str] = None) -> list[dict]:
     if not db_path(cwd).exists():
         return []
-    with _connect(cwd) as conn:
+    with _read_connection(cwd) as conn:
         query = ("SELECT s.*,w.session_id AS session_id FROM steps s "
                  "JOIN work_items w ON w.id=s.work_id "
                  "WHERE s.work_id=?")
@@ -809,22 +862,22 @@ def update_step(work_id: str, step_id: str, *, cwd: Optional[str] = None,
         status = fields.get("status", row["status"])
         if status not in STEP_STATUSES:
             raise WorkGraphError(f"invalid step status: {status}")
-        if "status" in fields and status != row["status"]:
-            allowed = STEP_TRANSITIONS.get(row["status"], set())
-            if status not in allowed:
-                raise WorkGraphConflict(
-                    f"invalid step transition: {row['status']} -> {status}")
         try:
             progress = int(fields.get("progress", row["progress"]))
         except (TypeError, ValueError) as exc:
             raise WorkGraphError("progress must be an integer") from exc
         progress = max(0, min(100, progress))
-        if progress == 100 and "status" not in fields:
+        if "progress" in fields and progress == 100 and "status" not in fields:
             status = "completed"
         if status == "completed":
             progress = 100
         elif row["status"] == "completed" and status == "in_progress" and "progress" not in fields:
             progress = 0
+        if status != row["status"]:
+            allowed = STEP_TRANSITIONS.get(row["status"], set())
+            if status not in allowed:
+                raise WorkGraphConflict(
+                    f"invalid step transition: {row['status']} -> {status}")
         if status in {"in_progress", "completed"}:
             blockers = conn.execute("""
               SELECT d.blocked_by_step_id FROM step_dependencies d

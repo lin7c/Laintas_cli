@@ -158,5 +158,62 @@ class SyncTests(unittest.TestCase):
             json.loads(official_messages.CACHE_FILE.read_text(encoding="utf-8")), [])
 
 
+class DeleteTests(unittest.TestCase):
+    """Deleting in L> deletes on the site, and survives being offline."""
+
+    SESSION = {"cookies": {"laintas-v2.session_token": "t"}}
+
+    def setUp(self):
+        startup_mail.clear()
+        self.addCleanup(startup_mail.clear)
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        for name, file in (("CACHE_FILE", "messages.json"),
+                           ("PENDING_DELETES_FILE", "messages-deleted.json")):
+            patcher = mock.patch.object(official_messages, name, Path(self._dir.name) / file)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        official_messages._ids.clear()
+        self.addCleanup(official_messages._ids.clear)
+        # Run the background flush inline so the test can observe it.
+        patcher = mock.patch.object(official_messages.threading, "Thread",
+                                    side_effect=lambda target, args=(), **_: mock.Mock(
+                                        start=lambda: target(*args)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.site = [_message(id="o:5", slug="a"), _message(id="s:9", slug="sys-recharge-9")]
+        with mock.patch("requests.get", return_value=self._list()):
+            official_messages.sync(self.SESSION, "https://laintas.com")
+
+    def _list(self):
+        return mock.Mock(status_code=200,
+                         json=mock.Mock(return_value={"messages": list(self.site)}))
+
+    def test_a_delete_reaches_the_site(self):
+        with mock.patch("requests.post",
+                        return_value=mock.Mock(status_code=200)) as post:
+            self.assertEqual(official_messages.delete(["official:a", "local:other"]), 1)
+        self.assertEqual(post.call_args.kwargs["json"], {"id": "o:5"})
+        self.assertFalse(official_messages.PENDING_DELETES_FILE.exists())
+
+    def test_an_offline_delete_is_kept_out_of_the_list_and_retried(self):
+        with mock.patch("requests.post", side_effect=OSError("offline")):
+            official_messages.delete(["official:a"])
+        self.assertEqual(json.loads(official_messages.PENDING_DELETES_FILE.read_text()), ["o:5"])
+        # Next start, still offline: the site still lists it, the L> list does not.
+        startup_mail.clear()
+        with mock.patch("requests.post", side_effect=OSError("offline")), \
+                mock.patch("requests.get", return_value=self._list()):
+            self.assertEqual(official_messages.sync(self.SESSION, "https://laintas.com"), 1)
+        self.assertIsNone(startup_mail.get("official:a"))
+        # Back online: the retry lands and the pending file goes away.
+        with mock.patch("requests.post",
+                        return_value=mock.Mock(status_code=200)) as post, \
+                mock.patch("requests.get", return_value=self._list()):
+            official_messages.sync(self.SESSION, "https://laintas.com")
+        self.assertEqual(post.call_args.kwargs["json"], {"id": "o:5"})
+        self.assertFalse(official_messages.PENDING_DELETES_FILE.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

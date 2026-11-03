@@ -1,7 +1,7 @@
 """Concurrent dispatch of an all-read-only turn.
 
 Tool calls were dispatched strictly one after another, so a turn cost the sum
-of its calls rather than the slowest one. The gate mirrors Helpwo's: a turn goes
+of its calls rather than the slowest one. The gate mirrors Helpwow's: a turn goes
 parallel only when EVERY call in it is read-only, which is what keeps the
 agent's single persistent PTY unshared and every write ordered.
 """

@@ -40,7 +40,7 @@ import os
 import threading
 from typing import Optional
 
-#: Long edge for the vision path. Helpwo settled on this value for its own
+#: Long edge for the vision path. Helpwow settled on this value for its own
 #: describe_image and it has held: enough for UI review, small enough that the
 #: base64 does not dominate the request.
 DESCRIBE_MAX_EDGE = 1024

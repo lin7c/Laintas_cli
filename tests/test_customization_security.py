@@ -67,9 +67,9 @@ class BackendProfileSecurityTests(unittest.TestCase):
             "cookies": {"session": "official-cookie"},
         }
         official = backend_profiles.BackendProfile(
-            "official", "official", "https://helpwo.laintas.com")
+            "official", "official", "https://helpwow.laintas.com")
         lookalike = backend_profiles.BackendProfile(
-            "lookalike", "custom", "https://helpwo.laintas.com.evil.test")
+            "lookalike", "custom", "https://helpwow.laintas.com.evil.test")
 
         official_headers, official_cookies = backend_profiles.request_auth(
             official, session)
@@ -96,7 +96,7 @@ class BackendProfileSecurityTests(unittest.TestCase):
             with mock.patch.object(paths, "BACKENDS_FILE", config), \
                     mock.patch.dict(os.environ, {}, clear=True):
                 profile = backend_profiles.resolve(
-                    "https://helpwo.laintas.com")
+                    "https://helpwow.laintas.com")
             self.assertEqual(profile.kind, "custom")
             self.assertFalse(profile.sends_laintas_credentials)
 

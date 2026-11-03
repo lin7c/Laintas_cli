@@ -17,7 +17,7 @@ def build_parser():
              "--execute. Use - to read the task from standard input.")
     parser.add_argument("--version", "-V", action="version",
                         version=f"laintas-cli {__version__}")
-    parser.add_argument("--name", type=str, help="Set agent name (shows in Helpwo AGENTS)")
+    parser.add_argument("--name", type=str, help="Set agent name (shows in Helpwow AGENTS)")
     parser.add_argument("--cwd", type=str, default=None, metavar="DIR",
                         help="Work in DIR instead of the current directory")
     parser.add_argument("--model", type=str, default=None, metavar="ID",

@@ -5,7 +5,7 @@ The properties pinned here are the ones the design depends on:
     their data by, and a non-persistent one keeps none of them;
   * the parent never mistakes an earlier launch's runtime report for this one;
   * trusted applications expose the authenticated runtime APIs;
-  * the main terminal launches a sub-terminal instead of serving Helpwo itself.
+  * the main terminal launches a sub-terminal instead of serving Helpwow itself.
 """
 import io
 import json
@@ -217,12 +217,12 @@ class PromptSectionTests(unittest.TestCase):
 
     def test_helpwo_section_uses_its_own_prompt(self):
         app_host.activate("helpwo", "You are the dedicated agent of the "
-                          "Helpwo sub-terminal. Every message you receive "
-                          "comes from a person using the Helpwo web app.",
+                          "Helpwow sub-terminal. Every message you receive "
+                          "comes from a person using the Helpwow web app.",
                           builtin=True)
         section = app_host.render_prompt_section()
         self.assertIn('name="helpwo"', section)
-        self.assertIn("Helpwo web app", section)
+        self.assertIn("Helpwow web app", section)
 
     def test_manifest_prompt_is_attributed_to_its_author(self):
         app_host.activate("notes", "Summarise notes.", builtin=False)
@@ -744,7 +744,7 @@ if __name__ == "__main__":
 
 class SubterminalGracefulExitTests(unittest.TestCase):
     def test_waits_for_a_slow_sigterm_handler(self):
-        """The nested CLI unregisters from Helpwo inside its SIGTERM handler;
+        """The nested CLI unregisters from Helpwow inside its SIGTERM handler;
         closing must not SIGKILL it before that finishes."""
         import subprocess
         import laintas_cli

@@ -1,13 +1,13 @@
 """HWO workflow language — canonical grammar (parser + validation).
 
-Source of truth for the HWO DSL shared by laintas_cli (Python) and Helpwo (TS).
+Source of truth for the HWO DSL shared by laintas_cli (Python) and Helpwow (TS).
 This module is PURE: it turns a `.hwo` source string into a JSON-serialisable
 AST and validates it. It has NO I/O and NO agent runtime — each product keeps
 its own executor that walks this AST.
 
 Distribution (vendored copy, see scripts/sync_hwo.sh):
   - laintas_cli : cp adapter.py -> laintas_cli/hwo_adapter/adapter.py
-  - Helpwo      : the TS mirror adapter.ts -> Helpwo/src/tools/hwo-core.ts
+  - Helpwow      : the TS mirror adapter.ts -> Helpwo/src/tools/hwo-core.ts
 
 The TS mirror `adapter.ts` MUST stay byte-for-byte equivalent in behaviour;
 samples/ + test_parity.py guard against drift.

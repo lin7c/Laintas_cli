@@ -1,6 +1,6 @@
-"""local_runtime.py — the loopback half of the Helpwo ⇄ laintas_cli transports.
+"""local_runtime.py — the loopback half of the Helpwow ⇄ laintas_cli transports.
 
-Helpwo reaches a laintas_cli host over one of two topologies:
+Helpwow reaches a laintas_cli host over one of two topologies:
 
   p2p       a genuinely different machine. Everything (filesystem RPC, AI
             command execution, the PTY, the HTTP tunnel, the VNC framebuffer)
@@ -135,6 +135,8 @@ _exec_requests: dict[str, _ExecRequest] = {}
 
 def _register_exec(req_id: str) -> Optional[_ExecRequest]:
     with _exec_lock:
+        if req_id in _exec_requests:
+            raise ValueError(f"request {req_id!r} is already running")
         if len(_exec_requests) >= MAX_CONCURRENT_EXEC:
             return None
         req = _ExecRequest(req_id)
@@ -142,9 +144,10 @@ def _register_exec(req_id: str) -> Optional[_ExecRequest]:
         return req
 
 
-def _release_exec(req_id: str) -> None:
+def _release_exec(req: _ExecRequest) -> None:
     with _exec_lock:
-        _exec_requests.pop(req_id, None)
+        if _exec_requests.get(req.req_id) is req:
+            del _exec_requests[req.req_id]
 
 
 def respond_approval(req_id: str, decision: str) -> bool:
@@ -271,7 +274,11 @@ def run_exec(body: dict, sse: SseWriter, resolve_cwd, agent_id: Optional[str] = 
         return
     cwd = str(resolved)
 
-    req = _register_exec(req_id)
+    try:
+        req = _register_exec(req_id)
+    except ValueError as exc:
+        sse.event({"t": "final", "status": "fail", "error": str(exc)})
+        return
     if req is None:
         sse.event({"t": "final", "status": "fail",
                    "error": "too many commands are already running"})
@@ -337,7 +344,7 @@ def run_exec(body: dict, sse: SseWriter, resolve_cwd, agent_id: Optional[str] = 
                 pass
         if proc is not None:
             child_registry.unregister(proc.pid)
-        _release_exec(req_id)
+        _release_exec(req)
 
 
 def _stream_process(proc: subprocess.Popen, req: _ExecRequest,
@@ -471,12 +478,14 @@ class LocalTerminal:
     def _pump(self) -> None:
         try:
             while not self.closed.is_set():
+                self._reap_if_expired()
+                if self.closed.is_set():
+                    break
                 try:
                     ready, _w, _x = select.select([self.master_fd], [], [], 1.0)
                 except (OSError, ValueError):
                     break
                 if not ready:
-                    self._reap_if_expired()
                     continue
                 try:
                     data = os.read(self.master_fd, 65536)
@@ -716,7 +725,6 @@ def serve_terminal(term: LocalTerminal, sock: socket.socket, resumed: bool) -> N
 _HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "content-length",
-    "content-encoding",
 })
 
 

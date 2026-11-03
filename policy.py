@@ -1791,7 +1791,7 @@ def evaluate_browser_action(action: str, params: dict,
 
 
 def evaluate_terminal_open(cwd: str = None, req_id: str = None, agent_id: str = None) -> PolicyDecision:
-    """Evaluate a term-open request (Helpwo asking to attach a real, raw PTY).
+    """Evaluate a term-open request (Helpwow asking to attach a real, raw PTY).
 
     Opening is intentionally not a per-connection approval boundary. The user
     already opted in locally with `disable_remote_terminal=false`; the gateway

@@ -1,7 +1,7 @@
 """
 app_host.py -- Applications hosted in their own sub-terminal.
 
-An application (Helpwo, or anything registered with /app) runs in a dedicated
+An application (Helpwow, or anything registered with /app) runs in a dedicated
 sub-terminal: a nested laintas_cli process whose primary agent serves only
 that application. The main terminal's conversation is never the one an
 application talks to, and closing the sub-terminal ends the application, its
@@ -17,7 +17,7 @@ This module is the part both commands share and that needs no REPL:
   * the prompt section that tells the nested agent whom it serves;
   * the application's own child process, if the manifest starts one.
 
-Helpwo is deliberately not a manifest. It is its own product with its own
+Helpwow is deliberately not a manifest. It is its own product with its own
 command; it only borrows the launch/state machinery.
 """
 
@@ -50,7 +50,7 @@ PERSISTENCE_NONE = "none"
 PERSISTENCE_WORKSPACE = "workspace"
 PERSISTENCE_MODES = (PERSISTENCE_NONE, PERSISTENCE_WORKSPACE)
 
-# A trusted application's token controls its runtime, like the Helpwo token.
+# A trusted application's token controls its runtime, like the Helpwow token.
 SESSION_ALLOWED_KINDS = frozenset({
     "chat", "abort", "approval-response", "exec", "query", "delegate",
     "webtest", "analyze_site", "term-open", "term-new", "term-close",
@@ -148,7 +148,7 @@ def ensure_state(app: str, root: str, persistent: bool) -> tuple[Path, dict]:
     Persistent: everything the browser and the agent key their data by stays
     the same across launches — the token (so the cookie keeps working), the
     port (so the browser origin, and with it IndexedDB, is the same), the
-    bridge agent id (Helpwo stores its conversations under it) and the
+    bridge agent id (Helpwow stores its conversations under it) and the
     conversation id the nested agent saves to.
 
     Not persistent: the same shape, regenerated on every launch.

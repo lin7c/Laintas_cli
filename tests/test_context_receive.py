@@ -84,7 +84,7 @@ class SendContextTest(unittest.TestCase):
 
 
 class LandTest(unittest.TestCase):
-    ENVELOPE = {"kernel": 1, "kind": "conversation", "origin": "Helpwo", "items": [
+    ENVELOPE = {"kernel": 1, "kind": "conversation", "origin": "Helpwow", "items": [
         {"role": "user", "content": "fix the build"},
         {"role": "assistant", "content": "done"}]}
 
@@ -123,7 +123,7 @@ class LandTest(unittest.TestCase):
 
     def test_handoff_notices_are_not_offered_for_import(self):
         self.assertIsNone(cr.parse_context_ref(
-            "https://helpwo.laintas.com/?context=handoff%3Arepo%2Fh1"))
+            "https://helpwow.laintas.com/?context=handoff%3Arepo%2Fh1"))
 
 
 if __name__ == "__main__":

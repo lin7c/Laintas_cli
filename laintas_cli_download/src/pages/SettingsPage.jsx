@@ -15,7 +15,7 @@ export default function SettingsPage() {
   // The CLI's own monthly allowance. Sold here rather than on a central price
   // list, because this is the page somebody lands on when it runs out.
   const [calls, setCalls] = useState(null);
-  // One store, shared with Helpwo — but bought from whichever product the user
+  // One store, shared with Helpwow — but bought from whichever product the user
   // happens to be looking at, because "go to the other site" is not an answer.
   const [storage, setStorage] = useState(null);
   const [buying, setBuying] = useState('');
@@ -196,8 +196,8 @@ export default function SettingsPage() {
             </div>
           )}
 
-          {/* Shared storage — what `/shared` and Helpwo's "Laintas 存储" both
-              write into. Sold here as well as in Helpwo: it is one allowance,
+          {/* Shared storage — what `/shared` and Helpwow's "Laintas 存储" both
+              write into. Sold here as well as in Helpwow: it is one allowance,
               and the person who filled it from the CLI is standing here. */}
           {storage && storage.limit_bytes != null && (
             <div className="rounded-2xl p-6 mb-5" style={{ background: 'var(--card-bg)', border: '1px solid var(--card-border)' }}>
@@ -221,7 +221,7 @@ export default function SettingsPage() {
                   <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
                     {storage.extra_bytes > 0
                       ? `含 ${fmtBytes(storage.base_bytes)} + 已加购 ${fmtBytes(storage.extra_bytes)}`
-                      : '与 Helpwo 共用同一份存储'}
+                      : '与 Helpwow 共用同一份存储'}
                   </span>
                   {storage.top_up && (
                     <button onClick={() => buyPack(storage.top_up.kind)} disabled={!!buying}

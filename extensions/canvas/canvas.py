@@ -1,10 +1,10 @@
 """Whiteboards, from the terminal.
 
-A board is an ordinary `.excalidraw` file — Excalidraw's own JSON. Helpwo draws
+A board is an ordinary `.excalidraw` file — Excalidraw's own JSON. Helpwow draws
 it; this reads it, lists them, and creates empty ones, so a person working in a
 terminal can see what is on a board without opening a GUI for it.
 
-The rendering rules here mirror Helpwo's `src/utils/canvasScene.ts` — a label
+The rendering rules here mirror Helpwow's `src/utils/canvasScene.ts` — a label
 bound to a shape is folded onto its container's line, an arrow reports what it
 connects, tombstones are not part of the board. That is a duplicated
 implementation in two languages and therefore a place where the two can drift;
@@ -13,7 +13,7 @@ sides assert the same three properties. The alternative — one side shelling ou
 to the other to read a JSON file — would be worse.
 
 What this deliberately does NOT do is change a board that something else may
-have open. Helpwo holds an open board's elements in the editor and writes the
+have open. Helpwow holds an open board's elements in the editor and writes the
 file behind them, so a write from here while it is open would be overwritten by
 its next autosave, silently. `write_scene` therefore refuses when the file has
 changed since it was read, which turns that race into a refusal instead of lost
@@ -90,7 +90,7 @@ def write_scene(path: str, scene: dict, *, expect_mtime: Optional[float] = None,
 
     `expect_mtime` is the modification time the caller read the file at, and
     `expect_digest` is what `scene_digest` returned for it. A mismatch in
-    either means somebody else — Helpwo with the board open, most likely —
+    either means somebody else — Helpwow with the board open, most likely —
     wrote it in between, and continuing would drop their work without saying
     so.
 
@@ -110,7 +110,7 @@ def write_scene(path: str, scene: dict, *, expect_mtime: Optional[float] = None,
     if changed:
         raise CanvasError(
             f"{os.path.basename(path)} changed while this was working on it "
-            f"— it is probably open in Helpwo. Nothing was written; read it "
+            f"— it is probably open in Helpwow. Nothing was written; read it "
             f"again and retry.")
     parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, exist_ok=True)

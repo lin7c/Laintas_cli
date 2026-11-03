@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 laintas_cli — Autonomous AI agent for your terminal.
-Same agent loop as Helpwo, but executes real system commands.
+Same agent loop as Helpwow, but executes real system commands.
 
 Usage:
     laintas-cli                    # Start interactive session in cwd
@@ -140,7 +140,6 @@ SYSTEM = platform.system()  # "Linux", "Darwin"
 
 def _open_external_url(url: str) -> bool:
     """Open a URL using the operating system's browser integration."""
-    import webbrowser
     try:
         return bool(webbrowser.open(url))
     except Exception:
@@ -283,7 +282,6 @@ class _LazyModule:
 
 requests = _LazyModule("requests")
 from rich.console import Console, Group
-from rich.panel import Panel
 from rich.padding import Padding
 from rich.markdown import Markdown as RichMarkdown
 from rich.table import Table as RichTable
@@ -1640,7 +1638,7 @@ def strip_ansi(text: str) -> str:
 
 # ── Configuration ──────────────────────────────────────────────────────
 def _detect_backend() -> str:
-    """Auto-detect the Helpwo backend URL. Prefers local if running."""
+    """Auto-detect the Helpwow backend URL. Prefers local if running."""
     local = "http://127.0.0.1:2913"
     try:
         r = requests.get(f"{local}/api/agents", timeout=1.5)
@@ -2097,7 +2095,7 @@ def _shell_attach_available() -> bool:
     """Can a typed command run in term0 with the real terminal attached?
 
     Needs a real terminal on both ends and the screen to be ours: the /agents
-    view owns it while open, and a remote (Helpwo) request has no keyboard.
+    view owns it while open, and a remote (Helpwow) request has no keyboard.
     `/config shell_attach off` returns to the marker-poll path.
     """
     try:
@@ -2210,7 +2208,7 @@ def _report_detached_finish() -> None:
     session = info.session if info is not None else None
     if session is None:
         return
-    # Any is_busy() check may already have settled it (an agent turn, a Helpwo
+    # Any is_busy() check may already have settled it (an agent turn, a Helpwow
     # command); the result waits on the session to be reported here.
     try:
         finished = term_attach.take_finished(session)
@@ -2748,8 +2746,8 @@ def _build_connected_subterminal_cmd(terminal_name: str,
     """Command line for a user-facing sub-terminal running a nested CLI.
 
     Carries the terminal's identity (name + remote parent agent id).
-    auto_connect=True (used by Helpwo's term-new) registers at startup,
-    handing exactly this terminal to Helpwo.
+    auto_connect=True (used by Helpwow's term-new) registers at startup,
+    handing exactly this terminal to Helpwow.
     terminal_id overrides the id derived from the parent terminal — an app
     sub-terminal keeps one per folder, so its terminal preferences survive a
     new SSH login. extra_args are appended, each quoted. env adds variable
@@ -3911,7 +3909,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             ("close", "Mark it handed over and done"),
             ("reopen", "Undo a close"),
             ("sync", "Merge with the shared copy through Laintas storage"),
-            ("send", "Hand this conversation to Helpwo or Laintas AI as a context envelope"),
+            ("send", "Hand this conversation to Helpwow or Laintas AI as a context envelope"),
             ("export", "Render it as one string to send over any channel"),
             ("import", "Take a handoff somebody pasted or mailed you"),
             ("remote", "List handoffs other machines shared for this repository"),
@@ -3926,7 +3924,7 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             "separately; credentials and live processes are never transferred."
         )),
     CommandSpec(
-        "/shared", "Share files with Helpwo through Laintas storage",
+        "/shared", "Share files with Helpwow through Laintas storage",
         "Agents & Terminals",
         "/shared [list [path]|push <local> [remote]|pull <remote> [local]|rm <path>|mkdir <path>|mv <from> <to>|cp <from> <to>|usage]",
         subcommands=("list", "push", "pull", "rm", "mkdir", "mv", "cp", "usage"),
@@ -3941,9 +3939,9 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
             ("usage", "Show storage used, free allowance and cost"),
         ),
         help_text=(
-            "Reads and writes the same per-account storage Helpwo mounts as its "
+            "Reads and writes the same per-account storage Helpwow mounts as its "
             "\"Laintas Storage\" cloud folder: push a file here and it is in the "
-            "Helpwo file tree, pull one that Helpwo wrote. It does not need a "
+            "Helpwow file tree, pull one that Helpwow wrote. It does not need a "
             "live link and it outlives this process — the files "
             "sit on the server. Storage above the plan's free allowance is "
             "billed monthly; /shared usage shows where you stand."
@@ -7764,7 +7762,7 @@ def _normalize_model_entry(item) -> dict:
 def _model_supply_label(provider_id: str) -> str:
     """Collapse routing providers into the user-facing supply groups.
 
-    Mirrors Helpwo's modelSupplyGroupId (AIChat.tsx): the person's own
+    Mirrors Helpwow's modelSupplyGroupId (AIChat.tsx): the person's own
     keys hosted by Laintas (provider "my-keys") are "Activated", their own
     Laintas Compute machines ("my-devices") are "Compute" and their
     organisation's account ("org") is "Organization" and their Laintas
@@ -7788,7 +7786,7 @@ def _model_display_name(model_id: str) -> str:
     """Display name for a model id: ``key/<source>/<model>`` reads as just
     the model — the supply tag already says whose key it is — and
     ``preset/<name>`` as just the name. Mirrors
-    Helpwo's modelDisplayName. Presentation only: the id itself is
+    Helpwow's modelDisplayName. Presentation only: the id itself is
     unchanged everywhere it is stored or sent."""
     model_id = str(model_id or "")
     if model_id.startswith("key/"):
@@ -10530,7 +10528,7 @@ def _call_backend_stream_impl(
     _local_sink: Optional[dict] = None,
     request_timeout_override: Optional[float] = None,
 ) -> dict:
-    """Call Helpwo backend /api/chat/stream, same as Helpwo frontend.
+    """Call Helpwow backend /api/chat/stream, same as Helpwow frontend.
     Returns parsed {reply, command, memory, done, _billing} dict.
 
     If interrupt_event is provided, it is checked between SSE chunks so the
@@ -11361,7 +11359,7 @@ def _call_backend_stream_impl(
             "stream_dropped", f"Error: {e}", locals(), tool_name_map)
 
 
-# ── Agent Registration with Helpwo Backend ─────────────────────────────
+# ── Agent Registration with Helpwow Backend ─────────────────────────────
 
 class TerminalSession:
     """A real PTY shell bridged to the browser over a WebSocket relay.
@@ -11567,7 +11565,7 @@ class TerminalSession:
 
 
 class AgentRegistry:
-    """Manages remote agent registration with Helpwo backend."""
+    """Manages remote agent registration with Helpwow backend."""
 
     # Bound both active work and queued work. A remote client must not be able
     # to turn the polling loop into an unbounded thread/PTY factory.
@@ -11588,24 +11586,24 @@ class AgentRegistry:
             paths, "PROCESS_INSTANCE_ID",
             getattr(paths, "INSTANCE_ID", f"pid-{os.getpid()}"),
         )
-        # ── Sub-terminal identity (two-end handshake with Helpwo) ────────
+        # ── Sub-terminal identity (two-end handshake with Helpwow) ────────
         # depth 0 = primary CLI (auto-registers = "online"). depth ≥ 1 = a
         # nested CLI inside a sub-terminal: it registers ONLY when the user
-        # runs /helpwo --remote there (or Helpwo asked for it via term-new), carrying
-        # terminal_meta so Helpwo can show the CLI-side name/definition.
+        # runs /helpwo --remote there (or Helpwow asked for it via term-new), carrying
+        # terminal_meta so Helpwow can show the CLI-side name/definition.
         self.depth: int = 0
         self.parent_remote_id: Optional[str] = None
         self.terminal_meta: Optional[dict] = None
-        # A nested CLI that exists to BE a runtime environment (the Helpwo
+        # A nested CLI that exists to BE a runtime environment (the Helpwow
         # app sub-terminal behind /helpwo --remote) rather than a terminal
         # exposed to the local companion application as a runtime.
-        # workspace, no terminal identity, no parent — because Helpwo files
+        # workspace, no terminal identity, no parent — because Helpwow files
         # anything carrying `terminal` under the terminal dock and keeps it
         # out of the runtime-environment picker.
         self.as_environment: bool = False
-        # Absolute host path the user chose to SHARE as Helpwo's remote
+        # Absolute host path the user chose to SHARE as Helpwow's remote
         # workspace via /helpwo. None = link only, share nothing
-        # (Helpwo keeps its virtual workspace). Only meaningful at depth 0.
+        # (Helpwow keeps its virtual workspace). Only meaningful at depth 0.
         self.workspace_path: Optional[str] = None
         # Raw PTY relay sessions are tracked separately from nested CLI
         # terminals so disconnect/unregister can revoke them all.
@@ -11624,13 +11622,13 @@ class AgentRegistry:
         self._registration_lock = threading.Lock()
         self._last_reregister = 0.0
         # Remembered across re-registrations so the gateway can resurrect the
-        # same agentId (keeps Helpwo tabs + sub-terminal parent links stable).
+        # same agentId (keeps Helpwow tabs + sub-terminal parent links stable).
         self._last_agent_id: str = ""
-        # Serializes background Helpwo chats (they share the REPL history).
+        # Serializes background Helpwow chats (they share the REPL history).
         self._chat_run_lock = threading.Lock()
         # Set when this process serves a registered application (/app) or one
         # of its users' sessions: {"approval": "deny" | "auto"}. None for
-        # Helpwo and every ordinary CLI. See _request_approval and _handle_chat.
+        # Helpwow and every ordinary CLI. See _request_approval and _handle_chat.
         self.app_mode: Optional[dict] = None
         self._remote_executor = self._new_remote_executor()
         self._remote_control_executor = ThreadPoolExecutor(
@@ -11724,7 +11722,7 @@ class AgentRegistry:
 
 
     def start_message_poll(self, agent_state_cb, chat_history_cb):
-        """Start background thread to poll for incoming messages from Helpwo UI.
+        """Start background thread to poll for incoming messages from Helpwow UI.
 
         Args:
             agent_state_cb: callable() → dict — returns current agent state
@@ -11737,14 +11735,14 @@ class AgentRegistry:
         self._chat_cb = chat_history_cb
         if not self._listening:
             self._listening = True
-            console.print("[dim]Listening for remote messages from Helpwo...[/dim]")
+            console.print("[dim]Listening for remote messages from Helpwow...[/dim]")
 
     def _dispatch_inputs(self, messages: list, agent_state_cb, chat_history_cb):
-        """Run what Helpwo sent, each in a bounded worker.
+        """Run what Helpwow sent, each in a bounded worker.
 
         Dispatch in a worker so a long-running handler (chat/delegate can run
         for minutes) never stalls delivery — term-new/term-close/abort from
-        Helpwo must stay responsive throughout.
+        Helpwow must stay responsive throughout.
         """
         for msg in messages:
             if not isinstance(msg, dict):
@@ -11836,7 +11834,7 @@ class AgentRegistry:
         """Run a remote chat message WITHOUT occupying the local REPL.
 
         Plain messages run their own agent loop in this worker thread (the
-        local prompt stays usable; Helpwo streams the events). The shared
+        local prompt stays usable; Helpwow streams the events). The shared
         chat history keeps continuity with the local conversation. Slash
         commands are the exception — they must execute in the main loop, so
         they still go through REPL injection.
@@ -11854,7 +11852,7 @@ class AgentRegistry:
 
         console.print(Panel(
             f"[bold cyan]Remote message from "
-            f"{'the application' if self.app_mode is not None else 'Helpwo'}:"
+            f"{'the application' if self.app_mode is not None else 'Helpwow'}:"
             f"[/bold cyan]\n{escape(content)}",
             title="Incoming",
             border_style="cyan",
@@ -11891,7 +11889,7 @@ class AgentRegistry:
             return
 
         if not self._chat_run_lock.acquire(timeout=300):
-            self._push_final(req_id, "fail", "another Helpwo chat is still running")
+            self._push_final(req_id, "fail", "another Helpwow chat is still running")
             return
         remote_error = ""
         try:
@@ -12088,7 +12086,7 @@ class AgentRegistry:
             self._push_final(req_id, "fail", f"exec error: {e}")
 
     def _handle_webtest(self, req_id: str, payload: dict):
-        """Run browser test flows for Helpwo's run_tests tool.
+        """Run browser test flows for Helpwow's run_tests tool.
 
         payload: {tests: [{name, target(url), viewportWidth?, checkErrors?,
         steps: [test_flow steps]}]}. Each test navigates to its target first,
@@ -12226,7 +12224,7 @@ class AgentRegistry:
             return True, f"robots check error ({e}) — treated as allowed"
 
     def _handle_analyze_site(self, req_id: str, payload: dict):
-        """Capture a public web page for Helpwo's analyze_site tool (analysis &
+        """Capture a public web page for Helpwow's analyze_site tool (analysis &
         reference, NOT clone-and-republish).
 
         payload: {url, desktopWidth?, mobileWidth?}. Respects robots.txt,
@@ -12236,7 +12234,7 @@ class AgentRegistry:
         screenshot, the rendered DOM, design tokens (colors/fonts/sizes), the
         referenced first-party asset URLs, and the observed XHR/fetch API log.
         Large artifacts are written to host temp files; the report (meta.report)
-        carries their paths so Helpwo pulls them over P2P. Exactly one final.
+        carries their paths so Helpwow pulls them over P2P. Exactly one final.
         """
         url = str(payload.get("url") or "").strip()
         if not url:
@@ -12508,7 +12506,7 @@ class AgentRegistry:
     def _handle_term_open(self, req_id: str, payload: dict):
         """Spawn a real PTY shell and dial into the backend terminal relay.
 
-        Gives the Helpwo browser a live shell (vim/htop/colors/Ctrl-C all
+        Gives the Helpwow browser a live shell (vim/htop/colors/Ctrl-C all
         work). It can be disabled only from the CLI's local runtime
         configuration (disable_remote_terminal).
 
@@ -12554,7 +12552,7 @@ class AgentRegistry:
                 self._push_final(req_id, "fail", "terminal session is already open")
                 return
 
-        # The relay must be dialed at the SAME Helpwo host the browser is on —
+        # The relay must be dialed at the SAME Helpwow host the browser is on —
         # that host's nginx carries the /term WebSocket-upgrade config and
         # reaches the same gateway. The CLI's own get_backend_url() may point
         # at a different laintas origin (e.g. the main site) whose nginx has
@@ -12563,15 +12561,15 @@ class AgentRegistry:
         # Exact allow-list, NOT a "*.laintas.com" suffix match. The CLI dials
         # this host carrying `Authorization: Agent <secret>` (its long-lived
         # host credential); a suffix match would let anyone who can send a
-        # term-open (i.e. already holds the Helpwo session) name an
+        # term-open (i.e. already holds the Helpwow session) name an
         # attacker-controlled *.laintas.com subdomain and exfiltrate that
-        # secret / hijack the PTY to a rogue relay. Only known Helpwo origins
+        # secret / hijack the PTY to a rogue relay. Only known Helpwow origins
         # (or an env override for self-hosters) are accepted; anything else
         # falls back to the CLI's own configured backend.
         backend_url = get_backend_url()
         allowed_relay_hosts = {
             h.strip().lower() for h in os.environ.get(
-                "LAINTAS_RELAY_HOSTS", "helpwo.laintas.com,localhost:5173,127.0.0.1:5173"
+                "LAINTAS_RELAY_HOSTS", "helpwow.laintas.com,localhost:5173,127.0.0.1:5173"
             ).split(",") if h.strip()
         }
         raw_host = str(payload.get("host") or "").strip().lower()
@@ -12611,9 +12609,9 @@ class AgentRegistry:
                 pass
 
     def _handle_term_new(self, req_id: str, payload: dict):
-        """Helpwo's add-terminal action creates a named sub-terminal here (same path as
+        """Helpwow's add-terminal action creates a named sub-terminal here (same path as
         /term <name>) running a nested laintas_cli that auto-links (--connect), so it
-        registers itself back to Helpwo as a managed terminal."""
+        registers itself back to Helpwow as a managed terminal."""
         if self.depth > 0:
             self._push_final(req_id, "fail", "term-new must target the primary CLI (depth 0)")
             return
@@ -12652,14 +12650,14 @@ class AgentRegistry:
             self._push_final(req_id, "fail", f"could not register terminal '{name}': {exc}")
             return
         console.print(Panel(
-            f"[bold cyan]Helpwo created sub-terminal [bold]{name}[/bold][/bold cyan]\n"
-            f"[dim]It will hand itself over to Helpwo once it finishes starting.[/dim]",
+            f"[bold cyan]Helpwow created sub-terminal [bold]{name}[/bold][/bold cyan]\n"
+            f"[dim]It will hand itself over to Helpwow once it finishes starting.[/dim]",
             title="Remote Terminal", border_style="cyan",
         ))
         self._push_final(req_id, "success", name)
 
     def _handle_term_close(self, req_id: str, payload: dict):
-        """Helpwo's close-terminal action closes a sub-terminal.
+        """Helpwow's close-terminal action closes a sub-terminal.
 
         Sent to the primary CLI with a name: closes that registered
         sub-terminal (kills the nested CLI with it). Sent to a sub-terminal
@@ -12671,7 +12669,7 @@ class AgentRegistry:
         if self.depth > 0 and (not name or name == own_name):
             self._push_final(req_id, "success", own_name or "closing")
             self._flush_events(timeout=2.0)
-            console.print("[yellow]Helpwo closed this sub-terminal.[/yellow]")
+            console.print("[yellow]Helpwow closed this sub-terminal.[/yellow]")
             def _die():
                 time.sleep(0.3)
                 try:
@@ -12718,14 +12716,14 @@ class AgentRegistry:
                     pass
             threading.Thread(target=_reap, daemon=True).start()
         console.print(Panel(
-            f"[yellow]Helpwo closed sub-terminal [bold]{name}[/bold][/yellow]",
+            f"[yellow]Helpwow closed sub-terminal [bold]{name}[/bold][/yellow]",
             title="Remote Terminal", border_style="yellow",
         ))
         self._push_final(req_id, "success", name)
 
     def _build_loop_deps(self, req_id: str) -> "LoopDeps":
         """LoopDeps for a remote-initiated agent loop (chat/delegate): local
-        display wiring plus approvals routed back to Helpwo under req_id."""
+        display wiring plus approvals routed back to Helpwow under req_id."""
         return LoopDeps(
             read_file=read_file, append_file=append_file,
             write_file=write_file, strip_ansi=strip_ansi,
@@ -12749,10 +12747,10 @@ class AgentRegistry:
         )
 
     def _handle_disconnect(self, req_id: str, payload: dict):
-        """Helpwo unilaterally unlinked this agent. Withdraw quietly: stop
+        """Helpwow unilaterally unlinked this agent. Withdraw quietly: stop
         heartbeat/poll and unregister. The local terminal keeps running."""
         console.print(Panel(
-            "[yellow]Helpwo disconnected this terminal.[/yellow]\n"
+            "[yellow]Helpwow disconnected this terminal.[/yellow]\n"
             "[dim]The CLI keeps running locally. Run /helpwo to connect again.[/dim]",
             title="Disconnected", border_style="yellow",
         ))
@@ -12823,7 +12821,7 @@ class AgentRegistry:
         session = self._session or {}
         # Isolation: a delegated loop should see only its goal + the caller's
         # briefing — NOT whatever conversation happens to sit in this CLI's
-        # local REPL. Mirrors how local Helpwo sub-agents are isolated from
+        # local REPL. Mirrors how local Helpwow sub-agents are isolated from
         # their parent's history. (chat kind still uses the local history.)
         chat_history = []
 
@@ -15830,7 +15828,7 @@ def _show_usage_command(args: list, session: dict) -> None:
                 f"limit ({_rate:.0f}%){_detail}",
                 style="warning" if _rate >= 10 else "muted"))
 
-    # ── LAINTAS — backend usage, same gateway endpoints Helpwo uses ──
+    # ── LAINTAS — backend usage, same gateway endpoints Helpwow uses ──
     footnotes: list[str] = []
     if not local_only:
         body.append(Text())
@@ -15885,7 +15883,7 @@ def _show_usage_command(args: list, session: dict) -> None:
                 calls_val.append(" subscription", style="muted")
                 grid.add_row("calls", calls_val)
                 # Two allowances, two different things to run out of. Storage is
-                # shared with Helpwo because it is one store; calls are not.
+                # shared with Helpwow because it is one store; calls are not.
                 cli_product = next(
                     (p for p in (sub.get("byProduct") or [])
                      if p.get("productId") == "cli"), None)
@@ -15962,7 +15960,7 @@ def _show_usage_command(args: list, session: dict) -> None:
                         if cd else "5h rolling window nearly used up")
                 if _usage_allowance_tight(store, "used_bytes", "limit_bytes"):
                     footnotes.append("storage nearly full — /usage buy storage "
-                                     "(one store, shared with Helpwo)")
+                                     "(one store, shared with Helpwow)")
                 if sub_calls:
                     footnotes.append("subscription calls carry no token counts on the "
                                      "backend — LOCAL tokens are authoritative")
@@ -16694,7 +16692,7 @@ def _cmd_login(session: dict, agent_registry: AgentRegistry, *, alias=None, acti
             return _request_account_switch(str(new_session["userId"]))
         session.clear()
         session.update(new_session)
-        # Refresh the Helpwo link only if this terminal was already
+        # Refresh the Helpwow link only if this terminal was already
         # linked — logging in never auto-links (two-end handshake).
         if agent_registry.agent_id:
             agent_registry.register(session, quiet=True)
@@ -17778,10 +17776,10 @@ def _shared_print_listing(entries, prefix: str) -> None:
 
 
 def _cmd_shared(parts: list, session: dict) -> None:
-    """Share files with Helpwo through Laintas shared storage.
+    """Share files with Helpwow through Laintas shared storage.
 
-    The same storage Helpwo mounts as its "Laintas Storage" cloud folder, so
-    this is how a terminal hands work to a Helpwo session and takes it back.
+    The same storage Helpwow mounts as its "Laintas Storage" cloud folder, so
+    this is how a terminal hands work to a Helpwow session and takes it back.
     Unlike /helpwo --remote, it outlives the process and needs no live link.
     """
     import shared_storage as ss
@@ -17794,7 +17792,7 @@ def _cmd_shared(parts: list, session: dict) -> None:
             "Usage: [bold]/shared[/bold] [list \\[path]|push <local> \\[remote]|"
             "pull <remote> \\[local]|rm <path>|mkdir <path>|mv <from> <to>|"
             "cp <from> <to>|usage]\n"
-            "[dim]Files land in the same storage Helpwo mounts as "
+            "[dim]Files land in the same storage Helpwow mounts as "
             "\"Laintas Storage\" — push here, open it there.[/dim]")
         return
 
@@ -17848,7 +17846,7 @@ def _cmd_shared(parts: list, session: dict) -> None:
                     size = client.push_file(local, remote)
                 console.print(
                     f"[green]Pushed {escape(remote)} ({ss.human_bytes(size)}).[/green]")
-            console.print("[dim]Open it in Helpwo under Laintas Storage.[/dim]")
+            console.print("[dim]Open it in Helpwow under Laintas Storage.[/dim]")
             return
 
         if sub == "pull":
@@ -18163,7 +18161,7 @@ def _cmd_handoff(parts: list, session: dict) -> None:
                           if gained else "[dim]already in step[/dim]")
                 console.print(f"{escape(env['id'])} {symbols.BULLET} {detail}")
             # A synced handoff is also announced in the account inbox,
-            # so it can be opened from Helpwo like any other hand.
+            # so it can be opened from Helpwow like any other hand.
             import context_receive
             for env in targets:
                 key = (env.get("repo") or {}).get("key") or "unkeyed"
@@ -18171,7 +18169,7 @@ def _cmd_handoff(parts: list, session: dict) -> None:
                         session, LAINTAS_BASE, "handoff",
                         f"{key}/{env['id']}", "helpwo",
                         title=str(env.get("title") or "")):
-                    console.print("[dim]Announced in your Laintas inbox for Helpwo.[/dim]")
+                    console.print("[dim]Announced in your Laintas inbox for Helpwow.[/dim]")
             return
 
         if sub == "send":
@@ -18194,7 +18192,7 @@ def _cmd_handoff(parts: list, session: dict) -> None:
             except context_receive.SendError as exc:
                 console.print(f"[red]{escape(str(exc))}[/red]")
                 return
-            label = "Helpwo" if target == "helpwo" else "Laintas AI"
+            label = "Helpwow" if target == "helpwo" else "Laintas AI"
             console.print(
                 f"[green]Handed this conversation to {label}.[/green] "
                 f"[dim]It waits in your Laintas inbox "
@@ -22212,7 +22210,7 @@ def _bind_current_agent_runtime(prepared_state: dict, chat_history: list,
     """Persist one REPL turn on whichever Agent ``/agent`` selected.
 
     Primary keeps its long-lived state dict identity because Agents Mode and
-    Helpwo share that exact object. Other Agents receive the prepared state as
+    Helpwow share that exact object. Other Agents receive the prepared state as
     their new authoritative state. Both paths retain history and PTY/session
     ownership so switching away and back cannot lose conversation progress.
     """
@@ -22588,7 +22586,7 @@ def _attach_primary_runtime_view(agent, *, show_result: bool = True):
 # ── Agents view: the full-screen /agents UI is only a display + input
 # router. It runs in a background thread; every submitted line is injected
 # into the main REPL loop (the single executor) via _inject_input, exactly
-# like a locally typed line or a Helpwo remote message.
+# like a locally typed line or a Helpwow remote message.
 
 _agents_view_state: dict = {"controller": None}
 
@@ -23634,7 +23632,7 @@ def _let_subterminal_exit(sess, timeout: float = 8.0) -> None:
 
     Closing a terminal session sends SIGTERM and follows with SIGKILL 0.3s
     later. A nested CLI's SIGTERM handler first flushes its events and
-    unregisters from Helpwo, which takes seconds, so the SIGKILL landed first
+    unregisters from Helpwow, which takes seconds, so the SIGKILL landed first
     and the gateway kept listing the environment as online until its
     heartbeat timed out.
     """
@@ -23879,8 +23877,8 @@ def _cmd_app(parts: list, agent_registry: AgentRegistry) -> None:
     """/app list | start <name> | stop <name> | trust <name> | revoke <name>
 
     Any application described by a manifest (~/.laintas/apps/*.json, or the
-    project's .laintas/apps/*.json) runs the way Helpwo does: in its own
-    sub-terminal, with its own agent. Helpwo itself is not one of them — it
+    project's .laintas/apps/*.json) runs the way Helpwow does: in its own
+    sub-terminal, with its own agent. Helpwow itself is not one of them — it
     has /helpwo.
     """
     sub = parts[1].lower() if len(parts) >= 2 else "list"
@@ -26234,6 +26232,8 @@ def _build_mailbox_browser(*, input=None,
                 message=f"Press x again to dismiss {item.title}",
                 message_style="class:warning")
         removed = startup_mail.delete(item.payload)
+        if removed:
+            official_messages.delete([item.payload])
         armed.update(key="", at=0.0)
         return resource_ui.UIActionResult(
             message=(f"Dismissed {item.title}" if removed else "Already gone."),
@@ -26255,7 +26255,9 @@ def _build_mailbox_browser(*, input=None,
                 message="Press c again to clear every message",
                 message_style="class:warning")
         armed.update(key="", at=0.0)
+        keys = [m.key for m in startup_mail.items()]
         startup_mail.clear(remember=True)
+        official_messages.delete(keys)
         return resource_ui.UIActionResult(
             message="Cleared", message_style="class:success", refresh=True)
 
@@ -26318,7 +26320,7 @@ def _offer_context_import(item, ref, session) -> None:
     the conversation lands here as a session (Context Kernel §14)."""
     import context_receive
     origin = ref[0]
-    label = {"helpwo": "Helpwo", "laintas-ai": "Laintas AI",
+    label = {"helpwo": "Helpwow", "laintas-ai": "Laintas AI",
              "issues": "Laintas Issues"}.get(origin, origin)
     console.print(
         f"  [dim]This message carries a conversation from {label}. "
@@ -26408,6 +26410,7 @@ def _cmd_messages(parts: list, session: dict = None) -> None:
             return
         title = item.title
         startup_mail.delete(item.key)
+        official_messages.delete([item.key])
         console.print(f"[green]Dismissed {escape(title)}.[/green]")
         return
 
@@ -26415,7 +26418,9 @@ def _cmd_messages(parts: list, session: dict = None) -> None:
         if not items:
             console.print("[dim]No messages.[/dim]")
             return
+        keys = [m.key for m in items]
         startup_mail.clear(remember=True)
+        official_messages.delete(keys)
         console.print(f"[green]Cleared {len(items)} message(s).[/green]")
         return
 
@@ -28575,7 +28580,7 @@ def authorize_direct_command(command: str, cwd: str = None, *,
     executing any part of the command.
 
     When *remote_source* is True the command was injected from a remote
-    channel (Helpwo chat -> _inject_input) rather than typed by the local
+    channel (Helpwow chat -> _inject_input) rather than typed by the local
     user.  In that case ``needs_approval`` decisions are NOT silently
     allowed - the local terminal is unattended and the ``/exec`` channel
     is the proper remote path with its own approval dialog.
@@ -29337,6 +29342,43 @@ _startup_auto_approve: Optional[str] = None
 _startup_first_message: Optional[str] = None
 
 
+def _decompose_task_via_backend(task: str, strategy: str, timeout: float):
+    """Bound both inference and retry delays by the decomposition deadline."""
+    if not aux_calls_enabled():
+        return None
+    timeout = max(0.001, float(timeout))
+    cancel = threading.Event()
+    timer = threading.Timer(timeout, cancel.set)
+    timer.daemon = True
+    timer.start()
+    try:
+        mode_word = ("independent" if strategy == auto_pilot.PARALLEL_HINT
+                     else "sequential")
+        system_prompt = (
+            "You are a task decomposition assistant. Break the given "
+            f"task into 2-4 {mode_word} subtasks. Return ONLY a JSON "
+            "array of strings, no explanation. "
+            'Example: ["subtask 1", "subtask 2", "subtask 3"]'
+        )
+        result = call_backend_stream(
+            load_session() or {}, message=task, system_prompt=system_prompt,
+            current_path=os.getcwd(), tools_enabled=False,
+            task_kind="auto_pilot_decompose", interrupt_event=cancel,
+            request_timeout_override=timeout,
+            max_tokens_override=int(get_runtime_config("auto_pilot_decompose_max_tokens") or 500),
+        )
+        if cancel.is_set():
+            return None
+        reply = (result or {}).get("reply", "")
+        return _parse_subtask_json(reply) if reply else None
+    except Exception:
+        return None
+    finally:
+        cancel.set()
+        timer.cancel()
+        timer.join()
+
+
 def _split_startup_list(value: Optional[str]) -> list:
     return [item.strip() for item in str(value or "").split(",") if item.strip()]
 
@@ -29741,10 +29783,10 @@ def main():
         which is put the text in the prompt and press enter.
 
         `_inject_input` already is that: the same queue `/agents` and the
-        Helpwo bridge use to hand a line to the single executor. The main loop
+        Helpwow bridge use to hand a line to the single executor. The main loop
         then routes it normally — meta command, shell passthrough, or agent —
         renders it as the foreground turn, and shares the one conversation.
-        The result comes back the way the Helpwo bridge takes it, off
+        The result comes back the way the Helpwow bridge takes it, off
         `agent_state` once the loop signals `done`.
 
         Serialised here rather than relying on the queue: the caller wants the
@@ -29754,7 +29796,7 @@ def main():
             source = (conversation or "extension").split(":", 1)[0]
             # Injected lines are not echoed, so a task would otherwise appear
             # to run with nothing having asked for it.
-            # escape(): injected text is arbitrary (extension tasks, Helpwo
+            # escape(): injected text is arbitrary (extension tasks, Helpwow
             # bridge) and may contain Rich-looking sequences like "[/\\]".
             console.print(f"\n[dim]({escape(source)})[/dim] "
                           f"[bold]{escape(str(text))}[/bold]",
@@ -30050,10 +30092,10 @@ def main():
                 lambda: chat_history,
             )
         elif args.connect:
-            # --connect (any depth; used by Helpwo's term-new for sub-terminals).
+            # --connect (any depth; used by Helpwow's term-new for sub-terminals).
             connect_terminal_to_helpwo(agent_registry, session)
         # Otherwise NO auto-link (two-end handshake): a terminal goes online
-        # only when linked deliberately — Helpwo's term-new (--connect) or
+        # only when linked deliberately — Helpwow's term-new (--connect) or
         # monitor mode above.
 
     # PTY session managed at REPL level (must be before shutdown for nonlocal)
@@ -30265,37 +30307,7 @@ def main():
     set_trigger_wake_callback(_trigger_wake_cb)
 
     # ── Phase 2: Register LLM decomposition callback for auto-pilot ──
-    def _decompose_cb(task: str, strategy: str, timeout: float):
-        """Decompose a task into subtasks via backend LLM with timeout."""
-        if not aux_calls_enabled():
-            return None
-        try:
-            _session = load_session() or {}
-            if strategy == auto_pilot.PARALLEL_HINT:
-                mode_word = "independent"
-            else:
-                mode_word = "sequential"
-            system_prompt = (
-                "You are a task decomposition assistant. Break the given "
-                f"task into 2-4 {mode_word} subtasks. Return ONLY a JSON "
-                "array of strings, no explanation. "
-                'Example: ["subtask 1", "subtask 2", "subtask 3"]'
-            )
-            result = call_backend_stream(
-                _session, message=task, system_prompt=system_prompt,
-                current_path=os.getcwd(), tools_enabled=False,
-                task_kind="auto_pilot_decompose",
-                max_tokens_override=int(get_runtime_config("auto_pilot_decompose_max_tokens") or 500),
-            )
-            reply = (result or {}).get("reply", "")
-            if not reply:
-                return None
-            # Robust JSON extraction: handle code blocks + surrounding text.
-            return _parse_subtask_json(reply)
-        except Exception:
-            return None
-
-    auto_pilot.set_decompose_callback(_decompose_cb)
+    auto_pilot.set_decompose_callback(_decompose_task_via_backend)
 
     # Refresh gateway-managed documentation skills before scanning metadata.
     # A short/offline failure is intentionally silent: the last verified local
@@ -30410,7 +30422,7 @@ def main():
         if args.depth > 0:
             # Sub-terminal CLI: its console may already be a dead PTY (parent
             # closed it / tmux window killed), where console.print and the
-            # graceful save path can wedge. Unregister from Helpwo first,
+            # graceful save path can wedge. Unregister from Helpwow first,
             # best-effort cleanup, then hard-exit.
             try:
                 agent_registry.unregister()
@@ -30456,8 +30468,8 @@ def main():
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
-    # tmux kill-window (parent's unregister_terminal / Helpwo term-close)
-    # delivers SIGHUP — unregister from Helpwo before dying instead of
+    # tmux kill-window (parent's unregister_terminal / Helpwow term-close)
+    # delivers SIGHUP — unregister from Helpwow before dying instead of
     # leaving a stale agent until the 60s heartbeat timeout.
     signal.signal(signal.SIGHUP, shutdown)
 
@@ -30622,7 +30634,7 @@ def main():
             user_input = item
             injected_done = None
             _is_dialogue = False
-        # Injected lines (Helpwo chat, extensions, app bridges) are not local
+        # Injected lines (Helpwow chat, extensions, app bridges) are not local
         # keystrokes. /password must only open from the local terminal: a
         # remote trigger would put a hidden passphrase prompt on a screen its
         # requester cannot see — a phishing surface, and the vault design
@@ -31241,7 +31253,7 @@ def main():
                 interactive_session.close()
                 interactive_session = None
 
-            # Remote-injected commands (from Helpwo Activity terminal): use
+            # Remote-injected commands (from Helpwow Activity terminal): use
             # subprocess capture so stdout can be forwarded to the event stream.
             # pty_passthrough directly inherits the local tty and returns
             # stdout="" — nothing to forward.  Local commands keep pty_passthrough

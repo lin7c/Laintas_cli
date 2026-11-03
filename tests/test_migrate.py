@@ -97,7 +97,7 @@ class MigrateAllTests(unittest.TestCase):
 
     def _run(self):
         # Real home migrations would move the developer's own files: pin the
-        # list to empty and test the cwd half, which is the Helpwo linkage.
+        # list to empty and test the cwd half, which is the Helpwow linkage.
         with mock.patch.object(migrate, "_home_migrations", return_value=[]):
             return migrate.migrate_all(verbose=False)
 

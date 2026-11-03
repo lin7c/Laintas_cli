@@ -691,7 +691,7 @@ def apply_frozen_update(manifest: dict, channel_dir: str, log) -> Optional[str]:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ── Helpwo dist ──────────────────────────────────────────────────────────
+# ── Helpwow dist ──────────────────────────────────────────────────────────
 #
 # The browser UI /helpwo serves is a build artifact of a separate project, so
 # it needs a way to reach a user who does not have that project checked out.
@@ -786,7 +786,7 @@ def helpwo_dist_changed(manifest: dict) -> list:
 
 
 def install_helpwo_dist(log=None, console=None) -> tuple[bool, str]:
-    """Download and install the Helpwo dist if it differs from what is on disk.
+    """Download and install the Helpwow dist if it differs from what is on disk.
 
     Returns (ok, message). Verifies every file against the manifest before a
     single byte is written, then swaps the directory into place, so a failed
@@ -799,20 +799,20 @@ def install_helpwo_dist(log=None, console=None) -> tuple[bool, str]:
     try:
         manifest = fetch_helpwo_manifest()
     except Exception as e:
-        return False, f"could not fetch the Helpwo manifest: {e}"
+        return False, f"could not fetch the Helpwow manifest: {e}"
 
     version = str(manifest.get("version", "?"))
     installed = helpwo_installed()
     changed = helpwo_dist_changed(manifest)
     if not changed and installed.get("version") == version:
-        return True, f"Helpwo UI {version} is already current"
+        return True, f"Helpwow UI {version} is already current"
 
-    emit(f"Downloading Helpwo UI {version} ({len(changed)} file(s) differ)…")
+    emit(f"Downloading Helpwow UI {version} ({len(changed)} file(s) differ)…")
     try:
         data = _download(_asset_url(update_channel(), HELPWO_ZIP_ASSET),
                          label=HELPWO_ZIP_ASSET, console=console)
     except Exception as e:
-        return False, f"could not download the Helpwo bundle: {e}"
+        return False, f"could not download the Helpwow bundle: {e}"
 
     import io
     import zipfile
@@ -825,14 +825,14 @@ def install_helpwo_dist(log=None, console=None) -> tuple[bool, str]:
                         return False, f"bundle contains an unsafe path: {entry!r}"
                 zf.extractall(tmpdir)
         except zipfile.BadZipFile:
-            return False, "the Helpwo bundle is not a valid zip"
+            return False, "the Helpwow bundle is not a valid zip"
 
         # Verify EVERY file, not just the changed ones: the directory is
         # swapped wholesale, so anything unverified would go live too.
         for name, meta in manifest.get("files", {}).items():
             src = os.path.join(tmpdir, name)
             if not os.path.exists(src):
-                return False, f"{name} is missing from the Helpwo bundle"
+                return False, f"{name} is missing from the Helpwow bundle"
             if _sha256_file(src) != meta.get("sha256"):
                 return False, f"checksum mismatch for {name}"
 
@@ -856,7 +856,7 @@ def install_helpwo_dist(log=None, console=None) -> tuple[bool, str]:
                     os.rename(previous, target)
                 except OSError:
                     pass
-            return False, f"could not install the Helpwo UI: {e}"
+            return False, f"could not install the Helpwow UI: {e}"
         finally:
             shutil.rmtree(previous, ignore_errors=True)
             shutil.rmtree(staging, ignore_errors=True)
@@ -866,6 +866,6 @@ def install_helpwo_dist(log=None, console=None) -> tuple[bool, str]:
                 json.dump(manifest, fh)
         except OSError:
             pass
-        return True, f"Helpwo UI {version} installed to {target}"
+        return True, f"Helpwow UI {version} installed to {target}"
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

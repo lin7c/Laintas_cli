@@ -166,7 +166,7 @@ class DoneGateTests(unittest.TestCase):
 
 
 class MediaTests(unittest.TestCase):
-    """Helpwo may put reference media in a description; the terminal does not show it."""
+    """Helpwow may put reference media in a description; the terminal does not show it."""
 
     TEXT = ("Open the settings page.\n"
             "![callback settings](refs/callback.png)\n"

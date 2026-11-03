@@ -23,9 +23,8 @@ This module adds a lazy, file-system based coordination layer:
   L2 write log     — successful writes are appended to a per-day jsonl so a
                      change can be attributed to the instance that made it.
 
-Everything is inert for a single instance: the only costs are one atomic
-registration write at startup, one mtime refresh and one tiny listdir per
-agent turn.  Fingerprint tracking, the write log and the conflict checks
+File accesses always share a per-path process lock, so a read and its recorded
+fingerprint describe the same version. Fingerprint tracking, the write log and the conflict checks
 activate only after a second live peer is detected (or an explicit
 `peer_coordination: off` runtime config forces them off).
 """
@@ -40,10 +39,12 @@ import re
 import stat
 import time
 import uuid
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Optional
 
 import paths
+import file_lock
 
 # Tuneables
 _HEARTBEAT_STALE_SECS = 600      # a registration file this old is dead (10 min)
@@ -54,6 +55,53 @@ _WRITES_RETENTION_DAYS = 3
 _WRITE_ENTRY_MAX_BYTES = 65536   # cap a single log line
 _ETAG_CONTENT_CAP = 262144       # files ≤256KB get a content hash in their etag
 _SHELL_CHANGE_LIMIT = 40         # max files one post-shell scan reports
+_FILE_LOCK_SLOTS = 1024         # bound persistent sidecars across all accessed paths
+
+
+@contextmanager
+def write_guard(*filenames):
+    """Serialize cooperating writers from their first read through commit.
+
+    Locks live in the shared instance directory, outside the files being
+    replaced. Stable hash slots bound metadata growth; collisions only
+    serialize unrelated accesses. Resolve aliases and sort lock paths to give
+    multi-path moves the same order. Sidecars must never be unlinked.
+    """
+    lock_dir = paths.INSTANCES_DIR / "file-locks"
+    locks = {
+        lock_dir / f"{int(hashlib.sha256(os.fsencode(os.path.realpath(name))).hexdigest(), 16) % _FILE_LOCK_SLOTS:04x}.lock"
+        for name in filenames
+    }
+    with ExitStack() as stack:
+        for lock in sorted(locks):
+            stack.enter_context(file_lock.guard(lock, rank=file_lock.WORKSPACE))
+        yield
+
+
+def write_bytes_atomically(filename, data: bytes) -> None:
+    """Commit complete file contents while preserving mode and symlink targets.
+
+    The caller holds write_guard through its read/check/write operation.
+    Atomic replacement alone does not protect against a stale snapshot.
+    """
+    target = Path(os.path.realpath(filename))
+    # A valid target basename can already consume NAME_MAX bytes.
+    tmp = target.with_name(f".laintas-write-{uuid.uuid4().hex}.tmp")
+    try:
+        try:
+            mode = stat.S_IMODE(target.stat().st_mode)
+        except FileNotFoundError:
+            mode = None
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            if mode is not None:
+                os.fchmod(stream.fileno(), mode)
+            os.fsync(stream.fileno())
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _stat_triple(abs_path: str):
@@ -115,11 +163,11 @@ class _PeerCoordinator:
         self._last_scan = 0.0
         self._last_heartbeat = 0.0
         # Writers sharing this process's working directory that are NOT this
-        # process's agent loop — today that means an attached Helpwo, reaching
+        # process's agent loop — today that means an attached Helpwow, reaching
         # the disk through the P2P filesystem RPC or the local bridge.
         #
         # Without this, two AIs editing one repo through one CLI were invisible
-        # to each other: the peer scan counts processes, and Helpwo's writes
+        # to each other: the peer scan counts processes, and Helpwow's writes
         # land inside this one. A frontend agent and a backend agent would then
         # silently overwrite each other's edits with no error on either side,
         # which is exactly the case this module exists to prevent.
@@ -160,7 +208,7 @@ class _PeerCoordinator:
                 return
 
     def attach_actor(self, actor: str) -> None:
-        """Declare a second writer inside this process (e.g. an attached Helpwo).
+        """Declare a second writer inside this process (e.g. an attached Helpwow).
 
         Coordination activates immediately: unlike a peer process, an actor is
         known the moment it connects, so there is nothing to discover by
@@ -284,7 +332,7 @@ class _PeerCoordinator:
         file was previously read by this actor and its etag differs now.
         Zero overhead (no tracking) while coordination is inactive.
 
-        `actor` defaults to this process's agent loop. An attached Helpwo
+        `actor` defaults to this process's agent loop. An attached Helpwow
         passes its own id so the two keep separate views of the same file:
         each is protected against the other's edits, and neither trips over
         its own.
@@ -746,23 +794,23 @@ def uuid_hex() -> str:
     return uuid.uuid4().hex[:8]
 
 
-# ── External writers (Helpwo over P2P or the local bridge) ─────────────
+# ── External writers (Helpwow over P2P or the local bridge) ─────────────
 #
-# Helpwo edits the same working directory as the CLI's own agent loop, but it
-# does so *through this process* — the P2P filesystem RPC this CLI used to host (now the Helpwo kernel's)
+# Helpwow edits the same working directory as the CLI's own agent loop, but it
+# does so *through this process* — the P2P filesystem RPC this CLI used to host (now the Helpwow kernel's)
 # and the /api/local-fs endpoints in helpwo_server.py both write the disk from
 # inside the CLI. That made the two agents invisible to each other here: the
 # activation scan counts processes, and both writers live in one.
 #
 # These wrappers give an external client its own actor identity so the same
 # L1 compare-and-swap and L2 write log that protect two CLI instances from
-# each other now also protect a Helpwo frontend agent and a CLI backend agent
+# each other now also protect a Helpwow frontend agent and a CLI backend agent
 # working the same repository. Every one of them is best-effort: coordination
 # is an accuracy improvement, never a reason for a file operation to fail
 # because the bookkeeping itself broke.
 
 # The two transports attach independently: a user can have the local bridge
-# serving this machine's browser AND a remote Helpwo peered in at the same
+# serving this machine's browser AND a remote Helpwow peered in at the same
 # time. Sharing one actor name would let either one's teardown revoke the
 # other's protection, so each gets its own.
 HELPWO_ACTOR = "helpwo"
@@ -802,8 +850,8 @@ def guard_external_write(abs_path: str, actor: str = HELPWO_ACTOR) -> Optional[s
     """
     try:
         return get_coord().assert_unchanged(abs_path, actor=actor)
-    except Exception:
-        return None
+    except Exception as exc:
+        return f"file coordination unavailable: {exc}"
 
 
 def note_external_write(abs_path: str, op: str = "write",

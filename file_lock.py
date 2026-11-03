@@ -1,7 +1,8 @@
 """Per-file reentrant thread/process locks with an enforced lock order.
 
 Acquire STORE (handoff/profile/adoption) -> SESSION (lifecycle) -> CLAIM
-(lease/GC). Different locks of the same rank follow canonical path order.
+(lease/GC) -> WORKSPACE (file mutations). Different locks of the same rank
+follow canonical path order.
 Reentering an already held file is allowed. Never unlink a lock sidecar while
 it may be held: a replacement inode would be a different process lock.
 """
@@ -14,6 +15,7 @@ import weakref
 STORE = 10
 SESSION = 20
 CLAIM = 30
+WORKSPACE = 40
 _registry_mutex = threading.Lock()
 _locks = weakref.WeakValueDictionary()
 _local = threading.local()
@@ -48,7 +50,7 @@ def guard(path, *, rank=STORE):
         return
     order = (rank, key)
     if held and order <= max(held.values()):
-        raise LockOrderError("Lock order must be STORE -> SESSION -> CLAIM, then canonical path order")
+        raise LockOrderError("Lock order must be STORE -> SESSION -> CLAIM -> WORKSPACE, then canonical path order")
     # This mutex only protects the lock table. Never wait on a file or run a
     # caller's critical section while holding it.
     with _registry_mutex:

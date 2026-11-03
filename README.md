@@ -30,7 +30,7 @@ Current release: [Laintas CLI beta v4 (1.32.5b4)](https://github.com/lin7c/Laint
 - Modes, roles, workflow phases, policy, trust, and hooks constrain execution in layers.
 - Project memory, plans, events, traces, tasks, and workflow state survive restarts.
 - Official, custom, and local backends have separate credential boundaries.
-- Browser automation, Helpwo, shared storage, and Enterprise integrations are optional.
+- Browser automation, Helpwow, shared storage, and Enterprise integrations are optional.
 
 ## Install and Start
 
@@ -63,7 +63,7 @@ interrupts otherwise, and Ctrl+V pastes.
 
 The macOS build is a native terminal CLI for Apple Silicon (`arm64`) and Intel
 (`x86_64`). The installer detects the architecture automatically and verifies
-the archive's SHA-256 checksum. It does not include Helpwo Kernel or Helpwo
+the archive's SHA-256 checksum. It does not include Helpwow Kernel or Helpwow
 machine sharing:
 
 ```bash
@@ -517,7 +517,7 @@ Role selection and routing never broaden the parent's tool permissions.
 | Execution | `/term`, `/spawn`, `/agents`, `/task` | Terminals, delegated agents, and task tracking |
 | Workflows | `/hwo`, `/hwg` | Live orchestration and durable graph execution |
 | Plugins | `/mcp`, `/extensions`, `/evolve`, `/reload`, `/trust` | External tools and executable customization |
-| Connectivity | `/backend`, `/web`, `/identity`, `/helpwo`, `/shared` | Inference, search/fetch, browser identity, the cloud folder, and Helpwo sharing where a kernel is available |
+| Connectivity | `/backend`, `/web`, `/identity`, `/helpwo`, `/shared` | Inference, search/fetch, browser identity, the cloud folder, and Helpwow sharing where a kernel is available |
 | Applications | `/app` | Run a registered application in its own sub-terminal with its own agent |
 | Administration | `/policy`, `/usage`, `/training`, `/v`, `/org` | Policy, allowance, data preference, updates, Enterprise |
 
@@ -529,7 +529,7 @@ before switching. A refresh of the current login keeps its task; a login as a
 different account switches environments instead of changing a running task's
 credentials. Run `laintas-cli --account A` and `laintas-cli --account B` in
 separate terminals for concurrent work. Separate Git worktrees are appropriate
-when both tasks edit code. Helpwo linking still requires the kernel and CLI to
+when both tasks edit code. Helpwow linking still requires the kernel and CLI to
 use the same account.
 
 Account switches validate the restart executable before saving or shutting
@@ -603,7 +603,7 @@ automatically, using the creator's consent.
 Only two terminal levels are permitted: an executor cannot acquire execution
 children, and a controller with children cannot itself become an executor.
 Local pairing permits different accounts with explicit acceptance; remote
-pairing requires the same account and updated Helpwo kernel/gateway support.
+pairing requires the same account and updated Helpwow kernel/gateway support.
 `/term release A` in B, or `/term release` in A, revokes the relationship
 without terminating an independently started CLI. Lost contact expires the
 execution lease after 30 seconds and requests cancellation of delegated work;
@@ -660,9 +660,9 @@ closes that view. Protected browser autofill remains unavailable.
 
 ### Hosted applications: `/helpwo` and `/app`
 
-The CLI no longer installs, starts or communicates with Helpwo Kernel.
+The CLI no longer installs, starts or communicates with Helpwow Kernel.
 `/helpwo` retains its hosted-application entry point; remote machine sharing
-is unavailable without a separately supplied host adapter. The Helpwo
+is unavailable without a separately supplied host adapter. The Helpwow
 desktop application for Windows is a separate product with its own kernel
 integration and chat UI; it is not laintas-cli-windows.
 
@@ -775,14 +775,14 @@ published. Installers live at `cli.laintas.com/windows-cli/<release>/`, and
 `windows-cli/download.json` names the one `install.ps1` installs. A newer
 version is installed by running its installer; the window does not update
 itself yet.
-`cli.laintas.com/windows/` belongs to the Helpwo desktop application and its
+`cli.laintas.com/windows/` belongs to the Helpwow desktop application and its
 signed updates; CLI releases must never overwrite that channel. Historical
 release notes below describe the builds shipped at the time.
 
 The current public release is [Laintas CLI v2.0.1](https://github.com/lin7c/Laintas_cli/releases/tag/v2.0.1)
 (tag `v2.0.1`). It is an ordinary GitHub Release, marked `latest`;
 its Python package version is `2.0.1`. The Mac package is an initial native
-CLI build without Helpwo Kernel. See [the release guide](build/RELEASE.md) for
+CLI build without Helpwow Kernel. See [the release guide](build/RELEASE.md) for
 build and verification details.
 
 ## Version History
@@ -846,7 +846,7 @@ The history below is curated from the repository tags and changes, following an 
 
 - Native macOS CLI archives for Apple Silicon and Intel, with an installer that
   detects the architecture and verifies the archive checksum.
-- Mac downloads mirrored on `cli.laintas.com`; no Helpwo Kernel in the Mac build.
+- Mac downloads mirrored on `cli.laintas.com`; no Helpwow Kernel in the Mac build.
 
 ### [v1.32.4](https://github.com/lin7c/Laintas_cli/releases/tag/v1.32.4) — 2026-09-25
 
@@ -1255,7 +1255,7 @@ The history below is curated from the repository tags and changes, following an 
 
 **Added**
 
-- Added the shared-storage channel and `file_push` tool for Laintas Storage and Helpwo.
+- Added the shared-storage channel and `file_push` tool for Laintas Storage and Helpwow.
 - Added Enterprise installer extension roots.
 - Added organization policy and CLI call-pack configuration.
 
@@ -1280,8 +1280,8 @@ The history below is curated from the repository tags and changes, following an 
 
 **Changed**
 
-- Restricted the Helpwo local bridge to loopback by default and separated explicit remote exposure.
-- Added HTTPS support and reuse of CLI account, model, and usage state for Helpwo.
+- Restricted the Helpwow local bridge to loopback by default and separated explicit remote exposure.
+- Added HTTPS support and reuse of CLI account, model, and usage state for Helpwow.
 
 **Fixed**
 
@@ -1337,12 +1337,12 @@ The history below is curated from the repository tags and changes, following an 
 
 ### [v1.9.1](https://github.com/lin7c/Laintas_cli/releases/tag/v1.9.1) — 2026-07-23
 
-- Added the offline Helpwo runtime bridge.
+- Added the offline Helpwow runtime bridge.
 
 ### [v1.9.0](https://github.com/lin7c/Laintas_cli/releases/tag/v1.9.0) — 2026-07-21
 
 - Added full-screen Agents mode, auto-pilot, triggers, agent switching, cascade abort, and multi-agent working-directory handling.
-- Added WebRTC security controls, update-integrity checks, Markdown themes, the `/told` browser, Helpwo commands, and Esc soft interruption.
+- Added WebRTC security controls, update-integrity checks, Markdown themes, the `/told` browser, Helpwow commands, and Esc soft interruption.
 - Hardened concurrency, state corruption recovery, memory cleanup, tool rendering, and slash-command handling.
 
 </details>

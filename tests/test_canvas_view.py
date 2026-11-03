@@ -95,13 +95,13 @@ class EmptyBoardTests(unittest.TestCase):
     def _empty(self, **kw):
         return canvas_view.CanvasViewer(
             ic.Scene(title="fresh"), title="fresh.excalidraw",
-            empty_hint=["draw on it in Helpwo", ""], output=DummyOutput(), **kw)
+            empty_hint=["draw on it in Helpwow", ""], output=DummyOutput(), **kw)
 
     def test_an_empty_scene_opens_and_says_so(self):
         viewer = self._empty()
         text = "".join(t for _s, t in viewer._canvas_fragments())
         self.assertIn("empty board", text)
-        self.assertIn("draw on it in Helpwo", text)
+        self.assertIn("draw on it in Helpwow", text)
 
     def test_open_scene_refuses_an_empty_scene_unless_asked(self):
         self.assertFalse(canvas_view.open_scene(ic.Scene()))
@@ -343,7 +343,7 @@ class DrawingTests(unittest.TestCase):
         self.assertFalse(viewer.typing_label)
 
     def test_an_edit_refused_by_a_concurrent_write_is_reported(self):
-        """Helpwo saved the board while it was open here."""
+        """Helpwow saved the board while it was open here."""
         canvas_edit = extension_module("canvas", "canvas_edit")
         theirs = self.canvas.empty_scene()
         theirs["elements"] = [canvas_edit.shape("ellipse", 0, 0, 20, 20)]

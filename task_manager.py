@@ -209,49 +209,50 @@ def update_task(task_id: str, *, cwd: str = None, session_id: str = None,
     """
     with _lock:
         try:
-            work = _active_work(cwd, session_id)
-            target = workgraph.get_step(
-                work["id"], str(task_id), cwd=cwd, session_id=session_id,
-                owner_agent_id=owner_agent_id)
-            if target is None:
-                return False, f"Task '{task_id}' not found", None
+            with workgraph.transaction(cwd):
+                work = _active_work(cwd, session_id)
+                target = workgraph.get_step(
+                    work["id"], str(task_id), cwd=cwd, session_id=session_id,
+                    owner_agent_id=owner_agent_id)
+                if target is None:
+                    return False, f"Task '{task_id}' not found", None
 
-            if "addSubtask" in kwargs:
-                value = kwargs["addSubtask"]
-                subject = value.get("subject", "Subtask") if isinstance(value, dict) else str(value)
-                description = value.get("description", "") if isinstance(value, dict) else ""
-                workgraph.create_step(
-                    work["id"], subject, description, cwd=cwd,
-                    metadata=({"_session_key": _session_key}
-                              if target.get("session_only") else None),
-                    session_only=bool(target.get("session_only")), parent_id=str(task_id),
-                    session_id=session_id, owner_agent_id=owner_agent_id,
-                    parent_agent_id=parent_agent_id)
+                if "addSubtask" in kwargs:
+                    value = kwargs["addSubtask"]
+                    subject = value.get("subject", "Subtask") if isinstance(value, dict) else str(value)
+                    description = value.get("description", "") if isinstance(value, dict) else ""
+                    workgraph.create_step(
+                        work["id"], subject, description, cwd=cwd,
+                        metadata=({"_session_key": _session_key}
+                                  if target.get("session_only") else None),
+                        session_only=bool(target.get("session_only")), parent_id=str(task_id),
+                        session_id=session_id, owner_agent_id=owner_agent_id,
+                        parent_agent_id=parent_agent_id)
 
-            for blocker in kwargs.get("addBlockedBy", []) or []:
-                workgraph.add_dependency(work["id"], str(task_id), str(blocker), cwd=cwd)
-            for blocked in kwargs.get("addBlocks", []) or []:
-                workgraph.add_dependency(work["id"], str(blocked), str(task_id), cwd=cwd)
-            for blocker in kwargs.get("removeBlockedBy", []) or []:
-                workgraph.remove_dependency(work["id"], str(task_id), str(blocker), cwd=cwd)
-            for blocked in kwargs.get("removeBlocks", []) or []:
-                workgraph.remove_dependency(work["id"], str(blocked), str(task_id), cwd=cwd)
+                for blocker in kwargs.get("addBlockedBy", []) or []:
+                    workgraph.add_dependency(work["id"], str(task_id), str(blocker), cwd=cwd)
+                for blocked in kwargs.get("addBlocks", []) or []:
+                    workgraph.add_dependency(work["id"], str(blocked), str(task_id), cwd=cwd)
+                for blocker in kwargs.get("removeBlockedBy", []) or []:
+                    workgraph.remove_dependency(work["id"], str(task_id), str(blocker), cwd=cwd)
+                for blocked in kwargs.get("removeBlocks", []) or []:
+                    workgraph.remove_dependency(work["id"], str(blocked), str(task_id), cwd=cwd)
 
-            fields = {key: kwargs[key] for key in
-                      ("status", "subject", "description", "metadata", "progress", "notes")
-                      if key in kwargs}
-            updated = workgraph.update_step(
-                work["id"], str(task_id), cwd=cwd, session_id=session_id,
-                owner_agent_id=owner_agent_id, parent_agent_id=parent_agent_id,
-                **fields) if fields or parent_agent_id is not None else (
-                    workgraph.get_step(
-                        work["id"], str(task_id), cwd=cwd, session_id=session_id,
-                        owner_agent_id=owner_agent_id) or {})
-            remaining = [item for item in workgraph.list_steps(work["id"], cwd=cwd)
-                         if item.get("status") not in {"completed", "skipped", "deleted"}]
-            if not remaining and work.get("status") == "EXECUTING":
-                workgraph.update_work(work["id"], cwd=cwd, status="VERIFYING")
-            return True, f"Updated task {task_id}", _compat(updated)
+                fields = {key: kwargs[key] for key in
+                          ("status", "subject", "description", "metadata", "progress", "notes")
+                          if key in kwargs}
+                updated = workgraph.update_step(
+                    work["id"], str(task_id), cwd=cwd, session_id=session_id,
+                    owner_agent_id=owner_agent_id, parent_agent_id=parent_agent_id,
+                    **fields) if fields or parent_agent_id is not None else (
+                        workgraph.get_step(
+                            work["id"], str(task_id), cwd=cwd, session_id=session_id,
+                            owner_agent_id=owner_agent_id) or {})
+                remaining = [item for item in workgraph.list_steps(work["id"], cwd=cwd)
+                             if item.get("status") not in {"completed", "skipped", "deleted"}]
+                if not remaining and work.get("status") == "EXECUTING":
+                    workgraph.update_work(work["id"], cwd=cwd, status="VERIFYING")
+                return True, f"Updated task {task_id}", _compat(updated)
         except (workgraph.WorkGraphError, workgraph.WorkGraphConflict) as exc:
             return False, str(exc), None
 

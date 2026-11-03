@@ -4743,8 +4743,8 @@
       "category": "message candidate",
       "sink": "dict",
       "field": "error",
-      "template": "local Helpwo bridge: host not allowed",
-      "source_template": "local Helpwo bridge: host not allowed"
+      "template": "local Helpwow bridge: host not allowed",
+      "source_template": "local Helpwow bridge: host not allowed"
     },
     {
       "file": "helpwo_server.py",
@@ -7755,8 +7755,8 @@
       "category": "command/help",
       "sink": "CommandSpec",
       "field": "/helpwo:description",
-      "template": "Start the local Helpwo companion in its own sub-terminal; /helpwo stop closes it",
-      "source_template": "Start the local Helpwo companion in its own sub-terminal; /helpwo stop closes it"
+      "template": "Start the local Helpwow companion in its own sub-terminal; /helpwo stop closes it",
+      "source_template": "Start the local Helpwow companion in its own sub-terminal; /helpwo stop closes it"
     },
     {
       "file": "laintas_cli.py",
@@ -7865,8 +7865,8 @@
       "category": "command/help",
       "sink": "CommandSpec",
       "field": "/app:help_text",
-      "template": "Applications are described by manifests in ~/.laintas/apps/*.json or ./.laintas/apps/*.json: name, description, command, prompt, persistence (none|workspace), port. Starting one creates a sub-terminal of the same name whose agent serves only that application, and a loopback bridge that exposes nothing but the conversation (send chat/abort/approval-response, poll updates). The manifest's command is started with LAINTAS_APP_BRIDGE_URL, LAINTAS_APP_TOKEN and LAINTAS_APP_AGENT_ID in its environment. A manifest must be trusted before it can start, and again after it changes. Helpwo is not an /app; use /helpwo.",
-      "source_template": "Applications are described by manifests in ~/.laintas/apps/*.json or ./.laintas/apps/*.json: name, description, command, prompt, persistence (none|workspace), port. Starting one creates a sub-terminal of the same name whose agent serves only that application, and a loopback bridge that exposes nothing but the conversation (send chat/abort/approval-response, poll updates). The manifest's command is started with LAINTAS_APP_BRIDGE_URL, LAINTAS_APP_TOKEN and LAINTAS_APP_AGENT_ID in its environment. A manifest must be trusted before it can start, and again after it changes. Helpwo is not an /app; use /helpwo."
+      "template": "Applications are described by manifests in ~/.laintas/apps/*.json or ./.laintas/apps/*.json: name, description, command, prompt, persistence (none|workspace), port. Starting one creates a sub-terminal of the same name whose agent serves only that application, and a loopback bridge that exposes nothing but the conversation (send chat/abort/approval-response, poll updates). The manifest's command is started with LAINTAS_APP_BRIDGE_URL, LAINTAS_APP_TOKEN and LAINTAS_APP_AGENT_ID in its environment. A manifest must be trusted before it can start, and again after it changes. Helpwow is not an /app; use /helpwo.",
+      "source_template": "Applications are described by manifests in ~/.laintas/apps/*.json or ./.laintas/apps/*.json: name, description, command, prompt, persistence (none|workspace), port. Starting one creates a sub-terminal of the same name whose agent serves only that application, and a loopback bridge that exposes nothing but the conversation (send chat/abort/approval-response, poll updates). The manifest's command is started with LAINTAS_APP_BRIDGE_URL, LAINTAS_APP_TOKEN and LAINTAS_APP_AGENT_ID in its environment. A manifest must be trusted before it can start, and again after it changes. Helpwow is not an /app; use /helpwo."
     },
     {
       "file": "laintas_cli.py",
@@ -8125,8 +8125,8 @@
       "category": "command/help",
       "sink": "CommandSpec",
       "field": "/shared:description",
-      "template": "Share files with Helpwo through Laintas storage",
-      "source_template": "Share files with Helpwo through Laintas storage"
+      "template": "Share files with Helpwow through Laintas storage",
+      "source_template": "Share files with Helpwow through Laintas storage"
     },
     {
       "file": "laintas_cli.py",
@@ -8235,8 +8235,8 @@
       "category": "command/help",
       "sink": "CommandSpec",
       "field": "/shared:help_text",
-      "template": "Reads and writes the same per-account storage Helpwo mounts as its \"Laintas Storage\" cloud folder: push a file here and it is in the Helpwo file tree, pull one that Helpwo wrote. Unlike /helpwo --remote, it does not need a live link and it outlives this process — the files sit on the server. Storage above the plan's free allowance is billed monthly; /shared usage shows where you stand.",
-      "source_template": "Reads and writes the same per-account storage Helpwo mounts as its \"Laintas Storage\" cloud folder: push a file here and it is in the Helpwo file tree, pull one that Helpwo wrote. Unlike /helpwo --remote, it does not need a live link and it outlives this process — the files sit on the server. Storage above the plan's free allowance is billed monthly; /shared usage shows where you stand."
+      "template": "Reads and writes the same per-account storage Helpwow mounts as its \"Laintas Storage\" cloud folder: push a file here and it is in the Helpwow file tree, pull one that Helpwow wrote. Unlike /helpwo --remote, it does not need a live link and it outlives this process — the files sit on the server. Storage above the plan's free allowance is billed monthly; /shared usage shows where you stand.",
+      "source_template": "Reads and writes the same per-account storage Helpwow mounts as its \"Laintas Storage\" cloud folder: push a file here and it is in the Helpwow file tree, pull one that Helpwow wrote. Unlike /helpwo --remote, it does not need a live link and it outlives this process — the files sit on the server. Storage above the plan's free allowance is billed monthly; /shared usage shows where you stand."
     },
     {
       "file": "laintas_cli.py",
@@ -11116,8 +11116,8 @@
       "category": "output",
       "sink": "console.print",
       "field": "0",
-      "template": "Listening for remote messages from Helpwo...",
-      "source_template": "[dim]Listening for remote messages from Helpwo...[/dim]"
+      "template": "Listening for remote messages from Helpwow...",
+      "source_template": "[dim]Listening for remote messages from Helpwow...[/dim]"
     },
     {
       "file": "laintas_cli.py",
@@ -11136,9 +11136,9 @@
       "category": "resolved output candidate",
       "sink": "console.print",
       "field": "",
-      "template": "Remote message from {'the application' if self.app_mode is not None else 'Helpwo'}:\n{escape(content)}",
-      "source_template": "[bold cyan]Remote message from {'the application' if self.app_mode is not None else 'Helpwo'}:[/bold cyan]\n{escape(content)}",
-      "expression": "Panel(f'[bold cyan]Remote message from {('the application' if self.app_mode is not None else 'Helpwo')}:[/bold cyan]\\n{escape(content)}', title='Incoming', border_style='cyan')"
+      "template": "Remote message from {'the application' if self.app_mode is not None else 'Helpwow'}:\n{escape(content)}",
+      "source_template": "[bold cyan]Remote message from {'the application' if self.app_mode is not None else 'Helpwow'}:[/bold cyan]\n{escape(content)}",
+      "expression": "Panel(f'[bold cyan]Remote message from {('the application' if self.app_mode is not None else 'Helpwow')}:[/bold cyan]\\n{escape(content)}', title='Incoming', border_style='cyan')"
     },
     {
       "file": "laintas_cli.py",
@@ -11279,9 +11279,9 @@
       "category": "resolved output candidate",
       "sink": "console.print",
       "field": "",
-      "template": "Helpwo created sub-terminal {name}\nIt will hand itself over to Helpwo once it finishes starting.",
-      "source_template": "[bold cyan]Helpwo created sub-terminal [bold]{name}[/bold][/bold cyan]\n[dim]It will hand itself over to Helpwo once it finishes starting.[/dim]",
-      "expression": "Panel(f'[bold cyan]Helpwo created sub-terminal [bold]{name}[/bold][/bold cyan]\\n[dim]It will hand itself over to Helpwo once it finishes starting.[/dim]', title='Remote Terminal', border_style='cyan')"
+      "template": "Helpwow created sub-terminal {name}\nIt will hand itself over to Helpwow once it finishes starting.",
+      "source_template": "[bold cyan]Helpwow created sub-terminal [bold]{name}[/bold][/bold cyan]\n[dim]It will hand itself over to Helpwow once it finishes starting.[/dim]",
+      "expression": "Panel(f'[bold cyan]Helpwow created sub-terminal [bold]{name}[/bold][/bold cyan]\\n[dim]It will hand itself over to Helpwow once it finishes starting.[/dim]', title='Remote Terminal', border_style='cyan')"
     },
     {
       "file": "laintas_cli.py",
@@ -11300,8 +11300,8 @@
       "category": "output",
       "sink": "console.print",
       "field": "0",
-      "template": "Helpwo closed this sub-terminal.",
-      "source_template": "[yellow]Helpwo closed this sub-terminal.[/yellow]"
+      "template": "Helpwow closed this sub-terminal.",
+      "source_template": "[yellow]Helpwow closed this sub-terminal.[/yellow]"
     },
     {
       "file": "laintas_cli.py",
@@ -11310,9 +11310,9 @@
       "category": "resolved output candidate",
       "sink": "console.print",
       "field": "",
-      "template": "Helpwo closed sub-terminal {name}",
-      "source_template": "[yellow]Helpwo closed sub-terminal [bold]{name}[/bold][/yellow]",
-      "expression": "Panel(f'[yellow]Helpwo closed sub-terminal [bold]{name}[/bold][/yellow]', title='Remote Terminal', border_style='yellow')"
+      "template": "Helpwow closed sub-terminal {name}",
+      "source_template": "[yellow]Helpwow closed sub-terminal [bold]{name}[/bold][/yellow]",
+      "expression": "Panel(f'[yellow]Helpwow closed sub-terminal [bold]{name}[/bold][/yellow]', title='Remote Terminal', border_style='yellow')"
     },
     {
       "file": "laintas_cli.py",
@@ -11331,9 +11331,9 @@
       "category": "resolved output candidate",
       "sink": "console.print",
       "field": "",
-      "template": "Helpwo disconnected this terminal.\nThe CLI keeps running locally. Run /helpwo to connect again.",
-      "source_template": "[yellow]Helpwo disconnected this terminal.[/yellow]\n[dim]The CLI keeps running locally. Run /helpwo to connect again.[/dim]",
-      "expression": "Panel('[yellow]Helpwo disconnected this terminal.[/yellow]\\n[dim]The CLI keeps running locally. Run /helpwo to connect again.[/dim]', title='Disconnected', border_style='yellow')"
+      "template": "Helpwow disconnected this terminal.\nThe CLI keeps running locally. Run /helpwo to connect again.",
+      "source_template": "[yellow]Helpwow disconnected this terminal.[/yellow]\n[dim]The CLI keeps running locally. Run /helpwo to connect again.[/dim]",
+      "expression": "Panel('[yellow]Helpwow disconnected this terminal.[/yellow]\\n[dim]The CLI keeps running locally. Run /helpwo to connect again.[/dim]', title='Disconnected', border_style='yellow')"
     },
     {
       "file": "laintas_cli.py",
@@ -14623,8 +14623,8 @@
       "category": "output",
       "sink": "console.print",
       "field": "0",
-      "template": "Usage: /shared [list [path]|push <local> [remote]|pull <remote> [local]|rm <path>|mkdir <path>|mv <from> <to>|cp <from> <to>|usage]\nFiles land in the same storage Helpwo mounts as \"Laintas Storage\" — push here, open it there.",
-      "source_template": "Usage: [bold]/shared[/bold] [list \\[path]|push <local> \\[remote]|pull <remote> \\[local]|rm <path>|mkdir <path>|mv <from> <to>|cp <from> <to>|usage]\n[dim]Files land in the same storage Helpwo mounts as \"Laintas Storage\" — push here, open it there.[/dim]"
+      "template": "Usage: /shared [list [path]|push <local> [remote]|pull <remote> [local]|rm <path>|mkdir <path>|mv <from> <to>|cp <from> <to>|usage]\nFiles land in the same storage Helpwow mounts as \"Laintas Storage\" — push here, open it there.",
+      "source_template": "Usage: [bold]/shared[/bold] [list \\[path]|push <local> \\[remote]|pull <remote> \\[local]|rm <path>|mkdir <path>|mv <from> <to>|cp <from> <to>|usage]\n[dim]Files land in the same storage Helpwow mounts as \"Laintas Storage\" — push here, open it there.[/dim]"
     },
     {
       "file": "laintas_cli.py",
@@ -14723,8 +14723,8 @@
       "category": "output",
       "sink": "console.print",
       "field": "0",
-      "template": "Open it in Helpwo under Laintas Storage.",
-      "source_template": "[dim]Open it in Helpwo under Laintas Storage.[/dim]"
+      "template": "Open it in Helpwow under Laintas Storage.",
+      "source_template": "[dim]Open it in Helpwow under Laintas Storage.[/dim]"
     },
     {
       "file": "laintas_cli.py",
@@ -21794,8 +21794,8 @@
       "category": "output",
       "sink": "console.print",
       "field": "0",
-      "template": "This CLI isn't connected to Helpwo.",
-      "source_template": "[dim]This CLI isn't connected to Helpwo.[/dim]"
+      "template": "This CLI isn't connected to Helpwow.",
+      "source_template": "[dim]This CLI isn't connected to Helpwow.[/dim]"
     },
     {
       "file": "laintas_cli.py",
@@ -21804,8 +21804,8 @@
       "category": "output",
       "sink": "console.print",
       "field": "0",
-      "template": "Runtime environment {name} withdrawn from Helpwo (its terminal and files are no longer reachable there). Run /helpwo to connect again.",
-      "source_template": "[yellow]Runtime environment [bold]{name}[/bold] withdrawn from Helpwo (its terminal and files are no longer reachable there). Run /helpwo to connect again.[/yellow]"
+      "template": "Runtime environment {name} withdrawn from Helpwow (its terminal and files are no longer reachable there). Run /helpwo to connect again.",
+      "source_template": "[yellow]Runtime environment [bold]{name}[/bold] withdrawn from Helpwow (its terminal and files are no longer reachable there). Run /helpwo to connect again.[/yellow]"
     },
     {
       "file": "laintas_cli.py",
@@ -21814,8 +21814,8 @@
       "category": "output",
       "sink": "console.print",
       "field": "0",
-      "template": "Sub-terminal {name} withdrawn from Helpwo.",
-      "source_template": "[yellow]Sub-terminal [bold]{name}[/bold] withdrawn from Helpwo.[/yellow]"
+      "template": "Sub-terminal {name} withdrawn from Helpwow.",
+      "source_template": "[yellow]Sub-terminal [bold]{name}[/bold] withdrawn from Helpwow.[/yellow]"
     },
     {
       "file": "laintas_cli.py",
@@ -22136,8 +22136,8 @@
       "category": "output",
       "sink": "console.print",
       "field": "0",
-      "template": "Helpwo sub-terminal closed (its agent and local API with it).",
-      "source_template": "[yellow]Helpwo sub-terminal closed (its agent and local API with it).[/yellow]"
+      "template": "Helpwow sub-terminal closed (its agent and local API with it).",
+      "source_template": "[yellow]Helpwow sub-terminal closed (its agent and local API with it).[/yellow]"
     },
     {
       "file": "laintas_cli.py",
@@ -22146,8 +22146,8 @@
       "category": "output",
       "sink": "console.print",
       "field": "0",
-      "template": "Helpwo local API stopped.",
-      "source_template": "[yellow]Helpwo local API stopped.[/yellow]"
+      "template": "Helpwow local API stopped.",
+      "source_template": "[yellow]Helpwow local API stopped.[/yellow]"
     },
     {
       "file": "laintas_cli.py",
@@ -22156,8 +22156,8 @@
       "category": "output",
       "sink": "console.print",
       "field": "0",
-      "template": "Helpwo is not running and this CLI isn't connected.",
-      "source_template": "[dim]Helpwo is not running and this CLI isn't connected.[/dim]"
+      "template": "Helpwow is not running and this CLI isn't connected.",
+      "source_template": "[dim]Helpwow is not running and this CLI isn't connected.[/dim]"
     },
     {
       "file": "laintas_cli.py",
@@ -22216,8 +22216,8 @@
       "category": "output",
       "sink": "console.print",
       "field": "0",
-      "template": "Helpwo has its own command: /helpwo",
-      "source_template": "[yellow]Helpwo has its own command: /helpwo[/yellow]"
+      "template": "Helpwow has its own command: /helpwo",
+      "source_template": "[yellow]Helpwow has its own command: /helpwo[/yellow]"
     },
     {
       "file": "laintas_cli.py",
@@ -26023,8 +26023,8 @@
       "category": "title/menu/help",
       "sink": "parser.add_argument",
       "field": "help",
-      "template": "Set agent name (shows in Helpwo AGNETS)",
-      "source_template": "Set agent name (shows in Helpwo AGNETS)"
+      "template": "Set agent name (shows in Helpwow AGNETS)",
+      "source_template": "Set agent name (shows in Helpwow AGNETS)"
     },
     {
       "file": "laintas_cli.py",
@@ -26193,8 +26193,8 @@
       "category": "title/menu/help",
       "sink": "parser.add_argument",
       "field": "help",
-      "template": "Helpwo backend agent id of the primary CLI that owns this sub-terminal",
-      "source_template": "Helpwo backend agent id of the primary CLI that owns this sub-terminal"
+      "template": "Helpwow backend agent id of the primary CLI that owns this sub-terminal",
+      "source_template": "Helpwow backend agent id of the primary CLI that owns this sub-terminal"
     },
     {
       "file": "laintas_cli.py",
@@ -26203,8 +26203,8 @@
       "category": "title/menu/help",
       "sink": "parser.add_argument",
       "field": "help",
-      "template": "Hand this sub-terminal over to Helpwo at startup (internal; used by term-new)",
-      "source_template": "Hand this sub-terminal over to Helpwo at startup (internal; used by term-new)"
+      "template": "Hand this sub-terminal over to Helpwow at startup (internal; used by term-new)",
+      "source_template": "Hand this sub-terminal over to Helpwow at startup (internal; used by term-new)"
     },
     {
       "file": "laintas_cli.py",
@@ -26473,8 +26473,8 @@
       "category": "startup/notice",
       "sink": "startup_mail.post",
       "field": "",
-      "template": "Not connected to Helpwo",
-      "source_template": "Not connected to Helpwo"
+      "template": "Not connected to Helpwow",
+      "source_template": "Not connected to Helpwow"
     },
     {
       "file": "laintas_cli.py",
@@ -26483,8 +26483,8 @@
       "category": "startup/notice",
       "sink": "startup_mail.post",
       "field": "",
-      "template": "Start the local Helpwo companion with /helpwo.",
-      "source_template": "Start the local Helpwo companion with /helpwo."
+      "template": "Start the local Helpwow companion with /helpwo.",
+      "source_template": "Start the local Helpwow companion with /helpwo."
     },
     {
       "file": "laintas_cli.py",
@@ -26493,8 +26493,8 @@
       "category": "startup/notice",
       "sink": "startup_mail.post",
       "field": "",
-      "template": "This sub-terminal isn't linked to Helpwo yet.",
-      "source_template": "This sub-terminal isn't linked to Helpwo yet."
+      "template": "This sub-terminal isn't linked to Helpwow yet.",
+      "source_template": "This sub-terminal isn't linked to Helpwow yet."
     },
     {
       "file": "laintas_cli.py",
@@ -34386,8 +34386,8 @@
       "category": "message candidate",
       "sink": "dict",
       "field": "error",
-      "template": "missing 'target_agent_id' — the Helpwo agent to notify",
-      "source_template": "missing 'target_agent_id' — the Helpwo agent to notify"
+      "template": "missing 'target_agent_id' — the Helpwow agent to notify",
+      "source_template": "missing 'target_agent_id' — the Helpwow agent to notify"
     },
     {
       "file": "tools.py",
@@ -37486,8 +37486,8 @@
       "category": "title/menu/help",
       "sink": "Tool",
       "field": "description",
-      "template": "List a folder in Laintas Storage — the same cloud folder Helpwo mounts as \"Laintas Storage\" and the user manages with /shared. Omit 'path' for the root. This is remote storage, not this machine: use fs.ls for local files.",
-      "source_template": "List a folder in Laintas Storage — the same cloud folder Helpwo mounts as \"Laintas Storage\" and the user manages with /shared. Omit 'path' for the root. This is remote storage, not this machine: use fs.ls for local files."
+      "template": "List a folder in Laintas Storage — the same cloud folder Helpwow mounts as \"Laintas Storage\" and the user manages with /shared. Omit 'path' for the root. This is remote storage, not this machine: use fs.ls for local files.",
+      "source_template": "List a folder in Laintas Storage — the same cloud folder Helpwow mounts as \"Laintas Storage\" and the user manages with /shared. Omit 'path' for the root. This is remote storage, not this machine: use fs.ls for local files."
     },
     {
       "file": "tools.py",
@@ -37496,8 +37496,8 @@
       "category": "tool/help",
       "sink": "Tool",
       "field": "description",
-      "template": "List a folder in Laintas Storage — the same cloud folder Helpwo mounts as \"Laintas Storage\" and the user manages with /shared. Omit 'path' for the root. This is remote storage, not this machine: use fs.ls for local files.",
-      "source_template": "List a folder in Laintas Storage — the same cloud folder Helpwo mounts as \"Laintas Storage\" and the user manages with /shared. Omit 'path' for the root. This is remote storage, not this machine: use fs.ls for local files."
+      "template": "List a folder in Laintas Storage — the same cloud folder Helpwow mounts as \"Laintas Storage\" and the user manages with /shared. Omit 'path' for the root. This is remote storage, not this machine: use fs.ls for local files.",
+      "source_template": "List a folder in Laintas Storage — the same cloud folder Helpwow mounts as \"Laintas Storage\" and the user manages with /shared. Omit 'path' for the root. This is remote storage, not this machine: use fs.ls for local files."
     },
     {
       "file": "tools.py",
@@ -37526,8 +37526,8 @@
       "category": "title/menu/help",
       "sink": "Tool",
       "field": "description",
-      "template": "Upload one local file to Laintas Storage, where the user and their Helpwo sessions can open it. 'path' is the remote destination (defaults to the file's own name). To hand files to a specific Helpwo agent instead, use file_push.",
-      "source_template": "Upload one local file to Laintas Storage, where the user and their Helpwo sessions can open it. 'path' is the remote destination (defaults to the file's own name). To hand files to a specific Helpwo agent instead, use file_push."
+      "template": "Upload one local file to Laintas Storage, where the user and their Helpwow sessions can open it. 'path' is the remote destination (defaults to the file's own name). To hand files to a specific Helpwow agent instead, use file_push.",
+      "source_template": "Upload one local file to Laintas Storage, where the user and their Helpwow sessions can open it. 'path' is the remote destination (defaults to the file's own name). To hand files to a specific Helpwow agent instead, use file_push."
     },
     {
       "file": "tools.py",
@@ -37536,8 +37536,8 @@
       "category": "tool/help",
       "sink": "Tool",
       "field": "description",
-      "template": "Upload one local file to Laintas Storage, where the user and their Helpwo sessions can open it. 'path' is the remote destination (defaults to the file's own name). To hand files to a specific Helpwo agent instead, use file_push.",
-      "source_template": "Upload one local file to Laintas Storage, where the user and their Helpwo sessions can open it. 'path' is the remote destination (defaults to the file's own name). To hand files to a specific Helpwo agent instead, use file_push."
+      "template": "Upload one local file to Laintas Storage, where the user and their Helpwow sessions can open it. 'path' is the remote destination (defaults to the file's own name). To hand files to a specific Helpwow agent instead, use file_push.",
+      "source_template": "Upload one local file to Laintas Storage, where the user and their Helpwow sessions can open it. 'path' is the remote destination (defaults to the file's own name). To hand files to a specific Helpwow agent instead, use file_push."
     },
     {
       "file": "tools.py",
@@ -37586,8 +37586,8 @@
       "category": "title/menu/help",
       "sink": "Tool",
       "field": "description",
-      "template": "Delete a file or folder from Laintas Storage. Always asks the user first, in every policy mode: this store is shared with Helpwo and nothing here is covered by the local checkpoint.",
-      "source_template": "Delete a file or folder from Laintas Storage. Always asks the user first, in every policy mode: this store is shared with Helpwo and nothing here is covered by the local checkpoint."
+      "template": "Delete a file or folder from Laintas Storage. Always asks the user first, in every policy mode: this store is shared with Helpwow and nothing here is covered by the local checkpoint.",
+      "source_template": "Delete a file or folder from Laintas Storage. Always asks the user first, in every policy mode: this store is shared with Helpwow and nothing here is covered by the local checkpoint."
     },
     {
       "file": "tools.py",
@@ -37596,8 +37596,8 @@
       "category": "tool/help",
       "sink": "Tool",
       "field": "description",
-      "template": "Delete a file or folder from Laintas Storage. Always asks the user first, in every policy mode: this store is shared with Helpwo and nothing here is covered by the local checkpoint.",
-      "source_template": "Delete a file or folder from Laintas Storage. Always asks the user first, in every policy mode: this store is shared with Helpwo and nothing here is covered by the local checkpoint."
+      "template": "Delete a file or folder from Laintas Storage. Always asks the user first, in every policy mode: this store is shared with Helpwow and nothing here is covered by the local checkpoint.",
+      "source_template": "Delete a file or folder from Laintas Storage. Always asks the user first, in every policy mode: this store is shared with Helpwow and nothing here is covered by the local checkpoint."
     },
     {
       "file": "tools.py",
@@ -37606,8 +37606,8 @@
       "category": "title/menu/help",
       "sink": "Tool",
       "field": "description",
-      "template": "Push local files to Laintas shared cloud storage (R2) and notify a Helpwo agent. Files are uploaded via presigned URLs — the gateway never touches the bytes. After upload, a 'file_push' message is sent to the target agent so it can download the files into its workspace.",
-      "source_template": "Push local files to Laintas shared cloud storage (R2) and notify a Helpwo agent. Files are uploaded via presigned URLs — the gateway never touches the bytes. After upload, a 'file_push' message is sent to the target agent so it can download the files into its workspace."
+      "template": "Push local files to Laintas shared cloud storage (R2) and notify a Helpwow agent. Files are uploaded via presigned URLs — the gateway never touches the bytes. After upload, a 'file_push' message is sent to the target agent so it can download the files into its workspace.",
+      "source_template": "Push local files to Laintas shared cloud storage (R2) and notify a Helpwow agent. Files are uploaded via presigned URLs — the gateway never touches the bytes. After upload, a 'file_push' message is sent to the target agent so it can download the files into its workspace."
     },
     {
       "file": "tools.py",
@@ -37616,8 +37616,8 @@
       "category": "tool/help",
       "sink": "Tool",
       "field": "description",
-      "template": "Push local files to Laintas shared cloud storage (R2) and notify a Helpwo agent. Files are uploaded via presigned URLs — the gateway never touches the bytes. After upload, a 'file_push' message is sent to the target agent so it can download the files into its workspace.",
-      "source_template": "Push local files to Laintas shared cloud storage (R2) and notify a Helpwo agent. Files are uploaded via presigned URLs — the gateway never touches the bytes. After upload, a 'file_push' message is sent to the target agent so it can download the files into its workspace."
+      "template": "Push local files to Laintas shared cloud storage (R2) and notify a Helpwow agent. Files are uploaded via presigned URLs — the gateway never touches the bytes. After upload, a 'file_push' message is sent to the target agent so it can download the files into its workspace.",
+      "source_template": "Push local files to Laintas shared cloud storage (R2) and notify a Helpwow agent. Files are uploaded via presigned URLs — the gateway never touches the bytes. After upload, a 'file_push' message is sent to the target agent so it can download the files into its workspace."
     },
     {
       "file": "tools.py",
@@ -39226,8 +39226,8 @@
       "category": "output",
       "sink": "emit",
       "field": "0",
-      "template": "Downloading Helpwo UI {version} ({len(changed)} file(s) differ)…",
-      "source_template": "Downloading Helpwo UI {version} ({len(changed)} file(s) differ)…"
+      "template": "Downloading Helpwow UI {version} ({len(changed)} file(s) differ)…",
+      "source_template": "Downloading Helpwow UI {version} ({len(changed)} file(s) differ)…"
     },
     {
       "file": "usage_tracker.py",

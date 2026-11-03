@@ -112,7 +112,8 @@ def decompose_task(task: str, strategy: str, timeout: float = 20.0) -> Optional[
     # Try LLM decomposition first.
     if _decompose_cb is not None:
         try:
-            result = _run_with_timeout(_decompose_cb, task, strategy, timeout)
+            result = _run_with_timeout(_decompose_cb, task, strategy, timeout,
+                                       timeout=timeout)
             if result and isinstance(result, list) and len(result) >= 2:
                 cleaned = [str(s).strip() for s in result if str(s).strip()]
                 if len(cleaned) >= 2:

@@ -928,7 +928,7 @@ def test_tool_nodes_are_refused_by_name(tmp_path, monkeypatch):
     result = hwg_runner.run_hwg_file(str(graph), deps=None, session={})
     assert result["ok"] is False
     assert "#render#" in result["msg"]
-    assert "only Helpwo executes" in result["msg"]
+    assert "only Helpwow executes" in result["msg"]
 
 
 class HwgInterruptTests(unittest.TestCase):

@@ -73,7 +73,7 @@ def capture(state, history, tasks, user_id, *, older_summary="", rules=None):
         "created_by": str(state.get("created_by", user_id)),
         "state": {key: copy.deepcopy(state[key]) for key in STATE_FIELDS if key in state},
         # Wire form, as the model was sent it: the receiving CLI resends it
-        # (prompt cache) and Helpwo's importer reads wire form directly.
+        # (prompt cache) and Helpwow's importer reads wire form directly.
         "chat_history": copy.deepcopy(history),
         "tasks": copy.deepcopy(tasks or []),
         "older_summary": str(older_summary or ""), "rules": copy.deepcopy(rules or []),

@@ -2,21 +2,19 @@
 
 This module intentionally uses a small project-local JSON store instead of a
 new WorkGraph schema migration. The state shape is stable JSON so both CLI
-commands and future Helpwo sync code can inspect or migrate it cheaply.
+commands and future Helpwow sync code can inspect or migrate it cheaply.
 """
 
 from __future__ import annotations
 
 import json
-import os
-import threading
 import time
 import uuid
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 
-import fcntl
+import file_lock
+import json_store
 
 
 RUNS_FILE = "workflow_runs.json"
@@ -38,10 +36,7 @@ def _read_json(path: Path, default: Any) -> Any:
 
 
 def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    json_store.save_json_atomic(path, value, newline=True, default=str)
 
 
 def _runs_path(cwd: Optional[str] = None) -> Path:
@@ -52,57 +47,9 @@ def _cache_path(cwd: Optional[str] = None) -> Path:
     return _project_dir(cwd) / CACHE_FILE
 
 
-# D3 (bughunt): every writer does an unlocked read-modify-write of the whole
-# runs/cache file, so concurrent writers (HWG frontier threads, two CLI
-# processes) silently dropped each other's records — 200 concurrent saves
-# left 37 on disk. Serialize the RMW with a per-path thread lock (same
-# process) plus an flock sidecar (across processes), the same pattern as
-# session_lifecycle.guard. Reentrant per-thread: nested save_run calls
-# (checkpoint -> save_run) share the outer hold.
-_thread_locks: dict = {}
-_thread_locks_guard = threading.Lock()
-_local = threading.local()
-
-
-@contextmanager
 def _store_lock(path: Path):
-    key = str(path)
-    with _thread_locks_guard:
-        lock = _thread_locks.setdefault(key, threading.RLock())
-    held = getattr(_local, "held", set())
-    if key in held:
-        yield
-        return
-    lock_path = path.with_name(path.name + ".lock")
-    with lock:
-        # Only ACQUIRING the file lock is allowed to fail softly. The yield
-        # must sit outside that try: an OSError raised by the caller's body
-        # (disk full in _write_json) used to land in the handler, which
-        # yielded a second time and turned it into "generator didn't stop
-        # after throw()".
-        lf = None
-        try:
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            lf = lock_path.open("a")
-            fcntl.flock(lf, fcntl.LOCK_EX)
-        except OSError:
-            # A lock-file failure must not break persistence: fall back to
-            # the thread lock alone (previous behaviour, minus same-process
-            # races).
-            if lf is not None:
-                lf.close()
-            lf = None
-        _local.held = held | {key}
-        try:
-            yield
-        finally:
-            _local.held = held
-            if lf is not None:
-                try:
-                    fcntl.flock(lf, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-                lf.close()
+    """Use the common reentrant process lock for each read/modify/write."""
+    return file_lock.guard(path.with_name(path.name + ".lock"))
 
 
 def new_run(kind: str, source: str, inputs: Optional[dict] = None, cwd: Optional[str] = None) -> dict:

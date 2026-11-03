@@ -3012,7 +3012,7 @@ class FinalTurnWrapUpTests(unittest.TestCase):
                 max_loops_override=max_loops, **kwargs)
 
     def test_override_alone_is_not_step_mode(self):
-        # Helpwo's chat/delegate paths pass max_loops_override for ordinary
+        # Helpwow's chat/delegate paths pass max_loops_override for ordinary
         # runs. Treating any override as STEP mode reported real exhaustion to
         # a remote caller as "press Enter for the next step".
         result = self._run_always_tooling(1)

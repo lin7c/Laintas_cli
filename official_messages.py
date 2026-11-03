@@ -50,8 +50,20 @@ _BODY_MAX = 1200
 
 _TIMEOUT = 5
 
+#: Deletions the site has not confirmed yet (offline, signed out, a 5xx).
+#: Retried on the next sync, and kept out of the list until then, so a
+#: message deleted here does not come back just because the network was down.
+PENDING_DELETES_FILE = paths.account_path("LAINTAS_HOME") / "messages-deleted.json"
+
 #: Only ever posted from one thread, but the cache write is not, so guard it.
 _LOCK = threading.RLock()
+
+#: What the last sync used, so a delete from the inbox can reach the same site.
+_remote: dict = {"session": None, "base_url": ""}
+#: L> key (``official:<slug>``) → server id (``o:<n>`` / ``s:<n>``).
+_ids: dict[str, str] = {}
+
+KEY_PREFIX = "official:"
 
 
 def auth_args(session: dict) -> dict | None:
@@ -88,6 +100,79 @@ def _save_cache(messages: list[dict]) -> None:
             pass
 
 
+def _load_pending() -> list[str]:
+    try:
+        with open(PENDING_DELETES_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return [str(i) for i in data if isinstance(i, str)] if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_pending(ids: list[str]) -> None:
+    with _LOCK:
+        try:
+            if not ids:
+                PENDING_DELETES_FILE.unlink(missing_ok=True)
+                return
+            PENDING_DELETES_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = PENDING_DELETES_FILE.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(sorted(set(ids)), handle)
+            os.replace(tmp, PENDING_DELETES_FILE)
+        except Exception:
+            pass
+
+
+def _delete_on_site(session: dict, base_url: str, message_id: str) -> bool:
+    """True once the site has the delete (or the message is already gone)."""
+    args = auth_args(session)
+    if not args or not base_url:
+        return False
+    try:
+        import requests
+        response = requests.post(
+            f"{base_url.rstrip('/')}/api/messages/delete",
+            json={"id": message_id},
+            timeout=_TIMEOUT, allow_redirects=False, **args,
+        )
+        # 200 with deleted=0 means "nothing of yours by that id" — done either way.
+        return response.status_code == 200
+    except Exception:
+        return False
+
+
+def _flush_pending(session: dict, base_url: str) -> list[str]:
+    """Retry unconfirmed deletes; returns the ones still pending."""
+    with _LOCK:
+        pending = _load_pending()
+        if not pending:
+            return []
+        left = [i for i in pending if not _delete_on_site(session, base_url, i)]
+        _save_pending(left)
+        return left
+
+
+def delete(keys) -> int:
+    """Delete these L> items from the account's inbox on the site as well.
+
+    Takes L> keys; anything that is not an official message is ignored, so a
+    caller can pass whatever it just removed locally. The request runs in the
+    background — the local list has already changed, and a failure only means
+    the delete is retried on the next start.
+    """
+    ids = [_ids[k] for k in keys if isinstance(k, str) and k.startswith(KEY_PREFIX) and k in _ids]
+    if not ids:
+        return 0
+    with _LOCK:
+        _save_pending(_load_pending() + ids)
+    session, base_url = _remote["session"], _remote["base_url"]
+    if session and base_url:
+        threading.Thread(target=_flush_pending, args=(session, base_url),
+                         daemon=True, name="official-messages-delete").start()
+    return len(ids)
+
+
 def fetch(session: dict, base_url: str, *, lang: str = "zh") -> list[dict] | None:
     """The account's live messages, or None when the site could not be asked."""
     args = auth_args(session)
@@ -117,7 +202,10 @@ def post(messages: list[dict]) -> int:
     unread again while an unchanged one stays read.
     """
     posted = 0
+    pending = set(_load_pending())
     for message in messages:
+        if str(message.get("id") or "") in pending:
+            continue
         slug = str(message.get("slug") or "").strip()
         title = str(message.get("title") or "").strip()
         if not slug or not title:
@@ -125,6 +213,9 @@ def post(messages: list[dict]) -> int:
         body = str(message.get("body") or "").strip()[:_BODY_MAX]
         action = str(message.get("actionUrl") or "").strip()
         digest = str(message.get("digest") or "")
+        message_id = str(message.get("id") or "")
+        if message_id:
+            _ids[f"{KEY_PREFIX}{slug}"] = message_id
         startup_mail.post(
             f"official:{slug}", title, body,
             action=f"laintas.com{action}" if action.startswith("/") else action,
@@ -139,6 +230,9 @@ def post(messages: list[dict]) -> int:
 
 def sync(session: dict, base_url: str, *, lang: str = "zh") -> int:
     """Fetch and post, falling back to the last successful fetch when offline."""
+    _remote.update(session=session, base_url=base_url)
+    # Deletes first, so the list fetched next already reflects them.
+    _flush_pending(session, base_url)
     messages = fetch(session, base_url, lang=lang)
     if messages is None:
         return post(_load_cache())

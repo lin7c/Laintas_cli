@@ -14,7 +14,7 @@ triggers:
 
 Complete the user's hosting task with tools. Write the manifest yourself with
 `app.manifest.put`; do not hand file placement back to the user. Each app runs
-in a nested CLI with its own primary agent. Helpwo uses `/helpwo`, not a manifest.
+in a nested CLI with its own primary agent. Helpwow uses `/helpwo`, not a manifest.
 
 ## Workflow
 

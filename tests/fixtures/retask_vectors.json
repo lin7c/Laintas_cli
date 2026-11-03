@@ -1,5 +1,5 @@
 {
-  "_comment": "Shared by laintas_cli (tests/test_retask.py) and Helpwo (scripts/retask-core.test.mjs). A .retask file must parse to the same thing on both sides; edit here and both suites check it.",
+  "_comment": "Shared by laintas_cli (tests/test_retask.py) and Helpwow (scripts/retask-core.test.mjs). A .retask file must parse to the same thing on both sides; edit here and both suites check it.",
   "tokenize": [
     {"line": "file_exists .env", "tokens": ["file_exists", ".env"]},
     {"line": "contains .env \"WECHAT_MCH_ID=\"", "tokens": ["contains", ".env", "WECHAT_MCH_ID="]},

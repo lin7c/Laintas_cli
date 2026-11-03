@@ -11,9 +11,9 @@ renders, then behaves strangely the moment somebody edits or undoes it.
 
 **A deletion is a tombstone.** Dropping the entry lets the element come back
 the next time an older copy of the scene is reconciled in. Same rule, same
-reason, as Helpwo's `canvasScene.ts`.
+reason, as Helpwow's `canvasScene.ts`.
 
-**Nobody owns the file.** Helpwo keeps an open board in its editor and writes
+**Nobody owns the file.** Helpwow keeps an open board in its editor and writes
 the file behind it; this writes the file directly. Neither can lock out the
 other, so every write here goes through ``canvas.write_scene(expect_mtime=)``
 — the board changing underneath turns into a refusal instead of into somebody
@@ -86,7 +86,7 @@ def new_id(prefix: str = "t") -> str:
 
 # Who the factories attribute new elements to. The person drawing in the
 # terminal is "cli"; an agent drawing on their behalf is "ai" plus a turn id,
-# which is what Helpwo's editor groups its Show / Keep / Undo banner by. Get
+# which is what Helpwow's editor groups its Show / Keep / Undo banner by. Get
 # this wrong and work the model did lands on someone's board with no way to
 # review it — the banner counts `author == "ai"` and nothing else.
 _AUTHOR: dict = {"author": "cli"}
@@ -450,7 +450,7 @@ class BoardEditor:
 
     ``author``/``turn`` stamp what this editor creates. A person drawing in
     the terminal is the author of their own work; an agent is not, and its
-    elements carry the tag Helpwo's review banner looks for.
+    elements carry the tag Helpwow's review banner looks for.
     """
 
     def __init__(self, path: str, canvas_mod, max_undo: int = 50,
@@ -493,7 +493,7 @@ class BoardEditor:
     def apply(self, elements: list) -> tuple[bool, str]:
         """Write a new element list. (ok, message).
 
-        A refusal means somebody else — Helpwo with this board open — wrote
+        A refusal means somebody else — Helpwow with this board open — wrote
         the file since it was read. The board on disk is theirs and is left
         alone; this reloads so the next edit starts from what is really there.
         """
@@ -592,7 +592,7 @@ class BoardEditor:
         """A whole diagram in one write.
 
         Batched deliberately: a caller drawing five boxes one call at a time
-        is five chances for Helpwo to save the board in between and have the
+        is five chances for Helpwow to save the board in between and have the
         rest refused, leaving half a diagram behind. One write either lands
         whole or does not land.
 

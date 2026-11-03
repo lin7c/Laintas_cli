@@ -33,6 +33,7 @@ import threading
 import time
 import traceback
 import difflib
+import functools
 import unicodedata
 import symbols                # Centralized UI symbol constants
 from contextlib import contextmanager, nullcontext
@@ -43,6 +44,7 @@ import child_registry
 import paths
 import durable_rules
 import git_attribution
+import peer_coordination
 from hwo_adapter import HWO_TOOL_DESCRIPTION
 
 
@@ -143,7 +145,7 @@ def infer_capabilities(name: str) -> frozenset[str]:
         caps.add("browser.mutate")
     if name.startswith("storage.") or name == "file_push":
         # Everything here crosses the network to an object store the user
-        # shares with Helpwo. The two transfer directions also touch this
+        # shares with Helpwow. The two transfer directions also touch this
         # machine, and are labeled for it: a download writes a local file, an
         # upload reads one and sends its contents off the box.
         caps.add("network")
@@ -1305,7 +1307,23 @@ def unknown_result_flags(result: dict) -> list:
                   if key.startswith("_") and key not in RESULT_FLAGS)
 
 
+def _serialized_file_access(function):
+    @functools.wraps(function)
+    def invoke(params, ctx):
+        path = params.get("path")
+        if not path:
+            return function(params, ctx)
+        absolute = os.path.abspath(os.path.join(ctx.cwd or os.getcwd(), path))
+        try:
+            with peer_coordination.write_guard(absolute):
+                return function(params, ctx)
+        except OSError as exc:
+            return {"ok": False, "error": str(exc), "path": absolute}
+    return invoke
+
+
 @private_files.guard("fs.read")
+@_serialized_file_access
 def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
     """Read a file as UTF-8 with optional line range and cat-style numbering.
 
@@ -1384,7 +1402,7 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
         limit = max(1, int(params.get("limit") or sys.maxsize))
 
     # ── Already in front of you? ──────────────────────────────────────────
-    # Helpwo refuses a read whose range it has already served; the piece it is
+    # Helpwow refuses a read whose range it has already served; the piece it is
     # missing is whether the model can still SEE that range, so after its
     # compaction the refusal outlives the content. Here the eviction
     # projection publishes exactly what survived into the request, so the
@@ -1423,7 +1441,7 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
             pass
 
     # A page of an unchanged file is byte-identical to what was delivered
-    # before, so serve it from the process cache (Helpwo's tryServeCachedView):
+    # before, so serve it from the process cache (Helpwow's tryServeCachedView):
     # no disk round-trip, and one page number can never yield two bodies.
     #
     # The geometry is part of the key, and has to be: the cache is shared by
@@ -1570,7 +1588,6 @@ def _bi_fs_read(params: dict, ctx: ToolCtx) -> dict:
         if _page_notice:
             result["note"] = "; ".join(_page_notice)
     try:
-        import peer_coordination
         note = peer_coordination.get_coord().note_read(abs_path)
         if note.get("changed"):
             result["external_change"] = (
@@ -1740,7 +1757,20 @@ def _describe_delete_target(abs_path: str) -> tuple[dict, Optional[str]]:
     }, None
 
 
+def _check_file_conflict(absolute):
+    try:
+        stale = peer_coordination.get_coord().assert_unchanged(absolute)
+    except Exception as exc:
+        stale = f"file coordination unavailable: {exc}"
+    if stale is not None:
+        return {"ok": False,
+                "error": f"Blocked by cross-instance coordination: {stale}",
+                "path": absolute}
+    return None
+
+
 @private_files.guard("fs.delete")
+@_serialized_file_access
 def _bi_fs_delete(params: dict, ctx: ToolCtx) -> dict:
     """Delete one file, symlink, or directory after explicit policy approval."""
     path = params.get("path")
@@ -1815,6 +1845,7 @@ def _bi_fs_delete(params: dict, ctx: ToolCtx) -> dict:
 
 
 @private_files.guard("fs.write")
+@_serialized_file_access
 def _bi_fs_write(params: dict, ctx: ToolCtx) -> dict:
     path = params.get("path")
     content = params.get("content", "")
@@ -1846,20 +1877,14 @@ def _bi_fs_write(params: dict, ctx: ToolCtx) -> dict:
 
     # Cross-instance coordination: CAS — refuse to overwrite a file that
     # changed since this instance last read it (silent lost-update guard).
-    try:
-        import peer_coordination
-        _stale = peer_coordination.get_coord().assert_unchanged(abs_path)
-        if _stale is not None:
-            return {"ok": False,
-                    "error": f"Blocked by cross-instance coordination: {_stale}",
-                    "path": abs_path}
-    except Exception:
-        pass
+    blocked = _check_file_conflict(abs_path)
+    if blocked is not None:
+        return blocked
 
     # mkdir -p for the parent chain. Deliberately last of the gates: policy,
     # contract scope and the CAS check have all already cleared abs_path, and
     # the directories created here are a prefix of that authorized path, so
-    # this widens no boundary. Helpwo's write has done this since
+    # this widens no boundary. Helpwow's write has done this since
     # fs/ensureParentDirs.ts; a write of "docs/x.md" into a fresh tree used to
     # succeed there and fail here with ENOENT for the same model and prompt.
     created_dirs = []
@@ -1883,17 +1908,9 @@ def _bi_fs_write(params: dict, ctx: ToolCtx) -> dict:
             created_dirs = list(reversed(missing))
 
     try:
-        with open(abs_path, "w", encoding="utf-8") as f:
-            f.write(content)
+        peer_coordination.write_bytes_atomically(abs_path, content.encode("utf-8"))
     except OSError as e:
         return {"ok": False, "error": str(e)}
-
-    try:
-        import peer_coordination
-        peer_coordination.get_coord().note_write(abs_path)
-        peer_coordination.get_coord().log_write(abs_path, "write")
-    except Exception:
-        pass
 
     action = "updated" if existed else "created"
     if _run_formatter(abs_path):
@@ -1905,6 +1922,12 @@ def _bi_fs_write(params: dict, ctx: ToolCtx) -> dict:
                 content = _formatted
         except OSError:
             pass
+    try:
+        peer_coordination.get_coord().note_write(abs_path)
+        peer_coordination.get_coord().log_write(abs_path, "write")
+    except Exception:
+        pass
+
     # Surfaced, never silent: a typo'd path now succeeds instead of failing,
     # so the directories it invented have to be visible in the same breath.
     _base = ctx.cwd or os.getcwd()
@@ -2516,6 +2539,7 @@ def _bi_evolve_lab_draft(params: dict, ctx: ToolCtx) -> dict:
 
 
 @private_files.guard("fs.edit")
+@_serialized_file_access
 def _bi_fs_edit(params: dict, ctx: ToolCtx) -> dict:
     """Exact string replacement in a file.
 
@@ -2566,22 +2590,14 @@ def _bi_fs_edit(params: dict, ctx: ToolCtx) -> dict:
         blocked = _check_file_write_policy(abs_path, ctx, diff or "(no differences)")
         if blocked is not None:
             return blocked
+        blocked = _check_file_conflict(abs_path)
+        if blocked is not None:
+            return blocked
         try:
-            import peer_coordination
-            _stale = peer_coordination.get_coord().assert_unchanged(abs_path)
-            if _stale is not None:
-                return {"ok": False,
-                        "error": f"Blocked by cross-instance coordination: {_stale}",
-                        "path": abs_path}
-        except Exception:
-            pass
-        try:
-            with open(abs_path, "w", encoding="utf-8") as f:
-                f.write(new_content)
+            peer_coordination.write_bytes_atomically(abs_path, new_content.encode("utf-8"))
         except OSError as e:
             return {"ok": False, "error": str(e)}
         try:
-            import peer_coordination
             peer_coordination.get_coord().note_write(abs_path)
             peer_coordination.get_coord().log_write(abs_path, "edit")
         except Exception:
@@ -2613,24 +2629,16 @@ def _bi_fs_edit(params: dict, ctx: ToolCtx) -> dict:
     if blocked is not None:
         return blocked
 
-    try:
-        import peer_coordination
-        _stale = peer_coordination.get_coord().assert_unchanged(abs_path)
-        if _stale is not None:
-            return {"ok": False,
-                    "error": f"Blocked by cross-instance coordination: {_stale}",
-                    "path": abs_path}
-    except Exception:
-        pass
+    blocked = _check_file_conflict(abs_path)
+    if blocked is not None:
+        return blocked
 
     try:
-        with open(abs_path, "w", encoding="utf-8") as f:
-            f.write(new_content)
+        peer_coordination.write_bytes_atomically(abs_path, new_content.encode("utf-8"))
     except OSError as e:
         return {"ok": False, "error": str(e)}
 
     try:
-        import peer_coordination
         peer_coordination.get_coord().note_write(abs_path)
         peer_coordination.get_coord().log_write(abs_path, "edit")
     except Exception:
@@ -2706,6 +2714,7 @@ def _edit_anchor_hint(content: str, old: str, limit: int = 160) -> str:
 
 
 @private_files.guard("fs.multi_edit")
+@_serialized_file_access
 def _bi_fs_multi_edit(params: dict, ctx: ToolCtx) -> dict:
     """Apply multiple sequential exact-string edits to one file atomically.
 
@@ -2816,24 +2825,16 @@ def _bi_fs_multi_edit(params: dict, ctx: ToolCtx) -> dict:
     if blocked is not None:
         return blocked
 
-    try:
-        import peer_coordination
-        _stale = peer_coordination.get_coord().assert_unchanged(abs_path)
-        if _stale is not None:
-            return {"ok": False,
-                    "error": f"Blocked by cross-instance coordination: {_stale}",
-                    "path": abs_path}
-    except Exception:
-        pass
+    blocked = _check_file_conflict(abs_path)
+    if blocked is not None:
+        return blocked
 
     try:
-        with open(abs_path, "w", encoding="utf-8") as f:
-            f.write(working)
+        peer_coordination.write_bytes_atomically(abs_path, working.encode("utf-8"))
     except OSError as e:
         return {"ok": False, "error": str(e)}
 
     try:
-        import peer_coordination
         peer_coordination.get_coord().note_write(abs_path)
         peer_coordination.get_coord().log_write(abs_path, "multi_edit")
     except Exception:
@@ -3091,7 +3092,7 @@ def _bi_fs_grep(params: dict, ctx: ToolCtx) -> dict:
 
     pattern = params.get("pattern", "")
     search_path = params.get("path", ".")
-    # `glob` is the shared catalog's name for this filter (and Helpwo's); a call
+    # `glob` is the shared catalog's name for this filter (and Helpwow's); a call
     # written against that contract used to be searched unfiltered.
     include = params.get("include") or params.get("glob") or "**/*"
     exclude = params.get("exclude", "")
@@ -5709,10 +5710,10 @@ def _bi_diag_tool_failures(params: dict, ctx: ToolCtx) -> dict:
 
 
 # ── Laintas Storage ────────────────────────────────────────────────────
-# The same cloud folder Helpwo mounts as "Laintas Storage" and `/shared`
+# The same cloud folder Helpwow mounts as "Laintas Storage" and `/shared`
 # manages from the REPL. `shared_storage.SharedStorage` already wraps every
 # endpoint; these tools exist because the model had only `file_push` — an
-# upload that also notifies a Helpwo agent — and so could write to the folder
+# upload that also notifies a Helpwow agent — and so could write to the folder
 # but never read it back, list it, or find out how full it was.
 
 
@@ -5855,7 +5856,7 @@ def _bi_storage_delete(params: dict, ctx: ToolCtx) -> dict:
 
     Remote deletion has no undo and no snapshot behind it: the local
     checkpoint the loop takes before a mutation covers this machine's files,
-    not an object store shared with Helpwo. So this asks every time, in every
+    not an object store shared with Helpwow. So this asks every time, in every
     policy mode, exactly as a shell `rm` does.
     """
     path = str(params.get("path") or "").strip()
@@ -5874,7 +5875,7 @@ def _bi_storage_delete(params: dict, ctx: ToolCtx) -> dict:
             approved = approve_fn(
                 f"Laintas Storage: {clean}",
                 f"DELETE from shared cloud storage\n{clean}",
-                "shared storage deletion is permanent and shared with Helpwo")
+                "shared storage deletion is permanent and shared with Helpwow")
         except Exception:
             approved = False
         if not approved:
@@ -5888,8 +5889,8 @@ def _bi_storage_delete(params: dict, ctx: ToolCtx) -> dict:
 def _bi_file_push(params: dict, ctx: ToolCtx) -> dict:
     """Push files from the local filesystem to Laintas shared storage (R2).
 
-    Uploads files to the Helpwo shared storage via agent_gateway's presigned
-    PUT URLs, then sends a 'file_push' message to a target Helpwo agent so it
+    Uploads files to the Helpwow shared storage via agent_gateway's presigned
+    PUT URLs, then sends a 'file_push' message to a target Helpwow agent so it
     can receive the files into its workspace.
 
     Requires LAINTAS_BACKEND to be configured and the user to be authenticated.
@@ -5914,7 +5915,7 @@ def _bi_file_push(params: dict, ctx: ToolCtx) -> dict:
 
     target_agent_id = (params.get("target_agent_id") or "").strip()
     if not target_agent_id:
-        return {"ok": False, "error": "missing 'target_agent_id' — the Helpwo agent to notify"}
+        return {"ok": False, "error": "missing 'target_agent_id' — the Helpwow agent to notify"}
 
     headers, cookies = backend_profiles.request_auth(profile, ctx.session)
     gateway_base = profile.base_url
@@ -8070,7 +8071,6 @@ def _notify_workspace_changes(command: str, ctx: ToolCtx, result: dict) -> dict:
     if not isinstance(result, dict):
         return result
     try:
-        import peer_coordination
         coord = peer_coordination.get_coord()
         if not coord.enabled():
             return result
@@ -8660,7 +8660,7 @@ def vision_call_backend(default_session=None, get_profile=None, lane="vision"):
     reply, a different administrator-ordered family behind it.
 
     The endpoint, rather than the CLI, selects the first live model in the
-    administrator's image-understanding order.  This keeps CLI, Helpwo and
+    administrator's image-understanding order.  This keeps CLI, Helpwow and
     every other client on one failover policy.
 
     `/img` and `image.describe` both come through here. `/img` once posted to
@@ -8888,9 +8888,9 @@ _bi_video_frames = _video_tool("video.frames", _run_video_frames)
 # ── Whiteboards ──────────────────────────────────────────────────────────
 # The agent draws through the same element-level operations a person does,
 # never by writing a board file wholesale: a whole-file write pushes back the
-# shapes somebody is dragging in Helpwo, and it does it silently. Everything
+# shapes somebody is dragging in Helpwow, and it does it silently. Everything
 # created here is stamped `author="ai"` with the run as its turn, which is
-# what Helpwo's editor groups its Show / Keep / Undo banner by — work the
+# what Helpwow's editor groups its Show / Keep / Undo banner by — work the
 # model did stays reviewable instead of just appearing on somebody's board.
 
 
@@ -9798,7 +9798,7 @@ def _bi_browser_test_flow(params: dict, ctx: ToolCtx) -> dict:
 
 
 # ── Contract tools ──────────────────────────────────────────────────────
-# The shared API contract between this backend and a Helpwo frontend.
+# The shared API contract between this backend and a Helpwow frontend.
 # See contract_store.py for why it is a file in the repository and not a
 # message on a channel.
 
@@ -9888,7 +9888,7 @@ def _bi_contract_mock(params: dict, ctx) -> dict:
 
 
 def _contract_notify(ctx, result: dict, what: str) -> None:
-    """Tell an attached Helpwo the contract moved.
+    """Tell an attached Helpwow the contract moved.
 
     The file is the truth; this is only the nudge that saves the other agent
     from polling. Losing it costs a round of staleness, never correctness,
@@ -11470,7 +11470,7 @@ def register_builtin_tools() -> None:
             },
             invoke=_bi_diag_tool_failures,
         ),
-        # ── Laintas Storage: the cloud folder Helpwo mounts ──────────
+        # ── Laintas Storage: the cloud folder Helpwow mounts ──────────
         Tool(
             name="storage.usage",
             description=(
@@ -11486,7 +11486,7 @@ def register_builtin_tools() -> None:
             name="storage.list",
             description=(
                 "List a folder in Laintas Storage — the same cloud folder "
-                "Helpwo mounts as \"Laintas Storage\" and the user manages "
+                "Helpwow mounts as \"Laintas Storage\" and the user manages "
                 "with /shared. Omit 'path' for the root. This is remote "
                 "storage, not this machine: use fs.ls for local files."
             ),
@@ -11521,9 +11521,9 @@ def register_builtin_tools() -> None:
             name="storage.put",
             description=(
                 "Upload one local file to Laintas Storage, where the user and "
-                "their Helpwo sessions can open it. 'path' is the remote "
+                "their Helpwow sessions can open it. 'path' is the remote "
                 "destination (defaults to the file's own name). To hand files "
-                "to a specific Helpwo agent instead, use file_push."
+                "to a specific Helpwow agent instead, use file_push."
             ),
             schema={
                 "type": "object",
@@ -11566,7 +11566,7 @@ def register_builtin_tools() -> None:
             description=(
                 "Delete a file or folder from Laintas Storage. Always asks the "
                 "user first, in every policy mode: this store is shared with "
-                "Helpwo and nothing here is covered by the local checkpoint."
+                "Helpwow and nothing here is covered by the local checkpoint."
             ),
             schema={
                 "type": "object",
@@ -11581,7 +11581,7 @@ def register_builtin_tools() -> None:
             name="file_push",
             description=(
                 "Push local files to Laintas shared cloud storage (R2) and notify a "
-                "Helpwo agent. Files are uploaded via presigned URLs — the gateway "
+                "Helpwow agent. Files are uploaded via presigned URLs — the gateway "
                 "never touches the bytes. After upload, a 'file_push' message is sent "
                 "to the target agent so it can download the files into its workspace."
             ),
@@ -11595,7 +11595,7 @@ def register_builtin_tools() -> None:
                     },
                     "target_agent_id": {
                         "type": "string",
-                        "description": "The Helpwo agent ID to notify after upload.",
+                        "description": "The Helpwow agent ID to notify after upload.",
                     },
                 },
                 "required": ["paths", "target_agent_id"],

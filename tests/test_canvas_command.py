@@ -7,7 +7,7 @@ without a recognised extension into "unknown action", which sends the user to
 the help text when what they needed was "no such file". So the verbs are a
 small closed set and everything else is a path; these tests pin that direction.
 
-The board rendering rules mirror Helpwo's canvasScene.ts. That duplication is
+The board rendering rules mirror Helpwow's canvasScene.ts. That duplication is
 the reason both sides assert the same properties: a bound label is folded onto
 its container's line, an arrow says what it connects, tombstones are gone.
 """
@@ -170,13 +170,13 @@ class BoardFiles(unittest.TestCase):
         self.assertIn("not a readable", str(caught.exception))
 
     def test_a_write_is_refused_when_the_file_moved_under_us(self):
-        """Helpwo holds an open board in the editor and writes the file behind
+        """Helpwow holds an open board in the editor and writes the file behind
         it; overwriting that silently loses whatever the person just drew."""
         self._write([])
         stale = os.path.getmtime(self.path) - 5
         with self.assertRaises(canvas.CanvasError) as caught:
             canvas.write_scene(self.path, canvas.empty_scene(), expect_mtime=stale)
-        self.assertIn("open in Helpwo", str(caught.exception))
+        self.assertIn("open in Helpwow", str(caught.exception))
         # And nothing was written.
         self.assertEqual(json.load(open(self.path))["elements"], [])
 

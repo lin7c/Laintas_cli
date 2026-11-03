@@ -10,8 +10,8 @@ by what those settings would send. It exports only the values that changed,
 as a `.config` file — one `/config` line per setting, the format
 `/config import` reads. The gateway's own block is never part of it.
 
-The template (context_policy/budget_page.html) is shared with Helpwo, whose
-copy is src/context/budget-tuner.html; keep the two identical. Helpwo runs it
+The template (context_policy/budget_page.html) is shared with Helpwow, whose
+copy is src/context/budget-tuner.html; keep the two identical. Helpwow runs it
 in `mode: "helpwo"` and applies the result in place; here it runs in
 `mode: "cli"` and downloads the file.
 
@@ -30,7 +30,7 @@ import config_file
 
 _TEXT_LIMIT = 200_000
 _TEMPLATE_PATH = Path(__file__).resolve().parent / "context_policy" / "budget_page.html"
-#: Top-level trees the CLI fits (Helpwo fits only output/system/live).
+#: Top-level trees the CLI fits (Helpwow fits only output/system/live).
 ACTIVE_TREES = ("output", "system", "tools", "live", "thread")
 
 
@@ -79,7 +79,7 @@ def page_data(rows: dict, window: dict, described: dict, *, newest_index: int) -
 
 
 def write_page(data: dict, target: Path) -> Path:
-    # `<` escaped as in Helpwo: no text in a block can close the data script.
+    # `<` escaped as in Helpwow: no text in a block can close the data script.
     payload = json.dumps(data, ensure_ascii=False).replace("<", "\\u003c")
     title = f"Context budget · #{data.get('request', 1)}"
     template = _TEMPLATE_PATH.read_text(encoding="utf-8")

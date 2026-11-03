@@ -5,7 +5,7 @@ x11vnc. The AI side drives Chrome over CDP (http://127.0.0.1:<debug-port>) —
 see the browser.* tools in tools.py.
 
 The user-facing live view is peer-to-peer: x11vnc serves RFB on
-127.0.0.1:<rfb_port>, and the Helpwo kernel's screen relay carries those bytes to
+127.0.0.1:<rfb_port>, and the Helpwow kernel's screen relay carries those bytes to
 the browser's noVNC over a WebRTC DataChannel, so the framebuffer never touches
 the backend. See Helpwo/docs/vnc-p2p-design.md. (An earlier revision relayed RFB
 through a backend /vnc WebSocket; that endpoint was never deployed and the code
@@ -960,7 +960,7 @@ class BrowserSession:
       close()  → kill subprocesses, drop the proxy relay, remove user-data-dir.
 
     Nothing here reaches out to the backend: the live view is attached
-    separately by the Helpwo kernel, which connects to rfb_port on demand.
+    separately by the Helpwow kernel, which connects to rfb_port on demand.
     """
 
     def __init__(self, backend_url: str, agent_id: str,
@@ -1872,7 +1872,7 @@ def get_all_browser_sessions() -> List[BrowserSession]:
 def get_latest_browser_session() -> Optional[BrowserSession]:
     """The most recently registered session, or None.
 
-    For viewers that have no way to name one: Helpwo's live-view button is a
+    For viewers that have no way to name one: Helpwow's live-view button is a
     single icon per agent, so "this agent's browser" is the only thing it can
     mean, and it should not depend on how the session happened to be named.
     """

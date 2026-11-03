@@ -28,7 +28,7 @@ import paths
 # the CLI takes with /handoff receive, not through the broker.
 ORIGINS = ("helpwo", "laintas-ai", "laintas-cli", "issues")
 _IMPORTED_NOTE = "[imported context]\n"
-_ORIGIN_LABELS = {"helpwo": "Helpwo", "laintas-ai": "Laintas AI",
+_ORIGIN_LABELS = {"helpwo": "Helpwow", "laintas-ai": "Laintas AI",
                   "laintas-cli": "Laintas CLI",
                   "issues": "Laintas Issues", "handoff": "Laintas CLI"}
 _FIT_CHARS = 400_000
@@ -38,7 +38,7 @@ _TIMEOUT = 12
 def parse_context_ref(action: str):
     """(origin, envelope_id, from_user_id) from a message action URL.
 
-    The link is the Helpwo (or Laintas AI) open URL; its ``context``
+    The link is the Helpwow (or Laintas AI) open URL; its ``context``
     query parameter is the reference, ``cfrom`` names the exporter on
     a cross-account Issues hand. Returns None for any other action.
     """

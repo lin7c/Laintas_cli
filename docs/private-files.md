@@ -18,6 +18,6 @@ Native commands could bypass these application checks. While custom rules exist,
 
 Automatic prompt/memory/skill loading and cached references check read permission. Hidden current directories are omitted from generated model context. Local storage transfers and evidence collection also check file permissions.
 
-The local `/helpwo` file bridge also enforces these rules. Its restricted files can be managed by changing rules from the local owner terminal. Cloud Helpwo maintains separate browser rules with the same semantics; rules are not automatically synchronized between devices.
+The local `/helpwo` file bridge also enforces these rules. Its restricted files can be managed by changing rules from the local owner terminal. Cloud Helpwow maintains separate browser rules with the same semantics; rules are not automatically synchronized between devices.
 
-See `/root/Helpwo/docs/private-files-and-passwords.md` in the joint workspace for Helpwo's UI and password-vault contract.
+See `/root/Helpwo/docs/private-files-and-passwords.md` in the joint workspace for Helpwow's UI and password-vault contract.

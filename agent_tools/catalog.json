@@ -1,6 +1,6 @@
 {
   "version": "0.1.1",
-  "description": "Canonical, language-neutral agent tool catalog shared across agent products (laintas_cli, Helpwo, future agents). Single source of truth for tool NAMES, parameter JSON Schemas, and execution context. Per-language adapters (Python/TS) consume this. Names are flat snake_case with NO dots (DeepSeek and other providers reject '.' in function names). Product-specific legacy names are recorded under `aliases` to support a migration window.",
+  "description": "Canonical, language-neutral agent tool catalog shared across agent products (laintas_cli, Helpwow, future agents). Single source of truth for tool NAMES, parameter JSON Schemas, and execution context. Per-language adapters (Python/TS) consume this. Names are flat snake_case with NO dots (DeepSeek and other providers reject '.' in function names). Product-specific legacy names are recorded under `aliases` to support a migration window.",
   "conventions": {
     "naming": "flat snake_case, no dots, no namespaces; extensions use a source prefix (e.g. mcp__server__tool), the core stays unprefixed",
     "execContext": "host = runs where the OS/files live (CLI local PTY, remote agent); browser = runs in the user's browser/local workspace; backend = runs server-side (gateway); either = location-agnostic / logical",

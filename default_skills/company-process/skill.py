@@ -1,4 +1,4 @@
-"""company-process skill — run Helpwo company pipelines on the CLI.
+"""company-process skill — run Helpwow company pipelines on the CLI.
 
 Executes each stage as a hired employee (register_agent + EmployeeProfile.prompt
 = the persona) stationed on a dedicated sub-terminal (the same recipe /station
@@ -417,7 +417,7 @@ def get_tools():
     _RW = frozenset({"agent.control", "process.exec", "fs.read", "fs.write"})
     _RO = frozenset({"fs.read"})
     return [
-        Tool(name="company.deploy", description="Register a Helpwo company process on the CLI and pre-hire its employees (set runNow to also run one cycle).",
+        Tool(name="company.deploy", description="Register a Helpwow company process on the CLI and pre-hire its employees (set runNow to also run one cycle).",
              schema={"type": "object", "properties": {"process": {"type": "object"}, "runNow": {"type": "boolean"}}, "required": ["process"]},
              invoke=_t_deploy, source="skill:company-process", capabilities=_RW),
         Tool(name="company.run", description="Run one cycle of a registered company process now.",

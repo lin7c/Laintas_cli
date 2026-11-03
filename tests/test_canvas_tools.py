@@ -1,7 +1,7 @@
 """The canvas tools an agent calls.
 
 The thing being pinned here is not "does it write a file" — it is that what
-the model draws stays *reviewable*. Helpwo's editor groups its Show / Keep /
+the model draws stays *reviewable*. Helpwow's editor groups its Show / Keep /
 Undo banner by `customData.author == "ai"` and the turn id; anything drawn
 without those tags lands on a person's board as an anonymous change they
 cannot single out. That, and the same concurrency rule everything else on a
@@ -208,7 +208,7 @@ class CanvasToolTests(unittest.TestCase):
     # ---- the rule everything on a board obeys ----
 
     def test_a_write_over_somebody_elses_edit_is_refused(self):
-        """Between the read and the write, Helpwo saved the board."""
+        """Between the read and the write, Helpwow saved the board."""
         canvas_edit = extension_module("canvas", "canvas_edit")
         self.call("canvas.draw", path="flow.excalidraw",
                   shapes=[{"kind": "rectangle"}])

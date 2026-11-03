@@ -26,7 +26,8 @@ BackendKind = Literal["official", "custom", "local"]
 
 OFFICIAL_ORIGINS = frozenset({
     "https://laintas.com",          # primary — CLI gateway paths proxied here
-    "https://helpwo.laintas.com",   # legacy/compat — Helpwo's own domain
+    "https://helpwow.laintas.com",
+    "https://helpwo.laintas.com",   # legacy/compat — Helpwow's own domain
     "https://api.laintas.com",
 })
 

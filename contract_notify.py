@@ -1,7 +1,7 @@
-"""contract_notify.py — tell an attached Helpwo that the contract moved.
+"""contract_notify.py — tell an attached Helpwow that the contract moved.
 
-The link between Helpwo and this CLI has always been one-directional in the
-sense that matters: Helpwo sends a request, the CLI answers it. Every event the
+The link between Helpwow and this CLI has always been one-directional in the
+sense that matters: Helpwow sends a request, the CLI answers it. Every event the
 CLI emits is tagged with the `reqId` it is answering. There was no way for the
 CLI to start a conversation — to say "I changed the shape of /api/orders, the
 frontend needs to follow".
@@ -20,7 +20,7 @@ because the *contract file* is the source of truth and this is only a nudge:
   - so nothing here is allowed to raise, and nothing here retries.
 
 Events are emitted as type "peer-request" with kind "contract-changed", which
-is the vocabulary Helpwo's inbox listens on for work that nobody asked it for.
+is the vocabulary Helpwow's inbox listens on for work that nobody asked it for.
 """
 
 from __future__ import annotations
@@ -40,20 +40,20 @@ _last_push = 0.0
 _last_summary = ""
 
 
-#: The session registry shared with Helpwo, set by AgentRegistry when a
+#: The session registry shared with Helpwow, set by AgentRegistry when a
 #: share succeeds. Looked up rather than imported:
 #: this module must not pull the CLI's main module in.
 _shared_registry: Optional[Any] = None
 
 
 def set_registry(registry: Optional[Any]) -> None:
-    """Record (or clear) the registry that is shared with Helpwo."""
+    """Record (or clear) the registry that is shared with Helpwow."""
     global _shared_registry
     _shared_registry = registry
 
 
 def _registry() -> Optional[Any]:
-    """The agent registry, if this session is shared with Helpwo.
+    """The agent registry, if this session is shared with Helpwow.
 
     Nothing to notify when it is not — which is also the only state where the
     answer being None is correct rather than a failure.

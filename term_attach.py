@@ -452,7 +452,7 @@ def is_busy(session) -> bool:
 
     Settles a job that has finished since anyone last looked. The main loop
     only looks before drawing a prompt, so without this an agent turn, or a
-    Helpwo command while the CLI sits at the prompt, was refused for a command
+    Helpwow command while the CLI sits at the prompt, was refused for a command
     that had already ended.
     """
     if detached_job(session) is None:
@@ -581,7 +581,7 @@ def run(session, command: str, *, hold, write=None, mirror=None,
     ``hold`` is ``terminal_arbiter.hold``-shaped: ``hold(owner, mode,
     timeout=, raw_bytes=True)`` returning a context whose value has
     ``read_bytes(timeout)``. ``mirror(text)`` receives what is shown, for the
-    /agents and Helpwo mirrors. Returns None when the command could not be
+    /agents and Helpwow mirrors. Returns None when the command could not be
     attached (no integration, locks busy) — nothing was sent, so the caller
     can use another path.
     """

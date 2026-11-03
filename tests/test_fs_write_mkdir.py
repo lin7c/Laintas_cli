@@ -1,8 +1,8 @@
 """fs.write creates its parent directories (mkdir -p), and only after the gates.
 
-Helpwo's write has done this since fs/ensureParentDirs.ts, so the same model
+Helpwow's write has done this since fs/ensureParentDirs.ts, so the same model
 running the same prompt would write "docs/notes.md" into a fresh tree
-successfully in Helpwo and get a bare ENOENT here. Three such failures are in
+successfully in Helpwow and get a bare ENOENT here. Three such failures are in
 the retained sessions, one of them the standard "new skill folder + SKILL.md"
 shape.
 

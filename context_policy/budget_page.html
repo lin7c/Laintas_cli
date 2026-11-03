@@ -5,11 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>__TITLE__</title>
 <!--
-  Context budget page — shared by Helpwo and laintas_cli.
+  Context budget page — shared by Helpwow and laintas_cli.
   Source of truth: Helpwo/src/context/budget-tuner.html. laintas_cli keeps a
   byte-identical copy (context_policy/budget_page.html); edit here, copy there.
-  Helpwo writes it to the hidden workspace file .budget.html and shows it in
-  its preview, where "Apply" hands the settings back to Helpwo; the CLI writes
+  Helpwow writes it to the hidden workspace file .budget.html and shows it in
+  its preview, where "Apply" hands the settings back to Helpwow; the CLI writes
   a file for any browser and downloads a .config for `/config import`.
 -->
 <style>
@@ -300,7 +300,7 @@ const $ = (id) => document.getElementById(id);
 const ZH = {
   title: "上下文预算", request: "请求", captured: "采集于", window: "模型总容量", model: "模型",
   stats: {cut: "预计被裁剪的分区", saved: "预计省略的 tokens", conv: "预计剩余（对话与工具）"}, blocks: (n) => `${n} 个分区`,
-  apply: "应用到 Helpwo", applyNeedsHelpwo: "请在 Helpwo 设置里点「预算」打开此页，再应用", download: "下载 .config",
+  apply: "应用到 Helpwow", applyNeedsHelpwo: "请在 Helpwow 设置里点「预算」打开此页，再应用", download: "下载 .config",
   undo: "撤销修改", defaults: "恢复出厂默认",
   nav: {back: "后退", up: "上一级", enter: "进入", tree: "结构树", hint: "单击选中 · 双击进入 · Backspace 返回上一级"},
   overview: "概览", root: "上下文窗口", input: "输入预算", output: "输出预留", conv: "对话历史",
@@ -338,14 +338,14 @@ const ZH = {
   guideExample: "例如模型容量为 100,000 tokens，回答预留 25% 时会先留出 25,000，输入剩下 75,000；最低额度和模型输出上限也会影响结果。",
   guideNumbers: (w,o,i) => `当前采集容量 ${w} → 回答预留 ${o} + 输入 ${i} tokens`,
   mobileViews: {sections:"分区", parameters:"参数", diagram:"分配图"}, mobileViewLabel:"切换预算视图",
-  guideStart: "选择分区，查看说明与调整：", guideTerms: "参数怎么读？展开查看示例", guideEffect: CLI ? "修改先用于预估；下载 .config 后，通过 /config import 导入才生效。无需调整时保留默认即可。" : "页面上的修改先用于预估；点「应用到 Helpwo」后，下一轮请求才使用新设置。无需调整时保留默认即可。",
+  guideStart: "选择分区，查看说明与调整：", guideTerms: "参数怎么读？展开查看示例", guideEffect: CLI ? "修改先用于预估；下载 .config 后，通过 /config import 导入才生效。无需调整时保留默认即可。" : "页面上的修改先用于预估；点「应用到 Helpwow」后，下一轮请求才使用新设置。无需调整时保留默认即可。",
   previewNote: "这是根据本次请求估算的调整结果，裁剪标记和此前的裁剪状态可能让实际发送量有所不同；「采集时发送」显示的是本次请求记录。",
   termHelp: {share:"顶层比例占父级总容量，例如输入 75,000 × 系统 15% = 11,250。子分区先扣除完整保留内容，再按相对权重分配剩余容量；0.2 和 0.1 表示约 2∶1，不是固定占整个窗口 20% 和 10%。",min:"按比例算出的额度小于这个数时，使用最低额度。调高可能占用更多空间；它不预先填充内容，也不能扩大模型窗口。",shrink:"父分区超额后才按此方式处理子分区：保留开头、保留结尾或整块省略。「不压缩」始终完整保留；这不是对话摘要。",metrics:"原始内容量＝裁剪前大小；分配额度＝允许占用的空间；预计保留量＝按当前设置估算要发送的大小。分配额度不是已经用掉的容量。",lock:"仅锁定此页调节时的比例，防止拖动其它分区时被连带修改；不会把内容改成「不压缩」，也不会作为运行配置保存。",hysteresis:"被裁剪的分区低于这个占用比例后，才恢复完整。例如额度 10,000，阈值 90% 时，需降到 9,000 或以下。"},
   termNames: {share:"比例与相对权重",min:"最低额度",shrink:"超额处理",metrics:"三个数量",lock:"锁定比例",hysteresis:"恢复完整的阈值"},
   purposeTitle: "这个分区装什么", effectTitle: "调大或调小会怎样", absentHelp: "本次请求没有使用这个分区，因此没有内容可预览；它的配置仍可用于后续请求。",
   effects: {output:"调大：给回答更多空间，能容纳的输入更少。调小：给输入更多空间，但回答可用长度减少；模型输出上限始终有效。",system:"调大：系统指令、技能说明有更多空间；调小：超额时部分说明可能被裁剪，对话与工具通常能获得更多空间。",live:"调大：当前任务、进度等状态可保留更多；调小：可裁剪的状态可能更少，但完整保留的目标等规则仍按实际大小占用。",child:"调大相对权重：父分区超额时，优先给这里更多空间，其它可分配分区可能变少。父分区未超额时，子分区仍可完整发送。",fixed:"这个分区当前设置为完整保留，按内容的实际大小占用。比例和最低额度不会把它裁短；它会先占用父级的空间。"},
-  applied: (n) => `已应用到 Helpwo（${n} 项自定义），下一轮对话生效`, applyFail: "应用失败：",
-  stalePage: "这个页面不是 Helpwo 最近生成的那份（可能被改过或已过期）。请在设置里点「预算」重新打开。",
+  applied: (n) => `已应用到 Helpwow（${n} 项自定义），下一轮对话生效`, applyFail: "应用失败：",
+  stalePage: "这个页面不是 Helpwow 最近生成的那份（可能被改过或已过期）。请在设置里点「预算」重新打开。",
   compactOrder: "对话压缩阈值需满足 目标 < 后台 < 前台 ≤ 1。",
   threadMarks: {compact_target: "压缩目标", compact_background: "后台压缩", compact_foreground: "前台压缩"},
   threadNow: (u, t) => `当前对话 ${u} / 可用 ${t}`, itemCaps: "单项上限（占对话预算的比例）",
@@ -358,7 +358,7 @@ const ZH = {
 const EN = {
   title: "Context budget", request: "request", captured: "captured", window: "window", model: "model",
   stats: {cut: "Estimated clipped sections", saved: "Estimated tokens omitted", conv: "Estimated room (chat & tools)"}, blocks: (n) => `${n} section${n === 1 ? "" : "s"}`,
-  apply: "Apply to Helpwo", applyNeedsHelpwo: "Open this page with Budget in Helpwo's settings to apply it", download: "Download .config",
+  apply: "Apply to Helpwow", applyNeedsHelpwo: "Open this page with Budget in Helpwow's settings to apply it", download: "Download .config",
   undo: "Undo changes", defaults: "Shipped defaults",
   nav: {back: "Back", up: "Up", enter: "Open", tree: "Tree", hint: "click selects · double-click opens · Backspace goes up"},
   overview: "Overview", root: "Context window", input: "Input budget", output: "Output reserve", conv: "Conversation",
@@ -396,14 +396,14 @@ const EN = {
   guideExample: "For a 100,000-token window, a 25% answer reserve leaves 25,000 for output and 75,000 for input. Minimum space and the model's output limit also affect the result.",
   guideNumbers: (w,o,i) => `Captured capacity ${w} → answer reserve ${o} + input ${i} tokens`,
   mobileViews: {sections:"Sections", parameters:"Parameters", diagram:"Diagram"}, mobileViewLabel:"Budget view",
-  guideStart: "Select a section to read and adjust its settings:", guideTerms: "How to read the parameters — examples", guideEffect: CLI ? "Edits are estimates first. Download the .config and use /config import to activate them. Keep the defaults if you do not need to tune them." : "Edits on this page are estimates first. Apply to Helpwo uses the new settings from the next request. Keep the defaults if you do not need to tune them.",
+  guideStart: "Select a section to read and adjust its settings:", guideTerms: "How to read the parameters — examples", guideEffect: CLI ? "Edits are estimates first. Download the .config and use /config import to activate them. Keep the defaults if you do not need to tune them." : "Edits on this page are estimates first. Apply to Helpwow uses the new settings from the next request. Keep the defaults if you do not need to tune them.",
   previewNote: "These are estimates from the captured request. Clipping markers and previous clipping state can change the actual size. “Sent at capture” shows the recorded request.",
   termHelp: {share:"Top-level shares use the parent's total: 75,000 input × 15% system = 11,250. Child sections first subtract protected content, then split the remainder by relative weight. Weights 0.2 and 0.1 mean about 2:1, not 20% and 10% of the whole window.",min:"Used when the proportional allocation is smaller. Raising it may consume more space; it does not fill unused space or enlarge the model's window.",shrink:"Applies to children once their parent is over budget: keep the start, keep the end, or omit the section. Never cut preserves all content. This is not a chat summary.",metrics:"Original size is before clipping; allocated space is available room; estimated retained is what these settings would keep. Allocated space is not already-used space.",lock:"Keeps this share from moving when you adjust other sections on this page. It does not protect content from clipping and is not saved as a runtime setting.",hysteresis:"A clipped section returns to full content below this fraction of its space. At 90% of 10,000, it must reach 9,000 or less."},
   termNames: {share:"Shares and relative weights",min:"Minimum space",shrink:"Overflow handling",metrics:"The three sizes",lock:"Locking a share",hysteresis:"Recovery threshold"},
   purposeTitle: "What this section contains", effectTitle: "What a larger or smaller allocation does", absentHelp: "This request did not use this section, so there is no content to preview. Its settings can still apply to later requests.",
   effects: {output:"Larger: more room for the answer, less for input. Smaller: more input room, less answer room. The model's maximum output still applies.",system:"Larger: more room for instructions and skill manuals. Smaller: overflowing instructions may be clipped, usually leaving more room for chat and tools.",live:"Larger: more task state can be retained. Smaller: flexible state may be clipped, while protected goals and rules still use their actual size.",child:"A larger relative weight gives this section more room when its parent is over budget; other flexible sections may get less. If the parent fits, its children can still be sent whole.",fixed:"This section is currently protected and uses its actual size. Shares and minimum space do not clip it; it takes space from its parent first."},
-  applied: (n) => `Applied to Helpwo (${n} custom setting${n === 1 ? "" : "s"}); takes effect from the next turn`, applyFail: "Could not apply: ",
-  stalePage: "This page is not the one Helpwo generated last (it was edited, or is out of date). Open it again with Budget in the settings.",
+  applied: (n) => `Applied to Helpwow (${n} custom setting${n === 1 ? "" : "s"}); takes effect from the next turn`, applyFail: "Could not apply: ",
+  stalePage: "This page is not the one Helpwow generated last (it was edited, or is out of date). Open it again with Budget in the settings.",
   compactOrder: "Compaction needs target < background < foreground ≤ 1.",
   threadMarks: {compact_target: "target", compact_background: "background", compact_foreground: "foreground"},
   threadNow: (u, t) => `thread now ${u} of ${t}`, itemCaps: "Per-item caps (share of the conversation budget)",
@@ -419,7 +419,7 @@ const SECTION_HELP = {
     output:"模型这一次生成回答时预留的容量。",system:"告诉 AI 扮演什么角色、有哪些能力、遵循哪些规则的指令。",live:"每轮更新的任务目标、进度、当前环境等信息。",tools:"模型可调用的工具及其参数说明。",
     platform_safety_policy:"平台注入的安全要求。",role:"你保存的系统提示词和角色设定。",authority:"可执行操作、权限边界与指令优先级。",environment:"工作区和运行环境的信息。",context:"项目记忆与长期规则的总分区。",persistentMemory:"跨轮保留的项目记忆。",durableRules:"需要长期遵守的项目规则。",globalMemory:"跨项目使用的记忆信息。",
     skills:"技能目录与技能操作说明。",skillContext:"已加载技能的详细操作说明。",capabilities:"当前产品和工具支持哪些能力的说明。",execution:"当前模式和执行方式的要求。",workflowPhase:"当前工作流所在阶段的说明。",rolePrompt:"执行阶段使用的角色要求。",confidenceGuidance:"如何表达不确定性、核验结果的指引。",orchestration:"工作流及多个任务之间的协调信息。",verification:"交付前需要执行的检查要求。",completion:"什么条件下可以报告任务完成。",safety:"安全操作要求。",
-    durable_user_rules:"你要求长期保留的操作规则。",durable_rule_protocol:"如何读取和维护长期规则。",runtime_ownership:"Helpwo 的当前能力、运行边界与模式规则；Engine 的架构要求也在这里。",harness_reminders:"运行器补充的执行提醒。",intent_alignment:"保持执行过程符合你的实际目标的要求。",laintas_product_protocol:"Laintas 产品的使用协议与约定。",work_orchestration:"安排、协调和交接任务的说明。",terminal_output_style:"终端结果的输出格式要求。",hwo_prompt_overlay:"HWO 工作流为本次执行补充的指令。",
+    durable_user_rules:"你要求长期保留的操作规则。",durable_rule_protocol:"如何读取和维护长期规则。",runtime_ownership:"Helpwow 的当前能力、运行边界与模式规则；Engine 的架构要求也在这里。",harness_reminders:"运行器补充的执行提醒。",intent_alignment:"保持执行过程符合你的实际目标的要求。",laintas_product_protocol:"Laintas 产品的使用协议与约定。",work_orchestration:"安排、协调和交接任务的说明。",terminal_output_style:"终端结果的输出格式要求。",hwo_prompt_overlay:"HWO 工作流为本次执行补充的指令。",
     task:"本次正在执行的任务说明。",objective:"当前要实现的目标。",progress:"已经完成的工作与当前进度。",warnings:"错误、失败或需要注意的执行信息。",session_memory:"这次会话保留的工作记忆。",relevant_skills:"与当前任务相关的技能提示。",sub_terminals:"已打开的子终端及运行信息。",delegated_work:"已经交给其他智能体的任务及结果。",files_seen:"本次执行已经读取过哪些文件。",active_tasks:"当前任务列表及其状态。",environment_now:"当前目录、编辑文件等即时环境信息。",now:"本次请求的当前时间。",workflow_phase:"当前工作流的执行阶段。",behavior_diagnostics:"执行器发现的重复操作等诊断信息。",role_identity:"当前智能体的名称和角色信息。",
     thread:"历史聊天消息与工具返回结果。",recent_tail:"优先保留的最近几条消息。",tool_result:"一条工具返回结果能占用的容量。",read_page:"一次文件分页读取的容量。",web_fetch:"一次网页抓取结果的容量。",grep_line:"搜索命中的单行结果容量。",pruned_output:"已裁剪的工具输出容量。",aux:"用于摘要、审阅和记忆整理的辅助请求。",summary:"生成摘要的辅助请求。",critic:"审阅结果的辅助请求。",mem_extract:"提取记忆的辅助请求。",margin:"为辅助请求预留的余量。",source:"辅助请求要读取的源材料。",
   },
@@ -427,7 +427,7 @@ const SECTION_HELP = {
     output:"Room reserved for the model's answer in this request.",system:"Instructions about the AI's role, abilities and rules.",live:"Task goals, progress and environment updated each turn.",tools:"Available tools and their parameter schemas.",
     platform_safety_policy:"Safety requirements supplied by the platform.",role:"Your saved system prompt and role settings.",authority:"Permissions, allowed actions and instruction priority.",environment:"Workspace and runtime information.",context:"The parent section for project memory and lasting rules.",persistentMemory:"Project memory kept across turns.",durableRules:"Project rules that must remain in effect.",globalMemory:"Memory used across projects.",
     skills:"The skill catalog and operating instructions.",skillContext:"Detailed instructions for loaded skills.",capabilities:"What the product and its tools currently support.",execution:"Requirements for the active mode and execution model.",workflowPhase:"The current workflow stage.",rolePrompt:"Role requirements for this execution stage.",confidenceGuidance:"Guidance for uncertainty and verification.",orchestration:"Coordination between workflows and tasks.",verification:"Checks required before delivery.",completion:"Conditions for reporting completion.",safety:"Safe operation requirements.",
-    durable_user_rules:"Operating rules you asked to keep.",durable_rule_protocol:"How to read and maintain lasting rules.",runtime_ownership:"Helpwo's current capabilities, execution boundaries and mode rules, including Engine architecture requirements.",harness_reminders:"Reminders added by the runner.",intent_alignment:"Requirements to keep execution aligned with your goal.",laintas_product_protocol:"Laintas product conventions and protocols.",work_orchestration:"Task scheduling, coordination and handoff instructions.",terminal_output_style:"Formatting requirements for terminal results.",hwo_prompt_overlay:"Instructions added by the HWO workflow for this execution.",
+    durable_user_rules:"Operating rules you asked to keep.",durable_rule_protocol:"How to read and maintain lasting rules.",runtime_ownership:"Helpwow's current capabilities, execution boundaries and mode rules, including Engine architecture requirements.",harness_reminders:"Reminders added by the runner.",intent_alignment:"Requirements to keep execution aligned with your goal.",laintas_product_protocol:"Laintas product conventions and protocols.",work_orchestration:"Task scheduling, coordination and handoff instructions.",terminal_output_style:"Formatting requirements for terminal results.",hwo_prompt_overlay:"Instructions added by the HWO workflow for this execution.",
     task:"The task currently being executed.",objective:"The goal to achieve.",progress:"Completed work and current progress.",warnings:"Errors, failures and execution notices.",session_memory:"Working memory for this session.",relevant_skills:"Skill suggestions relevant to this task.",sub_terminals:"Opened sub-terminals and their runtime information.",delegated_work:"Tasks assigned to other agents and their results.",files_seen:"Files already read in this run.",active_tasks:"The current task list and status.",environment_now:"Live context such as the current folder and file.",now:"The time of this request.",workflow_phase:"The current workflow execution stage.",behavior_diagnostics:"Runner diagnostics such as repeated operations.",role_identity:"The current agent's name and role.",
     thread:"Previous messages and tool results.",recent_tail:"Recent messages kept with priority.",tool_result:"Room for a single tool result.",read_page:"Room for one page of a file read.",web_fetch:"Room for a fetched web page.",grep_line:"Room for a single search result line.",pruned_output:"Room for an already-clipped tool result.",aux:"Supporting summary, review and memory requests.",summary:"A supporting summary request.",critic:"A supporting review request.",mem_extract:"A supporting memory extraction request.",margin:"Extra room for a supporting request.",source:"Source material for a supporting request.",
   },
@@ -1057,7 +1057,7 @@ function changes() {
   for (const k of Object.keys(scal)) if (scal[k] !== scalInit[k]) out.push({p: "", l: k, from: scalInit[k], to: scal[k]});
   return out;
 }
-function profile() { // Helpwo: every value that differs from the shipped defaults
+function profile() { // Helpwow: every value that differs from the shipped defaults
   const out = {};
   for (const p of Object.keys(cfg)) for (const l of Object.keys(cfg[p])) if (cfg[p][l] !== def[p][l]) out[`budget.${p}.${l}`] = cfg[p][l];
   for (const k of Object.keys(scal)) if (scal[k] !== scalDef[k]) out[`budget.${k}`] = scal[k];

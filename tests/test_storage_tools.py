@@ -1,7 +1,7 @@
 """The cloud-folder tools, and the two other things the model could not see.
 
 Laintas Storage had exactly one tool (`file_push`, an upload that also pokes a
-Helpwo agent), so the model could write into the user's cloud folder and never
+Helpwow agent), so the model could write into the user's cloud folder and never
 read it back, list it, or find out how full it was — while `/shared` had done
 all of that for the user since the beginning. These pin the tools that closed
 that gap, plus `account.usage` and `diag.tool_failures`, which had the same

@@ -14,7 +14,7 @@ import { useMotionPreference } from '../hooks/useMotionPreference';
 // The site mirrors the verified assets from the latest GitHub Release.
 const RELEASE_BASE = 'https://cli.laintas.com/releases/latest';
 // laintas-cli-windows: the CLI in its own terminal window. It is published
-// beside the Unix releases, apart from the Helpwo desktop channel in /windows/.
+// beside the Unix releases, apart from the Helpwow desktop channel in /windows/.
 const WINDOWS_DOWNLOAD = 'https://cli.laintas.com/windows-cli/beta-v5/laintas-cli-windows_beta-v5_x64-setup.exe';
 const WINDOWS_RELEASE = { version: 'beta v5', installer: WINDOWS_DOWNLOAD };
 // The Windows channel publishes its own pointer file; read it live so this
@@ -60,7 +60,7 @@ const COPY = {
     title: ['命令照常敲，', '其余交给 agent。'],
     lead: '熟悉的 shell，多一个能动手的 agent。照常运行命令，也可以用一句话让它读代码、改文件、跑测试。执行过程看得见，权限由你掌握。',
     install: '安装 Laintas CLI', seeHow: '看它怎么工作',
-    facts: [['免费', '运行时免费使用，可下载源码审计'], ['Linux · macOS · Windows', 'x86_64 / arm64，Windows 10 2004+ / 11'], ['一个账号', '与 Helpwo、插件市场共用 Laintas 账号']],
+    facts: [['免费', '运行时免费使用，可下载源码审计'], ['Linux · macOS · Windows', 'x86_64 / arm64，Windows 10 2004+ / 11'], ['一个账号', '与 Helpwow、插件市场共用 Laintas 账号']],
     videoTitle: '一段真实会话',
     videoNote: '在真实机器上录制的终端会话，保留模型等待过程。你可以暂停、拖动进度，或从头观看。',
 
@@ -103,7 +103,7 @@ const COPY = {
     perMonth: '/ 月', pricing: '查看完整定价与模型分档',
     ecoTitle: '同一个账号，也通向这些',
     eco: [
-      ['Helpwo', '网页端 AI 工作台。在 CLI 里 /connect，就能在浏览器里看到这台机器的终端并直接派任务。', 'https://helpwo.laintas.com/'],
+      ['Helpwow', '网页端 AI 工作台。在 CLI 里 /connect，就能在浏览器里看到这台机器的终端并直接派任务。', 'https://helpwow.laintas.com/'],
       ['插件市场', '官方与社区扩展。/extensions install 一条命令装进 CLI，社区代码安装前会先过一遍审查。', '/plugins'],
       ['Laintas 账户', '余额、订阅、用量与订单，所有产品在同一处查看。', 'https://laintas.com/dashboard'],
     ],
@@ -115,13 +115,13 @@ const COPY = {
     startSteps: [['运行安装命令', '自动识别架构并完成安装'], ['启动并登录', '输入 laintas-cli，按提示登录 Laintas 账号'], ['说出第一个任务', '比如“看看这个项目怎么跑起来”']],
     windowsSteps: [['安装', '在 PowerShell 执行指令，或直接下载安装包；无需管理员权限'], ['启动并登录', '从开始菜单打开 laintas-cli-windows，登录页会在默认浏览器里打开'], ['开始对话', '在默认工作区给 agent 一个任务']],
     packages: '安装包', download: '下载', checksums: '全部文件的 SHA256 校验和',
-    requirements: 'Linux 需 64 位 glibc 系统；Mac 支持 Apple Silicon 和 Intel，暂不包含 Helpwo Kernel；laintas-cli-windows 需 x86_64、Windows 10/11 和 WebView2，安装器可联网安装 WebView2；无需 WSL。',
+    requirements: 'Linux 需 64 位 glibc 系统；Mac 支持 Apple Silicon 和 Intel，暂不包含 Helpwow Kernel；laintas-cli-windows 需 x86_64、Windows 10/11 和 WebView2，安装器可联网安装 WebView2；无需 WSL。',
   },
   en: {
     title: ['Your shell, as usual.', 'Plus an agent.'],
     lead: 'Your familiar shell, with an agent that can act. Run commands as usual, or ask it to read code, edit files and run tests. Follow the work as it happens, with permissions you control.',
     install: 'Install Laintas CLI', seeHow: 'See how it works',
-    facts: [['Free', 'Free runtime, source you can download and audit'], ['Linux · macOS · Windows', 'x86_64 / arm64, Windows 10 2004+ / 11'], ['One account', 'Shared with Helpwo and the plugin market']],
+    facts: [['Free', 'Free runtime, source you can download and audit'], ['Linux · macOS · Windows', 'x86_64 / arm64, Windows 10 2004+ / 11'], ['One account', 'Shared with Helpwow and the plugin market']],
     videoTitle: 'A real session, recorded as it ran',
     videoNote: 'A terminal session recorded on a real machine, with model waiting time included. Pause, seek, or watch again from the beginning.',
 
@@ -164,7 +164,7 @@ const COPY = {
     perMonth: '/ mo', pricing: 'Full pricing and model tiers',
     ecoTitle: 'The same account also opens',
     eco: [
-      ['Helpwo', 'The web AI workspace. Run /connect in the CLI and see this machine’s terminal — and hand it tasks — from your browser.', 'https://helpwo.laintas.com/'],
+      ['Helpwow', 'The web AI workspace. Run /connect in the CLI and see this machine’s terminal — and hand it tasks — from your browser.', 'https://helpwow.laintas.com/'],
       ['Plugin market', 'Official and community extensions, one /extensions install away. Community code is reviewed before it installs.', '/plugins'],
       ['Laintas account', 'Balance, subscription, usage and orders for every product, in one place.', 'https://laintas.com/dashboard'],
     ],
@@ -176,7 +176,7 @@ const COPY = {
     startSteps: [['Run the installer', 'It detects your architecture and installs laintas-cli'], ['Start and sign in', 'Type laintas-cli and sign in to your Laintas account'], ['Give it a first task', 'Try “figure out how to run this project”']],
     windowsSteps: [['Install', 'Run the command in PowerShell, or download the installer; no administrator rights needed'], ['Launch and sign in', 'Open laintas-cli-windows from Start; the sign-in page opens in your default browser'], ['Start a conversation', 'Give the agent a task in the default workspace']],
     packages: 'Packages', download: 'Download', checksums: 'SHA256 checksums for every file',
-    requirements: 'Linux needs a 64-bit glibc system. Mac supports Apple Silicon and Intel without Helpwo Kernel. laintas-cli-windows needs Windows 10/11 x86_64 and WebView2; the installer can download WebView2. WSL is not needed.',
+    requirements: 'Linux needs a 64-bit glibc system. Mac supports Apple Silicon and Intel without Helpwow Kernel. laintas-cli-windows needs Windows 10/11 x86_64 and WebView2; the installer can download WebView2. WSL is not needed.',
   },
 };
 

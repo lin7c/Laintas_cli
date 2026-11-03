@@ -21,7 +21,7 @@ Tools:
   `{ name, description?, schedule?, stages, roles }`, where
   each role = `{ name, persona }` and each stage = `{ id, role, task, manual?,
   next:[{ to?, on?, maxLoops? }] }`. `runNow:true` also runs one cycle now. This
-  is what Helpwo's "deploy this process" sends over.
+  is what Helpwow's "deploy this process" sends over.
 - `company.run({ name })` — run one cycle of a registered process immediately.
 - `company.list()` — list registered processes.
 - `company.status({ name })` — the last run's status + workspace.

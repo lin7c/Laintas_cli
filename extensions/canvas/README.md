@@ -2,7 +2,7 @@
 
 Whiteboards in the terminal, and for the agent.
 
-A board is an ordinary `.excalidraw` file, so it opens in Helpwo's editor, in
+A board is an ordinary `.excalidraw` file, so it opens in Helpwow's editor, in
 Excalidraw itself, or in anything else that reads the format. This extension
 adds the terminal half: a full-screen viewer you can pan, zoom and draw on, and
 four tools the model uses to put diagrams on a board you then review.
@@ -13,7 +13,7 @@ four tools the model uses to put diagrams on a board you then review.
 /canvas list              boards under this directory
 /canvas text <path>       what is on it, as text — ids, labels, arrows
 /canvas new <path>        create a named board and open it
-/canvas open [path]       open it in Helpwo, where you draw with a mouse
+/canvas open [path]       open it in Helpwow, where you draw with a mouse
 ```
 
 In the viewer: `w` turns drawing on (`r` rect, `o` ellipse, `d` diamond,
@@ -41,7 +41,7 @@ every copy of the agent four tool schemas in front of the model whether or not
 anyone draws.
 
 The command still uses the CLI for the parts the CLI owns: argument splitting,
-the Helpwo sub-terminal launcher, the console. That is the normal arrangement —
+the Helpwow sub-terminal launcher, the console. That is the normal arrangement —
 an extension runs in-process with the same permissions, and the host's context
 is documented as a convenience rather than a boundary.
 

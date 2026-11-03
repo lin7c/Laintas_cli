@@ -435,7 +435,7 @@ class LoopIntegrationTests(unittest.TestCase):
     def test_re_reading_what_is_still_on_screen_is_declined(self):
         """The lines are in the transcript; serving them twice buys nothing.
 
-        Helpwo refuses this too, but from a ledger of what was READ. Here the
+        Helpwow refuses this too, but from a ledger of what was READ. Here the
         refusal is conditioned on what is still VISIBLE, which is why it cannot
         outlive the content the way its does.
         """
@@ -483,7 +483,7 @@ class LoopIntegrationTests(unittest.TestCase):
 
 
 class VisibilityGateTests(unittest.TestCase):
-    """Refuse only what the model can still see (merged from Helpwo)."""
+    """Refuse only what the model can still see (merged from Helpwow)."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -539,7 +539,7 @@ class VisibilityGateTests(unittest.TestCase):
         self.assertTrue(self.read(offset=100, limit=50)["ok"])
 
     def test_pruned_content_does_not_count_as_visible(self):
-        """The failure mode Helpwo's gate has: refusing content compaction ate.
+        """The failure mode Helpwow's gate has: refusing content compaction ate.
 
         A tool message truncated by compaction is no longer a copy of what it
         delivered, so the lines it held stop counting and the read is served.

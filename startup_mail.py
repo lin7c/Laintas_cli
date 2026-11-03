@@ -2,7 +2,7 @@
 
 The startup banner used to spray four or five dim advisory lines above the
 first prompt — the tips row, the training-data opt-in, the "previous session
-in this directory" hint, the Helpwo link hint, the update notice. None of them
+in this directory" hint, the Helpwow link hint, the update notice. None of them
 are urgent and all of them push the actual prompt down the screen, so they are
 collected here instead and read on demand with Alt+0.
 

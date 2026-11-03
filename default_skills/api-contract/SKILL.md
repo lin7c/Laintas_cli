@@ -1,6 +1,6 @@
 ---
 name: api-contract
-description: Building the backend half of a product whose frontend is written by a Helpwo agent — the shared API contract, what each state means, and why "I implemented it" is not the same claim as "it works". Load when a frontend agent is on the other end, or when the contract tools appear in a task.
+description: Building the backend half of a product whose frontend is written by a Helpwow agent — the shared API contract, what each state means, and why "I implemented it" is not the same claim as "it works". Load when a frontend agent is on the other end, or when the contract tools appear in a task.
 version: 1.0.0
 triggers:
   - contract
@@ -15,7 +15,7 @@ triggers:
 
 # Working against a frontend agent
 
-When a Helpwo agent writes the frontend and you write the backend, you are two
+When a Helpwow agent writes the frontend and you write the backend, you are two
 processes with no shared conversation. The frontend cannot see your code, you
 cannot see its components, and neither of you remembers the other's last run.
 

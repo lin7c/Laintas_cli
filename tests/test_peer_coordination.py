@@ -150,7 +150,7 @@ class PeerCoordinationTestCase(unittest.TestCase):
         p = self._make_file(content="v1")
         note = self._coord.note_read(p)
         self.assertFalse(note["changed"])
-        # Fingerprints are keyed per writer, not per path: an attached Helpwo
+        # Fingerprints are keyed per writer, not per path: an attached Helpwow
         # writes this same directory from inside this process, so the two must
         # keep separate views of the same file (see attach_actor).
         self.assertIn(self._coord._key(None, os.path.realpath(p)),

@@ -1,6 +1,6 @@
 """HWO runner — parse and execute .hwo workflow files.
 
-Mirrors hwo.ts from the Helpwo project:
+Mirrors hwo.ts from the Helpwow project:
   - HwoParser: ports the TypeScript parser verbatim
   - run_hwo_file(): entry point
   - run_sequence(): serial execution with context inheritance

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Laintas CLI is an autonomous AI agent for the terminal. Users type natural-language tasks at a prompt; the AI agent loop calls a backend API (Laintas/Helpwo), receives a reply with a shell command, executes that command in a pseudo-terminal, feeds the output back to the AI, and iterates until the task is done. System commands typed directly are executed via PTY passthrough with no AI involvement.
+Laintas CLI is an autonomous AI agent for the terminal. Users type natural-language tasks at a prompt; the AI agent loop calls a backend API (Laintas/Helpwow), receives a reply with a shell command, executes that command in a pseudo-terminal, feeds the output back to the AI, and iterates until the task is done. System commands typed directly are executed via PTY passthrough with no AI involvement.
 
 **Version:** 1.25.2
 **Python:** >= 3.10
@@ -219,14 +219,14 @@ cycle detection, normalized progress/status, and an append-only event history.
 ### 12.1 Platform separation
 
 The terminal CLI targets Linux and macOS. The independent
-`Helpwo windows` desktop product owns the Windows kernel,
-Helpwo chat UI, native installer and signed updater. Its private source
+`Helpwow windows` desktop product owns the Windows kernel,
+Helpwow chat UI, native installer and signed updater. Its private source
 repository is `lin7c/laintas-Helpwo-cli-agent-for-windows`.
 
 The CLI contains no Windows host, kernel lifecycle commands, WSL launcher,
 machine-tool integration or Windows packaging jobs. `runtime_host.py` is a
 generic injectable capability boundary. The default host does not register
-with a gateway or discover Helpwo Kernel. Local application APIs and
+with a gateway or discover Helpwow Kernel. Local application APIs and
 terminal pairing remain separate generic features.
 
 See [build/RELEASE.md](build/RELEASE.md) for the Unix packaging contract and

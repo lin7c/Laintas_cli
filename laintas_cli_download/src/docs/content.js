@@ -63,9 +63,9 @@ export const GROUPS = [
         id: 'install',
         title: L('安装', 'Install'),
         blocks: [
-          { t: 'note', title: L('Helpwo windows 桌面版', 'Helpwo windows desktop edition'),
-            ...L('想在 Windows 桌面使用 Helpwo 的对话、编辑器、预览和多个 Agent，请下载 [Helpwo windows](https://cli.laintas.com/#helpwo-windows)（原名 laintas-Helpwo-cli-for-windows）。它默认使用本机工作区的文件和终端；安装与使用见 [Helpwo windows 文档](https://helpwo.laintas.com/docs/#windows)。本节下面的 laintas-cli-windows 是独立的终端产品。',
-              'For Helpwo chat, editor, preview and agents in a Windows desktop window, download [Helpwo windows](https://cli.laintas.com/#helpwo-windows), formerly laintas-Helpwo-cli-for-windows. It uses local workspace files and terminals by default; see the [Helpwo windows guide](https://helpwo.laintas.com/docs/#windows). The laintas-cli-windows described below is a separate terminal product.') },
+          { t: 'note', title: L('Helpwow windows 桌面版', 'Helpwow windows desktop edition'),
+            ...L('想在 Windows 桌面使用 Helpwow 的对话、编辑器、预览和多个 Agent，请下载 [Helpwow windows](https://cli.laintas.com/#helpwo-windows)（原名 laintas-Helpwo-cli-for-windows）。它默认使用本机工作区的文件和终端；安装与使用见 [Helpwow windows 文档](https://helpwow.laintas.com/docs/#windows)。本节下面的 laintas-cli-windows 是独立的终端产品。',
+              'For Helpwow chat, editor, preview and agents in a Windows desktop window, download [Helpwow windows](https://cli.laintas.com/#helpwo-windows), formerly laintas-Helpwo-cli-for-windows. It uses local workspace files and terminals by default; see the [Helpwow windows guide](https://helpwow.laintas.com/docs/#windows). The laintas-cli-windows described below is a separate terminal product.') },
           { t: 'h', ...L('系统要求', 'Requirements') },
           {
             t: 'table',
@@ -97,8 +97,8 @@ export const GROUPS = [
           { t: 'code', label: 'bash', code: 'curl -fsSL https://cli.laintas.com/install.sh | bash\nlaintas-cli' },
           {
             t: 'p', ...L(
-              '安装脚本会选择 Apple Silicon 或 Intel 安装包，校验 SHA-256 后安装到 `~/.local/bin`。Mac 版不包含 Helpwo Kernel。',
-              'The installer chooses the Apple Silicon or Intel archive, verifies its SHA-256 checksum and installs to `~/.local/bin`. The Mac build does not include Helpwo Kernel.',
+              '安装脚本会选择 Apple Silicon 或 Intel 安装包，校验 SHA-256 后安装到 `~/.local/bin`。Mac 版不包含 Helpwow Kernel。',
+              'The installer chooses the Apple Silicon or Intel archive, verifies its SHA-256 checksum and installs to `~/.local/bin`. The Mac build does not include Helpwow Kernel.',
             ),
           },
           { t: 'h', ...L('Windows', 'Windows') },
@@ -871,28 +871,28 @@ export const GROUPS = [
     sections: [
       {
         id: 'helpwo',
-        title: L('与 Helpwo 一起使用', 'Using it with Helpwo'),
-        lead: L('[Helpwo](https://helpwo.laintas.com) 是浏览器里的 AI 工作台。CLI 可以把所在的机器作为 Helpwo 的运行环境，也可以在本地直接运行 Helpwo。',
-          '[Helpwo](https://helpwo.laintas.com) is an AI workspace in the browser. The CLI can make its machine a runtime environment for Helpwo, or run Helpwo locally.'),
+        title: L('与 Helpwow 一起使用', 'Using it with Helpwow'),
+        lead: L('[Helpwow](https://helpwow.laintas.com) 是浏览器里的 AI 工作台。CLI 可以把所在的机器作为 Helpwow 的运行环境，也可以在本地直接运行 Helpwow。',
+          '[Helpwow](https://helpwow.laintas.com) is an AI workspace in the browser. The CLI can make its machine a runtime environment for Helpwow, or run Helpwow locally.'),
         blocks: [
           {
             t: 'table',
             head: L(['命令', '作用'], ['Command', 'Effect']),
             rows: L([
-              ['`/helpwo --remote`', '让这台机器上线为 Helpwo 的运行环境：在 helpwo.laintas.com 中可以浏览它的文件、打开终端、让 AI 在这里执行命令'],
-              ['`/helpwo`', '在名为 `helpwo` 的子终端里本地运行 Helpwo；当前目录就是它的工作区，登录、数据和对话按目录保存'],
-              ['`/helpwo stop`', '关闭 Helpwo 子终端及其中的一切'],
-              ['`/shared`', '通过 Laintas 存储与 Helpwo 共享文件（push / pull / list）'],
+              ['`/helpwo --remote`', '让这台机器上线为 Helpwow 的运行环境：在 helpwow.laintas.com 中可以浏览它的文件、打开终端、让 AI 在这里执行命令'],
+              ['`/helpwo`', '在名为 `helpwo` 的子终端里本地运行 Helpwow；当前目录就是它的工作区，登录、数据和对话按目录保存'],
+              ['`/helpwo stop`', '关闭 Helpwow 子终端及其中的一切'],
+              ['`/shared`', '通过 Laintas 存储与 Helpwow 共享文件（push / pull / list）'],
             ], [
-              ['`/helpwo --remote`', 'Bring this machine online as a Helpwo runtime environment: on helpwo.laintas.com you can browse its files, open terminals and let the AI run commands here'],
-              ['`/helpwo`', 'Run Helpwo locally in a sub-terminal named `helpwo`; the current folder is its workspace, and sign-in, data and conversation are kept per folder'],
-              ['`/helpwo stop`', 'Close the Helpwo sub-terminal and everything in it'],
-              ['`/shared`', 'Share files with Helpwo through Laintas storage (push / pull / list)'],
+              ['`/helpwo --remote`', 'Bring this machine online as a Helpwow runtime environment: on helpwow.laintas.com you can browse its files, open terminals and let the AI run commands here'],
+              ['`/helpwo`', 'Run Helpwow locally in a sub-terminal named `helpwo`; the current folder is its workspace, and sign-in, data and conversation are kept per folder'],
+              ['`/helpwo stop`', 'Close the Helpwow sub-terminal and everything in it'],
+              ['`/shared`', 'Share files with Helpwow through Laintas storage (push / pull / list)'],
             ]),
           },
           {
-            t: 'p', ...L('远程模式下，文件内容通过点对点连接直接在浏览器和这台机器之间传输，不经过 Helpwo 服务器。Helpwo 侧的用法见 [Helpwo 文档](https://helpwo.laintas.com/docs/#environments)。',
-              'In remote mode, file contents travel peer-to-peer between the browser and this machine, not through Helpwo’s servers. For the Helpwo side, see the [Helpwo docs](https://helpwo.laintas.com/docs/#environments).'),
+            t: 'p', ...L('远程模式下，文件内容通过点对点连接直接在浏览器和这台机器之间传输，不经过 Helpwow 服务器。Helpwow 侧的用法见 [Helpwow 文档](https://helpwow.laintas.com/docs/#environments)。',
+              'In remote mode, file contents travel peer-to-peer between the browser and this machine, not through Helpwow’s servers. For the Helpwow side, see the [Helpwow docs](https://helpwow.laintas.com/docs/#environments).'),
           },
         ],
       },
@@ -988,7 +988,7 @@ export const GROUPS = [
               ['`/spawn`、`/tell`、`/abort`', '派生子 Agent、发消息、中止'],
               ['`/station`', 'Agent 与终端管理器（别名 `/st`）'],
               ['`/term`、`/send`、`/terminate`', '终端的创建、输入、关闭（`/t` 打开终端浏览器）'],
-              ['`/helpwo`、`/app`、`/shared`', 'Helpwo、托管应用、共享文件'],
+              ['`/helpwo`、`/app`、`/shared`', 'Helpwow、托管应用、共享文件'],
               ['`/handoff`', '把工作以文件形式交接给下一个人'],
             ], [
               ['`/name [new-name]`', 'Show or set the current agent’s name'],
@@ -996,7 +996,7 @@ export const GROUPS = [
               ['`/spawn`, `/tell`, `/abort`', 'Spawn a sub-agent, message one, abort one'],
               ['`/station`', 'Agent and terminal manager (alias `/st`)'],
               ['`/term`, `/send`, `/terminate`', 'Create, feed and close terminals (`/t` opens the terminal browser)'],
-              ['`/helpwo`, `/app`, `/shared`', 'Helpwo, hosted applications, shared files'],
+              ['`/helpwo`, `/app`, `/shared`', 'Helpwow, hosted applications, shared files'],
               ['`/handoff`', 'Hand work to the next person as a file'],
             ]),
           },

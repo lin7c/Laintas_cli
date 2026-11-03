@@ -1,6 +1,6 @@
 """contract_store.py — the API contract two agents coordinate through.
 
-When Helpwo writes the frontend and laintas_cli writes the backend, the thing
+When Helpwow writes the frontend and laintas_cli writes the backend, the thing
 they have to agree on is the interface between them. Today that agreement is
 carried by a human retelling it in two chat windows, which is exactly the
 failure mode multi-agent work is known for: each agent optimises its own task
@@ -12,7 +12,7 @@ The fix is not a better message. It is a **file**:
     .laintas/contract/contract.lock.json who agreed to what, and whether the
                                          code still matches
 
-A file is the only thing both sides can reach in both topologies. When Helpwo
+A file is the only thing both sides can reach in both topologies. When Helpwow
 runs against a remote CLI it edits that CLI's disk over the P2P filesystem;
 when it runs against the local bridge it edits the same disk over loopback.
 Either way the contract lives in the repository, so it is versioned, diffable,
@@ -22,7 +22,7 @@ an empty conversation history by design (laintas_cli._handle_delegate), so the
 contract file is also the backend agent's memory of what it agreed to.
 
 Why JSON and not YAML: OpenAPI is defined for both, YAML is nicer to read, and
-Helpwo has no YAML parser in the browser while the CLI's is only a transitive
+Helpwow has no YAML parser in the browser while the CLI's is only a transitive
 dependency. A format one of the two participants cannot parse is not a shared
 source of truth, so the machine-readable copy is JSON on both sides.
 
@@ -47,16 +47,20 @@ source of truth, so the machine-readable copy is JSON on both sides.
 from __future__ import annotations
 
 import hashlib
+import copy
+import functools
+import inspect
 import json
 import os
 import re
-import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 
 import json_store
 import paths
+import file_lock
 
 CONTRACT_DIR = ".laintas/contract"
 SPEC_FILE = "openapi.json"
@@ -67,7 +71,6 @@ METHODS = ("get", "put", "post", "delete", "options", "head", "patch", "trace")
 
 _MAX_HISTORY = 50
 _MAX_PROBE_BYTES = 256 * 1024
-_lock = threading.RLock()
 
 
 class ContractError(Exception):
@@ -94,7 +97,7 @@ def _empty_spec() -> dict:
     return {
         "openapi": "3.1.0",
         "info": {"title": "Project API", "version": "0.1.0",
-                 "description": "Shared contract between the Helpwo frontend "
+                 "description": "Shared contract between the Helpwow frontend "
                                 "and the laintas_cli backend. Edit through the "
                                 "contract tools so the lock file stays in step."},
         "servers": [],
@@ -126,8 +129,44 @@ def _write_json(path: Path, data: dict) -> None:
     json_store.save_json_atomic(path, data, indent=2, newline=True)
 
 
+def _journal_path(cwd=None):
+    # Coordination metadata stays outside the versioned contract directory.
+    return contract_dir(cwd).parent / "contract.transaction.json"
+
+
+def _recover_commit(cwd):
+    journal = _journal_path(cwd)
+    if not journal.exists():
+        return
+    pending = _read_json(journal, {})
+    if not isinstance(pending.get("spec"), dict) or not isinstance(pending.get("lock"), dict):
+        raise ContractError("invalid pending contract transaction")
+    _write_json(spec_path(cwd), pending["spec"])
+    _write_json(lock_path(cwd), pending["lock"])
+    _ensure_gitignore_exception(cwd)
+    journal.unlink()
+
+
+@contextmanager
+def _store_guard(cwd):
+    with file_lock.guard(contract_dir(cwd).parent / "contract.store.lock"):
+        _recover_commit(cwd)
+        yield
+
+
+def _serialized(function):
+    signature = inspect.signature(function)
+
+    @functools.wraps(function)
+    def invoke(*args, **kwargs):
+        cwd = signature.bind(*args, **kwargs).arguments.get("cwd")
+        with _store_guard(cwd):
+            return function(*args, **kwargs)
+    return invoke
+
+
 def load(cwd: Optional[str] = None) -> tuple[dict, dict]:
-    with _lock:
+    with _store_guard(cwd):
         return (_read_json(spec_path(cwd), _empty_spec()),
                 _read_json(lock_path(cwd), _empty_lock()))
 
@@ -163,13 +202,12 @@ def _ensure_gitignore_exception(cwd: Optional[str] = None) -> bool:
 
 
 def save(spec: dict, lock: dict, cwd: Optional[str] = None) -> None:
-    with _lock:
-        first_time = not spec_path(cwd).exists()
+    with _store_guard(cwd):
         lock["updatedAt"] = _now()
-        _write_json(spec_path(cwd), spec)
-        _write_json(lock_path(cwd), lock)
-        if first_time:
-            _ensure_gitignore_exception(cwd)
+        # Readers recover a partially applied pair before exposing either
+        # file. A crash between the two replacements cannot split the state.
+        _write_json(_journal_path(cwd), {"spec": spec, "lock": lock})
+        _recover_commit(cwd)
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +286,7 @@ def _record(entry: dict, actor: str, state: str, note: str = "") -> None:
 # State transitions
 # ---------------------------------------------------------------------------
 
+@_serialized
 def propose(operation: str, definition: dict, actor: str,
             note: str = "", cwd: Optional[str] = None) -> dict:
     """Declare (or re-declare) what an endpoint should look like.
@@ -279,6 +318,7 @@ def propose(operation: str, definition: dict, actor: str,
             "wasState": previous_state, "specHash": entry["specHash"]}
 
 
+@_serialized
 def agree(operation: str, actor: str, note: str = "", cwd: Optional[str] = None) -> dict:
     """Accept a proposed shape. From here it is a commitment, not a wish."""
     key, method, path = normalize_operation(operation)
@@ -296,6 +336,7 @@ def agree(operation: str, actor: str, note: str = "", cwd: Optional[str] = None)
     return {"ok": True, "operation": key, "state": "agreed"}
 
 
+@_serialized
 def implement(operation: str, actor: str, files: list, base_url: str = "",
               note: str = "", cwd: Optional[str] = None) -> dict:
     """Claim an agreed operation is now built, naming the files that build it.
@@ -336,6 +377,7 @@ def implement(operation: str, actor: str, files: list, base_url: str = "",
 # Drift
 # ---------------------------------------------------------------------------
 
+@_serialized
 def drift(cwd: Optional[str] = None, mark: bool = False) -> dict:
     """Find every operation whose contract and code have parted ways.
 
@@ -450,6 +492,7 @@ def verify(operation: str = "", base_url: str = "", cwd: Optional[str] = None,
 
     spec, lock = load(cwd)
     operations = lock.get("operations") or {}
+    baseline = copy.deepcopy(operations)
     if operation:
         key, _method, _path = normalize_operation(operation)
         if key not in operations:
@@ -525,7 +568,29 @@ def verify(operation: str = "", base_url: str = "", cwd: Optional[str] = None,
         _record(entry, "verify", "verified" if ok else "drift",
                 "verified" if ok else "; ".join(problems)[:400])
 
-    save(spec, lock, cwd)
+    # Probes can take seconds. Merge only the checked operations and reject
+    # results whose definition/implementation changed while the request ran.
+    # Never hold a project lock while waiting on the remote service.
+    with _store_guard(cwd):
+        latest_spec, latest_lock = load(cwd)
+        latest_operations = latest_lock.setdefault("operations", {})
+        changed = False
+        for result in results:
+            key = result["operation"]
+            if operations[key] == baseline[key]:
+                continue
+            _, method, path = normalize_operation(key)
+            if (latest_operations.get(key) != baseline[key]
+                    or _operation_fingerprint(latest_spec, method, path)
+                    != _operation_fingerprint(spec, method, path)
+                    or latest_spec.get("components") != spec.get("components")
+                    or latest_spec.get("servers") != spec.get("servers")):
+                result.update(ok=False, error="contract changed during verification; retry")
+                continue
+            latest_operations[key] = operations[key]
+            changed = True
+        if changed:
+            save(latest_spec, latest_lock, cwd)
     return {"ok": all(r.get("ok") for r in results), "results": results}
 
 

@@ -1,6 +1,6 @@
 """Tests for the API contract two agents coordinate through.
 
-The contract is the thing that stops a Helpwo frontend agent and a laintas_cli
+The contract is the thing that stops a Helpwow frontend agent and a laintas_cli
 backend agent from agreeing on nothing. Its value is entirely in the parts that
 refuse: a shape that was never agreed, an implementation claimed before the
 shape was settled, a response that does not match what was promised, code that
@@ -312,7 +312,7 @@ class ContractVerificationTests(unittest.TestCase):
 
 
 class ContractFingerprintTests(unittest.TestCase):
-    """The fingerprint is shared with Helpwo's TypeScript half.
+    """The fingerprint is shared with Helpwow's TypeScript half.
 
     Both sides hash canonical JSON — sorted keys, no whitespace — and keep the
     first 32 hex characters of SHA-256. If the two ever disagree, every
