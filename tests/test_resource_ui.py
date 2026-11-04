@@ -324,15 +324,15 @@ class ResourceBrowserModelTests(unittest.TestCase):
         self.assertIn("● PROMPT", rendered)
         self.assertIn("├ KNOWLEDGE", rendered)
 
-        styles = dict((text, style) for style, text in fragments)
-        self.assertEqual(styles[" ✗ "], "class:timeline.failed")
-        self.assertEqual(styles["TOOL · Bash"], "class:timeline.failed")
-        self.assertEqual(styles[" ✓ "], "class:timeline.tool")
+        style_for = lambda needle: next(style for style, value in fragments if needle in value)
+        self.assertEqual(style_for(" ✗ "), "class:timeline.failed")
+        self.assertEqual(style_for("TOOL · Bash"), "class:timeline.failed")
+        self.assertEqual(style_for(" ✓ "), "class:timeline.tool")
         # The failed call's own output is red; the successful and the
         # verdict-less bodies keep their ordinary style.
-        self.assertEqual(styles["ModuleNotFoundError"], "class:detail.failed")
-        self.assertEqual(styles["def login():"], "class:detail")
-        self.assertEqual(styles["learned context"], "class:detail")
+        self.assertEqual(style_for("ModuleNotFoundError"), "class:detail.failed")
+        self.assertEqual(style_for("def login():"), "class:detail")
+        self.assertEqual(style_for("learned context"), "class:detail")
 
     def test_failed_verdict_is_visible_in_document_and_operations_modes(self):
         for presentation in ("document", "operations"):
@@ -344,9 +344,9 @@ class ResourceBrowserModelTests(unittest.TestCase):
                     resource_ui.UILine("ModuleNotFoundError",
                                        "class:detail.code", state="failed"),
                 ], kind="timeline")
-            styles = dict((text, style)
-                          for style, text in browser._detail_fragments())
-            self.assertEqual(styles["ModuleNotFoundError"],
+            style = next(style for style, value in browser._detail_fragments()
+                         if "ModuleNotFoundError" in value)
+            self.assertEqual(style,
                              "class:detail.failed", presentation)
 
     def test_section_navigation_wraps_across_headings_and_changes(self):
@@ -432,7 +432,7 @@ class ResourceBrowserModelTests(unittest.TestCase):
             left = browser._pane_header_fragments("list")
             right = browser._pane_header_fragments("detail")
         self.assertEqual(left[0][0], "class:pane.header.focus")
-        self.assertIn("INDEX  2", left[0][1])
+        self.assertIn("INDEX  1/2", left[0][1])
         self.assertIn("SOURCE  Alpha", right[0][1])
 
     def test_real_event_loop_enters_detail_then_quits(self):

@@ -33,6 +33,7 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 
 import terminal_arbiter
+from terminal_layout import fit_hints, fit_line, themed_style, wrap_fragments
 
 
 _MARKUP_RE = re.compile(r"\[/?[^\]]+\]")
@@ -230,30 +231,7 @@ _PANE_LABELS = {
 
 def _browser_style() -> Style:
     """Keep resource screens readable with the terminal's active theme."""
-    import terminal_theme
-    mode = "mono" if "NO_COLOR" in os.environ else terminal_theme.active()
-    if mode == "dark":
-        return _STYLE
-    colors = {
-        "#0d1117": "#ffffff", "#161b22": "#f6f8fa", "#21262d": "#d0d7de",
-        "#e6edf3": "#24292f", "#f0f6fc": "#24292f", "#c9d1d9": "#24292f",
-        "#8b949e": "#57606a", "#30363d": "#8c959f", "#31533a": "#8c959f",
-        "#4ade80": "#176f2c", "#3fb950": "#176f2c", "#2ea043": "#176f2c",
-        "#a78bfa": "#6e40a8", "#d2a8ff": "#6e40a8", "#e3b341": "#8a5a00",
-        "#f85149": "#cf222e", "#ff7b72": "#cf222e", "#102619": "#dafbe1",
-        "#2d1518": "#ffebe9", "#3b275f": "#e8d9ff",
-    }
-    rules = []
-    for name, value in _STYLE.style_rules:
-        if mode == "mono":
-            value = re.sub(r"(?:bg:)?#[0-9a-fA-F]{6}", "", value)
-            if name in {"list.selected", "search.match", "search.match.current"}:
-                value += " bold reverse"
-        else:
-            value = re.sub(r"#[0-9a-fA-F]{6}",
-                           lambda match: colors.get(match.group(), match.group()), value)
-        rules.append((name, value))
-    return Style(rules)
+    return themed_style(_STYLE)
 
 
 class _MouseControl(FormattedTextControl):
@@ -326,6 +304,7 @@ class ResourceBrowser:
         self.assistant_busy = False
         self._assistant_interrupt = threading.Event()
         self._assistant_thread: Optional[threading.Thread] = None
+        self._assistant_request = 0
         self.search_scope = "list"
         self._list_query = ""
         self._detail_query = ""
@@ -339,6 +318,14 @@ class ResourceBrowser:
         self._last_loaded = 0.0
         self._last_selected_key = initial_key
         self._running = False
+        self._closed = False
+        self._help_scroll = 0
+        self._detail_rows_cache = None
+        self._filter_return_key = ""
+        self._filter_return_scroll = 0
+        self._filter_return_query = ""
+        self._last_wide = self.is_wide
+        self._last_width = shutil.get_terminal_size((100, 30)).columns
         self._lock = threading.RLock()
 
         self.search = Buffer(name="resource_search", multiline=False)
@@ -355,6 +342,40 @@ class ResourceBrowser:
             return None
         self.selected = max(0, min(self.selected, len(self.filtered) - 1))
         return self.filtered[self.selected]
+
+    def _body_height(self) -> int:
+        rows = shutil.get_terminal_size((100, 30)).lines
+        return max(1, rows - 4 - bool(self.status) - self.search_active
+                   - bool(self.assistant_handler)
+                   - bool(self._list_query and not self.search_active)
+                   - bool(self.detail and self.detail.subtitle and not self.help_open
+                          and (self.is_wide or self.mode == "detail")))
+
+    def _pane_width(self, pane: str) -> int:
+        width = shutil.get_terminal_size((100, 30)).columns
+        left = max(32, int(width * 0.38))
+        return max(1, (left if pane == "list" else width - left - 1)
+                   if self.is_wide else width)
+
+    def _resize_focus(self, app) -> None:
+        width = shutil.get_terminal_size((100, 30)).columns
+        if width != self._last_width:
+            self._last_width = width
+            cached = self._detail_rows_cache
+            if (self.detail and cached and cached[2]
+                    and cached[0][0] == tuple(self.detail.lines)):
+                source = cached[2][min(self.detail_scroll, len(cached[2]) - 1)]
+                self.detail_scroll = self._detail_position(source)
+            if self._detail_query and self._detail_matches:
+                self._locate_detail_match()
+        wide = self.is_wide
+        if wide == self._last_wide:
+            return
+        self._last_wide = wide
+        if not wide:
+            self.mode = "detail" if self.help_open or self.focus == "detail" else "list"
+        if not self.search_active and not self.assistant_active:
+            self._focus_pane(self.focus, app)
 
     def reload(self, *, preserve: bool = True) -> None:
         with self._lock:
@@ -437,10 +458,14 @@ class ResourceBrowser:
             visible = self._detail_visible_indices()
             if line_index not in visible:
                 return
-            line_index = visible.index(line_index)
-            self._detail_cursor = line_index
+            self._detail_cursor = self._detail_position(line_index)
+        line_index = self._detail_position(line_index)
+        for index, row in enumerate(self._detail_rows()):
+            if any(style == "class:search.match.current" for style, _ in row):
+                line_index = index
+                break
         # Put the hit near the upper third instead of pinning it to the edge.
-        height = max(4, shutil.get_terminal_size((100, 30)).lines - 7)
+        height = self._body_height()
         self.detail_scroll = max(0, line_index - max(0, height // 3))
 
     def _jump_detail_match(self, delta: int) -> None:
@@ -538,9 +563,9 @@ class ResourceBrowser:
             self._detail_search_key and self._detail_search_key != item.key)
         self.detail = detail
         self.detail_key = item.key
-        self.detail_scroll = max(0, int(detail.start_line or 0))
         self.selected_section = 0
         self._detail_cursor = 0
+        self.detail_scroll = self._detail_position(max(0, int(detail.start_line or 0)))
         if changed_item:
             self._detail_query = ""
             self._detail_search_key = ""
@@ -582,7 +607,7 @@ class ResourceBrowser:
             self.selected_section = section
             if section in self.detail.expanded_sections: self.detail.expanded_sections.remove(section)
             else: self.detail.expanded_sections.add(section)
-            self._detail_cursor = self._detail_visible_indices().index(source_line)
+            self._detail_cursor = self._detail_position(source_line)
             self.detail_scroll = self._detail_cursor
             self.app.invalidate()
 
@@ -594,20 +619,23 @@ class ResourceBrowser:
         headings = self._detail_headings()
         if headings:
             self.selected_section = min(self.selected_section, len(headings) - 1)
-            self._detail_cursor = self._detail_visible_indices().index(
-                headings[self.selected_section])
+            self._detail_cursor = self._detail_position(headings[self.selected_section])
             self.detail_scroll = self._detail_cursor
         self.app.invalidate()
 
     def _move_detail(self, delta: int) -> None:
+        if self.help_open:
+            self._help_scroll = max(0, self._help_scroll + delta)
+            return
         visible = self._detail_visible_indices()
-        count = len(visible)
+        rows = self._detail_rows()
+        count = len(rows)
         collapsible = bool(self.detail and self.collapsible_detail and self.detail.collapsible)
         start = self._detail_cursor if collapsible else self.detail_scroll
         self.detail_scroll = max(0, min(max(0, count - 1), start + delta))
-        if visible and collapsible:
+        if rows and collapsible:
             self._detail_cursor = self.detail_scroll
-            source_line = visible[self.detail_scroll]
+            source_line = self._detail_row_sources[self.detail_scroll]
             headings = self._detail_headings()
             self.selected_section = max(
                 0, sum(index <= source_line for index in headings) - 1)
@@ -627,7 +655,7 @@ class ResourceBrowser:
             headings = self._detail_headings()
             if headings:
                 visible = self._detail_visible_indices()
-                anchors = [visible.index(index) for index in headings]
+                anchors = [self._detail_position(index) for index in headings]
                 cursor = self._detail_cursor
                 if forward:
                     target = next((i for i in anchors if i > cursor), anchors[0])
@@ -637,7 +665,7 @@ class ResourceBrowser:
                 self._detail_cursor = target
                 self.detail_scroll = target
             return
-        anchors = self._detail_anchors()
+        anchors = [self._detail_position(index) for index in self._detail_anchors()]
         if not anchors:
             return
         if forward:
@@ -691,10 +719,11 @@ class ResourceBrowser:
         self.status = result.message
         self.status_style = result.message_style
         if result.detail is not None:
-            self.detail_cache[item.key] = result.detail
+            key = item.key if item is not None else "__action__"
+            self.detail_cache[key] = result.detail
             self.detail = result.detail
-            self.detail_key = item.key
-            self.detail_scroll = max(0, result.detail.start_line)
+            self.detail_key = key
+            self.detail_scroll = self._detail_position(max(0, result.detail.start_line))
             self.mode = "detail"
             self._focus_pane("detail")
         if result.refresh:
@@ -725,10 +754,9 @@ class ResourceBrowser:
         self._sync_detail(force=True)
 
     def _list_fragments(self):
-        width, height = shutil.get_terminal_size((100, 30))
-        pane_width = max(32, int(width * 0.38)) if self.is_wide else width
+        pane_width = self._pane_width("list")
         row_height = self._list_row_height()
-        visible_rows = max(3, (height - 7) // row_height)
+        visible_rows = max(1, (self._body_height() - 1) // row_height)
         if self.selected < self.list_scroll:
             self.list_scroll = self.selected
         if self.selected >= self.list_scroll + visible_rows:
@@ -737,8 +765,19 @@ class ResourceBrowser:
         end = min(len(self.filtered), start + visible_rows)
         fragments = []
         if not self.filtered:
-            message = "No matches." if self.items else self.empty_message
-            return [("class:muted", f"\n  {message}\n")]
+            if self.status_style == "class:error" and self.status:
+                message = "Could not load this list."
+                next_action = "Press Ctrl+R to retry or Esc to close."
+            elif self.items:
+                message = "No matches for this filter."
+                next_action = "Press / to edit the filter or Esc to clear it."
+            else:
+                message = self.empty_message
+                next_action = "Press ? for available actions or Esc to close."
+            rows = wrap_fragments([("class:detail.title", message + "\n\n"),
+                                   ("class:muted", next_action)], max(1, pane_width - 4))
+            return [(style, "  " + value if index == 0 else value)
+                    for row in rows for index, (style, value) in enumerate(row + [("", "\n")])]
         for index in range(start, end):
             item = self.filtered[index]
             selected = index == self.selected
@@ -750,7 +789,7 @@ class ResourceBrowser:
                 f"{len(self.filtered) - index:02d}  "
                 if self.presentation == "timeline" else "")
             max_title = max(
-                12, pane_width - display_width(status)
+                1, pane_width - display_width(status)
                 - display_width(badge) - display_width(ordinal) - 7)
             title = truncate_display(
                 plain(item.title).replace("\n", " "), max_title)
@@ -786,7 +825,7 @@ class ResourceBrowser:
                      "     │ " if self.presentation == "timeline" else "     "),
                 ])
                 fragments.extend(self._list_text_fragments(
-                    truncate_display(subtitle, max(12, pane_width - 8)),
+                        truncate_display(subtitle, max(1, pane_width - 8)),
                     "class:list.subtitle"))
                 fragments.append(("class:list.subtitle", "\n"))
         if end < len(self.filtered):
@@ -817,21 +856,14 @@ class ResourceBrowser:
             return None
         return NotImplemented
 
-    def _detail_fragments(self):
-        if self.help_open:
-            return self._help_fragments()
+    def _detail_unwrapped(self):
         detail = self.detail
         if detail is None:
             return [("class:muted", "\n  Select an item to see its details.\n")]
-        _, height = shutil.get_terminal_size((100, 30))
-        body_height = max(4, height - 7)
         visible = self._detail_visible_indices()
         headings = self._detail_headings()
-        max_scroll = max(0, len(visible) - body_height)
-        self.detail_scroll = max(0, min(self.detail_scroll, max_scroll))
-        end = min(len(visible), self.detail_scroll + body_height)
         fragments = []
-        for position in range(self.detail_scroll, end):
+        for position in range(len(visible)):
             line_index = visible[position]
             line = detail.lines[line_index]
             if self.presentation == "timeline" and detail.kind != "diff":
@@ -876,10 +908,51 @@ class ResourceBrowser:
                 fragments.extend(self._detail_text_fragments(
                     line_index, clean_ansi(line.text), base_style))
                 fragments.append((base_style, "\n"))
-        if end < len(visible):
-            fragments.append(("class:muted",
-                              f"\n  ↓ {len(visible) - end} more lines"))
         return fragments
+
+    def _detail_rows(self):
+        detail = self.detail
+        width = max(1, self._pane_width("detail") - 1)
+        key = (tuple(detail.lines) if detail else (), width, self.presentation,
+               detail.kind if detail else None,
+               bool(detail and detail.collapsible), self.collapsible_detail,
+               tuple(sorted(detail.expanded_sections)) if detail else (),
+               self.selected_section, self._detail_query, self._detail_match_index)
+        if self._detail_rows_cache and self._detail_rows_cache[0] == key:
+            self._detail_row_sources = self._detail_rows_cache[2]
+            return self._detail_rows_cache[1]
+        rows, sources, line, logical = [], [], [], 0
+        visible = self._detail_visible_indices()
+        for style, value in self._detail_unwrapped():
+            for segment in value.splitlines(keepends=True):
+                line.append((style, segment))
+                if segment.endswith("\n"):
+                    wrapped = wrap_fragments(line, width)
+                    rows.extend(wrapped)
+                    source = visible[min(logical, len(visible) - 1)] if visible else 0
+                    sources.extend([source] * len(wrapped))
+                    line, logical = [], logical + 1
+        if line:
+            wrapped = wrap_fragments(line, width)
+            rows.extend(wrapped)
+            sources.extend([visible[-1] if visible else 0] * len(wrapped))
+        self._detail_row_sources = sources
+        self._detail_rows_cache = (key, rows, sources)
+        return rows
+
+    def _detail_position(self, source_line: int) -> int:
+        self._detail_rows()
+        return next((index for index, source in enumerate(self._detail_row_sources)
+                     if source == source_line), 0)
+
+    def _detail_fragments(self):
+        if self.help_open:
+            return self._help_fragments()
+        rows = self._detail_rows()
+        height = self._body_height()
+        self.detail_scroll = max(0, min(self.detail_scroll, max(0, len(rows) - height)))
+        return [(style, value) for row in rows[self.detail_scroll:self.detail_scroll + height]
+                for style, value in row + [("", "\n")]]
 
     def _help_fragments(self):
         rows = [
@@ -896,6 +969,9 @@ class ResourceBrowser:
                                   for action in self.actions)
         if action_text:
             rows.append(("ACTIONS", action_text))
+        rows.append(("REFRESH", "Ctrl+R  reload the list"))
+        if self.status:
+            rows.append(("LAST RESULT", plain(self.status)))
         rows.append(("CLOSE", "?  close help    q  close screen"))
         fragments = [("class:help.heading", " KEYBOARD\n"),
                      ("class:border", " ───────────────────────────────────────\n")]
@@ -904,7 +980,11 @@ class ResourceBrowser:
                 ("class:help.heading", f" {heading}\n"),
                 ("class:help", f"   {body}\n\n"),
             ])
-        return fragments
+        physical = wrap_fragments(fragments, max(1, self._pane_width("detail") - 1))
+        height = self._body_height()
+        self._help_scroll = min(self._help_scroll, max(0, len(physical) - height))
+        return [(style, value) for row in physical[self._help_scroll:self._help_scroll + height]
+                for style, value in row + [("", "\n")]]
 
     def _detail_mouse(self, mouse_event):
         if mouse_event.event_type == MouseEventType.SCROLL_UP:
@@ -914,8 +994,10 @@ class ResourceBrowser:
             self._move_detail(3)
             return None
         if mouse_event.event_type == MouseEventType.MOUSE_UP and self.detail and self.detail.collapsible:
-            visible=self._detail_visible_indices(); pos=self.detail_scroll+max(0,mouse_event.position.y)
-            if pos < len(visible): self._toggle_detail_section(visible[pos])
+            self._detail_rows()
+            pos = self.detail_scroll + max(0, mouse_event.position.y)
+            if pos < len(self._detail_row_sources):
+                self._toggle_detail_section(self._detail_row_sources[pos])
             return None
         return NotImplemented
 
@@ -924,12 +1006,13 @@ class ResourceBrowser:
         total = len(self.items)
         scope = f"{count}/{total}" if count != total else str(total)
         mode = "DETAIL" if (not self.is_wide and self.mode == "detail") else "BROWSE"
-        return [
-            ("class:header.brand", "  LAINTAS"),
-            ("class:header.path", "  /  "),
-            ("class:header", plain(self.title).upper()),
-            ("class:header.meta", f"    {scope}  ·  {mode}\n"),
-        ]
+        width = shutil.get_terminal_size((100, 30)).columns
+        suffix = f"  {scope} · {mode}"
+        prefix = "  LAINTAS / " if width >= 80 else "  "
+        available = max(1, width - display_width(prefix + suffix) - 1)
+        return [("class:header.brand", prefix),
+                ("class:header", truncate_display(plain(self.title).upper(), available, "…")),
+                ("class:header.meta", suffix)]
 
     def _pane_header_fragments(self, pane: str):
         left, right = self.pane_labels
@@ -938,7 +1021,7 @@ class ResourceBrowser:
                    (not self.is_wide and self.mode == pane))
         style = "class:pane.header.focus" if focused else "class:pane.header"
         if pane == "list":
-            suffix = f"  {len(self.filtered)}"
+            suffix = f"  {self.selected + 1 if self.filtered else 0}/{len(self.filtered)}"
         elif self.help_open:
             suffix = "  SHORTCUTS"
         elif self.detail:
@@ -950,7 +1033,7 @@ class ResourceBrowser:
                 suffix += f"  ·  FIND {current}/{len(self._detail_matches)}"
         else:
             suffix = ""
-        return [(style, f"  {label}{suffix}\n")]
+        return fit_line([(style, f"  {label}{suffix}")], self._pane_width(pane) - 1)
 
     def _search_prompt_fragments(self):
         label = "Find in detail" if self.search_scope == "detail" else "Filter list"
@@ -966,16 +1049,21 @@ class ResourceBrowser:
         if not prompt or self.assistant_handler is None or self.assistant_busy:
             return
         item, detail = self._selected_item(), self.detail
-        self._assistant_interrupt.clear()
+        self._assistant_interrupt = threading.Event()
+        interrupt = self._assistant_interrupt
+        self._assistant_request += 1
+        request = self._assistant_request
         self.assistant_busy = True
         self.status = ("AI is inspecting the selected context…" if self.assistant_label == "AI"
                        else "Applying command…")
         self.status_style = "class:muted"
 
-        def work() -> None:
+        def complete(result=None, error=None) -> None:
+            if request != self._assistant_request:
+                return
             try:
-                result = self.assistant_handler(
-                    item, detail, prompt, self._assistant_interrupt)
+                if error is not None:
+                    raise error
                 if isinstance(result, UIActionResult):
                     action_result = result
                 elif isinstance(result, UIDetail):
@@ -983,24 +1071,53 @@ class ResourceBrowser:
                 else:
                     action_result = UIActionResult(
                         detail=UIDetail.text("AI RESPONSE", result))
-                if action_result.detail is not None:
-                    self.detail = action_result.detail
-                    self.detail_key = "__assistant__"
-                    self.detail_scroll = 0
-                    self.focus = "detail"
-                    if not self.is_wide:
-                        self.mode = "detail"
+                if self._closed or interrupt.is_set():
+                    return
                 if action_result.refresh:
-                    self.reload(preserve=True)
-                self.status = action_result.message or f"{self.assistant_label} complete"
+                    self._refresh_live()
+                current = self._selected_item()
+                deferred = bool(item is not None and (current is None or current.key != item.key))
+                if action_result.detail is not None:
+                    if item is not None:
+                        self.detail_cache[item.key] = action_result.detail
+                    if not deferred:
+                        self.detail = action_result.detail
+                        self.detail_key = "__assistant__"
+                        self.detail_scroll = self._detail_position(max(0, action_result.detail.start_line))
+                        self.focus = "detail"
+                        if not self.is_wide:
+                            self.mode = "detail"
+                self.status = action_result.message or (
+                    f"{self.assistant_label} response ready for {plain(item.title)}. Select it to read."
+                    if deferred and action_result.detail is not None else f"{self.assistant_label} complete")
                 self.status_style = action_result.message_style
             except Exception as exc:
-                self.status = f"{self.assistant_label} failed: {type(exc).__name__}: {exc}"
-                self.status_style = "class:error"
+                if not self._closed and not interrupt.is_set():
+                    self.status = f"{self.assistant_label} failed: {type(exc).__name__}: {exc}"
+                    self.status_style = "class:error"
             finally:
                 self.assistant_busy = False
+                if interrupt.is_set() and not self._closed:
+                    self.status = ("AI request cancelled." if self.assistant_label == "AI"
+                                   else "Stopped waiting for the command. Refresh to check its result.")
+                    self.status_style = "class:muted"
                 if hasattr(self, "app") and self.app.is_running:
                     self.app.invalidate()
+
+        def work() -> None:
+            result, error = None, None
+            try:
+                result = self.assistant_handler(item, detail, prompt, interrupt)
+            except Exception as exc:
+                error = exc
+            loop = getattr(self.app, "loop", None)
+            if self.app.is_running and loop is not None:
+                try:
+                    loop.call_soon_threadsafe(lambda: complete(result, error))
+                    return
+                except RuntimeError:
+                    pass  # The application closed between the check and publish.
+            complete(result, error)
 
         self._assistant_thread = threading.Thread(
             target=work, name="resource-ui-assistant", daemon=True)
@@ -1008,6 +1125,13 @@ class ResourceBrowser:
 
     def _footer_fragments(self):
         width = max(1, shutil.get_terminal_size((100, 30)).columns)
+        if self.help_open:
+            return fit_hints([("Esc", "Back"), ("↑↓", "Scroll"), ("PgUp/PgDn", "Page")], width, more=None)
+        if self.search_active:
+            return fit_hints([("Esc", "Cancel"), ("Enter", "Apply"), ("Ctrl+U", "Clear")], width, more=None)
+        if self.assistant_active:
+            return fit_hints([("Esc", "Cancel" if self.assistant_busy else "Back"),
+                              ("Enter", "Run" if self.assistant_label == "Command" else "Send")], width, more=None)
         if not self.is_wide and self.mode == "detail":
             parts = [("Esc", "Back"), ("↑↓", "Scroll"),
                      ("[/]", "Section"), ("Pg", "Page")]
@@ -1017,7 +1141,9 @@ class ResourceBrowser:
             parts.extend((action.key, action.label) for action in self.actions
                          if action.name != self.primary_action)
         else:
-            parts = [("↑↓", "Navigate"), ("↵", self.primary_label)]
+            parts = [("Esc", "Close")]
+            if self.filtered:
+                parts.extend([("↵", self.primary_label), ("↑↓", "Navigate")])
             if self.searchable:
                 parts.append(("/", "Find"))
             parts.extend((action.key, action.label) for action in self.actions
@@ -1029,49 +1155,22 @@ class ResourceBrowser:
                     if self._detail_query:
                         parts.append(("n/N", "Match"))
             parts.append(("?", "Keys"))
-            parts.append(("Esc", "Close"))
         if self.collapsible_detail and self.detail and self.detail.collapsible and (
                 self.focus == "detail" or (not self.is_wide and self.mode == "detail")):
             parts = [("↑↓", "Scroll"), ("[/]", "Section"), ("↵", "Expand/Collapse"), ("p", "Next"),
                      ("x", "Expand/Collapse all"), ("Esc", "Back")]
         if self.assistant_handler is not None and not self.assistant_active:
-            parts.insert(-1, ("a", "Ask AI"))
-        if width < 100:
+            parts.insert(-1, ("a", "Command" if self.assistant_label == "Command" else "Ask AI"))
+        escape_label = ("Clear Find" if self._detail_query else
+                        "Back" if not self.is_wide and self.mode == "detail" else
+                        "Clear filter" if self._list_query else "Close")
+        parts = [(key, escape_label if key == "Esc" else label) for key, label in parts]
+        if width < 100 or self.collapsible_detail:
             # Closing the view must remain visible when optional actions no
             # longer fit. The full key list remains one ? away.
             exits = [part for part in parts if part[0] == "Esc"]
             parts = exits + [part for part in parts if part[0] != "Esc"]
-        fragments = []
-        if self.status:
-            # A one-line footer must never wrap over the body. While feedback
-            # is visible it owns the row; Esc remains discoverable.
-            suffix = "  Esc Close"
-            available = max(4, width - len(suffix) - 2)
-            message = plain(self.status).replace("\n", " ")
-            message = truncate_display(message, available, "…")
-            return [
-                (self.status_style, f" {message}"),
-                ("class:footer", suffix),
-            ]
-        for idx, (key, label) in enumerate(parts):
-            if idx:
-                fragments.append(("class:footer", " · "))
-            fragments.extend([
-                ("class:footer.key", key),
-                ("class:footer", f" {label}"),
-            ])
-        # Defensive final clamp for very small terminals or extension actions.
-        used = 0
-        fitted = []
-        for style, value in fragments:
-            remaining = width - used - 1
-            if remaining <= 0:
-                break
-            value = truncate_display(value, remaining)
-            fitted.append((style, value))
-            used += display_width(value)
-        fragments = fitted
-        return fragments
+        return fit_hints(parts, width)
 
     def _build_application(self) -> None:
         kb = KeyBindings()
@@ -1116,7 +1215,9 @@ class ResourceBrowser:
 
         @kb.add("home", filter=browsing)
         def _home(event):
-            if self.focus == "detail" or (not self.is_wide and self.mode == "detail"):
+            if self.help_open:
+                self._help_scroll = 0
+            elif self.focus == "detail" or (not self.is_wide and self.mode == "detail"):
                 self.selected_section = 0
                 self._detail_cursor = 0
                 self.detail_scroll = 0
@@ -1126,8 +1227,10 @@ class ResourceBrowser:
 
         @kb.add("end", filter=browsing)
         def _end(event):
-            if self.focus == "detail" or (not self.is_wide and self.mode == "detail"):
-                self._move_detail(len(self._detail_visible_indices()))
+            if self.help_open:
+                self._help_scroll = 10 ** 12
+            elif self.focus == "detail" or (not self.is_wide and self.mode == "detail"):
+                self._move_detail(len(self._detail_rows()))
             elif self.filtered:
                 self.selected = len(self.filtered) - 1
                 self._sync_detail()
@@ -1157,7 +1260,7 @@ class ResourceBrowser:
                 nxt=next((i for i in range(len(headings)) if i not in self.detail.expanded_sections), None)
                 if nxt is not None:
                     self.selected_section = nxt
-                    self.detail.expanded_sections.add(nxt); self.detail_scroll=self._detail_visible_indices().index(headings[nxt]); event.app.invalidate()
+                    self.detail.expanded_sections.add(nxt); self.detail_scroll=self._detail_position(headings[nxt]); event.app.invalidate()
                     self._detail_cursor = self.detail_scroll
 
         @kb.add("x", filter=browsing)
@@ -1165,7 +1268,9 @@ class ResourceBrowser:
 
         @kb.add("enter")
         def _enter(event):
-            if self.assistant_active:
+            if self.help_open:
+                _help(event)
+            elif self.assistant_active:
                 self._submit_assistant()
             elif self.search_active:
                 self.search_active = False
@@ -1176,7 +1281,7 @@ class ResourceBrowser:
                 if headings:
                     current = max(0, min(len(headings) - 1, self.selected_section))
                     self._toggle_detail_section(headings[current])
-                    self.detail_scroll = self._detail_visible_indices().index(headings[current])
+                    self.detail_scroll = self._detail_position(headings[current])
                     event.app.invalidate()
             elif not self.is_wide and self.mode == "detail":
                 self.mode = "list"
@@ -1186,7 +1291,7 @@ class ResourceBrowser:
 
         @kb.add("/", filter=browsing)
         def _search(event):
-            if not self.searchable:
+            if not self.searchable or self.help_open:
                 return
             detail_scope = bool(
                 not self.help_open and self.detail is not None and
@@ -1198,6 +1303,10 @@ class ResourceBrowser:
                 value = self._detail_query
             else:
                 value = self._list_query
+                item = self._selected_item()
+                self._filter_return_key = item.key if item else ""
+                self._filter_return_scroll = self.list_scroll
+                self._filter_return_query = value
             self.search_active = True
             self.search.text = value
             self.search.cursor_position = len(value)
@@ -1207,6 +1316,8 @@ class ResourceBrowser:
 
         @kb.add("tab", filter=browsing)
         def _tab(event):
+            if self.help_open:
+                return
             if self.is_wide:
                 self.focus = "detail" if self.focus == "list" else "list"
                 event.app.layout.focus(
@@ -1221,6 +1332,7 @@ class ResourceBrowser:
                 self._help_return_focus = self.focus
                 self._help_return_mode = self.mode
                 self.help_open = True
+                self._help_scroll = 0
                 if not self.is_wide:
                     self.mode = "detail"
                 self._focus_pane("detail", event.app)
@@ -1248,14 +1360,18 @@ class ResourceBrowser:
                 self._focus_pane(pane, event.app)
             elif self.search_active:
                 restore_detail = self.search_scope == "detail"
-                if self.search.text:
-                    self.search.text = ""
                 if restore_detail:
+                    self.search.text = ""
                     self._detail_query = ""
                     self._detail_search_key = ""
                     self._detail_matches = []
                     self._detail_match_index = -1
                     self.detail_scroll = self._search_return_scroll
+                else:
+                    self.search.text = self._filter_return_query
+                    self._list_query = self._filter_return_query
+                    self._filter(selected_key=self._filter_return_key)
+                    self.list_scroll = self._filter_return_scroll
                 self.search_active = False
                 pane = (self.mode if not self.is_wide else self.focus)
                 self._focus_pane(pane, event.app)
@@ -1268,8 +1384,24 @@ class ResourceBrowser:
             elif not self.is_wide and self.mode == "detail":
                 self.mode = "list"
                 self._focus_pane("list", event.app)
+            elif self._list_query:
+                item = self._selected_item()
+                self._list_query = ""
+                self.search.text = ""
+                self._filter(selected_key=item.key if item else "")
             else:
                 event.app.exit(result=UIOutcome("cancel"))
+
+        @kb.add("c-u", filter=Condition(lambda: self.search_active))
+        def _clear_search(event):
+            self.search.text = ""
+
+        @kb.add("r", filter=Condition(lambda: not self.help_open and
+                 not self.search_active and not self.assistant_active))
+        @kb.add("c-r", filter=Condition(lambda: not self.help_open and
+                 not self.search_active and not self.assistant_active))
+        def _retry(event):
+            self._refresh_live()
 
         @kb.add("q", filter=browsing)
         @kb.add("c-c")
@@ -1294,7 +1426,7 @@ class ResourceBrowser:
 
             action_filter = Condition(
                 lambda key=action.key: not self.search_active and
-                not self.assistant_active and not (
+                not self.assistant_active and not self.help_open and not (
                     key in {"n", "N"} and self._detail_search_ready()))
 
             @kb.add(action.key, filter=action_filter)
@@ -1337,7 +1469,7 @@ class ResourceBrowser:
             _MouseControl(
                 self._detail_fragments, focusable=True,
                 mouse_callback=self._detail_mouse),
-            style="class:root", always_hide_cursor=True, wrap_lines=True,
+            style="class:root", always_hide_cursor=True, wrap_lines=False,
             width=Dimension(weight=62))
         self.list_header = Window(
             FormattedTextControl(lambda: self._pane_header_fragments("list")),
@@ -1346,7 +1478,12 @@ class ResourceBrowser:
             FormattedTextControl(lambda: self._pane_header_fragments("detail")),
             height=1, style="class:pane.header", always_hide_cursor=True)
         list_pane = HSplit([self.list_header, self.list_window])
-        detail_pane = HSplit([self.detail_header, self.detail_window])
+        detail_subtitle = ConditionalContainer(Window(
+            FormattedTextControl(lambda: fit_line([
+                ("class:detail.subtitle", "  " + plain(self.detail.subtitle) if self.detail else "")],
+                self._pane_width("detail") - 1)), height=1),
+            filter=Condition(lambda: bool(self.detail and self.detail.subtitle and not self.help_open)))
+        detail_pane = HSplit([self.detail_header, detail_subtitle, self.detail_window])
         divider = Window(char="│", width=1, style="class:border")
         split = VSplit([
             list_pane,
@@ -1367,8 +1504,20 @@ class ResourceBrowser:
         footer = Window(
             FormattedTextControl(self._footer_fragments), height=1,
             style="class:footer", always_hide_cursor=True)
+        status = ConditionalContainer(Window(
+            FormattedTextControl(lambda: fit_line([(self.status_style, "  " + plain(self.status))],
+                                                 shutil.get_terminal_size((100, 30)).columns - 1)),
+            height=1, style="class:footer", always_hide_cursor=True),
+            filter=Condition(lambda: bool(self.status)))
+        query = ConditionalContainer(Window(
+            FormattedTextControl(lambda: fit_line([
+                ("class:search.prompt", "  Filter: "),
+                ("class:detail", self._list_query),
+                ("class:muted", "  ·  Esc clears")],
+                shutil.get_terminal_size((100, 30)).columns - 1)), height=1),
+            filter=Condition(lambda: bool(self._list_query and not self.search_active)))
         root = HSplit([
-            header, search_container, body, assistant_container, footer])
+            header, search_container, query, body, assistant_container, status, footer])
         io_options = {}
         if self._input is not None:
             io_options["input"] = self._input
@@ -1380,6 +1529,7 @@ class ResourceBrowser:
             # Static browsers repaint only on input/invalidation. Live managers
             # use the explicit reload task below, avoiding duplicate timers.
             mouse_support=True, refresh_interval=None,
+            before_render=self._resize_focus,
             **io_options)
         self.app.ttimeoutlen = 0.1
 
@@ -1398,6 +1548,7 @@ class ResourceBrowser:
                 self.status, self.status_style = status, style
 
     def _pre_run(self) -> None:
+        self._closed = False
         self.reload(preserve=False)
         self._running = True
         if self.refresh_interval:
@@ -1425,6 +1576,9 @@ class ResourceBrowser:
             return UIOutcome("cancel")
         finally:
             self._running = False
+            self._closed = True
+            self._assistant_request += 1
+            self.assistant_busy = False
             self._assistant_interrupt.set()
             if (self._assistant_thread is not None
                     and self._assistant_thread.is_alive()):

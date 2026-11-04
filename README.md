@@ -469,6 +469,24 @@ use Alt+letter for action shortcuts so normal typing stays in the filter.
 Moving or typing cancels an automatic confirmation countdown. Pickers and
 resource browsers follow `/theme` and `NO_COLOR`.
 
+Wider pickers show the selected item's description and usage beside the list;
+narrower terminals show a preview below it. Short terminals retain inline
+descriptions. Use Ctrl+U to clear a picker filter and F1 to show its keys.
+The model picker also searches supply and provider information.
+
+Resource browsers keep operation feedback above the action bar. Press `/` to
+find in the focused pane, Enter to apply a filter, `?` for contextual help,
+and Ctrl+R to reload. Esc cancels a filter edit, clears an applied search, or
+returns from a detail view before closing the browser. Long documents scroll
+through their wrapped lines; End reaches the end of the complete document.
+
+In `/retask` and the `/hwg` graph viewer, `i` focuses the selected task or
+node's inspector; Esc returns to the checklist or graph. Narrow terminals show
+one pane at a time, preserving selection and reading position through resize.
+Ordinary command tables become labelled records when their columns would crowd,
+so account, configuration, task, tool, and extension fields remain readable.
+See [the terminal design guide](DESIGN.md) for the shared interface rules.
+
 Context compaction starts silently in the background at 70% of the usable
 message budget. At 90%, the agent waits for that result or uses foreground
 compaction. `/compact` still forces compaction; `/compact status` shows the

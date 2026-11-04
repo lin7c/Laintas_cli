@@ -370,11 +370,11 @@ class ModelRouteTests(unittest.TestCase):
         # auto, backend model, route; settings stay under /model routing.
         self.assertEqual(len(seen["labels"]), 3)
         self.assertFalse(any("auto-routing settings" in label for label in seen["labels"]))
-        self.assertIn("deepseek-chat", seen["labels"][2])
+        self.assertIn("deepseek-chat", seen["labels"][2][0])
         self.assertEqual(seen["index"], 2)                # the active route is current
-        self.assertTrue(seen["labels"][2].startswith(" *"))
-        self.assertFalse(seen["labels"][0].startswith(" *"))
-        self.assertFalse(seen["labels"][1].startswith(" *"))
+        self.assertTrue(seen["labels"][2][0].startswith(" *"))
+        self.assertFalse(seen["labels"][0][0].startswith(" *"))
+        self.assertFalse(seen["labels"][1][0].startswith(" *"))
         self.assertEqual(store.get(model_route.PREF_KEY), "ds")
 
     def test_picker_offers_routes_when_the_backend_list_fails(self):

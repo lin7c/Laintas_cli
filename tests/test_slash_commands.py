@@ -1148,9 +1148,9 @@ class SlashRegistryTests(unittest.TestCase):
             selected = laintas_cli.show_model_selector(models, "")
         # The row shows the bare model name; the Activated tag carries the
         # provenance the stripped prefix used to spell out.
-        self.assertIn("deepseek-flash", seen["items"][1])
-        self.assertNotIn("key/deepseek", seen["items"][1])
-        self.assertIn("Activated", seen["items"][1])
+        self.assertIn("deepseek-flash", seen["items"][1][0])
+        self.assertNotIn("key/deepseek", seen["items"][1][0])
+        self.assertIn("Activated", seen["items"][1][1])
         # Selection still returns the full gateway id.
         self.assertEqual(selected["id"], "key/deepseek/deepseek-flash")
 
@@ -1171,10 +1171,10 @@ class SlashRegistryTests(unittest.TestCase):
         with mock.patch.object(
                 laintas_cli, "select_dialog", side_effect=choose_first):
             laintas_cli.show_model_selector(models, "")
-        self.assertIn("deepseek-v4-pro", seen["items"][1])
-        self.assertIn("deepseek-v4-pro", seen["items"][2])
-        self.assertIn("Activated", seen["items"][2])
-        self.assertNotIn("key/deepseek", seen["items"][2])
+        self.assertIn("deepseek-v4-pro", seen["items"][1][0])
+        self.assertIn("deepseek-v4-pro", seen["items"][2][0])
+        self.assertIn("Activated", seen["items"][2][1])
+        self.assertNotIn("key/deepseek", seen["items"][2][0])
 
     def test_model_catalog_uses_three_supply_labels_without_losing_routing_provider(self):
         rows = laintas_cli._extract_model_entries({

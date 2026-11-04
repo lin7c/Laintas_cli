@@ -18,12 +18,14 @@ from typing import Optional
 
 import symbols
 import workflow_viz
+import terminal_arbiter
+from terminal_layout import clipped, fit_hints, slice_line, themed_style, wrap_fragments
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import (
-    ConditionalContainer, Layout, HSplit, VSplit, Window,
+    ConditionalContainer, DynamicContainer, Layout, HSplit, VSplit, Window,
     FormattedTextControl, ScrollOffsets)
 from prompt_toolkit.layout.controls import BufferControl
 from prompt_toolkit.buffer import Buffer
@@ -99,6 +101,10 @@ class HwgViewer:
                               if view.node_order else "")
         self.scroll_top = 0
         self.show_help = False
+        self.show_inspector = False
+        self.inspector_scroll = 0
+        self.help_scroll = 0
+        self.scroll_left = 0
         self._visible = self._visible_height()
         self._total = view.canvas.height
         self._quit = False
@@ -108,7 +114,7 @@ class HwgViewer:
         self._app = Application(
             layout=self._build_layout(),
             key_bindings=self._kb,
-            style=_STYLE,
+            style=themed_style(_STYLE),
             full_screen=True,
             mouse_support=True,
             input=input,
@@ -127,6 +133,7 @@ class HwgViewer:
         if nid and nid in self.view.nodes_by_id:
             self.selected = nid
             self._scroll_to_node(nid)
+            self.inspector_scroll = 0
 
     def _move(self, delta: int) -> None:
         order = self.view.node_order
@@ -173,6 +180,12 @@ class HwgViewer:
             self.scroll_top = row - self._visible + 1
 
     def _scroll(self, delta: int) -> None:
+        if self.show_help:
+            self.help_scroll = max(0, self.help_scroll + delta)
+            return
+        if self.show_inspector:
+            self.inspector_scroll = max(0, self.inspector_scroll + delta)
+            return
         max_top = max(0, self.view.canvas.height - self._visible)
         self.scroll_top = max(0, min(max_top, self.scroll_top + delta))
 
@@ -185,25 +198,41 @@ class HwgViewer:
             self._quit = True
             event.app.exit()
 
+        def _escape(event):
+            if self.show_help:
+                self._toggle_help(False)
+            elif self.show_inspector:
+                self.show_inspector = False
+            else:
+                _exit(event)
+
+        def _navigate(delta):
+            if self.show_help or self.show_inspector:
+                self._scroll(delta)
+            else:
+                self._move(delta)
+
         kb.add("q", filter=~Condition(lambda: self.show_help))(lambda e: _exit(e))
-        kb.add("escape")(lambda e: self._toggle_help(False) if self.show_help
-                         else _exit(e))
-        kb.add("down")(lambda e: self._move(1))
-        kb.add("up")(lambda e: self._move(-1))
-        kb.add("j", filter=~Condition(lambda: self.show_help))(lambda e: self._move(1))
-        kb.add("k", filter=~Condition(lambda: self.show_help))(lambda e: self._move(-1))
-        kb.add("right")(lambda e: self._neighbor("down"))
-        kb.add("l", filter=~Condition(lambda: self.show_help))(lambda e: self._neighbor("down"))
-        kb.add("left")(lambda e: self._neighbor("up"))
-        kb.add("h", filter=~Condition(lambda: self.show_help))(lambda e: self._neighbor("up"))
+        kb.add("escape")(_escape)
+        kb.add("c-c")(_exit)
+        kb.add("i", filter=~Condition(lambda: self.show_help))(lambda e: setattr(self, "show_inspector", not self.show_inspector))
+        kb.add("down")(lambda e: _navigate(1))
+        kb.add("up")(lambda e: _navigate(-1))
+        kb.add("j", filter=~Condition(lambda: self.show_help))(lambda e: _navigate(1))
+        kb.add("k", filter=~Condition(lambda: self.show_help))(lambda e: _navigate(-1))
+        navigate_graph = Condition(lambda: not self.show_help and not self.show_inspector)
+        kb.add("right", filter=navigate_graph)(lambda e: self._neighbor("down"))
+        kb.add("l", filter=navigate_graph)(lambda e: self._neighbor("down"))
+        kb.add("left", filter=navigate_graph)(lambda e: self._neighbor("up"))
+        kb.add("h", filter=navigate_graph)(lambda e: self._neighbor("up"))
         kb.add("pageup")(lambda e: self._scroll(-self._visible))
         kb.add("pagedown")(lambda e: self._scroll(self._visible))
         kb.add("home")(lambda e: setattr(self, "scroll_top", 0))
         kb.add("end")(lambda e: self._scroll(10 ** 6))
         kb.add("g")(lambda e: self._move(-10 ** 6))
         kb.add("G")(lambda e: self._move(10 ** 6))
-        kb.add("?")(lambda e: self._toggle_help(True))
-        kb.add("tab")(lambda e: self._cycle_next_status())
+        kb.add("?")(lambda e: self._toggle_help(not self.show_help))
+        kb.add("tab", filter=navigate_graph)(lambda e: self._cycle_next_status())
 
     def _toggle_help(self, show: bool) -> None:
         self.show_help = show
@@ -237,6 +266,15 @@ class HwgViewer:
 
     # ── rendering ────────────────────────────────────────────────────
 
+    def _width(self):
+        return shutil.get_terminal_size((100, 30)).columns
+
+    def _wide(self):
+        return self._width() >= 100
+
+    def _canvas_width(self):
+        return max(1, self._width() - (41 if self._wide() else 2))
+
     def _header_fragments(self):
         view = self.view
         status_bit = ""
@@ -244,10 +282,11 @@ class HwgViewer:
             done = sum(1 for s in self.status.values()
                        if s == workflow_viz.STATUS_DONE)
             status_bit = f"  {done}/{len(self.status)} done"
+        suffix = f"  {len(view.node_order)} nodes{status_bit}"
         return [
             ("class:header", "  HWG GRAPH"),
-            ("class:header.path", f"  {self.path}"),
-            ("class:dim", f"  {view.meta.get('counts', '')}{status_bit}"),
+            ("class:header.path", "  " + clipped(self.path, max(1, self._width() - len(suffix) - 15))),
+            ("class:dim", suffix),
         ]
 
     def _canvas_fragments(self):
@@ -260,12 +299,17 @@ class HwgViewer:
         visible = self._visible
         out = []
         sel_rect = view.node_rects.get(self.selected)
+        if sel_rect:
+            left = sel_rect[1]
+            if left < self.scroll_left or left >= self.scroll_left + self._canvas_width():
+                self.scroll_left = max(0, left - 2)
+        self.scroll_left = max(0, min(self.scroll_left, max(0, view.canvas.width - self._canvas_width())))
         for y in range(top, min(len(rows), top + visible)):
             runs = list(rows[y])
             if sel_rect and sel_rect[0] <= y <= sel_rect[0] + sel_rect[3] - 1:
                 runs = [(t, "class:selected") for t, _ in runs]
-            for text, style in runs:
-                out.append((style, text))
+            out.extend(slice_line([(style, text) for text, style in runs],
+                                  self.scroll_left, self._canvas_width()))
             out.append(("", "\n"))
         return out
 
@@ -335,13 +379,29 @@ class HwgViewer:
 
     def _status_fragments(self):
         if self.show_help:
-            return [("class:help",
-                     "  ↑↓/jk select · ←→/hl follow edge · PgUp/PgDn scroll · Tab cycle status · Esc close")]
-        counts = f"{len(self.view.node_order)} nodes"
-        return [
-            ("class:statusbar",
-             f"  ↑↓/jk select · ←→/hl follow edge · PgUp/PgDn scroll · q quit · ? help · {counts}"),
-        ]
+            parts = [("Esc", "Back"), ("↑↓", "Scroll"), ("PgUp/PgDn", "Page")]
+        elif self.show_inspector:
+            parts = [("Esc", "Back"), ("↑↓", "Scroll"), ("i", "Graph")]
+        else:
+            parts = [("Esc", "Close"), ("↑↓", "Select"), ("←→", "Follow"),
+                     ("i", "Inspect"), ("Tab", "State"), ("PgUp/PgDn", "Scroll"), ("?", "Help")]
+        return fit_hints(parts, self._width(), key_style="class:selected", text_style="class:statusbar")
+
+    def _inspector_view(self):
+        rows = wrap_fragments(self._inspector_fragments(), (38 if self._wide() else self._width()) - 1)
+        self.inspector_scroll = min(self.inspector_scroll, max(0, len(rows) - self._visible_height()))
+        return [part for row in rows[self.inspector_scroll:self.inspector_scroll + self._visible_height()]
+                for part in row + [("", "\n")]]
+
+    def _help_fragments(self):
+        text = ("  Graph keys\n\n  ↑↓ / j k  Select a node\n  ←→ / h l  Follow an incoming or outgoing edge\n"
+                "  i  Inspect the selected node; Esc returns to the graph\n  PgUp / PgDn  Scroll the current pane\n"
+                "  g / G  First or last node\n  Tab  Preview the next status in this viewer\n"
+                "  ? / Esc  Return from help\n  q / Ctrl+C  Close\n")
+        rows = wrap_fragments([("class:inspector.value", text)], self._width() - 1)
+        self.help_scroll = min(self.help_scroll, max(0, len(rows) - self._visible_height()))
+        return [part for row in rows[self.help_scroll:self.help_scroll + self._visible_height()]
+                for part in row + [("", "\n")]]
 
     # ── mouse ────────────────────────────────────────────────────────
 
@@ -354,7 +414,7 @@ class HwgViewer:
             return None
         if mouse_event.event_type == MouseEventType.MOUSE_UP:
             row = self.scroll_top + mouse_event.position.y
-            nid = self.view.canvas.hit_at(row, mouse_event.position.x)
+            nid = self.view.canvas.hit_at(row, mouse_event.position.x + self.scroll_left)
             if nid:
                 self.select(nid)
                 return None
@@ -378,15 +438,20 @@ class HwgViewer:
             content=FormattedTextControl(self._scrollbar_fragments),
             width=2, dont_extend_width=True, style="class:scrollbar.rail")
         inspector_win = Window(
-            content=FormattedTextControl(self._inspector_fragments),
-            width=38, wrap_lines=True, style="class:root")
+            content=FormattedTextControl(self._inspector_view),
+            width=lambda: 38 if self._wide() else self._width(),
+            wrap_lines=False, style="class:root")
         status_win = Window(
             content=FormattedTextControl(self._status_fragments), height=1,
             style="class:statusbar")
 
-        body = VSplit([canvas_win, scroll_win,
+        wide = VSplit([canvas_win, scroll_win,
                        Window(width=1, char="│", style="class:border"),
                        inspector_win])
+        graph = VSplit([canvas_win, scroll_win])
+        help_win = Window(FormattedTextControl(self._help_fragments), wrap_lines=False)
+        body = DynamicContainer(lambda: help_win if self.show_help else (
+            wide if self._wide() else (inspector_win if self.show_inspector else graph)))
         return Layout(HSplit([header_win, body, status_win]))
 
     # ── lifecycle ────────────────────────────────────────────────────
@@ -398,7 +463,8 @@ class HwgViewer:
         except Exception:
             pass
         try:
-            self._app.run()
+            with terminal_arbiter.hold("hwg-viewer", terminal_arbiter.Mode.EXTERNAL, timeout=10.0):
+                self._app.run()
         except (KeyboardInterrupt, EOFError):
             pass
         finally:

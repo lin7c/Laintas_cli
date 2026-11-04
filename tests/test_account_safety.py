@@ -377,11 +377,13 @@ agent_loop.save_resume_state({'_session_id':'task-a','owner_user_id':'A','object
         assert checkpoints[0]['state']['owner_user_id'] == 'A'
         assert checkpoints[0]['chat_history'][-1]['content'] == 'saved task'
         send('/account list')
-        assert '* B  B' in prompt()
+        account_rows = prompt()
+        assert any(line.split() == ['B', 'B', 'Current'] for line in account_rows.splitlines())
         send('/account switch A')
         assert 'Resumed saved session.' in prompt()
         send('/account list')
-        assert '* A  A' in prompt()
+        account_rows = prompt()
+        assert any(line.split() == ['A', 'A', 'Current'] for line in account_rows.splitlines())
         send('/q')
         process.communicate(timeout=15)
         assert process.returncode == 0

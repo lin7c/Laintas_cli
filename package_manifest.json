@@ -112,6 +112,7 @@
     "skill_router",
     "terminal_arbiter",
     "terminal_theme",
+    "terminal_layout",
     "term_attach",
     "tokenizer",
     "web_search",

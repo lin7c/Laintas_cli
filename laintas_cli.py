@@ -285,6 +285,7 @@ from rich.console import Console, Group
 from rich.padding import Padding
 from rich.markdown import Markdown as RichMarkdown
 from rich.table import Table as RichTable
+from terminal_layout import AdaptiveTable, fit_hints
 from rich.live import Live
 from rich.spinner import Spinner
 from rich.text import Text
@@ -338,7 +339,7 @@ def Table(*args, **kwargs):
     kwargs["show_lines"] = False
     kwargs.setdefault("show_edge", False)
     kwargs.setdefault("pad_edge", False)
-    return RichTable(*args, **kwargs)
+    return AdaptiveTable(*args, **kwargs)
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application
@@ -349,7 +350,9 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.keys import Keys
-from prompt_toolkit.layout import Layout, HSplit, Window, FormattedTextControl
+from prompt_toolkit.layout import (Layout, HSplit, VSplit, Window,
+                                   ConditionalContainer, FormattedTextControl)
+from prompt_toolkit.layout.processors import BeforeInput
 from prompt_toolkit.styles import Style
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.buffer import Buffer
@@ -752,6 +755,15 @@ _TERM_SIZE_INIT = [False]
 
 def _get_term_size() -> tuple[int, int]:
     """Cached terminal size; refreshes on SIGWINCH."""
+    # prompt_toolkit temporarily owns SIGWINCH while its Application runs.
+    # Its output size is authoritative then; our signal cache cannot observe
+    # those resizes until the application has returned control to the REPL.
+    from prompt_toolkit.application.current import get_app_or_none
+    running = get_app_or_none()
+    if running is not None and running.is_running:
+        size = running.output.get_size()
+        _TERM_SIZE_CACHE[:] = [size.columns, size.rows]
+        return size.columns, size.rows
     if not _TERM_SIZE_INIT[0]:
         import shutil, signal
         def _on_winch(signum, frame):
@@ -849,6 +861,9 @@ def _build_dialog_style() -> Style:
         "search-label": f"bold {terminal_theme.color('muted', mode)}",
         "search-input": f"{foreground} bg:{background}" if background else "",
         "auto-confirm": terminal_theme.color("warning", mode),
+        "preview": foreground,
+        "preview-title": f"bold {terminal_theme.color('info', mode)}",
+        "separator": terminal_theme.color("subtle", mode),
     })
 
 
@@ -1025,6 +1040,8 @@ def select_dialog(
     refresh_interval: float = 0.05,
     auto_confirm_seconds: Optional[float] = None,
     auto_confirm_index: Optional[int] = None,
+    details=None,
+    confirm_label: str = "Select",
 ):
     """Interactive arrow-key selector — single or multi-select.
 
@@ -1083,6 +1100,10 @@ def select_dialog(
         a selection or cancels first.
     auto_confirm_index : int | None
         Row confirmed by the timer. Defaults to the initially selected row.
+    details : list[str] | None
+        Optional precomputed Rich-markup descriptions for the selected-item
+        preview. No work is started from rendering. Full-screen dialogs show
+        this beside the list when space permits, or below it when narrow.
 
     Returns
     -------
@@ -1126,6 +1147,23 @@ def select_dialog(
             return f"{label} {description}".casefold()
 
     _plain_norm = [_search_text(*row) for row in norm]
+    has_preview = bool(full_screen and (details or any(desc for _, desc in norm)))
+    expanded_hints = [False]
+
+    def _split_preview():
+        return has_preview and _get_term_size()[0] >= 100
+
+    def _preview_height():
+        return min(6, max(3, _get_term_size()[1] // 4))
+
+    def _show_bottom_preview():
+        return has_preview and not _split_preview() and _get_term_size()[1] >= 16
+
+    def _preview_visible():
+        return _split_preview() or _show_bottom_preview()
+
+    def _footer_height():
+        return min(10, max(3, _get_term_size()[1] - 5)) if expanded_hints[0] else 2
 
     def _refresh_plain_norm():
         _plain_norm[:] = [_search_text(*row) for row in norm]
@@ -1178,8 +1216,10 @@ def select_dialog(
 
     def _page_size():
         # Footer, search input, title and overflow indicators each own rows.
-        available = max(1, _get_term_size()[1] - 2 - (2 if search else 0)
-                        - (1 if title else 0))
+        available = max(1, _get_term_size()[1] - _footer_height()
+                        - ((1 if full_screen else 2) if search else 0)
+                        - (1 if title else 0)
+                        - (_preview_height() + 1 if _show_bottom_preview() else 0))
         return max(1, available - 2)
 
     # Screen line -> what a click there means: ("item", index) or
@@ -1193,7 +1233,7 @@ def select_dialog(
         def _line_no() -> int:
             return sum(text.count("\n") for _style, text in lines)
 
-        if title:
+        if title and not full_screen:
             lines.append(("class:title", f"{title}\n"))
 
         vis = _clamp_sel()
@@ -1214,7 +1254,8 @@ def select_dialog(
             lines.append(("class:muted", f"  {symbols.ARROW_U} {start} more\n"))
 
         if not vis:
-            lines.append(("class:muted", "  No matches\n"))
+            message = (hint or "No choices available. Press Esc to go back.") if not norm else "No matches. Edit the filter or press Ctrl+U to clear it."
+            lines.append(("class:muted", "  " + message + "\n"))
 
         for vi in range(start, end):
             oi, lab, desc = vis[vi]
@@ -1225,9 +1266,9 @@ def select_dialog(
                 row_text = f" {prefix} {mark}  {lab}"
             else:
                 row_text = f" {prefix} {lab}"
-            if desc:
+            if desc and not _preview_visible():
                 row_text += f"  [dim]{desc}[/dim]"
-            if is_sel:
+            if is_sel and not _preview_visible():
                 _fixed = 0
                 if marquee_fixed is not None:
                     if isinstance(marquee_fixed, int):
@@ -1252,7 +1293,8 @@ def select_dialog(
             except Exception:
                 fitted = Text(row_text)
             fitted.plain = fitted.plain.replace("\n", " ").replace("\r", " ")
-            fitted.truncate(max(0, _get_term_size()[0] - 1), overflow="ellipsis")
+            width = int(_get_term_size()[0] * 0.46) if _split_preview() else _get_term_size()[0]
+            fitted.truncate(max(0, width - 1), overflow="ellipsis")
             _line_targets[_line_no()] = ("item", oi)
             lines.append((style, fitted.markup + "\n"))
 
@@ -1270,7 +1312,23 @@ def select_dialog(
         lines.append(("class:muted", f"  {position}/{len(vis)}"
                       + (f" of {len(norm)}" if search and filter_buf.text else "")
                       + (f"  {len(chk)} selected" if multi else "") + "\n"))
-        if not hint:
+        if full_screen:
+            parts = [("Esc", "Back"), ("Enter", "Confirm" if multi else confirm_label)]
+            if multi:
+                parts.append(("Space", "Toggle"))
+            parts.append(("↑↓", "Move"))
+            parts.extend((f"Alt+{key}" if search and len(key) == 1 else key, action.replace("_", " ").capitalize())
+                         for key, action in act_keys.items())
+            parts.extend([("PgUp/PgDn", "Page"), ("F1", "Keys")])
+            if expanded_hints[0]:
+                text = (hint + "\n" if hint else "") + "\n".join(f"{key}  {label}" for key, label in parts)
+                for line in Text(text).wrap(console, max(1, _get_term_size()[0] - 4)):
+                    lines.append(("class:muted", "  " + line.plain + "\n"))
+            else:
+                lines.extend(fit_hints(parts, _get_term_size()[0] - 2,
+                                      key_style="class:option", text_style="class:muted",
+                                      more=("F1", "Keys")))
+        elif not hint:
             if multi:
                 parts = ["Esc cancel", "Space toggle", "Enter confirm"]
             else:
@@ -1284,7 +1342,7 @@ def select_dialog(
             lines.append((f"class:muted", "  " + f"  {symbols.BULLET}  ".join(parts)))
         else:
             lines.append(("class:muted", "  " + hint))
-        if _get_term_size()[0] < 60:
+        if not full_screen and _get_term_size()[0] < 60:
             compact = ("Esc back  Space toggle" if multi else "Esc back  Enter select")
             if _get_term_size()[0] < 28:
                 compact = "Esc back  Enter OK"
@@ -1310,6 +1368,18 @@ def select_dialog(
         return (time.monotonic() - _opened_at) < 0.25
 
     kb = KeyBindings()
+
+    @kb.add("f1")
+    def _keys(event):
+        _user_interaction()
+        if full_screen:
+            expanded_hints[0] = not expanded_hints[0]
+
+    if search:
+        @kb.add("c-u")
+        def _clear_filter(event):
+            _user_interaction()
+            filter_buf.text = ""
 
     @kb.add("up")
     def _(event):
@@ -1361,6 +1431,9 @@ def select_dialog(
             return
         vis = _clamp_sel()
         if not vis:
+            return
+        if expanded_hints[0]:
+            expanded_hints[0] = False
             return
         if multi:
             checked_items = [items[oi] for oi in sorted(chk)
@@ -1455,6 +1528,9 @@ def select_dialog(
         # who sees a blank or half-rendered selector must always have an
         # immediate escape hatch.  Only affirmative actions (Enter, shortcut
         # selection) are protected from replayed typeahead above.
+        if expanded_hints[0] and event.key_sequence[-1].key != Keys.ControlC:
+            expanded_hints[0] = False
+            return
         if multi:
             event.app.exit(result=None)
         elif act_keys:
@@ -1464,13 +1540,19 @@ def select_dialog(
 
     # ── Layout ────────────────────────────────────────────────────
     layout_panes = []
+    if title and full_screen:
+        layout_panes.append(Window(
+            FormattedTextControl(lambda: _ptk_fragments(
+                [("class:title", "  " + title)], color_mode=_ui_theme_mode())),
+            height=1, wrap_lines=False))
     if search:
+        if not full_screen:
+            layout_panes.append(Window(
+                content=FormattedTextControl([("class:search-label", "  Filter")]),
+                height=1))
         layout_panes.append(Window(
-            content=FormattedTextControl([("class:search-label", "  Filter")]),
-            height=1,
-        ))
-        layout_panes.append(Window(
-            content=BufferControl(buffer=filter_buf),
+            content=BufferControl(buffer=filter_buf, input_processors=(
+                [BeforeInput([("class:search-label", "  Filter › ")])] if full_screen else [])),
             height=1,
             style="class:search-input",
         ))
@@ -1508,8 +1590,34 @@ def select_dialog(
 
     mode = _ui_theme_mode()
     list_ctrl = _ListControl(lambda: _ptk_fragments(_build_lines(), color_mode=mode))
+
+    def _preview_lines():
+        vis = _clamp_sel()
+        if not vis:
+            return [("class:muted", "  Nothing selected. Change the filter to see choices.")]
+        label, description = norm[sel[0]]
+        body = str(details[sel[0]]) if details and sel[0] < len(details) else description
+        return _ptk_fragments([
+            ("class:preview-title", "  " + label + "\n\n"),
+            ("class:preview", "  " + body.replace("\n", "\n  ")),
+        ], color_mode=mode)
+
     if full_screen:
-        layout_panes.append(Window(content=list_ctrl, wrap_lines=False))
+        list_window = Window(content=list_ctrl, wrap_lines=False)
+        if has_preview:
+            from prompt_toolkit.layout import DynamicContainer, Dimension
+            preview = Window(FormattedTextControl(_preview_lines), wrap_lines=True,
+                             width=Dimension(weight=54), always_hide_cursor=True)
+            list_window.width = Dimension(weight=46)
+            wide = VSplit([list_window, Window(width=1, char="│", style="class:separator"), preview])
+            narrow = HSplit([list_window, ConditionalContainer(
+                HSplit([Window(height=1, char="─", style="class:separator"),
+                        Window(FormattedTextControl(_preview_lines), wrap_lines=True,
+                               height=_preview_height, always_hide_cursor=True)]),
+                filter=Condition(_show_bottom_preview))])
+            layout_panes.append(DynamicContainer(lambda: wide if _split_preview() else narrow))
+        else:
+            layout_panes.append(list_window)
     else:
         # Rows + optional title + spacer + footer. The old ``height=len(items)``
         # clipped the hint and sometimes the final choices, making inline
@@ -1526,7 +1634,7 @@ def select_dialog(
     # labels can no longer push cancellation instructions off the screen.
     layout_panes.append(Window(
         content=FormattedTextControl(lambda: _ptk_fragments(
-            _footer_lines(), color_mode=mode)), height=2, wrap_lines=False))
+            _footer_lines(), color_mode=mode)), height=_footer_height, wrap_lines=False))
 
     layout = Layout(HSplit(layout_panes))
     style = _build_dialog_style()
@@ -1539,7 +1647,7 @@ def select_dialog(
         # Full-screen only: an inline dialog capturing the mouse would take
         # away the terminal's own text selection of the output above it.
         mouse_support=full_screen,
-        refresh_interval=refresh_interval,
+        refresh_interval=None,
     )
     app.ttimeoutlen = 0.1
     async def _auto_confirm():
@@ -1558,6 +1666,18 @@ def select_dialog(
     def _pre_run():
         if _auto_seconds is not None:
             app.create_background_task(_auto_confirm())
+        async def animate_when_needed():
+            while not app.is_done:
+                await asyncio.sleep(max(0.01, float(refresh_interval or 0.05)))
+                if app.is_done:
+                    return
+                animated = _auto_deadline is not None
+                if not animated and not _preview_visible():
+                    vis = _clamp_sel()
+                    animated = bool(vis and Text(_plain_norm[sel[0]]).cell_len > _get_term_size()[0] - 4)
+                if animated:
+                    app.invalidate()
+        app.create_background_task(animate_when_needed())
 
     # A selector is a cancellable UI component.  prompt_toolkit can still
     # surface KeyboardInterrupt when the terminal is interrupted while the
@@ -8211,7 +8331,8 @@ def show_model_selector(models: list[dict], current: str = "", *,
     # Prepend the auto-routing virtual entry at the start of the list,
     # using the same 30-char formatting as real models.
     auto_mark = " *" if current in ("auto", "") else "  "
-    labels.append(f"{auto_mark}[cyan]{'auto-routing':30}[/cyan] {'':3} Auto-routing (embedding-based)")
+    labels.append((f"{auto_mark}[cyan]auto-routing[/cyan]", "Choose a model automatically for each task"))
+    details = ["Auto-routing chooses among your configured candidates for each task.\n\nUse /model routing to review its preferences and candidates."]
     if current in ("auto", ""):
         sel_idx = 0
     model_start = len(labels)
@@ -8230,7 +8351,7 @@ def show_model_selector(models: list[dict], current: str = "", *,
 
     def _row_label(row, shown):
         _mid, provider, mark, tier = row
-        return f"{mark}[cyan]{shown:30}[/cyan] {tier:3} {provider}"
+        return (f"{mark}[cyan]{escape(shown)}[/cyan] {escape(tier)}", escape(provider))
 
     # A stripped name may coincide with another row's name (a hosted
     # deepseek-v4-pro next to the marketplace one): the tier and supply
@@ -8242,22 +8363,30 @@ def show_model_selector(models: list[dict], current: str = "", *,
     for row, label in zip(_rows, _stripped):
         labels.append(_row_label(row, row[0]) if label in _dup_labels
                       else label)
+        details.append(f"Model: {escape(row[0])}\nSupply: {escape(row[1]) or '(not specified)'}"
+                       + (f"\nTier: {escape(row[3])}" if row[3] else "")
+                       + ("\n\nCurrently selected." if row[2].strip() else ""))
     route_start = len(labels)
     for route in routes:
         mark = " *" if route.name == active_route else "  "
         blocked = model_route.policy_refusal(route)
         note = f"[red]{escape(blocked)}[/red]" if blocked else "[dim]your key, direct[/dim]"
-        labels.append(f"{mark}[cyan]{escape(route.model or '(no model)'):30}[/cyan] {'':3} "
-                      f"{escape(route.name)} {symbols.BULLET} {escape(route.spec.label)} {note}")
+        labels.append((f"{mark}[cyan]{escape(route.model or '(no model)')}[/cyan]",
+                       f"{escape(route.name)} {symbols.BULLET} {escape(route.spec.label)} {note}"))
+        details.append(f"Route: {escape(route.name)}\nModel: {escape(route.model or '(no model)')}\n"
+                       f"Provider: {escape(route.spec.label)}\n\n{note}")
         if route.name == active_route:
             sel_idx = len(labels) - 1
     chosen = select_dialog(
         labels,
-        title=f"Models — choose with {symbols.ARROW_U}{symbols.ARROW_D} and Enter",
+        title="Models",
         full_screen=True,
+        search=True,
+        details=details,
+        confirm_label="Use model",
         selected_index=sel_idx,
         hint=(f"{symbols.ARROW_U}{symbols.ARROW_D}/wheel navigate  ↵ or click twice "
-              "select  Esc/q cancel"),
+              "select  Esc cancel"),
     )
     if chosen is None:
         return None
@@ -16804,9 +16933,17 @@ def _cmd_account(parts: list, session: dict, agent_registry: AgentRegistry) -> b
     args = parts[2:]
     if sub == "list" and not args:
         rows = account_store.profiles(paths.ROOT_HOME)
+        table = Table(title="Saved accounts")
+        table.add_column("Alias", style="cyan")
+        table.add_column("Account ID", overflow="fold")
+        table.add_column("Status")
         for row in rows:
-            marker = "*" if row["userId"] == paths.ACCOUNT_USER_ID else " "
-            console.print(f"{marker} {escape(row.get('alias') or row.get('email') or row['userId'])}  {escape(row['userId'])}")
+            table.add_row(Text(row.get('alias') or row.get('email') or row['userId']),
+                          Text(row['userId']),
+                          Text("Current" if row["userId"] == paths.ACCOUNT_USER_ID else "Saved"))
+        if rows:
+            console.print(table)
+            console.print("[dim]/account switch <alias-or-id> to switch; /account add <alias> to save another.[/dim]")
         if not rows:
             console.print("[dim]No saved accounts. Use /account add <alias>.[/dim]")
     elif sub == "add" and len(args) == 1:
@@ -18593,7 +18730,7 @@ def _cmd_scan() -> None:
 
 
 def _cmd_cwd() -> None:
-    console.print(f"Working directory: [bold]{os.getcwd()}[/bold]")
+    console.print(Text.assemble("Working directory: ", (os.getcwd(), "bold")))
 
 
 def _cmd_bash(parts: list, raw_args: str) -> bool:
@@ -19010,20 +19147,24 @@ def _cmd_backend(parts: list) -> None:
     if sub == "status":
         profile = get_backend_profile()
         console.print(Panel(
-            f"Profile: {profile.name}\nKind: {profile.kind}\n"
-            f"URL: {profile.base_url}\nBilling: {profile.billing_label}\n"
+            f"Profile: {escape(profile.name)}\nKind: {escape(profile.kind)}\n"
+            f"URL: {escape(profile.base_url)}\nBilling: {escape(profile.billing_label)}\n"
             f"Sends Laintas credentials: {profile.sends_laintas_credentials}\n"
-            f"Model route: {model_route.selected_name()} (/model route)",
+            f"Model route: {escape(model_route.selected_name())} (/model route)",
             title="Backend", border_style=(
                 "green" if profile.sends_laintas_credentials else "yellow"),
         ))
     elif sub == "list":
         active = get_backend_profile().name
+        table = Table(title="Backend profiles")
+        for heading in ("Name", "Kind", "URL", "Billing", "Status"):
+            table.add_column(heading, overflow="fold")
         for profile in backend_profiles.list_profiles():
-            marker = "*" if profile.name == active else " "
-            console.print(
-                f"{marker} [bold]{profile.name}[/bold] [{profile.kind}] "
-                f"{profile.base_url} [dim]{profile.billing_label}[/dim]")
+            table.add_row(*(Text(str(value)) for value in (
+                profile.name, profile.kind, profile.base_url,
+                profile.billing_label, "Current" if profile.name == active else "Saved")))
+        console.print(table)
+        console.print("[dim]/backend use <name> to switch profiles.[/dim]")
     elif sub == "use":
         profile_name = parts[2] if len(parts) >= 3 else ""
         if not profile_name and sys.stdin.isatty():
@@ -19495,7 +19636,7 @@ def _cmd_hooks(parts: list) -> None:
                       else "[dim]Hooks were not trusted.[/dim]")
     elif sub == "reload":
         info = hooks_mod.reload()
-        console.print(json.dumps(info, ensure_ascii=False, indent=2))
+        console.print(json.dumps(info, ensure_ascii=False, indent=2), markup=False)
     else:
         console.print("[yellow]Usage: /hooks \\[status|trust|revoke|reload][/yellow]")
 
@@ -19820,11 +19961,16 @@ def _cmd_evolve(raw_args: str, parts: list, session: dict) -> None:
                 f"Loaded extensions: {len(runtime.list())}",
                 title="Evolution Lab Status", border_style="cyan"))
     elif sub == "branches":
-        for branch in evolution_lab.list_branches():
-            console.print(
-                f"  [cyan]{branch.get('id')}[/cyan] "
-                f"[{branch.get('intent')}] [dim]{branch.get('status')}[/dim] "
-                f"— {str(branch.get('description') or '')[:80]}")
+        branches = evolution_lab.list_branches()
+        if not branches:
+            console.print("[dim]No Evolution Lab branches. Use /evolve <idea> to start one.[/dim]")
+        else:
+            table = Table(title="Evolution Lab branches")
+            for heading in ("ID", "Intent", "Status", "Description"):
+                table.add_column(heading, overflow="fold")
+            for branch in branches:
+                table.add_row(*(Text(str(branch.get(key) or "")) for key in ("id", "intent", "status", "description")))
+            console.print(table)
     elif sub == "open":
         branch_id = parts[2] if len(parts) > 2 else ""
         if not branch_id and sys.stdin.isatty():
@@ -19936,11 +20082,15 @@ def _cmd_evolve(raw_args: str, parts: list, session: dict) -> None:
                 ok, message = evolution_lab.disable_extension(extension_name, runtime)
                 console.print(f"[{'green' if ok else 'red'}]{message}[/{'green' if ok else 'red'}]")
     elif sub == "profiles":
+        table = Table(title="Evolution profiles")
+        for heading in ("Name", "Status", "Extensions"):
+            table.add_column(heading)
         for profile in evolution_lab.list_profiles():
-            marker = "*" if profile.get("active") else " "
-            console.print(
-                f"{marker} [cyan]{profile.get('name')}[/cyan] "
-                f"[dim]{len(profile.get('extensions') or {})} extension(s)[/dim]")
+            table.add_row(Text(str(profile.get("name") or "")),
+                          "Current" if profile.get("active") else "Saved",
+                          str(len(profile.get("extensions") or {})))
+        console.print(table)
+        console.print("[dim]/evolve use <name> to switch profiles.[/dim]")
     elif sub == "profile":
         if len(parts) < 4 or parts[2].lower() != "create":
             console.print("[yellow]Usage: /evolve profile create <name> \\[candidate-id ...][/yellow]")
@@ -20022,12 +20172,12 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
         if not branches:
             console.print("[dim]No Prompt Lab branches in this project.[/dim]")
         else:
-            console.print("[bold]Prompt Lab branches[/bold]")
+            table = Table(title="Prompt Lab branches")
+            for heading in ("ID", "Status", "Description"):
+                table.add_column(heading, overflow="fold")
             for branch in branches:
-                console.print(
-                    f"  [cyan]{branch.get('id')}[/cyan] "
-                    f"[dim]{branch.get('status')}[/dim] — "
-                    f"{_escape(str(branch.get('description') or '')[:80])}")
+                table.add_row(*(Text(str(branch.get(key) or "")) for key in ("id", "status", "description")))
+            console.print(table)
     elif sub == "open":
         branch_id = parts[2] if len(parts) >= 3 else ""
         if not branch_id and sys.stdin.isatty():
@@ -20182,11 +20332,15 @@ def _cmd_prompt(raw_args: str, parts: list, session: dict) -> None:
                 ok, msg = prompt_lab.disable_patch(patch_id)
                 console.print(f"[{'green' if ok else 'red'}]{_escape(msg)}[/{'green' if ok else 'red'}]")
     elif sub == "profiles":
+        table = Table(title="Prompt profiles")
+        for heading in ("Name", "Status", "Patches"):
+            table.add_column(heading)
         for profile in prompt_lab.list_profiles():
-            marker = "[green]*[/green]" if profile.get("active") else " "
-            console.print(
-                f"{marker} [cyan]{profile.get('name')}[/cyan] "
-                f"[dim]{len(profile.get('patches') or [])} patch(es)[/dim]")
+            table.add_row(Text(str(profile.get("name") or "")),
+                          "Current" if profile.get("active") else "Saved",
+                          str(len(profile.get("patches") or [])))
+        console.print(table)
+        console.print("[dim]/prompt use <name> to switch profiles.[/dim]")
     elif sub == "profile":
         if len(parts) < 4 or parts[2].lower() != "create":
             console.print("[yellow]Usage: /prompt profile create <name> \\[patch-id ...][/yellow]")
@@ -20603,7 +20757,7 @@ def _cmd_work(parts: list) -> None:
             done = sum(1 for step in steps if step.get("status") in {"completed", "skipped"})
             console.print(Panel(
                 f"ID: [cyan]{work['id']}[/cyan]\n"
-                f"Objective: {work['objective']}\n"
+                f"Objective: {escape(work['objective'])}\n"
                 f"Status: [bold]{work['status']}[/bold]\n"
                 f"Revision: {work.get('current_revision') or 0}\n"
                 f"Approved: {work.get('approved_revision') or '(none)'}\n"
@@ -20615,10 +20769,14 @@ def _cmd_work(parts: list) -> None:
         items = workgraph.list_work()
         if not items:
             console.print("[dim]No WorkGraph history in this project.[/dim]")
-        for item in items:
-            console.print(
-                f"  [cyan]{item['id']}[/cyan] [dim]{item['status']}[/dim] — "
-                f"{item['objective'][:100]}")
+        else:
+            table = Table(title="WorkGraph history")
+            for heading in ("ID", "Status", "Objective"):
+                table.add_column(heading, overflow="fold")
+            for item in items:
+                table.add_row(*(Text(str(item.get(key) or "")) for key in ("id", "status", "objective")))
+            console.print(table)
+            console.print("[dim]/work resume <id> to return to a work item.[/dim]")
     elif sub == "resume":
         work_id = parts[2] if len(parts) >= 3 else ""
         if not work_id and sys.stdin.isatty():
@@ -20687,7 +20845,7 @@ def _cmd_work(parts: list) -> None:
             for event in reversed(workgraph.list_events(work["id"], limit=30)):
                 console.print(
                     f"  [dim]{event['id']}[/dim] {event['event_type']} "
-                    f"[dim]{json.dumps(event['payload'], ensure_ascii=False)[:120]}[/dim]")
+                    f"[dim]{escape(json.dumps(event['payload'], ensure_ascii=False))}[/dim]")
     else:
         console.print("[yellow]Usage: /work \\[status|list|resume <id>|history][/yellow]")
 
@@ -23014,9 +23172,13 @@ def _cmd_tools() -> None:
         console.print("[dim]No tools registered.[/dim]")
     else:
         for src in sorted(groups):
-            console.print(f"[bold]{src}[/bold]")
+            table = Table(title=escape(src))
+            table.add_column("Tool", style="cyan", overflow="fold", max_width=38)
+            table.add_column("Description", ratio=1)
             for t in groups[src]:
-                console.print(f"  [cyan]{t.name}[/cyan] — {t.description}")
+                table.add_row(Text(t.name), Text(t.description))
+            console.print(table)
+        console.print("[dim]/tool <name> <json> to run a tool; /tool opens the searchable picker.[/dim]")
 
 
 def _safe_input_line(prompt: str = "") -> Optional[str]:
@@ -23136,9 +23298,9 @@ def _cmd_tool(raw_args: str, session: dict, agent_registry: AgentRegistry) -> No
         )
         result = tools_mod.get_registry().invoke(tool_name, params, ctx)
         try:
-            console.print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+            console.print(json.dumps(result, ensure_ascii=False, indent=2, default=str), markup=False)
         except (TypeError, ValueError):
-            console.print(repr(result))
+            console.print(repr(result), markup=False)
 
 
 def _cmd_skill(parts: list) -> bool:
@@ -23153,16 +23315,18 @@ def _cmd_skill(parts: list) -> bool:
             console.print("[dim]Create one with: /skill new <name>[/dim]")
         else:
             groups = tools_mod.get_registry().list_by_source()
+            table = Table(title="Installed skills")
+            for heading in ("Name", "Status", "Description", "Tools", "Path"):
+                table.add_column(heading, overflow="fold")
             for name, meta in sorted(metas.items()):
                 src = f"skill:{name}"
                 tools = groups.get(src, [])
-                console.print(f"[bold]{name}[/bold] [dim]({meta.dir_path})[/dim]")
-                if meta.description:
-                    console.print(f"  [dim]{meta.description}[/dim]")
-                for t in tools:
-                    console.print(f"  [cyan]{t.name}[/cyan] — {t.description}")
-                if not tools:
-                    console.print("  [yellow](standby/documentation-only)[/yellow]")
+                status = "Loaded" if tools else ("Not loaded" if (Path(meta.dir_path) / "skill.py").is_file() else "Documentation")
+                table.add_row(Text(name), Text(status), Text(meta.description or ""),
+                              Text("\n".join(f"{tool.name} — {tool.description}" for tool in tools) or "—"),
+                              Text(str(meta.dir_path)))
+            console.print(table)
+            console.print("[dim]/skill to inspect or manage skills.[/dim]")
     elif sub in ("trust", "revoke"):
         skill_name = parts[2] if len(parts) >= 3 else ""
         if not skill_name and sys.stdin.isatty():
@@ -23300,6 +23464,9 @@ def _cmd_mcp(parts: list) -> bool:
             console.print(f"[dim]No servers in {_get_mcp_mod().CONFIG_PATH}[/dim]")
             console.print("[dim]Create one with: /mcp init[/dim]")
         else:
+            table = Table(title="MCP servers")
+            for heading in ("Name", "Status", "Tools", "Command", "Last error"):
+                table.add_column(heading, overflow="fold")
             for name, sc in cfg.items():
                 srv = mgr.servers.get(name)
                 enabled = sc.get("enabled", True)
@@ -23307,12 +23474,14 @@ def _cmd_mcp(parts: list) -> bool:
                     status = "(not connected)" if enabled else "(disabled)"
                     style = "dim"
                 else:
-                    status = f"({srv.status}, {len(srv.tools)} tools)"
+                    status = str(srv.status)
                     style = "green" if srv.status == "up" else "yellow"
                 cmd_str = sc.get("command", "?")
-                console.print(f"  [{style}]{name}[/{style}] {status} [dim]{cmd_str}[/dim]")
-                if srv and srv.last_error and srv.status != "up":
-                    console.print(f"    [red]{srv.last_error}[/red]")
+                table.add_row(Text(name), Text(status.strip("()"), style=style),
+                              str(len(srv.tools)) if srv else "0", Text(str(cmd_str)),
+                              Text(srv.last_error if srv and srv.last_error and srv.status != "up" else "—"))
+            console.print(table)
+            console.print("[dim]/mcp connect <name> to connect; /mcp tools <name> to inspect tools.[/dim]")
     elif sub in ("trust", "revoke"):
         server_name = parts[2] if len(parts) >= 3 else ""
         if not server_name and sys.stdin.isatty():
@@ -23992,7 +24161,7 @@ def _cmd_app(parts: list, agent_registry: AgentRegistry) -> None:
                           '"command": "node server.js", "prompt": "…", '
                           '"persistence": "none"}[/dim]')
         else:
-            table = RichTable(box=box.SIMPLE, show_edge=False)
+            table = Table()
             for column in ("App", "Scope", "Trusted", "Running", "Persistence", "Description"):
                 table.add_column(column)
             for manifest in sorted(manifests.values(), key=lambda m: m.name):
@@ -24320,9 +24489,9 @@ def _config_table(described: dict, title: str) -> Table:
     table.add_column("Description", style="dim")
     for key, meta in sorted(described.items()):
         table.add_row(
-            _config_display_key(key), repr(meta["value"]), meta["type"],
+            Text(_config_display_key(key)), Text(repr(meta["value"])), Text(meta["type"]),
             "override" if meta["overridden"] else "default",
-            meta["description"],
+            Text(meta["description"]),
         )
     return table
 
@@ -24845,7 +25014,7 @@ def _cmd_identity(parts: list) -> None:
             else:
                 checked = "never checked"
             table.add_row(
-                record["name"], ", ".join(record["domains"])[:40],
+                Text(record["name"]), Text(", ".join(record["domains"])),
                 str(record["cookies"]), str(record["origins"]),
                 "[green]ok[/green]" if record["egress_matches_now"]
                 else "[yellow]changed[/yellow]",
@@ -25997,14 +26166,17 @@ def _cmd_extensions(parts: list, session: dict) -> None:
         if not entries:
             console.print("[dim]No extensions installed.[/dim]")
             return
+        table = Table(title="Installed extensions")
+        for heading in ("Name", "Version", "Trust", "Scope", "Source", "Description"):
+            table.add_column(heading, overflow="fold")
         for entry in entries:
-            trust_marker = "[green]✓[/green]" if entry["trusted"] else "[yellow]![/yellow]"
-            console.print(
-                f"  {trust_marker} [cyan]{entry['name']}[/cyan] "
-                f"v{entry['version']}  [dim]{entry['scope']}[/dim]  "
-                f"[dim]{entry.get('source', '')}[/dim]  "
-                f"{entry['description']}")
-        console.print("\n[dim]✓ = trusted  ! = untrusted[/dim]")
+            table.add_row(Text(entry['name']), Text(str(entry['version'])),
+                          Text("Trusted" if entry["trusted"] else "Untrusted",
+                               style="green" if entry["trusted"] else "yellow"),
+                          Text(entry['scope']), Text(str(entry.get('source', ''))),
+                          Text(entry['description']))
+        console.print(table)
+        console.print("[dim]/extensions info <name> for commands and source details.[/dim]")
         return
 
     if sub in {"available", "search"}:
@@ -26909,11 +27081,28 @@ def show_command_palette():
     except Exception:
         pass
     items = [(f"[cyan]{escape(name)}[/cyan]", escape(desc)) for name, desc in entries]
+    details = []
+    for name, description in entries:
+        spec = _find_command_spec(name)
+        if spec is None:
+            details.append(escape(description) + f"\n\nUse /help {escape(name)} for extension actions.")
+            continue
+        text = escape(spec.description) + f"\n\n[bold]Usage[/bold]\n{escape(spec.usage or spec.name)}"
+        if spec.aliases:
+            text += "\n\nAliases: " + escape(", ".join(spec.aliases))
+        if spec.contextual_completions:
+            text += "\n\n[bold]Actions[/bold]\n" + "\n".join(
+                f"{escape(item.value)}  {escape(item.description)}"
+                for item in spec.contextual_completions[:7])
+            text += f"\n\n/help {escape(name)} for the complete command reference."
+        details.append(text)
     chosen = select_dialog(
         items,
-        title="Commands — type to filter",
+        title="Commands",
         full_screen=True,
         search=True,
+        details=details,
+        confirm_label="Open",
         hint=f"{symbols.ARROW_U}{symbols.ARROW_D} navigate  ↵ select  Esc cancel",
     )
     if chosen is None:

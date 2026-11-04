@@ -29,11 +29,14 @@ from typing import Optional
 
 import retask
 from hwg_view import _STYLE, _MouseControl, _crop
+from terminal_layout import clipped, fit_hints, themed_style, wrap_fragments
+import terminal_arbiter
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
+from prompt_toolkit.layout import (HSplit, Layout, VSplit, Window,
+                                   ConditionalContainer, DynamicContainer)
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.mouse_events import MouseEventType
 
@@ -79,10 +82,14 @@ class RetaskViewer:
         self.doc: retask.Retask = retask.load(path)
         self._mtime = self._disk_mtime()
         current = retask.current_task(self.doc)
-        self.selected: str = current.id if current else self.doc.tasks[0].id
+        self.selected: str = current.id if current else (self.doc.tasks[0].id if self.doc.tasks else "")
         self.expanded: set = {self.selected}
         self.scroll_top = 0
         self.show_help = False
+        self.show_inspector = False
+        self.inspector_scroll = 0
+        self.help_scroll = 0
+        self._follow_selection = True
         self.flash = ""
         self.error = ""
         self.mouse = False              # off: the terminal's own selection works
@@ -93,7 +100,7 @@ class RetaskViewer:
         self._app = Application(
             layout=self._build_layout(),
             key_bindings=self._kb,
-            style=_STYLE,
+            style=themed_style(_STYLE),
             full_screen=True,
             mouse_support=Condition(lambda: self.mouse),
             refresh_interval=1.0,
@@ -122,7 +129,7 @@ class RetaskViewer:
             return
         if self.doc.task(self.selected) is None:
             current = retask.current_task(self.doc)
-            self.selected = current.id if current else self.doc.tasks[0].id
+            self.selected = current.id if current else (self.doc.tasks[0].id if self.doc.tasks else "")
 
     # ── selection ────────────────────────────────────────────────────
 
@@ -138,6 +145,8 @@ class RetaskViewer:
         except ValueError:
             idx = 0
         self.selected = ids[max(0, min(len(ids) - 1, idx + delta))]
+        self._follow_selection = True
+        self.inspector_scroll = 0
         self.flash = ""
 
     def toggle(self, task_id: Optional[str] = None) -> None:
@@ -216,17 +225,34 @@ class RetaskViewer:
             self._quit = True
             event.app.exit()
 
+        def _escape(event):
+            if self.show_help:
+                self.show_help = False
+            elif self.show_inspector:
+                self.show_inspector = False
+            else:
+                _exit(event)
+
+        def _navigate(delta):
+            if self.show_help:
+                self.help_scroll = max(0, self.help_scroll + delta)
+            elif self.show_inspector:
+                self.inspector_scroll = max(0, self.inspector_scroll + delta)
+            else:
+                self._move(delta)
+
         kb.add("q", filter=not_help)(_exit)
-        kb.add("escape")(lambda e: setattr(self, "show_help", False)
-                         if self.show_help else _exit(e))
-        kb.add("down")(lambda e: self._move(1))
-        kb.add("up")(lambda e: self._move(-1))
-        kb.add("j", filter=not_help)(lambda e: self._move(1))
-        kb.add("k", filter=not_help)(lambda e: self._move(-1))
+        kb.add("escape")(_escape)
+        kb.add("c-c")(_exit)
+        kb.add("down")(lambda e: _navigate(1))
+        kb.add("up")(lambda e: _navigate(-1))
+        kb.add("j", filter=not_help)(lambda e: _navigate(1))
+        kb.add("k", filter=not_help)(lambda e: _navigate(-1))
         kb.add("g", filter=not_help)(lambda e: self._move(-10 ** 6))
         kb.add("G", filter=not_help)(lambda e: self._move(10 ** 6))
-        kb.add("enter")(lambda e: self.toggle())
-        kb.add("space")(lambda e: self.toggle())
+        kb.add("enter", filter=not_help)(lambda e: self.toggle())
+        kb.add("space", filter=not_help)(lambda e: self.toggle())
+        kb.add("i", filter=not_help)(lambda e: setattr(self, "show_inspector", not self.show_inspector))
         kb.add("s", filter=not_help)(lambda e: self.submit())
         kb.add("y", filter=not_help)(lambda e: self.copy_selected())
         kb.add("m", filter=not_help)(lambda e: self.toggle_mouse())
@@ -244,12 +270,22 @@ class RetaskViewer:
             return 100, 30
 
     def _visible_height(self) -> int:
-        return max(4, self._size()[1] - 3)
+        return max(1, self._size()[1] - 2 - bool(self.flash or self.error))
+
+    def _wide(self) -> bool:
+        return self._size()[0] >= 100
 
     def _body_width(self) -> int:
-        return max(24, self._size()[0] - _INSPECTOR_WIDTH - 2)
+        return max(1, self._size()[0] - (_INSPECTOR_WIDTH + 2 if self._wide() else 2))
 
     def _scroll(self, delta: int) -> None:
+        if self.show_help:
+            self.help_scroll = max(0, self.help_scroll + delta)
+            return
+        if self.show_inspector:
+            self.inspector_scroll = max(0, self.inspector_scroll + delta)
+            return
+        self._follow_selection = False
         self.scroll_top = max(0, self.scroll_top + delta)
 
     # ── rendering ────────────────────────────────────────────────────
@@ -258,13 +294,13 @@ class RetaskViewer:
         self._reload_if_changed()
         done, total = retask.progress(self.doc)
         shown = os.path.relpath(self.path, self.root) if self.root else self.path
+        suffix = f"  {done}/{total} done"
+        width = self._size()[0]
         out = [
             ("class:header", "  RETASK"),
-            ("class:header.path", f"  {shown}"),
-            ("class:dim", f"  {done}/{total} done"),
+            ("class:header.path", "  " + clipped(shown, max(1, width - len(suffix) - 12))),
+            ("class:dim", suffix),
         ]
-        if self.doc.goal:
-            out.append(("class:dim", f"  {symbol_dot()} {_crop(self.doc.goal, 60)}"))
         return out
 
     def _rows(self) -> list:
@@ -272,6 +308,10 @@ class RetaskViewer:
         width = self._body_width()
         current = retask.current_task(self.doc)
         rows = [(None, [("class:dim", f"  {self.doc.title}")])]
+        if self.doc.goal:
+            rows.extend((None, [("class:dim", "  " + line)]) for line in _wrap(self.doc.goal, max(1, width - 2)))
+        if not self.doc.tasks:
+            rows.append((None, [("class:dim", "  No tasks yet. Edit the checklist to add one.")]))
         rows.append((None, []))
         for task in self.doc.tasks:
             is_sel = task.id == self.selected
@@ -308,9 +348,9 @@ class RetaskViewer:
                            if tid == self.selected and fr and "›" in fr[0][1])
         except StopIteration:
             sel_row = 0
-        if sel_row < self.scroll_top:
+        if self._follow_selection and sel_row < self.scroll_top:
             self.scroll_top = sel_row
-        elif sel_row >= self.scroll_top + visible:
+        elif self._follow_selection and sel_row >= self.scroll_top + visible:
             self.scroll_top = sel_row - visible + 1
         self.scroll_top = max(0, min(self.scroll_top, max(0, len(rows) - visible)))
         out = []
@@ -351,14 +391,32 @@ class RetaskViewer:
         return out
 
     def _status_fragments(self):
-        if self.error:
-            return [("class:st.fail", f"  {self.error}")]
-        if self.flash:
-            return [("class:statusbar", f"  {self.flash}")]
-        keys = "↑↓/jk select · Enter fold · y copy task · s I finished this · m mouse · q close"
         if self.show_help:
-            return [("class:help", f"  {keys} · Esc close help")]
-        return [("class:statusbar", f"  {keys} · ? help · {len(self.doc.tasks)} tasks")]
+            parts = [("Esc", "Back"), ("↑↓", "Scroll"), ("PgUp/PgDn", "Page")]
+        elif self.show_inspector:
+            parts = [("Esc", "Back"), ("↑↓", "Scroll"), ("i", "Checklist")]
+        else:
+            parts = [("Esc", "Close"), ("↑↓", "Select"), ("Enter", "Fold"),
+                     ("i", "Inspect"), ("y", "Copy"), ("s", "Submit"), ("m", "Mouse"), ("?", "Help")]
+        return fit_hints(parts, self._size()[0], key_style="class:selected", text_style="class:statusbar")
+
+    def _inspector_view(self):
+        rows = wrap_fragments(self._inspector_fragments(),
+                              (_INSPECTOR_WIDTH if self._wide() else self._size()[0]) - 1)
+        self.inspector_scroll = min(self.inspector_scroll, max(0, len(rows) - self._visible_height()))
+        return [part for row in rows[self.inspector_scroll:self.inspector_scroll + self._visible_height()]
+                for part in row + [("", "\n")]]
+
+    def _help_fragments(self):
+        text = ("  Checklist keys\n\n  ↑↓ / j k  Select a task\n  Enter / Space  Expand or fold its description\n"
+                "  i  Inspect checks, dependencies, and history\n  PgUp / PgDn  Read long descriptions\n"
+                "  s  Submit your completion claim for AI verification\n  y  Copy the complete selected task\n"
+                "  m  Toggle mouse capture; off permits text selection\n  g / G  First or last task\n"
+                "  Esc  Back; close from the checklist\n  q / Ctrl+C  Close\n")
+        rows = wrap_fragments([("class:inspector.value", text)], self._size()[0] - 1)
+        self.help_scroll = min(self.help_scroll, max(0, len(rows) - self._visible_height()))
+        return [part for row in rows[self.help_scroll:self.help_scroll + self._visible_height()]
+                for part in row + [("", "\n")]]
 
     # ── mouse ────────────────────────────────────────────────────────
 
@@ -388,13 +446,21 @@ class RetaskViewer:
             content=_MouseControl(self._body_fragments, mouse_callback=self._body_mouse),
             style="class:root", wrap_lines=False)
         inspector_win = Window(
-            content=FormattedTextControl(self._inspector_fragments),
-            width=_INSPECTOR_WIDTH, wrap_lines=True, style="class:root")
+            content=FormattedTextControl(self._inspector_view),
+            width=lambda: _INSPECTOR_WIDTH if self._wide() else self._size()[0],
+            wrap_lines=False, style="class:root")
         status_win = Window(
             content=FormattedTextControl(self._status_fragments), height=1,
             style="class:statusbar")
-        body = VSplit([body_win, Window(width=1, char="│", style="class:border"), inspector_win])
-        return Layout(HSplit([header_win, body, status_win]))
+        wide = VSplit([body_win, Window(width=1, char="│", style="class:border"), inspector_win])
+        help_win = Window(FormattedTextControl(self._help_fragments), wrap_lines=False)
+        body = DynamicContainer(lambda: help_win if self.show_help else (
+            wide if self._wide() else (inspector_win if self.show_inspector else body_win)))
+        feedback = ConditionalContainer(Window(FormattedTextControl(lambda: [
+            ("class:st.fail" if self.error else "class:dim",
+             clipped("  " + (self.error or self.flash), self._size()[0] - 1))]), height=1),
+            filter=Condition(lambda: bool(self.error or self.flash)))
+        return Layout(HSplit([header_win, body, feedback, status_win]))
 
     # ── lifecycle ────────────────────────────────────────────────────
 
@@ -405,7 +471,8 @@ class RetaskViewer:
         except Exception:
             pass
         try:
-            self._app.run()
+            with terminal_arbiter.hold("retask-viewer", terminal_arbiter.Mode.EXTERNAL, timeout=10.0):
+                self._app.run()
         except (KeyboardInterrupt, EOFError):
             pass
         finally:
