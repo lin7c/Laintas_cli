@@ -761,9 +761,15 @@ def _get_term_size() -> tuple[int, int]:
     from prompt_toolkit.application.current import get_app_or_none
     running = get_app_or_none()
     if running is not None and running.is_running:
-        size = running.output.get_size()
-        _TERM_SIZE_CACHE[:] = [size.columns, size.rows]
-        return size.columns, size.rows
+        # Layout predicates and each visible row ask for this size. Read it
+        # once per render, which also observes the next SIGWINCH redraw.
+        cached = getattr(running, "_laintas_term_size", None)
+        if cached is None or cached[0] != running.render_counter:
+            size = running.output.get_size()
+            cached = (running.render_counter, (size.columns, size.rows))
+            running._laintas_term_size = cached
+        _TERM_SIZE_CACHE[:] = cached[1]
+        return cached[1]
     if not _TERM_SIZE_INIT[0]:
         import shutil, signal
         def _on_winch(signum, frame):
@@ -1167,6 +1173,7 @@ def select_dialog(
 
     def _refresh_plain_norm():
         _plain_norm[:] = [_search_text(*row) for row in norm]
+        _visible_cache[0] = None
 
     sel = [max(0, min(selected_index, len(norm) - 1))]
     _auto_seconds = (float(auto_confirm_seconds)
@@ -1179,6 +1186,7 @@ def select_dialog(
     ))
     chk: set[int] = set(checked) if (multi and checked) else set()
     filter_buf = Buffer() if search else None
+    _visible_cache = [None, [], {}]
     act_keys: dict[str, str] = action_keys or {}
     # Marquee state for focus-follow horizontal scroll on long selected rows.
     _marquee_last_sel = [-1]
@@ -1193,16 +1201,12 @@ def select_dialog(
 
     def _visible():
         """Return (list_of_(orig_idx, label, desc)) after filtering."""
-        unfiltered = [(oi, lab, desc) for oi, (lab, desc) in enumerate(norm)]
-        if not filter_buf:
-            return unfiltered
-        f = filter_buf.text.strip().casefold()
-        if not f:
-            return unfiltered
-        out = []
-        for oi, (lab, _desc) in enumerate(norm):
-            if _fuzzy_match(_plain_norm[oi], f):
-                out.append((oi, lab, _desc))
+        f = filter_buf.text.strip().casefold() if filter_buf else ""
+        if _visible_cache[0] == f:
+            return _visible_cache[1]
+        out = [(oi, lab, desc) for oi, (lab, desc) in enumerate(norm)
+               if not f or _fuzzy_match(_plain_norm[oi], f)]
+        _visible_cache[:] = [f, out, {oi: index for index, (oi, _, _) in enumerate(out)}]
         return out
 
     def _clamp_sel():
@@ -1210,7 +1214,7 @@ def select_dialog(
         if not vis:
             sel[0] = 0
             return vis
-        if not any(oi == sel[0] for oi, _, _ in vis):
+        if sel[0] not in _visible_cache[2]:
             sel[0] = vis[0][0]
         return vis
 
@@ -1243,8 +1247,7 @@ def select_dialog(
         if vis:
             list_h = _page_size()
             if len(vis) > list_h:
-                cur_pos = next((i for i, (oi, _, _) in enumerate(vis)
-                                if oi == sel[0]), 0)
+                cur_pos = _visible_cache[2].get(sel[0], 0)
                 half = list_h // 2
                 start = max(0, min(cur_pos - half, len(vis) - list_h))
                 end = min(start + list_h, len(vis))
@@ -1307,8 +1310,7 @@ def select_dialog(
     def _footer_lines():
         lines = []
         vis = _clamp_sel()
-        position = next((i + 1 for i, (oi, _, _) in enumerate(vis)
-                         if oi == sel[0]), 0)
+        position = _visible_cache[2].get(sel[0], -1) + 1
         lines.append(("class:muted", f"  {position}/{len(vis)}"
                       + (f" of {len(norm)}" if search and filter_buf.text else "")
                       + (f"  {len(chk)} selected" if multi else "") + "\n"))
@@ -1387,7 +1389,7 @@ def select_dialog(
         vis = _clamp_sel()
         if not vis:
             return
-        cur_vi = next((i for i, (oi, _, _) in enumerate(vis) if oi == sel[0]), 0)
+        cur_vi = _visible_cache[2].get(sel[0], 0)
         if cur_vi > 0:
             sel[0] = vis[cur_vi - 1][0]
 
@@ -1397,7 +1399,7 @@ def select_dialog(
         vis = _clamp_sel()
         if not vis:
             return
-        cur_vi = next((i for i, (oi, _, _) in enumerate(vis) if oi == sel[0]), 0)
+        cur_vi = _visible_cache[2].get(sel[0], 0)
         if cur_vi < len(vis) - 1:
             sel[0] = vis[cur_vi + 1][0]
 
@@ -1453,7 +1455,7 @@ def select_dialog(
         vis = _clamp_sel()
         if not vis:
             return
-        cur_vi = next((i for i, (oi, _, _) in enumerate(vis) if oi == sel[0]), 0)
+        cur_vi = _visible_cache[2].get(sel[0], 0)
         sel[0] = vis[max(0, min(len(vis) - 1, cur_vi + delta))][0]
 
     @kb.add("pageup")
@@ -1591,16 +1593,23 @@ def select_dialog(
     mode = _ui_theme_mode()
     list_ctrl = _ListControl(lambda: _ptk_fragments(_build_lines(), color_mode=mode))
 
+    _preview_cache = [None, None]
+
     def _preview_lines():
         vis = _clamp_sel()
         if not vis:
             return [("class:muted", "  Nothing selected. Change the filter to see choices.")]
         label, description = norm[sel[0]]
         body = str(details[sel[0]]) if details and sel[0] < len(details) else description
-        return _ptk_fragments([
+        key = (label, body)
+        if _preview_cache[0] == key:
+            return _preview_cache[1]
+        fragments = _ptk_fragments([
             ("class:preview-title", "  " + label + "\n\n"),
             ("class:preview", "  " + body.replace("\n", "\n  ")),
         ], color_mode=mode)
+        _preview_cache[:] = [key, fragments]
+        return fragments
 
     if full_screen:
         list_window = Window(content=list_ctrl, wrap_lines=False)

@@ -11,6 +11,7 @@ The presentation layer deliberately supports three product-specific idioms:
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import dataclass, field
 import os
 import re
@@ -33,7 +34,8 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 
 import terminal_arbiter
-from terminal_layout import fit_hints, fit_line, themed_style, wrap_fragments
+from terminal_layout import (
+    fit_hints, fit_line, iter_wrapped_fragments, themed_style, wrap_fragments)
 
 
 _MARKUP_RE = re.compile(r"\[/?[^\]]+\]")
@@ -105,6 +107,64 @@ class UILine:
     state: str = ""
 
 
+class _DetailLines(list):
+    """Mutable source lines with constant-time render-cache invalidation."""
+
+    def __init__(self, values=()):
+        super().__init__(values)
+        self.version = object()
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self.version = object()
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        self.version = object()
+
+    def append(self, value):
+        super().append(value)
+        self.version = object()
+
+    def extend(self, values):
+        self.version = object()
+        super().extend(values)
+
+    def insert(self, index, value):
+        super().insert(index, value)
+        self.version = object()
+
+    def pop(self, index=-1):
+        value = super().pop(index)
+        self.version = object()
+        return value
+
+    def remove(self, value):
+        super().remove(value)
+        self.version = object()
+
+    def clear(self):
+        super().clear()
+        self.version = object()
+
+    def reverse(self):
+        super().reverse()
+        self.version = object()
+
+    def sort(self, *args, **kwargs):
+        self.version = object()
+        super().sort(*args, **kwargs)
+
+    def __iadd__(self, values):
+        self.extend(values)
+        return self
+
+    def __imul__(self, count):
+        super().__imul__(count)
+        self.version = object()
+        return self
+
+
 @dataclass
 class UIDetail:
     title: str
@@ -114,6 +174,11 @@ class UIDetail:
     kind: str = ""
     collapsible: bool = False
     expanded_sections: set[int] = field(default_factory=set)
+
+    def __setattr__(self, name, value):
+        if name == "lines" and not isinstance(value, _DetailLines):
+            value = _DetailLines(value)
+        super().__setattr__(name, value)
 
     @classmethod
     def text(cls, title: str, content: Any, subtitle: str = "",
@@ -310,6 +375,7 @@ class ResourceBrowser:
         self._detail_query = ""
         self._detail_search_key = ""
         self._detail_matches: list[tuple[int, int, int]] = []
+        self._detail_matches_by_line = {}
         self._detail_match_index = -1
         self._search_return_scroll = 0
         self.help_open = False
@@ -321,6 +387,10 @@ class ResourceBrowser:
         self._closed = False
         self._help_scroll = 0
         self._detail_rows_cache = None
+        self._detail_headings_cache = None
+        self._detail_end_task = None
+        self._detail_end_request = 0
+        self._detail_end_status = None
         self._filter_return_key = ""
         self._filter_return_scroll = 0
         self._filter_return_query = ""
@@ -363,7 +433,7 @@ class ResourceBrowser:
             self._last_width = width
             cached = self._detail_rows_cache
             if (self.detail and cached and cached[2]
-                    and cached[0][0] == tuple(self.detail.lines)):
+                    and cached[0][0] is self.detail.lines.version):
                 source = cached[2][min(self.detail_scroll, len(cached[2]) - 1)]
                 self.detail_scroll = self._detail_position(source)
             if self._detail_query and self._detail_matches:
@@ -423,6 +493,7 @@ class ResourceBrowser:
     def _rebuild_detail_matches(self, *, reset: bool) -> None:
         """Index literal, case-insensitive matches in the complete detail."""
         self._detail_matches = []
+        self._detail_matches_by_line = {}
         query = self._detail_query
         if self.detail is not None and query:
             pattern = re.compile(re.escape(query), re.IGNORECASE)
@@ -433,6 +504,8 @@ class ResourceBrowser:
                 self._detail_matches.extend(
                     (line_index, match.start(), match.end())
                     for match in pattern.finditer(clean_ansi(line.text)))
+            for index, (line_index, start, end) in enumerate(self._detail_matches):
+                self._detail_matches_by_line.setdefault(line_index, []).append((index, start, end))
         if not self._detail_matches:
             self._detail_match_index = -1
         elif reset or self._detail_match_index < 0:
@@ -459,11 +532,19 @@ class ResourceBrowser:
             if line_index not in visible:
                 return
             self._detail_cursor = self._detail_position(line_index)
-        line_index = self._detail_position(line_index)
-        for index, row in enumerate(self._detail_rows()):
+        source_line = line_index
+        line_index = self._detail_position(source_line)
+        # Stop at the hit, even if the source line contains megabytes of text.
+        index = line_index
+        while True:
+            rows = self._detail_rows(limit=index + 1)
+            if index >= len(rows) or self._detail_row_sources[index] != source_line:
+                break
+            row = rows[index]
             if any(style == "class:search.match.current" for style, _ in row):
                 line_index = index
                 break
+            index += 1
         # Put the hit near the upper third instead of pinning it to the edge.
         height = self._body_height()
         self.detail_scroll = max(0, line_index - max(0, height // 3))
@@ -504,9 +585,8 @@ class ResourceBrowser:
                                base_style: str):
         spans = [
             (start, end, match_index == self._detail_match_index)
-            for match_index, (match_line, start, end)
-            in enumerate(self._detail_matches)
-            if match_line == line_index
+            for match_index, start, end
+            in self._detail_matches_by_line.get(line_index, ())
         ]
         return self._highlight_fragments(text, base_style, spans)
 
@@ -538,6 +618,7 @@ class ResourceBrowser:
             self.detail = None
             self.detail_key = ""
             self._detail_matches = []
+            self._detail_matches_by_line = {}
             self._detail_match_index = -1
             self._detail_search_key = ""
             return
@@ -570,6 +651,7 @@ class ResourceBrowser:
             self._detail_query = ""
             self._detail_search_key = ""
             self._detail_matches = []
+            self._detail_matches_by_line = {}
             self._detail_match_index = -1
         elif self._detail_query:
             # Live managers can replace the detail object for the same stable
@@ -596,8 +678,14 @@ class ResourceBrowser:
         return visible
 
     def _detail_headings(self) -> list[int]:
-        return [i for i, line in enumerate(self.detail.lines)
-                if line.style == "class:detail.heading"] if self.detail else []
+        if not self.detail:
+            return []
+        version = self.detail.lines.version
+        if self._detail_headings_cache is None or self._detail_headings_cache[0] is not version:
+            headings = [i for i, line in enumerate(self.detail.lines)
+                        if line.style == "class:detail.heading"]
+            self._detail_headings_cache = (version, headings)
+        return self._detail_headings_cache[1]
 
     def _toggle_detail_section(self, source_line: int) -> None:
         if not self.detail or not self.detail.collapsible: return
@@ -627,11 +715,10 @@ class ResourceBrowser:
         if self.help_open:
             self._help_scroll = max(0, self._help_scroll + delta)
             return
-        visible = self._detail_visible_indices()
-        rows = self._detail_rows()
-        count = len(rows)
         collapsible = bool(self.detail and self.collapsible_detail and self.detail.collapsible)
         start = self._detail_cursor if collapsible else self.detail_scroll
+        rows = self._detail_rows(limit=max(1, start + delta + self._body_height()))
+        count = len(rows)
         self.detail_scroll = max(0, min(max(0, count - 1), start + delta))
         if rows and collapsible:
             self._detail_cursor = self.detail_scroll
@@ -639,6 +726,56 @@ class ResourceBrowser:
             headings = self._detail_headings()
             self.selected_section = max(
                 0, sum(index <= source_line for index in headings) - 1)
+
+    def _cancel_detail_end(self) -> None:
+        """Any newer input takes priority over a pending jump to the end."""
+        self._detail_end_request += 1
+        if self._detail_end_task is not None:
+            self._detail_end_task.cancel()
+            self._detail_end_task = None
+        self._restore_detail_end_status()
+
+    def _restore_detail_end_status(self) -> None:
+        if self._detail_end_status is not None:
+            if self.status == "Finding the final lines…":
+                self.status, self.status_style = self._detail_end_status
+            self._detail_end_status = None
+
+    def _start_detail_end(self) -> None:
+        self._cancel_detail_end()
+        self._detail_rows(limit=0)
+        cache = self._detail_rows_cache
+        if cache[4]:
+            self._move_detail(len(cache[1]))
+            return
+        self._detail_end_status = (self.status, self.status_style)
+        self.status, self.status_style = "Finding the final lines…", "class:muted"
+        request = self._detail_end_request
+        self._detail_end_task = self.app.create_background_task(
+            self._finish_detail_end(request, cache))
+
+    async def _finish_detail_end(self, request, cache) -> None:
+        import asyncio
+        try:
+            while (self._running and not self.app.is_done
+                   and request == self._detail_end_request):
+                rows = self._detail_rows(limit=len(cache[1]) + 128)
+                if self._detail_rows_cache is not cache:
+                    return
+                if cache[4]:
+                    self.detail_scroll = max(0, len(rows) - self._body_height())
+                    if self.detail and self.collapsible_detail and self.detail.collapsible:
+                        self._detail_cursor = max(0, len(rows) - 1)
+                        self.selected_section = max(0, len(self._detail_headings()) - 1)
+                    return
+                # Share the input/render loop while indexing a large tail.
+                await asyncio.sleep(0)
+        finally:
+            if request == self._detail_end_request:
+                self._detail_end_task = None
+                self._restore_detail_end_status()
+                if not self._closed and not self.app.is_done:
+                    self.app.invalidate()
 
     def _detail_anchors(self) -> list[int]:
         """Return meaningful navigation stops for the current inspector."""
@@ -856,18 +993,23 @@ class ResourceBrowser:
             return None
         return NotImplemented
 
-    def _detail_unwrapped(self):
+    def _iter_detail_rows(self, width):
         detail = self.detail
         if detail is None:
-            return [("class:muted", "\n  Select an item to see its details.\n")]
-        visible = self._detail_visible_indices()
-        headings = self._detail_headings()
-        fragments = []
-        for position in range(len(visible)):
-            line_index = visible[position]
-            line = detail.lines[line_index]
+            for row in iter_wrapped_fragments(
+                    [("class:muted", "\n  Select an item to see its details.\n")], width):
+                yield row, 0
+            return
+        section = -1
+        collapsible = self.collapsible_detail and detail.collapsible
+        for line_index, line in enumerate(detail.lines):
+            heading = line.style == "class:detail.heading"
+            if heading:
+                section += 1
+            elif collapsible and section not in detail.expanded_sections:
+                continue
+            fragments = []
             if self.presentation == "timeline" and detail.kind != "diff":
-                heading = line.style == "class:detail.heading"
                 upper = line.text.upper()
                 if heading:
                     if line.state == "failed":
@@ -881,10 +1023,7 @@ class ResourceBrowser:
                     else:
                         glyph, style = "├", "class:timeline.tool"
                     if self.collapsible_detail and detail.collapsible:
-                        section = headings.index(line_index)
                         marker = "▼" if section in detail.expanded_sections else "▶"
-                        if section == self.selected_section:
-                            style += " reverse"
                         fragments.append((style, f" {marker}{glyph} "))
                     else:
                         fragments.append((style, f" {glyph} "))
@@ -908,51 +1047,59 @@ class ResourceBrowser:
                 fragments.extend(self._detail_text_fragments(
                     line_index, clean_ansi(line.text), base_style))
                 fragments.append((base_style, "\n"))
-        return fragments
+            for row in iter_wrapped_fragments(fragments, width):
+                yield row, line_index
 
-    def _detail_rows(self):
+    def _detail_rows(self, *, limit=None, source_line=None):
+        """Extend the row index only as far as the requested viewport needs."""
         detail = self.detail
         width = max(1, self._pane_width("detail") - 1)
-        key = (tuple(detail.lines) if detail else (), width, self.presentation,
+        key = (detail.lines.version if detail else None, width, self.presentation,
                detail.kind if detail else None,
                bool(detail and detail.collapsible), self.collapsible_detail,
                tuple(sorted(detail.expanded_sections)) if detail else (),
-               self.selected_section, self._detail_query, self._detail_match_index)
-        if self._detail_rows_cache and self._detail_rows_cache[0] == key:
-            self._detail_row_sources = self._detail_rows_cache[2]
-            return self._detail_rows_cache[1]
-        rows, sources, line, logical = [], [], [], 0
-        visible = self._detail_visible_indices()
-        for style, value in self._detail_unwrapped():
-            for segment in value.splitlines(keepends=True):
-                line.append((style, segment))
-                if segment.endswith("\n"):
-                    wrapped = wrap_fragments(line, width)
-                    rows.extend(wrapped)
-                    source = visible[min(logical, len(visible) - 1)] if visible else 0
-                    sources.extend([source] * len(wrapped))
-                    line, logical = [], logical + 1
-        if line:
-            wrapped = wrap_fragments(line, width)
-            rows.extend(wrapped)
-            sources.extend([visible[-1] if visible else 0] * len(wrapped))
+               self._detail_query, self._detail_match_index)
+        if not self._detail_rows_cache or self._detail_rows_cache[0] != key:
+            self._detail_rows_cache = [key, [], [], self._iter_detail_rows(width), False]
+        _, rows, sources, remaining, exhausted = self._detail_rows_cache
+        while ((limit is None or len(rows) < limit)
+               and (source_line is None or not sources or sources[-1] < source_line)
+               and not exhausted):
+            try:
+                row, source = next(remaining)
+            except StopIteration:
+                self._detail_rows_cache[4] = True
+                break
+            rows.append(row)
+            sources.append(source)
         self._detail_row_sources = sources
-        self._detail_rows_cache = (key, rows, sources)
         return rows
 
     def _detail_position(self, source_line: int) -> int:
-        self._detail_rows()
-        return next((index for index, source in enumerate(self._detail_row_sources)
-                     if source == source_line), 0)
+        self._detail_rows(source_line=source_line)
+        index = bisect_left(self._detail_row_sources, source_line)
+        return index if (index < len(self._detail_row_sources)
+                         and self._detail_row_sources[index] == source_line) else 0
 
     def _detail_fragments(self):
         if self.help_open:
             return self._help_fragments()
-        rows = self._detail_rows()
         height = self._body_height()
+        rows = self._detail_rows(limit=self.detail_scroll + height)
         self.detail_scroll = max(0, min(self.detail_scroll, max(0, len(rows) - height)))
-        return [(style, value) for row in rows[self.detail_scroll:self.detail_scroll + height]
-                for style, value in row + [("", "\n")]]
+        heading = None
+        if (self.detail and self.collapsible_detail and self.detail.collapsible
+                and self.presentation == "timeline" and self.detail.kind != "diff"):
+            headings = self._detail_headings()
+            if 0 <= self.selected_section < len(headings):
+                heading = headings[self.selected_section]
+        fragments = []
+        for index in range(self.detail_scroll, min(len(rows), self.detail_scroll + height)):
+            selected = heading is not None and self._detail_row_sources[index] == heading
+            fragments.extend((style + " reverse" if selected and style.startswith("class:timeline.") else style, value)
+                             for style, value in rows[index])
+            fragments.append(("", "\n"))
+        return fragments
 
     def _help_fragments(self):
         rows = [
@@ -994,8 +1141,8 @@ class ResourceBrowser:
             self._move_detail(3)
             return None
         if mouse_event.event_type == MouseEventType.MOUSE_UP and self.detail and self.detail.collapsible:
-            self._detail_rows()
             pos = self.detail_scroll + max(0, mouse_event.position.y)
+            self._detail_rows(limit=pos + 1)
             if pos < len(self._detail_row_sources):
                 self._toggle_detail_section(self._detail_row_sources[pos])
             return None
@@ -1230,7 +1377,7 @@ class ResourceBrowser:
             if self.help_open:
                 self._help_scroll = 10 ** 12
             elif self.focus == "detail" or (not self.is_wide and self.mode == "detail"):
-                self._move_detail(len(self._detail_rows()))
+                self._start_detail_end()
             elif self.filtered:
                 self.selected = len(self.filtered) - 1
                 self._sync_detail()
@@ -1365,6 +1512,7 @@ class ResourceBrowser:
                     self._detail_query = ""
                     self._detail_search_key = ""
                     self._detail_matches = []
+                    self._detail_matches_by_line = {}
                     self._detail_match_index = -1
                     self.detail_scroll = self._search_return_scroll
                 else:
@@ -1379,6 +1527,7 @@ class ResourceBrowser:
                 self._detail_query = ""
                 self._detail_search_key = ""
                 self._detail_matches = []
+                self._detail_matches_by_line = {}
                 self._detail_match_index = -1
                 event.app.invalidate()
             elif not self.is_wide and self.mode == "detail":
@@ -1532,6 +1681,7 @@ class ResourceBrowser:
             before_render=self._resize_focus,
             **io_options)
         self.app.ttimeoutlen = 0.1
+        self.app.key_processor.before_key_press += lambda _processor: self._cancel_detail_end()
 
     def _refresh_live(self) -> None:
         """Refresh data without pulling a reader back to the first line."""
@@ -1577,6 +1727,7 @@ class ResourceBrowser:
         finally:
             self._running = False
             self._closed = True
+            self._cancel_detail_end()
             self._assistant_request += 1
             self.assistant_busy = False
             self._assistant_interrupt.set()

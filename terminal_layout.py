@@ -35,38 +35,47 @@ def fit_line(fragments, width):
 
 def wrap_fragments(fragments, width):
     """Wrap styled text into physical terminal rows for accurate scrolling."""
+    return list(iter_wrapped_fragments(fragments, width))
+
+
+def iter_wrapped_fragments(fragments, width):
+    """Yield rows on demand, including when a single source line is huge."""
     width = max(1, width)
-    rows, row, used = [], [], 0
+    row, used, emitted = [], 0, False
 
     def emit(tokens):
-        result = []
+        result, chars, current = [], [], None
         for style, char, _size in tokens:
-            if result and result[-1][0] == style:
-                result[-1] = (style, result[-1][1] + char)
-            else:
-                result.append((style, char))
-        rows.append(result)
+            if chars and current != style:
+                result.append((current, "".join(chars)))
+                chars = []
+            current = style
+            chars.append(char)
+        if chars:
+            result.append((current, "".join(chars)))
+        return result
 
     for style, value in fragments:
         for char in value:
-            size = cell_len(char)
             if char == "\n":
-                emit(row)
+                yield emit(row)
+                emitted = True
                 row, used = [], 0
                 continue
+            size = 1 if " " <= char <= "~" else cell_len(char)
             if size > width:
                 char, size = "?", 1
             while used + size > width and row:
                 boundary = next((index + 1 for index in reversed(range(len(row)))
                                  if row[index][1].isspace()), len(row))
-                emit(row[:boundary])
+                yield emit(row[:boundary])
+                emitted = True
                 row = row[boundary:]
                 used = sum(token[2] for token in row)
             row.append((style, char, size))
             used += size
-    if row or not rows:
-        emit(row)
-    return rows
+    if row or not emitted:
+        yield emit(row)
 
 
 def themed_style(base):
@@ -107,6 +116,8 @@ def slice_line(fragments, start, width):
         shown = ""
         for char in value:
             size = cell_len(char)
+            if size and position >= start + width:
+                break
             if position >= start and position + size <= start + width:
                 shown += char
             elif position < start < position + size:

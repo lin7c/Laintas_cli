@@ -51,6 +51,10 @@ class AttachedCommandsInTheRealCli(unittest.TestCase):
         os.close(slave)
         self.master = master
         self.screen = pyte.Screen(self.COLS, self.ROWS)
+        # Let the emulator answer queries at their actual stream position.
+        # A fixed row-1 CPR makes prompt_toolkit erase unrelated screen rows.
+        self.screen.write_process_input = lambda data: os.write(
+            self.master, data.encode())
         self.stream = pyte.ByteStream(self.screen)
         self.transcript = bytearray()
         self.addCleanup(self._stop)
@@ -77,8 +81,6 @@ class AttachedCommandsInTheRealCli(unittest.TestCase):
                     return
                 self.stream.feed(data)
                 self.transcript.extend(data)
-                if b"\x1b[6n" in data:
-                    os.write(self.master, b"\x1b[1;1R")
 
     def text(self):
         return "\n".join(line.rstrip() for line in self.screen.display)
