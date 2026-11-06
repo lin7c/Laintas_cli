@@ -1,12 +1,17 @@
 """Offline credential gate. No samples, verification, logging, or raw findings."""
 from functools import lru_cache
 import importlib
+import hashlib
 import json
 import re
+import threading
 
 BLOCKED = ("Message not sent: possible password or API key detected. "
            "Remove it and try again. Use /password for credentials or /model for model keys.")
 UNAVAILABLE = "Message not sent: local security check unavailable. Please try again."
+CONFIRM = ("Possible password or API key detected. Third-party model providers may leak "
+           "what you send. Press Enter again to send it anyway, or edit it out first. "
+           "Use /password for credentials or /model for model keys.")
 MAX_TEXT = 1_000_000
 _PREFIX = re.compile(r"\b(?:KGAT_|sk-|ghp_|gho_|github_pat_|glpat-|xox[baprs]-|AIza)[A-Za-z0-9_-]{16,}")
 _PRIVATE = re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")
@@ -118,3 +123,41 @@ def require_safe_payload(value) -> None:
             if isinstance(item, str):
                 require_safe_input(f'{key}={json.dumps(item, ensure_ascii=False)}')
             require_safe_payload(item)
+
+
+# Confirm-then-send. A message the person chose to send after the warning is
+# remembered by digest only, for this process: the send gates below let it
+# through, while history persistence keeps using input_error() and so still
+# never writes it to disk.
+_confirmed: set[str] = set()
+_awaiting = {"digest": ""}
+_confirm_lock = threading.Lock()
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+
+
+def confirm_error(text: str) -> str:
+    """For text the person typed. First possible secret → CONFIRM; the same
+    text again → '' and remembered. A failed check still refuses (UNAVAILABLE)."""
+    error = input_error(text)
+    with _confirm_lock:
+        if error != BLOCKED:
+            if not error:
+                _awaiting["digest"] = ""
+            return error
+        digest = _digest(text)
+        if _awaiting["digest"] == digest:
+            _awaiting["digest"] = ""
+            _confirmed.add(digest)
+            return ""
+        _awaiting["digest"] = digest
+        return CONFIRM
+
+
+def send_error(text: str) -> str:
+    """input_error() for the model-send gates: confirmed text passes."""
+    if text and _digest(text) in _confirmed:
+        return ""
+    return input_error(text)

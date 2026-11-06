@@ -71,78 +71,6 @@ class AgentsModeTests(unittest.TestCase):
         self.assertEqual(terminal.stationed_agent_id, first.id)
         self.assertEqual(agent_loop.agent_deployment_terminal(second), None)
 
-    def test_one_shot_route_does_not_change_focus(self):
-        first = self._agent("first")
-        second = self._agent("AI-2")
-        agent_loop.set_dialog_agent_for_terminal("term0", first.id)
-        controller = agents_mode.AgentsModeController("term0", mock.Mock(), {})
-        with mock.patch.object(
-                agent_loop, "start_agent_assignment",
-                return_value=(True, "ok", object())) as start:
-            controller.dispatch("@AI-2 inspect auth")
-
-        self.assertEqual(controller.selected_id, first.id)
-        start.assert_called_once()
-        self.assertEqual(start.call_args.args[0:2], (second.id, "inspect auth"))
-
-    def test_foreground_employee_continues_via_repl_without_new_assignment(self):
-        scout = self._agent("scout")
-        agent_loop.set_current_agent_id(scout.id)
-        scout.chat_history = [{"role": "user", "content": "existing task"}]
-        submit = mock.Mock(return_value=(True, "Sent"))
-        controller = agents_mode.AgentsModeController(
-            "term0", mock.Mock(), {}, repl_submit_cb=submit)
-        controller.select(scout.id)
-        with mock.patch.object(agent_loop, "start_agent_assignment") as start:
-            controller.dispatch("continue that work")
-        submit.assert_called_once_with("continue that work")
-        start.assert_not_called()
-        self.assertEqual(scout.chat_history[0]["content"], "existing task")
-        self.assertEqual(controller._input_action(scout), "continue")
-
-    def test_panel_selection_keeps_foreground_and_shows_new_task_semantics(self):
-        primary = self._agent("primary", role="primary")
-        scout = self._agent("scout")
-        agent_loop.set_current_agent_id(primary.id)
-        controller = agents_mode.AgentsModeController(
-            "term0", mock.Mock(), {}, repl_submit_cb=mock.Mock())
-        controller.select(scout.id)
-        self.assertEqual(agent_loop.get_current_agent_id(), primary.id)
-        hints = "".join(text for _style, text in controller.hint_fragments())
-        self.assertIn("new task", hints)
-        inspector = "".join(text for _style, text in controller.inspector_fragments())
-        self.assertIn("/agent scout", inspector)
-        self.assertIn("/resume", inspector)
-        scout.status = "running"
-        self.assertEqual(controller._input_action(scout), "send update")
-
-    def test_addressing_primary_cannot_inject_into_foreground_scout(self):
-        primary = self._agent("primary", role="primary")
-        scout = self._agent("scout")
-        agent_loop.set_current_agent_id(scout.id)
-        submit = mock.Mock()
-        controller = agents_mode.AgentsModeController(
-            "term0", mock.Mock(), {}, repl_submit_cb=submit)
-        controller.select(scout.id)
-        controller.dispatch("@primary continue your task")
-        submit.assert_not_called()
-        self.assertIn("/agent primary", controller.notice)
-        self.assertEqual(agent_loop.get_current_agent_id(), scout.id)
-
-    def test_unsent_drafts_are_isolated_per_selected_agent(self):
-        first = self._agent("first")
-        second = self._agent("second")
-        controller = agents_mode.AgentsModeController("term0", object(), {})
-        controller.selected_id = first.id
-        controller._input_buffer = Buffer(multiline=False)
-        controller._input_buffer.text = "message for first"
-
-        self.assertTrue(controller.select(second.id))
-        self.assertEqual(controller._input_buffer.text, "")
-        controller._input_buffer.text = "message for second"
-        self.assertTrue(controller.select(first.id))
-        self.assertEqual(controller._input_buffer.text, "message for first")
-
     def test_stream_chunks_render_as_one_assistant_message(self):
         agent = self._agent("writer")
         controller = agents_mode.AgentsModeController("term0", object(), {})
@@ -178,24 +106,6 @@ class AgentsModeTests(unittest.TestCase):
 
         self.assertEqual(focus_text.count("hello"), 1)
         self.assertNotIn("ai_end", focus_text)
-
-    def test_unauthenticated_input_is_rejected_immediately_and_visibly(self):
-        agent = self._agent("primary", role="primary")
-        controller = agents_mode.AgentsModeController(
-            "term0", mock.Mock(), {},
-            execution_block_reason=(
-                "Not authenticated. Exit Agents Mode and run /login."))
-        controller.selected_id = agent.id
-        with mock.patch.object(agent_loop, "run_agent_loop") as run:
-            controller.dispatch("hello")
-
-        run.assert_not_called()
-        self.assertEqual(agent.status, "idle")
-        events = agent_ui_events.hub.agent_events(agent.id)
-        self.assertEqual(
-            [event.event_type for event in events],
-            ["user_message", "input_rejected"])
-        self.assertIn("/login", controller.notice)
 
     def test_running_tool_is_replaced_in_place_when_it_finishes(self):
         agent = self._agent("worker")
@@ -258,25 +168,65 @@ class AgentsModeTests(unittest.TestCase):
             controller.run()
         self.assertIsNone(controller.app)
 
-    def test_deployed_agents_excluded_from_rail_and_focus(self):
-        self._agent("primary", role="primary")
-        controller = agents_mode.AgentsModeController("term0", object(), {})
-        self.assertEqual(controller.agents(), [])
-        self.assertEqual(controller.selected_id, "")
-        rail_text = "".join(text for _style, text, *_ in controller.rail_fragments())
-        self.assertIn("No Agents", rail_text)
-        focus_text = "".join(text for _style, text in controller.focus_fragments())
-        self.assertIn("No Agents", focus_text)
-
-    def test_pool_agents_still_visible_alongside_deployed_primary(self):
+    def test_roster_lists_persistent_agents_not_subagents(self):
         primary = self._agent("primary", role="primary")
         worker = self._agent("worker")
+        child = self._agent("child", role="subagent")
+        child.parent_id = worker.id
         controller = agents_mode.AgentsModeController("term0", object(), {})
-        agents = controller.agents()
-        self.assertEqual(len(agents), 1)
-        self.assertEqual(agents[0].id, worker.id)
-        self.assertEqual(controller.selected_id, worker.id)
-        self.assertNotIn(primary.id, {a.id for a in agents})
+        ids = [a.id for a in controller.agents()]
+        self.assertEqual([primary.id, worker.id], ids)
+        self.assertNotIn(child.id, ids)
+
+    def test_enter_opens_detail_and_switches_on_exit(self):
+        self._agent("primary", role="primary")
+        worker = self._agent("worker")
+        worker.parent_id = "primary"
+        child = self._agent("child", role="subagent")
+        child.parent_id = worker.id
+        agent_loop._current_agent_id = "primary"
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        controller.select(worker.id)
+        controller.open_detail()
+        self.assertTrue(controller.detail)
+        text = "\n".join("".join(t for _s, t, *_ in row)
+                         for row in controller._detail_rows(80))
+        for heading in ("WHO", "RESPONSIBILITY", "NOW", "DELEGATED (1)",
+                        "RECENT TASKS", "SWITCH"):
+            self.assertIn(heading, text)
+        self.assertIn("child", text)
+        self.assertEqual(["/agent worker"], controller.exit_commands())
+
+    def test_busy_agent_is_not_made_a_switch_target(self):
+        self._agent("primary", role="primary")
+        worker = self._agent("worker")
+        worker.status = "running"
+        agent_loop._current_agent_id = "primary"
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        controller.select(worker.id)
+        controller.open_detail()
+        self.assertEqual([], controller.exit_commands())
+        self.assertIn("working", controller.notice)
+
+    def test_view_has_no_input_and_ctrl_c_never_leaves(self):
+        self._agent("worker")
+        controller = agents_mode.AgentsModeController("term0", object(), {})
+        seen = {}
+        with create_pipe_input() as pipe_input:
+            def keys():
+                time.sleep(0.3)
+                pipe_input.send_text("hello\x03")
+                time.sleep(0.2)
+                seen["running"] = controller.app is not None
+                seen["notice"] = controller.notice
+                pipe_input.send_text("\x1b")
+            sender = threading.Thread(target=keys)
+            sender.start()
+            controller.run(input=pipe_input, output=DummyOutput())
+            sender.join(timeout=2)
+        self.assertTrue(seen["running"])
+        self.assertIn("Esc", seen["notice"])
+        self.assertFalse(hasattr(controller, "dispatch"))
 
     def test_real_application_event_loop_starts_and_quits_cleanly(self):
         self._agent("primary", role="primary")
@@ -285,87 +235,6 @@ class AgentsModeTests(unittest.TestCase):
             pipe_input.send_bytes(b"\x11")  # Ctrl-Q
             controller.run(input=pipe_input, output=DummyOutput())
         self.assertIsNone(controller.app)
-
-    def test_real_application_enter_dispatches_once_and_escape_exits(self):
-        agent = self._agent("primary", role="primary")
-        controller = agents_mode.AgentsModeController(
-            "term0", mock.Mock(), {})
-        controller.selected_id = agent.id
-        started = threading.Event()
-        calls = []
-
-        def submit(target, text, _deps):
-            calls.append(text)
-            agent_ui_events.hub.emit(
-                "user_message", agent_id=target.id,
-                terminal_name="term0", summary=text, detail=text)
-            agent_ui_events.hub.emit(
-                "agent_done", agent_id=target.id,
-                terminal_name="term0", summary="answer", detail="answer")
-            started.set()
-            return True, "Submitted"
-
-        controller.primary_submit_cb = submit
-
-        with create_pipe_input() as pipe_input:
-            def keys():
-                pipe_input.send_bytes(b"hello\r")
-                started.wait(timeout=1)
-                pipe_input.send_bytes(b"\x1b")
-
-            sender = threading.Thread(target=keys)
-            sender.start()
-            controller.run(input=pipe_input, output=_WideOutput())
-            sender.join(timeout=1)
-
-        self.assertEqual(calls, ["hello"])
-        events = agent_ui_events.hub.agent_events(agent.id)
-        self.assertEqual(
-            sum(event.event_type == "user_message" for event in events), 1)
-        self.assertEqual(
-            sum(event.event_type == "agent_done" for event in events), 1)
-
-    def test_primary_runtime_survives_agents_view_exit(self):
-        agent = self._agent("primary", role="primary")
-        entered = threading.Event()
-        release = threading.Event()
-
-        def blocking_loop(_deps, _text, _session, state, _history, **_kwargs):
-            entered.set()
-            release.wait(timeout=2)
-            return {
-                "success": True,
-                "state": {**state, "lastReply": "mapped reply"},
-                "msg": "mapped reply",
-            }
-
-        controller = agents_mode.AgentsModeController(
-            "term0", mock.Mock(), {}, primary_submit_cb=lambda a, t, d:
-            laintas_cli._submit_primary_runtime_task(a, t, d, {}))
-        controller.selected_id = agent.id
-        with create_pipe_input() as pipe_input, \
-                mock.patch.object(laintas_cli, "run_agent_loop", blocking_loop):
-            def keys():
-                pipe_input.send_bytes(b"long task\r")
-                entered.wait(timeout=1)
-                pipe_input.send_bytes(b"\x1b")
-
-            sender = threading.Thread(target=keys)
-            sender.start()
-            controller.run(input=pipe_input, output=_WideOutput())
-            sender.join(timeout=1)
-
-            self.assertEqual(agent.status, "thinking")
-            self.assertTrue(agent.thread.is_alive())
-            self.assertTrue(agent.thread.name.startswith("primary-runtime-"))
-            release.set()
-            agent.thread.join(timeout=1)
-
-        self.assertEqual(agent.status, "idle")
-        self.assertEqual(agent.last_reply, "mapped reply")
-        self.assertEqual(
-            agent_ui_events.hub.agent_events(agent.id)[-1].event_type,
-            "agent_done")
 
     def test_outer_view_enters_thinking_and_attaches_without_second_run(self):
         agent = self._agent("primary", role="primary")
@@ -406,31 +275,6 @@ class AgentsModeTests(unittest.TestCase):
         self.assertEqual(agent.status, "idle")
         self.assertIn("outer mapped reply", output.getvalue())
 
-    def test_ctrl_c_clears_the_prompt_but_never_leaves_the_view(self):
-        self._agent("worker")
-        controller = agents_mode.AgentsModeController("term0", object(), {})
-        seen = {}
-        with create_pipe_input() as pipe_input:
-            def keys():
-                time.sleep(0.3)
-                pipe_input.send_text("draft")
-                time.sleep(0.1)
-                pipe_input.send_text("\x03")            # clears the draft
-                time.sleep(0.1)
-                seen["after_clear"] = controller._input_buffer.text
-                pipe_input.send_text("\x03")            # empty: only a hint
-                time.sleep(0.1)
-                seen["running"] = controller.app is not None
-                seen["notice"] = controller.notice
-                pipe_input.send_text("\x1b")
-            sender = threading.Thread(target=keys)
-            sender.start()
-            controller.run(input=pipe_input, output=DummyOutput())
-            sender.join(timeout=2)
-        self.assertEqual(seen["after_clear"], "")
-        self.assertTrue(seen["running"])
-        self.assertIn("Esc", seen["notice"])
-
     def test_escape_exits_even_when_input_buffer_has_unsubmitted_text(self):
         self._agent("primary", role="primary")
         controller = agents_mode.AgentsModeController(
@@ -444,211 +288,32 @@ class AgentsModeTests(unittest.TestCase):
             event.event_type == "user_message"
             for event in agent_ui_events.hub.events("term0")))
 
-    def test_exit_command_closes_mode_without_dispatching_to_agent(self):
+    def test_escape_closes_mode_without_dispatching_to_agent(self):
         self._agent("primary", role="primary")
         controller = agents_mode.AgentsModeController(
             "term0", mock.Mock(), {})
         with create_pipe_input() as pipe_input:
-            pipe_input.send_bytes(b"/exit\r")
+            pipe_input.send_bytes(b"\x1b")
             controller.run(input=pipe_input, output=_WideOutput())
 
         self.assertFalse(any(
             event.event_type == "user_message"
             for event in agent_ui_events.hub.events("term0")))
 
-    def test_exit_command_works_from_a_narrow_conversation(self):
+    def test_escape_works_from_a_narrow_conversation(self):
         self._agent("primary", role="primary")
         self._agent("worker", role="pool")
         controller = agents_mode.AgentsModeController(
             "term0", mock.Mock(), {})
         with create_pipe_input() as pipe_input:
             # Narrow terminals open on the agent list; Enter opens the
-            # selected conversation, where the prompt takes commands.
-            pipe_input.send_bytes(b"\r/exit\r")
+            # selected Agent, Esc steps back out level by level.
+            pipe_input.send_bytes(b"\r\x1b\x1b\x1b")
             controller.run(input=pipe_input, output=DummyOutput())
 
         self.assertFalse(any(
             event.event_type == "user_message"
             for event in agent_ui_events.hub.events("term0")))
-
-    def test_worker_deps_use_silent_renderers_in_full_screen_mode(self):
-        agent = self._agent("worker")
-        deps = mock.Mock()
-        controller = agents_mode.AgentsModeController("term0", deps, {})
-
-        wired = controller._deps_for(agent.id)
-
-        self.assertIsNot(wired.console, deps.console)
-        self.assertIs(wired.console, controller._console_for(agent.id))
-        # These calls must be harmless and write nothing to the terminal.
-        wired.console.print("hidden worker output")
-        wired.display_command_output("cmd", 0, "output")
-
-    def test_each_agent_gets_its_own_console(self):
-        # rich allows one live display per Console: two agents streaming at
-        # once on a shared console kill the second one with LiveError.
-        first, second = self._agent("one"), self._agent("two")
-        controller = agents_mode.AgentsModeController("term0", mock.Mock(), {})
-
-        self.assertIsNot(controller._deps_for(first.id).console,
-                         controller._deps_for(second.id).console)
-        self.assertIs(controller._deps_for(first.id).console,
-                      controller._deps_for(first.id).console)
-
-    def test_worker_approval_is_resolved_by_ui_and_attributed_to_agent(self):
-        agent = self._agent("reviewer")
-        controller = agents_mode.AgentsModeController("term0", object(), {})
-        result = []
-        thread = threading.Thread(target=lambda: result.append(
-            controller._request_approval(
-                agent.id, "write", "auth.py", "token refresh change")))
-        thread.start()
-        deadline = time.time() + 1
-        while controller.pending_approval() is None and time.time() < deadline:
-            time.sleep(0.01)
-        self.assertIsNotNone(controller.pending_approval())
-
-        controller.resolve_approval(True)
-        thread.join(timeout=1)
-
-        self.assertEqual(result, [True])
-        events = agent_ui_events.hub.agent_events(agent.id)
-        self.assertEqual(events[-2].event_type, "approval_requested")
-        self.assertEqual(events[-1].event_type, "approval_resolved")
-        self.assertEqual(events[-1].status, "approved")
-
-    def test_approval_keeps_original_terminal_after_ui_switch(self):
-        self._terminal("child", "term0")
-        agent = self._agent("reviewer", terminal="term0")
-        controller = agents_mode.AgentsModeController("term0", object(), {})
-        result = []
-        thread = threading.Thread(target=lambda: result.append(
-            controller._request_approval(
-                agent.id, "delete", "old.log", "remove generated log")))
-        thread.start()
-        deadline = time.time() + 1
-        while controller.pending_approval() is None and time.time() < deadline:
-            time.sleep(0.01)
-
-        controller.terminal_name = "child"
-        rendered = "".join(
-            fragment[1] for fragment in controller.approval_fragments())
-        self.assertIn("on term0", rendered)
-        self.assertIn("old.log", rendered)
-        controller.resolve_approval(False)
-        thread.join(timeout=1)
-
-        events = agent_ui_events.hub.agent_events(agent.id)[-2:]
-        self.assertEqual([event.terminal_name for event in events],
-                         ["term0", "term0"])
-        self.assertEqual(result, [False])
-
-    def test_closed_ui_denies_late_approval_without_blocking(self):
-        agent = self._agent("late")
-        controller = agents_mode.AgentsModeController("term0", object(), {})
-        controller.deny_pending_approvals(
-            close=True, reason="agents_mode_closed")
-
-        started = time.monotonic()
-        approved = controller._request_approval(
-            agent.id, "write", "late.txt", "after close")
-
-        self.assertFalse(approved)
-        self.assertLess(time.monotonic() - started, 0.2)
-        events = agent_ui_events.hub.agent_events(agent.id)
-        self.assertEqual(
-            [event.event_type for event in events[-2:]],
-            ["approval_requested", "approval_resolved"])
-        self.assertEqual(events[-1].data.get("reason"), "agents_mode_closed")
-
-    def test_abort_releases_agent_waiting_for_approval(self):
-        agent = self._agent("abortable")
-        controller = agents_mode.AgentsModeController("term0", object(), {})
-        result = []
-        thread = threading.Thread(target=lambda: result.append(
-            controller._request_approval(
-                agent.id, "command", "danger", "test abort")))
-        thread.start()
-        deadline = time.time() + 1
-        while controller.pending_approval() is None and time.time() < deadline:
-            time.sleep(0.01)
-
-        agent.abort_event.set()
-        thread.join(timeout=1)
-
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(result, [False])
-        self.assertIsNone(controller.pending_approval())
-        self.assertEqual(
-            agent_ui_events.hub.agent_events(agent.id)[-1].data.get("reason"),
-            "agent_aborted")
-
-    def test_later_approval_does_not_replace_visible_fifo_request(self):
-        first = self._agent("first")
-        second = self._agent("second")
-        controller = agents_mode.AgentsModeController("term0", object(), {})
-        results = []
-        first_thread = threading.Thread(target=lambda: results.append((
-            "first", controller._request_approval(
-                first.id, "delete", "first-danger.txt", "delete"))))
-        first_thread.start()
-        deadline = time.time() + 1
-        while controller.pending_approval() is None and time.time() < deadline:
-            time.sleep(0.01)
-        second_thread = threading.Thread(target=lambda: results.append((
-            "second", controller._request_approval(
-                second.id, "command", "second-safe", "command"))))
-        second_thread.start()
-        deadline = time.time() + 1
-        while len(controller._approvals) < 2 and time.time() < deadline:
-            time.sleep(0.01)
-
-        self.assertIn("first-danger.txt", controller.notice)
-        self.assertNotIn("second-safe", controller.notice)
-        controller.resolve_approval(True)
-        first_thread.join(timeout=1)
-        self.assertIn("second-safe", controller.notice)
-        controller.resolve_approval(False)
-        second_thread.join(timeout=1)
-        self.assertCountEqual(results, [("first", True), ("second", False)])
-
-    def test_slash_commands_are_not_duplicated_or_sent_to_agents(self):
-        agent = self._agent("queued")
-        agent.status = "queued"
-        controller = agents_mode.AgentsModeController("term0", object(), {})
-
-        controller.dispatch("/hire reviewer --profile reviewer")
-
-        self.assertTrue(agent.message_queue.empty())
-        self.assertTrue(agent.inbox.empty())
-        self.assertIsNone(agent_loop.get_agent("reviewer"))
-        self.assertIn("main CLI", controller.notice)
-
-    def test_failed_supplementary_delivery_is_not_recorded_as_success(self):
-        agent = self._agent("busy")
-        agent.status = "running"
-        agent.message_queue = queue.Queue(maxsize=1)
-        agent.message_queue.put_nowait("occupied")
-        controller = agents_mode.AgentsModeController("term0", object(), {})
-        controller.selected_id = agent.id
-
-        controller.dispatch("new instruction")
-
-        kinds = [event.event_type
-                 for event in agent_ui_events.hub.agent_events(agent.id)]
-        self.assertNotIn("user_message", kinds)
-        self.assertIn("user_message_failed", kinds)
-
-    def test_finished_subagent_cannot_be_reused_as_employee(self):
-        agent = self._agent("temporary", role="subagent")
-        agent.status = "done"
-        controller = agents_mode.AgentsModeController("term0", object(), {})
-        controller.selected_id = agent.id
-        with mock.patch.object(agent_loop, "start_agent_assignment") as start:
-            controller.dispatch("do another unrelated task")
-
-        start.assert_not_called()
-        self.assertIn("finished temporary Agent", controller.notice)
 
     def test_markdown_styles_and_completion_has_no_placeholder(self):
         agent = self._agent("writer")
@@ -900,91 +565,6 @@ class AgentsModeTests(unittest.TestCase):
         self.assertEqual(copied, ["alpha beta\n  gamma"])
         self.assertIn("Copied", controller.notice)
 
-    # ── title-bar buttons ───────────────────────────────────────────────
-    def _title_click(self, controller, name, press_on=None):
-        from prompt_toolkit.mouse_events import MouseEvent, MouseButton
-        from prompt_toolkit.data_structures import Point
-        # No app is running, so delivery would go straight to the REPL queue.
-        controller._deliver_pending_command = lambda: None
-        controller.title_lines(100, 1)
-        spans = {hit[2]: hit for hit in controller._title_hits}
-        x = spans[name][0] + 1
-        press_x = spans[press_on][0] + 1 if press_on else x
-        controller._title_mouse(MouseEvent(
-            Point(x=press_x, y=0), MouseEventType.MOUSE_DOWN,
-            MouseButton.LEFT, frozenset()))
-        controller._title_mouse(MouseEvent(
-            Point(x=x, y=0), MouseEventType.MOUSE_UP,
-            MouseButton.LEFT, frozenset()))
-
-    def test_title_buttons_have_one_shape_and_statuses_have_no_fill(self):
-        agent = self._agent("reviewer")
-        controller = agents_mode.AgentsModeController("term0", object(), {})
-        controller.selected_id = agent.id
-        line = controller.title_lines(100, 1)[0]
-        filled = [(style, text) for style, text, *_ in line if "chip" in style]
-        self.assertEqual([text.strip() for _s, text in filled][:1], ["resume"])
-        self.assertEqual({len(text) - len(text.strip()) for _s, text in filled}, {2})
-        # ●/○ come from a fallback font; behind a fill they change its height.
-        for style, text in filled:
-            self.assertTrue(text.isascii(), text)
-        self.assertIn("not deployed", "".join(t for _s, t, *_ in line))
-
-    def test_title_hits_line_up_with_the_painted_buttons(self):
-        agent = self._agent("reviewer")
-        controller = agents_mode.AgentsModeController("term0", object(), {})
-        controller.selected_id = agent.id
-        line = controller.title_lines(100, 1)[0]
-        painted = "".join(t for _s, t, *_ in line)
-        for lo, hi, name in controller._title_hits:
-            label = painted[lo:hi].strip()
-            self.assertEqual(label, "resume" if name == "resume"
-                             else controller._agent_profile(agent)["model"]
-                             or "default model")
-
-    def test_model_button_targets_the_agent_without_switching(self):
-        agent = self._agent("reviewer")
-        controller = agents_mode.AgentsModeController("term0", object(), {})
-        controller.selected_id = agent.id
-        self._title_click(controller, "model")
-        self.assertEqual(controller.pending_commands,
-                         [f"/model @{agent.id}", f"/agents {agent.id}"])
-
-    def test_resume_button_switches_by_id_then_reopens_the_view(self):
-        primary = self._agent("primary", role="primary")
-        self.assertTrue(agent_loop.switch_to_agent(primary.id))
-        agent = self._agent("reviewer")
-        controller = agents_mode.AgentsModeController("term0", object(), {})
-        controller.selected_id = agent.id
-        self._title_click(controller, "resume")
-        self.assertEqual(controller.pending_commands,
-                         [f"/agent {agent.id}", "/resume", f"/agents {agent.id}"])
-
-    def test_resume_button_refuses_a_working_agent(self):
-        """/agent would refuse the switch and /resume would then restore
-        into the REPL's current Agent instead."""
-        agent = self._agent("reviewer")
-        agent.status = "running"
-        controller = agents_mode.AgentsModeController("term0", object(), {})
-        controller.selected_id = agent.id
-        self._title_click(controller, "resume")
-        self.assertEqual(controller.pending_commands, [])
-        self.assertIn("Cannot resume", controller.notice)
-
-    def test_selection_released_on_a_button_does_not_fire_it(self):
-        agent = self._agent("reviewer")
-        controller = agents_mode.AgentsModeController("term0", object(), {})
-        controller.selected_id = agent.id
-        self._title_click(controller, "model", press_on="resume")
-        self.assertEqual(controller.pending_commands, [])
-
-    def test_subagent_has_no_title_buttons(self):
-        agent = self._agent("helper", role="subagent")
-        controller = agents_mode.AgentsModeController("term0", object(), {})
-        controller.selected_id = agent.id
-        controller.title_lines(100, 1)
-        self.assertEqual(controller._title_hits, [])
-
     def test_rail_click_targets_stay_aligned_when_scrolled(self):
         agents = [self._agent(f"a{index}") for index in range(8)]
         controller = agents_mode.AgentsModeController("term0", object(), {})
@@ -1041,7 +621,9 @@ class AgentsModeTests(unittest.TestCase):
                          "glm-5.3")
         self.assertEqual(agent.base_model, "")
 
-    def test_switching_terminal_skips_the_agent_deployed_there(self):
+    def test_switching_terminal_lists_the_agent_deployed_there(self):
+        # An Agent deployed in a terminal is still an Agent of that terminal:
+        # the roster lists every persistent Agent, deployed or not.
         self._terminal("build")
         deployed = self._agent("builder", terminal="build")
         self.assertTrue(agent_loop.station_agent(deployed.id, "build"))
@@ -1049,7 +631,9 @@ class AgentsModeTests(unittest.TestCase):
         controller = agents_mode.AgentsModeController("term0", object(), {})
         while controller.terminal_name != "build":
             controller.cycle_terminal(1)
-        self.assertEqual(controller.selected_id, other.id)
+        ids = {a.id for a in controller.agents()}
+        self.assertEqual({deployed.id, other.id}, ids)
+        self.assertIn(controller.selected_id, ids)
 
     def test_assignment_uses_employee_channels_and_reports_failed_loop(self):
         agent = self._agent("employee")
@@ -1112,150 +696,6 @@ class AgentsModeTests(unittest.TestCase):
             agent.thread.join(timeout=1)
 
         self.assertIsNone(agent.active_assignment)
-
-    def test_close_request_race_never_leaves_approval_waiter(self):
-        for index in range(20):
-            agent = self._agent(f"race-{index}")
-            controller = agents_mode.AgentsModeController(
-                "term0", object(), {})
-            barrier = threading.Barrier(3)
-            result = []
-
-            def request():
-                barrier.wait()
-                result.append(controller._request_approval(
-                    agent.id, "write", "race.txt", "race"))
-
-            def close():
-                barrier.wait()
-                controller.deny_pending_approvals(
-                    close=True, reason="agents_mode_closed")
-
-            requester = threading.Thread(target=request)
-            closer = threading.Thread(target=close)
-            requester.start()
-            closer.start()
-            barrier.wait()
-            requester.join(timeout=1)
-            closer.join(timeout=1)
-
-            self.assertFalse(requester.is_alive())
-            self.assertFalse(closer.is_alive())
-            self.assertEqual(result, [False])
-
-    def test_primary_failed_loop_is_not_reported_done(self):
-        agent = self._agent("primary", role="primary")
-        controller = agents_mode.AgentsModeController(
-            "term0", mock.Mock(), {}, primary_submit_cb=lambda a, t, d:
-            laintas_cli._submit_primary_runtime_task(a, t, d, {}))
-        controller.selected_id = agent.id
-        result = {
-            "success": False, "exit_reason": "provider_error",
-            "state": {"lastReply": "partial"}, "msg": "partial",
-        }
-        with mock.patch.object(laintas_cli, "run_agent_loop", return_value=result):
-            controller.dispatch("work")
-            agent.thread.join(timeout=1)
-
-        self.assertEqual(agent.status, "error")
-        self.assertEqual(
-            agent_ui_events.hub.agent_events(agent.id)[-1].event_type,
-            "agent_error")
-
-    def test_external_event_callback_failure_does_not_fail_primary(self):
-        agent = self._agent("primary", role="primary")
-        callback = mock.Mock(side_effect=RuntimeError("offline"))
-        controller = agents_mode.AgentsModeController(
-            "term0", mock.Mock(), {}, external_events_cb=callback,
-            primary_submit_cb=lambda a, t, d:
-            laintas_cli._submit_primary_runtime_task(a, t, d, {}, callback))
-        controller.selected_id = agent.id
-
-        def fake_loop(*_args, **kwargs):
-            kwargs["events_cb"]([{"type": "ai", "content": "answer"}])
-            return {"success": True, "state": {}, "msg": "done"}
-
-        with mock.patch.object(laintas_cli, "run_agent_loop", fake_loop):
-            controller.dispatch("work")
-            agent.thread.join(timeout=1)
-
-        self.assertEqual(agent.status, "idle")
-        self.assertEqual(
-            agent_ui_events.hub.agent_events(agent.id)[-1].event_type,
-            "agent_done")
-
-    def test_primary_preserves_repl_state_identity_and_existing_session(self):
-        agent = self._agent("primary", role="primary")
-        state_ref = {"shortTermMemory": "before"}
-        history_ref = []
-        agent.state = state_ref
-        agent.chat_history = history_ref
-        existing = object()
-        agent.runtime_session = existing
-        captured = {}
-        controller = agents_mode.AgentsModeController(
-            "term0", mock.Mock(), {}, existing_session=existing,
-            primary_submit_cb=lambda a, t, d:
-            laintas_cli._submit_primary_runtime_task(a, t, d, {}))
-        controller.selected_id = agent.id
-
-        def fake_loop(*_args, **kwargs):
-            captured.update(kwargs)
-            return {
-                "success": True,
-                "state": {"shortTermMemory": "after", "lastReply": "done"},
-                "msg": "done", "session": existing,
-            }
-
-        with mock.patch.object(laintas_cli, "run_agent_loop", fake_loop):
-            controller.dispatch("work")
-            agent.thread.join(timeout=1)
-
-        self.assertIs(captured["existing_session"], existing)
-        self.assertIs(agent.state, state_ref)
-        self.assertEqual(state_ref["shortTermMemory"], "after")
-        self.assertIs(agent.chat_history, history_ref)
-
-    def test_primary_has_one_shared_execution_lease_and_message_queue(self):
-        agent = self._agent("primary", role="primary")
-        state_ref = {"shortTermMemory": "shared"}
-        history_ref = []
-        agent.state = state_ref
-        agent.chat_history = history_ref
-        controller = agents_mode.AgentsModeController(
-            "term0", mock.Mock(), {}, primary_submit_cb=lambda a, t, d:
-            laintas_cli._submit_primary_runtime_task(a, t, d, {}))
-        controller.selected_id = agent.id
-        entered = threading.Event()
-        release = threading.Event()
-        captured = {}
-
-        def blocking_loop(_deps, _text, _session, state, history, **kwargs):
-            captured.update(state=state, history=history,
-                            queue=kwargs["message_queue"])
-            entered.set()
-            release.wait(timeout=2)
-            return {"success": True, "state": state, "msg": "same run"}
-
-        with mock.patch.object(laintas_cli, "run_agent_loop", blocking_loop):
-            controller.dispatch("first task")
-            self.assertTrue(entered.wait(timeout=1))
-            admitted, _detail = agent_loop.begin_primary_run(agent.id)
-            queued, _detail = agent_loop.queue_primary_message(
-                agent.id, "outside update")
-
-            self.assertFalse(admitted)
-            self.assertTrue(queued)
-            self.assertIs(captured["state"], state_ref)
-            self.assertIs(captured["history"], history_ref)
-            self.assertIs(captured["queue"], agent.message_queue)
-            self.assertEqual(agent.message_queue.get_nowait(), "outside update")
-            release.set()
-            agent.thread.join(timeout=1)
-
-        self.assertEqual(agent.status, "idle")
-        self.assertIs(agent.state, state_ref)
-        self.assertIs(agent.chat_history, history_ref)
 
     def test_agents_mode_is_only_a_primary_runtime_view(self):
         source = Path(agents_mode.__file__).read_text(encoding="utf-8")

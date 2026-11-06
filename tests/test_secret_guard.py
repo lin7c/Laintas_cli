@@ -121,13 +121,15 @@ def test_agent_admission_and_remote_chat_stop_before_events():
     remote._push_final.assert_called_once_with('req', 'fail', guard.BLOCKED)
 
 
-def test_agents_mode_rejects_before_dispatch():
-    import agents_mode
-    controller = mock.Mock()
-    agents_mode.AgentsModeController.dispatch(controller, 'password=DemoPass42')
-    assert controller.notice == guard.BLOCKED
-    controller.invalidate.assert_called_once_with()
-    controller.resolve_agent.assert_not_called()
+def test_at_agent_route_rejects_before_dispatch():
+    # `@name task` on the run's append line goes through the same gate as
+    # any supplementary line, before it can reach another Agent's queue.
+    import queue
+    import laintas_cli
+    with mock.patch.object(laintas_cli, "_route_at_agent") as route:
+        assert not laintas_cli._queue_supplementary(
+            queue.Queue(), '@scout password=DemoPass42')
+    route.assert_not_called()
 
 
 def test_acp_rejects_before_history_or_worker():
@@ -143,3 +145,19 @@ def test_acp_rejects_before_history_or_worker():
         asyncio.run(agent.prompt('security-test', [SimpleNamespace(text='password=DemoPass42')]))
     assert state.chat_history == []
     assert state.worker is None
+
+
+def test_confirm_then_send(monkeypatch):
+    monkeypatch.setattr(guard, "_confirmed", set())
+    monkeypatch.setattr(guard, "_awaiting", {"digest": ""})
+    typed = "my api_key=ZzQx81LmPq0vN3"
+    assert guard.send_error(typed) == guard.BLOCKED
+    assert guard.confirm_error(typed) == guard.CONFIRM
+    assert guard.confirm_error("password=Other123x") == guard.CONFIRM  # different text resets
+    assert guard.confirm_error(typed) == guard.CONFIRM
+    assert guard.confirm_error(typed) == ""                             # second Enter sends
+    assert guard.send_error(typed) == ""                                # downstream gates agree
+    assert guard.input_error(typed) == guard.BLOCKED                    # history still refuses it
+    assert guard.send_error("token=Qw8rT5yU2iO9pA") == guard.BLOCKED    # others still checked
+    assert guard.confirm_error("hello") == ""
+    assert typed not in repr(guard._confirmed)

@@ -5026,6 +5026,29 @@ class MetaCompleter(Completer):
         return False
 
     @staticmethod
+    def _agent_mention_completions(fragment: str):
+        """Persistent Agents of this terminal, other than the foreground one."""
+        try:
+            current = get_current_agent()
+            terminal = agent_scope_terminal(current) if current else "term0"
+            for agent in get_all_agents():
+                if (agent.role == "subagent" or agent.lifecycle_terminated
+                        or agent_scope_terminal(agent) != terminal
+                        or (current is not None and agent.id == current.id)):
+                    continue
+                name = agent.name or agent.id
+                if not name.casefold().startswith(fragment.casefold()):
+                    continue
+                busy = (agent.active_assignment is not None
+                        or agent.status in _AGENT_BUSY_STATES)
+                meta = ("working · line becomes an update" if busy
+                        else "idle · starts a background task")
+                yield Completion(f"{name} ", start_position=-len(fragment),
+                                 display=f"@{name}", display_meta=meta)
+        except Exception:
+            return
+
+    @staticmethod
     def _completion(value: str, fragment: str, description: str = "") -> Completion:
         """Build a menu entry that remains visible for an exact match.
 
@@ -5205,6 +5228,10 @@ class MetaCompleter(Completer):
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor.lstrip()
         if not text:
+            return
+        # `@name task`: complete the Agent name while it is the only word.
+        if text.startswith("@") and not any(ch.isspace() for ch in text):
+            yield from self._agent_mention_completions(text[1:])
             return
         # /-command completion — auto-popup while typing (complete_while_typing)
         if text.startswith("/"):
@@ -7378,6 +7405,44 @@ def _refresh_live_prompt() -> None:
         pass
 
 
+# Set while the main thread sits in the REPL prompt and nothing else is
+# running in the foreground. A background Agent's approval can then be asked
+# by the main loop itself (see _brokered_approval) instead of fighting the
+# prompt for the terminal.
+_repl_prompt_idle = threading.Event()
+
+
+@contextmanager
+def _repl_prompt_idle_scope():
+    _repl_prompt_idle.set()
+    try:
+        yield
+    finally:
+        _repl_prompt_idle.clear()
+
+
+def _park_prompt_text(text: str) -> None:
+    """Pre-fill the next prompt with `text`."""
+    global _pending_prompt_default
+    _pending_prompt_default = text
+
+
+def _interrupt_prompt_keeping_draft() -> None:
+    """Like _interrupt_prompt, but the half-typed line comes back afterwards."""
+    global _pending_prompt_default
+    session = _prompt_session
+    if session is not None:
+        try:
+            app = session.app
+            if app.is_running:
+                text = app.current_buffer.text or ""
+                if text:
+                    _pending_prompt_default = text
+        except Exception:
+            pass
+    _interrupt_prompt()
+
+
 def _interrupt_prompt():
     """Force prompt_toolkit to return from another thread.
 
@@ -7505,7 +7570,7 @@ def _pt_prompt_once(cwd: str) -> str:
             # O_NONBLOCK that prompt_toolkit can leave behind.
             with terminal_arbiter.hold("repl-prompt", TermMode.EXTERNAL,
                                        timeout=10.0):
-                with patch_stdout(raw=True):
+                with patch_stdout(raw=True), _repl_prompt_idle_scope():
                     user_input = session.prompt(
                         message,
                         pre_run=_first_prompt_started.set,
@@ -8359,12 +8424,12 @@ def show_model_selector(models: list[dict], current: str = "", *,
             sel_idx = i + model_start  # auto precedes the model rows
 
     def _row_label(row, shown):
-        _mid, provider, mark, tier = row
-        return (f"{mark}[cyan]{escape(shown)}[/cyan] {escape(tier)}", escape(provider))
+        _mid, provider, mark, _tier = row
+        return (f"{mark}[cyan]{escape(shown)}[/cyan]", escape(provider))
 
     # A stripped name may coincide with another row's name (a hosted
-    # deepseek-v4-pro next to the marketplace one): the tier and supply
-    # columns still tell those rows apart, so only a fully identical
+    # deepseek-v4-pro next to the marketplace one): the supply descriptions
+    # still tell those rows apart, so only a fully identical
     # label falls back to the unstripped id (the dialog maps a chosen
     # label back by string).
     _stripped = [_row_label(r, _model_display_name(r[0])) for r in _rows]
@@ -10778,10 +10843,9 @@ def _call_backend_stream_impl(
         # JSON) must not brick the session: an earlier version scanned the
         # whole payload here, so one such string in the history blocked
         # every later send, including /continue and plain questions.
-        try:
-            secret_guard.require_safe_input(message)
-        except secret_guard.SecretInputError as exc:
-            return {"reply": str(exc), "tool_calls": [], "done": True,
+        _secret_error = secret_guard.send_error(message)
+        if _secret_error:
+            return {"reply": _secret_error, "tool_calls": [], "done": True,
                     "error": True, "code": "sensitive_input"}
     backend_profile = get_backend_profile()
     backend_url = backend_profile.base_url
@@ -22893,32 +22957,15 @@ def _exit_agents_view() -> None:
     repl_mirror.hub.set_owner("cli")
 
 
-def _agents_repl_submit(text: str) -> tuple[bool, str]:
-    """Forward one /agents input line to the outer REPL as Agent dialogue.
-
-    Non-command input in the /agents view means "talk to this Agent", so the
-    injected line carries kind="dialogue" and the main loop routes it straight
-    to the agent loop.
-    """
-    text = str(text or "").strip()
-    if not text:
-        return False, ""
-    # Echo the accepted line into the mirror the way the prompt would.
-    repl_mirror.hub.write(
-        _mirror_target_agent_id(), f"\x1b[2m› {text}\x1b[0m\n")
-    _inject_input(text, threading.Event(), kind="dialogue")
-    return True, "Sent"
-
-
 def _open_agents_view(session: dict, agent_registry=None,
                       existing_session=None, fallback_args=None,
                       on_close=None) -> bool:
     """Hand the physical terminal to the /agents view. True when it opened.
 
-    Callable from ANY thread, which is the point: the view is where work is
-    dispatched to other Agents, and the moment a person most needs it is
-    while a turn is running — when the main thread is inside the loop and
-    cannot dispatch anything. The view runs in its own thread either way.
+    Callable from ANY thread: the view is read-only (who the Agents are and
+    what they are doing), and the moment a person most wants to look is
+    while a turn is running. The view runs in its own thread either way.
+    Work is handed out from the prompt with ``@name``, never from here.
 
     ``on_close`` runs once the terminal has come back, in the view's thread.
     The mid-run opener uses it to restart the input reader it stopped.
@@ -22927,10 +22974,9 @@ def _open_agents_view(session: dict, agent_registry=None,
 
     def _closed() -> None:
         _exit_agents_view()
-        # A title-bar button (resume / model) asked for slash commands on the
-        # SELECTED agent: hand them to the REPL now that the screen is back in
-        # the main loop's hands, in order (/agent <id>, the picker, then
-        # /agents <id> to come back).
+        # Enter on an Agent asked for the foreground to switch to it: hand
+        # /agent <id> to the REPL now that the screen is back in the main
+        # loop's hands. Mid-turn it waits in the queue until the turn ends.
         pending = getattr(controller, "pending_commands", None)
         if isinstance(pending, list) and pending:
             controller.pending_commands = []
@@ -22968,18 +23014,10 @@ def _open_agents_view(session: dict, agent_registry=None,
         external_cb = (
             (lambda events: agent_registry._push_events(events))
             if agent_registry is not None and agent_registry.agent_id else None)
-        execution_block_reason = ""
-        if (get_backend_profile().sends_laintas_credentials
-                and not session.get("userId")):
-            execution_block_reason = (
-                "Not authenticated. Exit Agents Mode and run /login.")
-
         controller = agents_mode.AgentsModeController(
             terminal_name, get_loop_deps(), session,
             external_events_cb=external_cb,
             existing_session=existing_session,
-            execution_block_reason=execution_block_reason,
-            repl_submit_cb=_agents_repl_submit,
             terminal_label=_terminal_display_name,
             mirror=repl_mirror.hub)
 
@@ -26541,11 +26579,24 @@ def _build_mailbox_browser(*, input=None,
         return resource_ui.UIActionResult(
             message="Cleared", message_style="class:success", refresh=True)
 
+    def open_item(item):
+        message = startup_mail.get(item.payload) if item is not None else None
+        if message is None:
+            return resource_ui.UIActionResult(
+                message="Nothing selected.", message_style="class:warning")
+        if not (message.key.startswith(_AGENT_MAIL_PREFIX)
+                or message.key.startswith("official:sys-context_handed-")):
+            return resource_ui.UIActionResult(
+                message="This message has nothing to open.",
+                message_style="class:warning")
+        return resource_ui.UIActionResult(close=True, value=message.key)
+
     return resource_ui.ResourceBrowser(
         title="Messages",
         load_items=load_items,
         load_detail=load_detail,
         actions=[
+            resource_ui.UIAction("o", "open", "Open", open_item),
             resource_ui.UIAction("x", "dismiss", "Dismiss", dismiss,
                                  "class:error"),
             resource_ui.UIAction("a", "mark-all", "Mark all read", mark_all,
@@ -26668,11 +26719,7 @@ def _cmd_messages(parts: list, session: dict = None) -> None:
         console.print()
         _print_message(item, startup_mail.index_of(item.key) + 1)
         console.print()
-        if session is not None and item.key.startswith("official:sys-context_handed-"):
-            import context_receive
-            ref = context_receive.parse_context_ref(item.action)
-            if ref:
-                _offer_context_import(item, ref, session)
+        _open_message_action(item, session)
         return
 
     if action == "seen":
@@ -26718,13 +26765,19 @@ def _show_mailbox() -> None:
     looks exactly like a crash from the outside.
     """
     try:
-        _build_mailbox_browser().run()
+        outcome = _build_mailbox_browser().run()
     except KeyboardInterrupt:
         return
     except BaseException as exc:
         console.print(f"[yellow]Message browser unavailable: "
                       f"{type(exc).__name__}: {exc}[/yellow]")
         _print_messages()
+        return
+    if getattr(outcome, "action", "") == "open" and outcome.value:
+        item = startup_mail.get(str(outcome.value))
+        if item is not None:
+            startup_mail.mark_read(item.key)
+            _open_message_action(item, _repl_session or None)
 
 
 def _handle_meta_command_impl(cmd: str, agent_registry: AgentRegistry, session: dict, interactive_session=None) -> bool:
@@ -27799,6 +27852,10 @@ def _get_input(cwd: str):
         except queue.Empty:
             return ""
 
+    # A background Agent is waiting on an approval: ask it before prompting.
+    if _process_brokered_approval():
+        return ""
+
     # Already-queued message (fast path)
     try:
         return _injected_input_queue.get_nowait()
@@ -27828,6 +27885,150 @@ def _parse_agent_target(text: str) -> tuple[str, str]:
     if not match:
         return "", str(text or "")
     return match.group(1), match.group(2).strip()
+
+
+_AGENT_BUSY_STATES = {"queued", "running", "thinking", "waiting"}
+_AGENT_MAIL_PREFIX = "agent:"
+
+
+def _agent_label(agent) -> str:
+    return (agent.name or agent.id) if agent is not None else "agent"
+
+
+def _remember_repl_session(session) -> None:
+    global _repl_session
+    if isinstance(session, dict):
+        _repl_session = session
+
+
+def _route_at_agent(text: str, session: Optional[dict] = None) -> tuple[bool, str]:
+    """``@agent task`` from the REPL prompt or the run's append line.
+
+    Returns ``(handled, text)``. Unhandled lines go on as ordinary input:
+    an ``@word`` that names no Agent is prose, and ``@`` + the foreground
+    Agent is just talking to it. Everything else runs in the background and
+    never moves the foreground:
+
+    * busy Agent       → the line joins its queue as a supplementary instruction
+    * idle employee    → a new background assignment; its result arrives as a
+                         message behind the L> mark
+    """
+    reference, body = _parse_agent_target(text)
+    if not reference:
+        return False, text
+    try:
+        agent = _resolve_agent_id_or_name(reference)
+    except ValueError as exc:
+        console.print(f"[yellow]{escape(str(exc))}[/yellow]")
+        return True, ""
+    current = get_current_agent()
+    terminal_name = agent_scope_terminal(current) if current else "term0"
+    if agent is None or agent_scope_terminal(agent) != terminal_name:
+        return False, text
+    if current is not None and agent.id == current.id:
+        return (False, body) if body else (True, "")
+    label = _agent_label(agent)
+    if not body:
+        console.print(f"[yellow]Usage: @{escape(reference)} <task>[/yellow]")
+        return True, ""
+    if (agent.active_assignment is not None
+            or agent.status in _AGENT_BUSY_STATES):
+        try:
+            agent.message_queue.put_nowait(body)
+        except queue.Full:
+            console.print(f"[error]{escape(label)}'s instruction queue is full.[/error]")
+            return True, ""
+        try:
+            import agent_ui_events
+            agent_ui_events.hub.emit(
+                "user_message", agent_id=agent.id, terminal_name=terminal_name,
+                summary=body, detail=body, status="queued")
+        except Exception:
+            pass
+        console.print(f"[accent.dim]↳[/accent.dim] [muted]{escape(label)} is "
+                      f"working; queued as an update: "
+                      f"{escape(agent_loop_crop_for_ui(body, 60))}[/muted]")
+        return True, ""
+    if agent.role == "primary":
+        console.print(
+            f"[yellow]{escape(label)} runs in the foreground only. "
+            f"Use /agent {escape(agent.id)} to talk to it.[/yellow]")
+        return True, ""
+    if agent.role not in {"pool", "deployed"}:
+        console.print(
+            f"[yellow]{escape(label)} is a finished temporary sub-agent and "
+            "cannot take a new task.[/yellow]")
+        return True, ""
+    ok, detail, _assignment = start_agent_assignment(
+        agent.id, body, get_loop_deps(), session or _repl_session or {},
+        on_finished=_user_assignment_finished(agent))
+    if ok:
+        console.print(f"[accent]→[/accent] [bold]{escape(label)}[/bold] "
+                      f"[muted]took it, working in the background · "
+                      f"/agents to watch[/muted]")
+    else:
+        console.print(f"[yellow]{escape(detail)}[/yellow]")
+    return True, ""
+
+
+def _user_assignment_finished(agent):
+    """Leave a message for the user when an ``@`` assignment ends.
+
+    The result is reported to the person who assigned it, not folded into
+    the foreground Agent's context. Opening the message switches to the
+    Agent's conversation; the conversation is also saved to that Agent's
+    /resume list, because its next assignment starts a fresh history.
+    """
+    cwd = os.getcwd()
+
+    def _finished(assignment) -> None:
+        history = list(agent.chat_history or [])
+        try:
+            if any(isinstance(m, dict) and m.get("role") == "user"
+                   for m in history):
+                save_resume_state(agent.state, history, cwd,
+                                  agent_id=agent.id)
+        except Exception:
+            pass
+        label = _agent_label(agent)
+        status = assignment.status
+        task = agent_loop_crop_for_ui(assignment.task, 60)
+        mark, level = {"completed": ("✓", "good"),
+                       "aborted": ("■", "warn")}.get(status, ("✗", "alert"))
+        outcome = (assignment.error or assignment.result or "").strip()
+        body = (f"Task: {assignment.task}\nStatus: {status}\n\n"
+                f"{outcome or '(no reply)'}")
+        startup_mail.post(
+            f"{_AGENT_MAIL_PREFIX}{agent.id}:{assignment.id}",
+            f"{mark} {label}: {task}", body,
+            action=f"Open it to switch to {label}'s conversation "
+                   f"(/agent {agent.id}).",
+            level=level)
+        console.print(f"[accent]{mark}[/accent] [bold]{escape(label)}[/bold] "
+                      f"[muted]{status} · {escape(task)} · Alt+0 to open"
+                      f"[/muted]")
+        _refresh_live_prompt()
+
+    return _finished
+
+
+def _open_message_action(item, session: Optional[dict]) -> None:
+    """What opening a message does beyond reading it, for every reader."""
+    key = str(getattr(item, "key", "") or "")
+    if key.startswith("official:sys-context_handed-"):
+        if session is None:
+            return
+        import context_receive
+        ref = context_receive.parse_context_ref(item.action)
+        if ref:
+            _offer_context_import(item, ref, session)
+        return
+    if key.startswith(_AGENT_MAIL_PREFIX):
+        agent_id = key[len(_AGENT_MAIL_PREFIX):].rsplit(":", 1)[0]
+        if get_agent(agent_id) is None:
+            console.print("[yellow]That Agent is no longer here.[/yellow]")
+            return
+        _inject_input(f"/agent {agent_id}", threading.Event())
 
 
 # ── Background stdin reader for supplementary input during agent loop ──
@@ -27934,6 +28135,11 @@ def _queue_supplementary(target_queue: queue.Queue, line: str,
     if error:
         console.print(error, style="yellow", markup=False)
         return False
+    if source == "local" and line.startswith("@"):
+        handled, rest = _route_at_agent(line)
+        if handled:
+            return True
+        line = rest
     if line.split(maxsplit=1)[0].lower() == "/progress":
         if line.lower() != "/progress":
             _progress_notice("error", "Usage: /progress", {
@@ -28266,16 +28472,11 @@ def _bg_reader_cbreak_mode(target_queue: queue.Queue,
 
 
 # ── Alt+A during a run: go to the /agents view ──────────────────────────
-# The view is where work is handed to another Agent — selecting one there and
-# typing calls start_agent_assignment, which runs it on its own thread in its
-# own private PTY. That is the parallelism; nothing else in the CLI dispatches
-# it. But the view is a slash command, and slash commands are dispatched by
-# the main thread after _get_input() returns — which never happens while a
-# turn is running. So the one situation that needs the multi-agent surface was
-# the one situation that could not reach it.
-#
-# Alt+A is that door. It used to park a focus change for the main loop to
-# apply later, which moved the registry pointer and dispatched nothing.
+# The view is a slash command, and slash commands are dispatched by the main
+# thread after _get_input() returns — which never happens while a turn is
+# running. Alt+A opens it from the input reader's thread so the Agents can be
+# watched mid-turn. (Handing out work does not need the view: `@name task` on
+# the append line starts it in the background.)
 
 
 def _open_agents_view_from_run() -> None:
@@ -28726,28 +28927,89 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
     # Take the terminal back before anything draws a prompt over it.
     import agent_loop as _al_status
     _al_status.pause_activity_status()
-    # While the /agents view owns the terminal, a full-screen arrow prompt
-    # would fight its prompt_toolkit app for stdin. Route the decision to
-    # the view's y/n approval UI instead ("always" is not offered there).
-    _view_controller = _agents_view_controller()
-    if _view_controller is not None:
-        # The asker is whoever is running on THIS thread — not whichever
-        # agent the view happens to have selected. Misattributing it put a
-        # sub-agent's prompt under a stranger's name and left the view's
-        # abort-cancels-the-prompt check watching the wrong agent.
-        try:
-            approved = _view_controller._request_approval(
-                _requesting_agent_label(),
-                "confirm", f"{title} — {question}", body)
-        except Exception:
-            approved = False
-        return "yes" if approved else "no"
+    import approval_broker
+    with approval_broker.waiting(_requesting_agent_label()):
+        return _brokered_approval(title, body, question,
+                                  allow_always=allow_always,
+                                  destructive=destructive)
 
-    if not sys.stdin.isatty():
-        console.print(
-            f"[yellow]Approval required but no interactive TTY available — denying.[/yellow]")
-        return "no"
 
+def _approval_asker_gone() -> bool:
+    """True when the Agent asking on this thread was aborted or removed."""
+    agent_id = get_thread_agent_id()
+    if not agent_id:
+        return False
+    agent = get_agent(agent_id)
+    return (agent is None or agent.lifecycle_terminated
+            or agent.abort_event.is_set())
+
+
+def _brokered_approval(title: str, body: str, question: str, *,
+                       allow_always: bool, destructive: bool) -> str:
+    """Ask an approval on whichever thread owns the terminal right now.
+
+    * A full-screen owner with its own approval UI (an extension's arena)
+      asks it. The /agents view is read-only: while it is open the question
+      waits (the view shows the Agent as waiting for approval) until it closes.
+    * A background Agent asking while the REPL is idle at its prompt hands
+      the question to the main loop, which owns the prompt; the half-typed
+      line is kept.
+    * Otherwise — a foreground turn is running, or the main thread itself is
+      asking — it is asked here, as before.
+    """
+    import approval_broker
+    on_main = threading.current_thread() is threading.main_thread()
+    while True:
+        if _approval_asker_gone():
+            return "no"
+        view = _agents_view_controller()
+        if view is not None:
+            # A full-screen owner that asks approvals itself (an extension's
+            # arena) answers here. The /agents view is read-only and cannot:
+            # the question waits until it closes, the Agent marked waiting.
+            ask = getattr(view, "_request_approval", None)
+            if callable(ask):
+                try:
+                    approved = ask(_requesting_agent_label(), "confirm",
+                                   f"{title} — {question}", body)
+                except Exception:
+                    approved = False
+                return "yes" if approved else "no"
+            time.sleep(0.2)
+            continue
+        if not sys.stdin.isatty():
+            console.print(
+                "[yellow]Approval required but no interactive TTY available — denying.[/yellow]")
+            return "no"
+        if not on_main and _repl_prompt_idle.is_set():
+            request = approval_broker.submit(approval_broker.ApprovalRequest(
+                agent_id=_requesting_agent_label(), title=title, body=body,
+                question=question, allow_always=allow_always,
+                destructive=destructive))
+            _interrupt_prompt_keeping_draft()
+            deadline = time.monotonic() + 2.0
+            while not request.done.wait(timeout=0.1):
+                if request.claimed:
+                    continue
+                if time.monotonic() >= deadline or _approval_asker_gone():
+                    if approval_broker.withdraw(request):
+                        break  # the REPL went elsewhere; re-evaluate
+            if request.done.is_set():
+                return request.result
+            continue
+        choice = _ask_approval_here(title, body, question,
+                                    allow_always=allow_always,
+                                    destructive=destructive)
+        # The REPL may have reopened its prompt between our check and the
+        # arbiter call; that comes back as unavailable. Hand it over instead.
+        if (str(choice).startswith("unavailable:") and not on_main
+                and _repl_prompt_idle.is_set()):
+            continue
+        return choice
+
+
+def _ask_approval_here(title: str, body: str, question: str, *,
+                       allow_always: bool, destructive: bool) -> str:
     auto_confirm_seconds = mode_manager.get_auto_confirm_timeout(
         destructive=destructive)
 
@@ -28757,6 +29019,31 @@ def _blocking_approval_prompt(title: str, body: str, question: str,
             title, body, question, allow_always=allow_always,
             destructive=destructive,
             auto_confirm_seconds=auto_confirm_seconds)
+
+
+def _process_brokered_approval() -> bool:
+    """Main loop, between prompts: ask one background Agent's approval.
+
+    True when one was handled, so the caller goes round again (more may be
+    queued, and the prompt must be redrawn under the answer).
+    """
+    import approval_broker
+    request = approval_broker.claim()
+    if request is None:
+        return False
+    try:
+        agent = get_agent(request.agent_id)
+        label = (agent.name or agent.id) if agent is not None else request.agent_id
+        console.print(f"[accent]● {escape(label)}[/accent] "
+                      "[muted]needs your approval[/muted]")
+        choice = _ask_approval_here(
+            request.title, request.body, request.question,
+            allow_always=request.allow_always,
+            destructive=request.destructive)
+    except Exception:
+        choice = "no"
+    approval_broker.resolve(request, choice)
+    return True
 
 
 def _prompt_for_approval(title: str, body: str, question: str, *,
@@ -30995,12 +31282,26 @@ def main():
         if (not _is_local_slash
                 and not (_is_password_command(user_input)
                          or _carries_model_key(user_input))):
-            _secret_error = secret_guard.input_error(user_input)
+            _secret_error = secret_guard.confirm_error(user_input)
             if _secret_error:
                 console.print(_secret_error, style="yellow", markup=False)
+                # Put the text back so Enter confirms it (history never keeps it).
+                if _secret_error == secret_guard.CONFIRM and not _is_injected_line:
+                    _park_prompt_text(user_input)
                 if injected_done is not None:
                     injected_done.set()
                 continue
+
+        # `@agent task` hands work to another Agent in the background; the
+        # foreground does not move. `@` + the foreground Agent (or an @word
+        # naming nobody) carries on as ordinary input.
+        if (not _is_dialogue and not _is_injected_line
+                and user_input.lstrip().startswith("@")):
+            _remember_repl_session(session)
+            _at_handled, _at_rest = _route_at_agent(user_input.strip(), session)
+            if _at_handled:
+                continue
+            user_input = _at_rest
 
         # A task submitted through /agents may have completed after that view
         # closed.  Pull its CLI-owned PTY/session back into the foreground

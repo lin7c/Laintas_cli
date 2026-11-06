@@ -1,11 +1,9 @@
 """Alt+A during a run, and the input reader it lives in.
 
-Alt+A opens the /agents view. That is where work is handed to another Agent —
-selecting one there and typing calls start_agent_assignment, which runs it on
-its own thread. The view is a slash command, and slash commands are dispatched
-by the main thread after _get_input() returns, which never happens while a
-turn is running; so without this key the multi-agent surface is unreachable in
-exactly the situation that needs it.
+Alt+A opens the read-only /agents view mid-turn. The view is a slash command,
+and slash commands are dispatched by the main thread after _get_input()
+returns, which never happens while a turn is running; so without this key the
+Agents cannot be watched in exactly the situation where they are busiest.
 """
 import threading
 import unittest

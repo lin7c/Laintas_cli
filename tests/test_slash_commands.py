@@ -1156,7 +1156,7 @@ class SlashRegistryTests(unittest.TestCase):
 
     def test_model_selector_strips_prefix_despite_same_named_marketplace_row(self):
         # A hosted model and a marketplace model can share a bare name;
-        # tier + supply keep the rows distinct, so both show the short name.
+        # supply descriptions keep the rows distinct, so both show the short name.
         models = [
             {"id": "deepseek-v4-pro", "provider": "openrouter",
              "tier": "T2", "supply": "Third-party Supply"},

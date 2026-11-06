@@ -3975,7 +3975,7 @@ def finish_primary_run(agent_id: str = "primary", *, reply: str = "",
 def queue_primary_message(agent_id: str, message: str) -> tuple[bool, str]:
     """Append input to the currently running primary task."""
     import secret_guard
-    error = secret_guard.input_error(message)
+    error = secret_guard.send_error(message)
     if error:
         return False, error
     import terminal_link
@@ -11689,7 +11689,7 @@ def run_agent_loop(
     messages from the user are injected into the conversation context.
     """
     import secret_guard
-    error = secret_guard.input_error(original_input)
+    error = secret_guard.send_error(original_input)
     if error:
         return {"success": False, "msg": error, "state": state,
                 "session": existing_session, "exit_reason": "sensitive_input"}

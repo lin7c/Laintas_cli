@@ -1,20 +1,25 @@
-"""Full-screen multi-Agent view: roster, styled transcript, and a prompt.
+"""Full-screen, read-only multi-Agent view: roster, transcript, detail page.
 
 Layout, left to right and top to bottom::
 
-    ┌ roster ────┐│ name · title                     model  ● deployed
-    │ ▌● worker  ││ ─────────────────────────────────────────────────
-    │    Writing ││ › the task                                      ┃
-    │    glm · … ││ ● read  src/app.py  42L  ▸                      ┃
-    │            ││ ● The answer …                                  │
+    ┌ roster ────┐│ name · title                 foreground  ● deployed
+    │ ▌● primary ││ ─────────────────────────────────────────────────
+    │    Main    ││ › the task                                      ┃
+    │  ● scout   ││ ● read  src/app.py  42L  ▸                      ┃
+    │    Writing ││ ● The answer …                                  │
     │            ││ L» Thinking… 12.4s · glm-5.3 · 3.1k tokens      │
-    │            ││ ╭───────────────────────────────────────────────╮
-    │            ││ │ › message worker…                             │
-    │            ││ ╰───────────────────────────────────────────────╯
-    └────────────┘│ enter send · @name route · ctrl+o expand · esc
+    └────────────┘│ enter details · ↑↓ agent · ctrl+o expand · esc
 
-The roster is shown from 96 columns up and hidden below (Tab shows it as an
-overlay). Under the transcript are only the prompt and its key row.
+The view watches; it never operates an Agent. Work is handed out from the
+CLI prompt with ``@name task`` and approvals are asked by the CLI (an Agent
+waiting on one is marked here). Enter opens the selected Agent's detail page —
+who it is, what it is responsible for, what it is doing, what it delegated —
+and makes it the switch target: when the view closes, the REPL switches its
+foreground to that Agent.
+
+The roster lists persistent Agents only (the main agent and employees);
+temporary sub-agents appear on their parent's detail page. It is shown from
+96 columns up and hidden below (Tab shows it as an overlay).
 
 The transcript is rendered by ``agents_transcript`` into exact screen rows,
 so scrolling, the scrollbar, mouse selection and click-to-expand all work on
@@ -31,28 +36,20 @@ from __future__ import annotations
 
 import base64
 from collections import defaultdict
-import copy
-import queue
 import re
 import shutil
-import threading
 import time
 from typing import Callable, Optional
 
 import symbols
 import terminal_theme
-from rich.console import Console
 from prompt_toolkit.application import Application
-from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI, FormattedText, to_formatted_text
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import HSplit, VSplit, Layout, Window, ConditionalContainer
 from prompt_toolkit.layout.controls import (
-    BufferControl, UIContent, UIControl)
-from prompt_toolkit.layout.dimension import Dimension
-from prompt_toolkit.layout.processors import (
-    AfterInput, BeforeInput, ConditionalProcessor)
+    UIContent, UIControl)
 from prompt_toolkit.layout.utils import explode_text_fragments
 from prompt_toolkit.mouse_events import MouseButton, MouseEventType
 from prompt_toolkit.styles import DynamicStyle, Style
@@ -523,42 +520,16 @@ def _slice_fragments(fragments: list, start: int, end: int) -> list:
     return out
 
 
-class _NullWriter:
-    """File-like sink used to keep Rich from corrupting the full-screen UI."""
-
-    encoding = "utf-8"
-
-    @staticmethod
-    def write(value):
-        return len(str(value or ""))
-
-    @staticmethod
-    def flush():
-        return None
-
-    @staticmethod
-    def isatty():
-        return False
-
-
 class AgentsModeController:
-    def __init__(self, terminal_name: str, deps, session: dict,
+    def __init__(self, terminal_name: str, deps=None, session: Optional[dict] = None,
                  external_events_cb: Optional[Callable] = None,
-                 primary_submit_cb: Optional[Callable] = None,
                  existing_session=None,
-                 execution_block_reason: str = "",
-                 repl_submit_cb: Optional[Callable] = None,
                  mirror=None, terminal_label: Optional[Callable] = None):
         self.terminal_name = terminal_name or "term0"
         self.terminal_label = terminal_label or (lambda name: name)
         self.deps = deps
         self.session = session or {}
         self.external_events_cb = external_events_cb
-        self.primary_submit_cb = primary_submit_cb
-        # repl_submit_cb forwards a dialogue message to the outer REPL loop —
-        # the single executor. When set, this view never runs the primary
-        # itself; input always means "talk to this Agent".
-        self.repl_submit_cb = repl_submit_cb
         # mirror: per-Agent ANSI scrollback of the real REPL output
         # (repl_mirror.MirrorHub). Shown on request (Ctrl+R) as the raw view.
         self.mirror = mirror
@@ -568,12 +539,6 @@ class AgentsModeController:
         self._model_ids: Optional[set] = None
         self._model_probe_state = "idle"
         self.existing_session = existing_session
-        self.execution_block_reason = str(execution_block_reason or "")
-        width = max(40, shutil.get_terminal_size(fallback=(100, 30)).columns)
-        self._silent_console = Console(
-            file=_NullWriter(), force_terminal=False, width=width)
-        self._agent_consoles: dict[str, Console] = {}
-        self._console_width = width
         self.app: Optional[Application] = None
         self.overlay = False
         self.rail_offset = 0
@@ -588,13 +553,14 @@ class AgentsModeController:
         self.read_seq: dict[str, int] = defaultdict(int)
         self._notice = ""
         self._notice_at = 0.0
-        self._approval_lock = threading.Lock()
-        self._approvals: list[dict] = []
-        self._closed = threading.Event()
         self._last_agents: list = []
         self._rows_cache: dict[str, tuple] = {}
-        self._drafts: dict[str, str] = defaultdict(str)
-        self._input_buffer: Optional[Buffer] = None
+        # Enter opens the selected Agent's detail page (who it is, what it is
+        # responsible for, what it is doing) and makes it the switch target:
+        # when the view closes, the REPL switches its foreground to it.
+        self.detail = False
+        self.switch_target = ""
+        self._detail_offset = 0
         # Tool blocks the person expanded, per Agent; Ctrl+O expands all.
         self._expanded: dict[str, set] = defaultdict(set)
         self._expand_all = False
@@ -618,23 +584,19 @@ class AgentsModeController:
         self._viewport = ("", 0, 0, 0, 0, 1, 1)
         self._pill: Optional[tuple] = None
         self._rail_hits: dict[int, tuple] = {}
-        self._title_hits: list = []
-        #: Slash commands a title-bar chip asked to run after the view closes.
-        #: A list, because the chips act on the SELECTED agent: switching to
-        #: it first (/agent <id>) scopes /model and /resume to that agent —
-        #: /resume lists get_current_agent_id()'s sessions and /model targets
-        #: the current agent's terminal. Consumed by the launcher's _closed().
+        #: Slash commands for the REPL to run once the view has closed —
+        #: the foreground switch Enter asked for. Consumed by the launcher.
         self.pending_commands: list[str] = []
-        self._button_hits: list = []
         # When each Agent started its current stretch of work, so the status
         # row can show an elapsed clock. Kept here rather than read off the
         # Agent because a primary has no assignment to carry one, and a clock
         # that only some Agents have is worse than none.
         self._work_since: dict[str, float] = {}
         selected = agent_loop.get_dialog_agent_for_terminal(self.terminal_name)
-        if selected is not None and agent_loop.agent_deployment_terminal(selected) == self.terminal_name:
-            selected = None
-        self.selected_id = selected.id if selected else ""
+        if selected is None or not self._on_roster(selected):
+            selected = agent_loop.get_current_agent()
+        self.selected_id = (selected.id if selected is not None
+                            and self._on_roster(selected) else "")
         # Resolve a selection now: the first frame used to paint the
         # transcript before the roster had picked anyone, so the view opened
         # on "No Agents" while the roster showed one selected.
@@ -653,11 +615,18 @@ class AgentsModeController:
         """Agent owns the persistent shell of this terminal (e.g. primary)."""
         return agent_loop.agent_deployment_terminal(agent) == self.terminal_name
 
+    def _on_roster(self, agent) -> bool:
+        """The roster lists Agents — persistent workers with an identity.
+
+        Temporary sub-agents are parts of some Agent's task, not workers of
+        their own: they appear under their parent's detail page instead.
+        """
+        return (agent is not None and agent.role != "subagent"
+                and not agent.lifecycle_terminated
+                and agent_loop.agent_scope_terminal(agent) == self.terminal_name)
+
     def agents(self) -> list:
-        rows = [a for a in agent_loop.get_all_agents()
-                if agent_loop.agent_scope_terminal(a) == self.terminal_name
-                and not a.lifecycle_terminated
-                and not self._is_deployed_in_terminal(a)]
+        rows = [a for a in agent_loop.get_all_agents() if self._on_roster(a)]
         rows.sort(key=lambda a: (
             0 if a.role == "primary" else 1, a.created_at, a.id))
         self._last_agents = rows
@@ -666,9 +635,9 @@ class AgentsModeController:
         # a new selection when selected_id is empty or stale.
         current = (agent_loop.get_agent(self.selected_id)
                    if self.selected_id else None)
-        if current is None or current.lifecycle_terminated:
+        if current is None or not self._on_roster(current):
             candidate = agent_loop.get_dialog_agent_for_terminal(self.terminal_name)
-            if candidate is not None and self._is_deployed_in_terminal(candidate):
+            if candidate is not None and not self._on_roster(candidate):
                 candidate = None
             self.selected_id = (candidate.id if candidate
                                 else (rows[0].id if rows else ""))
@@ -684,12 +653,9 @@ class AgentsModeController:
         if not agent_loop.set_dialog_agent_for_terminal(
                 self.terminal_name, agent_id):
             return False
-        if self._input_buffer is not None and previous_id:
-            self._drafts[previous_id] = self._input_buffer.text
         self.selected_id = agent_id
-        if self._input_buffer is not None:
-            self._input_buffer.text = self._drafts.get(agent_id, "")
-            self._input_buffer.cursor_position = len(self._input_buffer.text)
+        if agent_id != previous_id:
+            self._detail_offset = 0
         self.overlay = False
         events = agent_ui_events.hub.agent_events(agent_id)
         if events and self.follow[agent_id]:
@@ -710,7 +676,7 @@ class AgentsModeController:
     # ── layout geometry ──────────────────────────────────────────────────
     #: Rows of the right column that are not transcript: title, its rule,
     #: the three-row prompt box and the footer.
-    CHROME_ROWS = 1 + 1 + 3 + 1
+    CHROME_ROWS = 1 + 1 + 1
     PANEL_WIDTH = 34
 
     #: The roster is shown from this many columns up — the original /agents
@@ -740,7 +706,7 @@ class AgentsModeController:
         pane = width - (rail + 1 if rail else 0)
         if self._profile_visible():
             pane -= self.PANEL_WIDTH + 1
-        rows = height - self.CHROME_ROWS - self._approval_height()
+        rows = height - self.CHROME_ROWS
         return max(20, pane), max(3, rows)
 
     def _rail_page_size(self) -> int:
@@ -782,21 +748,13 @@ class AgentsModeController:
         if not terminals:
             return
         index = terminals.index(self.terminal_name) if self.terminal_name in terminals else 0
-        if self._input_buffer is not None and self.selected_id:
-            self._drafts[self.selected_id] = self._input_buffer.text
         self.terminal_name = terminals[(index + delta) % len(terminals)]
         candidate = agent_loop.get_dialog_agent_for_terminal(self.terminal_name)
-        # The Agent deployed in that terminal is not on its roster (the plain
-        # CLI already shows it), so selecting it left no card highlighted and
-        # a transcript that belonged to nobody on screen.
-        if candidate is not None and self._is_deployed_in_terminal(candidate):
+        if candidate is not None and not self._on_roster(candidate):
             candidate = None
         self.selected_id = candidate.id if candidate else ""
         self.rail_offset = 0
         self.agents()  # picks the first card when nothing was chosen
-        if self._input_buffer is not None:
-            self._input_buffer.text = self._drafts.get(self.selected_id, "")
-            self._input_buffer.cursor_position = len(self._input_buffer.text)
         self.overlay = False
         self.invalidate()
 
@@ -1182,8 +1140,9 @@ class AgentsModeController:
             else:
                 rows.append(Row([("class:empty.title", "  No conversation yet")],
                                 "  No conversation yet"))
-                hint = (f"  Send {name} a message below to give it a task. "
-                        f"Its replies, tool calls and results appear here.")
+                hint = (f"  Give {name} a task from the CLI prompt with "
+                        f"@{name} <task>. Its replies, tool calls and results "
+                        f"appear here.")
                 for chunk in agents_transcript.wrap(
                         [("class:muted", hint)], width, (), [("", "  ")]):
                     rows.append(Row(chunk, "".join(t for _s, t in chunk)))
@@ -1231,11 +1190,8 @@ class AgentsModeController:
     def _work_verb(self, agent) -> str:
         """What this Agent is doing, in the CLI's own vocabulary."""
         status = str(getattr(agent, "status", "") or "")
-        with self._approval_lock:
-            waiting_on_you = any(request.get("agent_id") == agent.id
-                                 for request in self._approvals)
-        if waiting_on_you:
-            return "Waiting for your approval…"
+        if self._awaiting_approval(agent.id):
+            return "Waiting for your approval · Esc to answer"
         if status == "queued":
             return "Queued…"
         if status == "waiting":
@@ -1369,6 +1325,14 @@ class AgentsModeController:
         if not agent_id or agent_loop.get_agent(agent_id) is None:
             self._viewport = ("", 0, 0, 0, 0, width, height)
             return self._empty_lines(width, height)
+        if self.detail:
+            self._viewport = ("", 0, 0, 0, 0, width, height)
+            rows = self._detail_rows(max(20, width - 2))
+            self._detail_offset = min(max(0, self._detail_offset),
+                                      max(0, len(rows) - height))
+            visible = rows[self._detail_offset:self._detail_offset + height]
+            lines = [_fit([("", " ")] + row, width) for row in visible]
+            return lines + [_fit([], width)] * max(0, height - len(lines))
         content_w = max(10, width - 3)   # 1 margin, 1 gap, 1 scrollbar
         rows = self._transcript_rows(agent_id, content_w)
         live = self._live_status_row(agent_id, content_w)
@@ -1645,161 +1609,28 @@ class AgentsModeController:
         if agent is None:
             return [_fit([("class:pane.title", " AGENTS")], width)]
         profile = self._agent_profile(agent)
-        # Only the two buttons (resume, model) sit on a filled background;
-        # everything else on the right is a plain coloured label. Keeping
-        # glyphs like ●/○/↑ out of the fills matters: terminals draw them from
-        # a fallback font, and a fill behind a fallback glyph comes out a
-        # different height from the pure-text buttons beside it.
-        chips: list = []
-        if self._raw[agent.id]:
-            chips += [("class:chip.raw", "RAW"), ("", "  ")]
+        right: list = []
+        if self.detail:
+            right += [("class:chip.raw", "DETAIL"), ("", "  ")]
+        elif self._raw[agent.id]:
+            right += [("class:chip.raw", "RAW"), ("", "  ")]
         offset = self.focus_scroll[agent.id]
-        if offset:
-            chips += [("class:muted", f"{symbols.ARROW_U} {offset}"), ("", "  ")]
-        # Keep identity on the left and put the actionable chips on the right.
-        # The hit spans are derived from the painted line so mouse targets stay
-        # aligned with the labels even when the title is cropped.
-        buttons = self._title_buttons(agent)
-        button_parts = []
-        for name, label in buttons:
-            button_parts += [(self._title_button_style(name, profile), f" {label} "), ("", "  ")]
-        status = profile["deployment"].replace("home ", "")
-        right = button_parts + [("class:muted", status)]
+        if offset and not self.detail:
+            right += [("class:muted", f"{symbols.ARROW_U} {offset}"), ("", "  ")]
+        if self._is_foreground(agent):
+            right += [("class:running", "foreground"), ("", "  ")]
+        elif self.switch_target == agent.id:
+            right += [("class:running", "switching on exit"), ("", "  ")]
+        right.append(("class:muted", profile["deployment"].replace("home ", "")))
         left = [("", " "), ("class:title.name", profile["name"])]
         if profile["title"]:
             left += [("class:dim", f"  {symbols.BULLET}  "),
                      ("class:title.role", profile["title"])]
-        line = self._spread(left, right, width)
-        painted = "".join(t for _s, t, *_ in line)
-        self._title_hits = []
-        cursor = 0
-        for style, text in line:
-            if "chip." in style:
-                label = text.strip()
-                if label in {name for name, _ in buttons} or any(label == value for _, value in buttons):
-                    lo = painted.find(label, cursor)
-                    if lo >= 0:
-                        name = next((n for n, v in buttons if v == label), label)
-                        self._title_hits.append((lo, lo + len(label), name))
-                        cursor = lo + len(label)
-        return [line]
+        return [self._spread(left, right, width)]
 
-    def _title_buttons(self, agent) -> list:
-        """``[(name, label), ...]`` for the clickable title-bar buttons.
-
-        A temporary sub-agent has no saved sessions and no model of its own,
-        so it gets neither.
-        """
-        if agent is None or agent.role == "subagent":
-            return []
-        profile = self._agent_profile(agent)
-        return [("resume", "resume"),
-                ("model", _crop_cells(profile["model"] or "default model", 28))]
-
-    def _title_button_style(self, name: str, profile: dict) -> str:
-        hovered = self._hover == ("title", name)
-        if name == "model" and profile["model_available"] is False:
-            return "class:chip.warn.hover" if hovered else "class:chip.warn"
-        return "class:chip.hover" if hovered else f"class:chip.{name}"
-
-    def _title_hit(self, x: int) -> Optional[str]:
-        return next((name for lo, hi, name in self._title_hits
-                     if lo <= x < hi), None)
-
-    def _title_mouse(self, mouse_event):
-        kind = mouse_event.event_type
-        hit = self._title_hit(mouse_event.position.x)
-        if kind == MouseEventType.MOUSE_MOVE:
-            hover = ("title", hit) if hit else None
-            if hover != self._hover:
-                self._hover = hover
-                self.invalidate()
-            return None
-        if kind == MouseEventType.MOUSE_DOWN:
-            self._drag = ("title", hit) if hit else None
-            return None
-        if kind != MouseEventType.MOUSE_UP:
-            return None
-        # A button fires only when the press started on it too: a text
-        # selection dragged up out of the transcript and released here must
-        # not close the view.
-        drag, self._drag = self._drag, None
-        if hit and drag == ("title", hit):
-            self._hover = None
-            self.open_picker(hit)
-        return None
-
-    def open_picker(self, name: str) -> bool:
-        """Run the CLI's own /resume or /model picker for the selected Agent.
-
-        The pickers are full-screen dialogs owned by the REPL, so the view
-        closes, the REPL runs them, and ``/agents <id>`` brings the view back
-        on the same Agent — chosen or cancelled.
-
-        /model is aimed at the Agent directly (``/model @<id>``), without
-        moving the REPL's focus. /resume has to switch the REPL to the Agent
-        first (``/agent <id>``): a resumed session is restored into the
-        REPL's conversation, and each Agent keeps its own resume list.
-        """
-        agent = agent_loop.get_agent(self.selected_id) if self.selected_id else None
-        if agent is None or not self._title_buttons(agent):
-            return False
-        label = agent.name or agent.id
-        if name == "model":
-            self.request_command([f"/model @{agent.id}", f"/agents {agent.id}"])
-            return True
-        current = agent_loop.get_agent(agent_loop.get_current_agent_id())
-        if agent.id != getattr(current, "id", None):
-            # /agent refuses both of these, and /resume would then restore
-            # into whatever the REPL was on — the wrong Agent's session.
-            if str(getattr(agent, "status", "")) in WORKING or getattr(
-                    agent, "active_assignment", None) is not None:
-                self.notice = f"Cannot resume {label} while it is working"
-                self.invalidate()
-                return False
-            if current is not None and str(
-                    getattr(current, "status", "")) in WORKING:
-                self.notice = (f"Cannot resume {label} while "
-                               f"{current.name or current.id} is working")
-                self.invalidate()
-                return False
-        elif str(getattr(agent, "status", "")) in WORKING:
-            self.notice = f"Cannot resume {label} while it is working"
-            self.invalidate()
-            return False
-        commands = []
-        if agent.id != getattr(current, "id", None):
-            commands.append(f"/agent {agent.id}")
-        commands += ["/resume", f"/agents {agent.id}"]
-        self.request_command(commands)
-        return True
-
-    def request_command(self, commands: list) -> None:
-        """Close the view and hand slash commands to the main REPL.
-
-        The pickers the chips open (/model, /resume) are full-screen dialogs
-        owned by the CLI body; running them inside this view would stack two
-        prompt_toolkit applications on one tty. So the chip only records the
-        commands, exits the view, and the launcher injects them into the REPL
-        loop once the screen is back in its hands.
-        """
-        self.pending_commands = [str(c) for c in commands]
-        if self.app is not None and not self.app.is_done:
-            self.app.exit()
-        else:
-            self._deliver_pending_command()
-
-    def _deliver_pending_command(self) -> None:
-        commands, self.pending_commands = self.pending_commands, []
-        if not commands:
-            return
-        try:
-            import threading as _threading
-            import laintas_cli
-            for command in commands:
-                laintas_cli._inject_input(command, _threading.Event())
-        except Exception:
-            pass
+    @staticmethod
+    def _is_foreground(agent) -> bool:
+        return agent is not None and agent.id == agent_loop.get_current_agent_id()
 
     # ── status row (segment 1) ───────────────────────────────────────────
     def _live_status_row(self, agent_id: str, width: int) -> Optional[list]:
@@ -1831,8 +1662,6 @@ class AgentsModeController:
     NOTICE_SECONDS = 6.0
 
     def _toast(self) -> Optional[tuple[str, str]]:
-        if self.pending_approval() is not None:
-            return None
         if not self._notice or time.monotonic() - self._notice_at > self.NOTICE_SECONDS:
             return None
         lowered = self._notice.casefold()
@@ -1848,8 +1677,13 @@ class AgentsModeController:
 
     def hint_fragments(self):
         """Keys that apply to what is on screen, not a fixed keycap dump."""
-        if self.pending_approval() is not None:
-            keys = [("y", "approve"), ("n", "deny"), ("esc", "back")]
+        waiting = self.awaiting_any()
+        if waiting:
+            name = waiting[0].name or waiting[0].id
+            keys = [("esc", f"answer {name}'s approval in the CLI")]
+        elif self.detail:
+            keys = [(symbols.ARROW_U + symbols.ARROW_D, "agent"),
+                    ("enter", "switch here"), ("esc", "conversation")]
         elif self.overlay:
             keys = [("alt+" + symbols.ARROW_U + symbols.ARROW_D, "pick"),
                     ("tab", "close"), ("esc", "back")]
@@ -1862,10 +1696,8 @@ class AgentsModeController:
             # Narrow conversation: Esc returns to the list.
             keys = [("esc", "agent list")]
         else:
-            agent = agent_loop.get_agent(self.selected_id)
-            keys = [("enter", self._input_action(agent)),
-                    ("@name", "route"),
-                    ("alt+" + symbols.ARROW_U + symbols.ARROW_D, "agent")]
+            keys = [("enter", "details"),
+                    (symbols.ARROW_U + symbols.ARROW_D, "agent")]
             if len(agent_loop.get_all_terminals()) > 1:
                 keys.append(("alt+" + symbols.ARROW_L + symbols.ARROW_R, "terminal"))
             keys.append(("ctrl+o", "collapse" if self._expand_all else "expand"))
@@ -2013,6 +1845,158 @@ class AgentsModeController:
                 [("", " " * 10)]))
         return rows
 
+    # ── detail page (Enter) ──────────────────────────────────────────────
+    _KIND_LABELS = {"primary": "Main agent", "pool": "Employee",
+                    "deployed": "Employee"}
+
+    def open_detail(self) -> None:
+        """Enter: show who the selected Agent is and make it the switch target."""
+        agent = agent_loop.get_agent(self.selected_id) if self.selected_id else None
+        if agent is None:
+            return
+        self.detail = True
+        self._detail_offset = 0
+        self._set_switch_target(agent)
+        self.invalidate()
+
+    def _set_switch_target(self, agent) -> None:
+        if self._is_foreground(agent):
+            self.switch_target = ""
+            return
+        busy = (getattr(agent, "active_assignment", None) is not None
+                or str(getattr(agent, "status", "")) in WORKING)
+        if busy:
+            self.switch_target = ""
+            self.notice = (f"{agent.name or agent.id} is working; switch to it "
+                           "after it finishes")
+            return
+        self.switch_target = agent.id
+
+    def close_detail(self) -> None:
+        self.detail = False
+        self.invalidate()
+
+    def exit_commands(self) -> list:
+        """What the REPL runs once the view has closed."""
+        target = agent_loop.get_agent(self.switch_target) if self.switch_target else None
+        if target is None or self._is_foreground(target) or not self._on_roster(target):
+            return []
+        return [f"/agent {target.id}"]
+
+    def _children(self, agent) -> list:
+        return [a for a in agent_loop.get_all_agents()
+                if getattr(a, "parent_id", None) == agent.id
+                and a.role == "subagent"]
+
+    def _detail_rows(self, width: int) -> list:
+        """The Agent's definition: identity, responsibility, now, history."""
+        agent = agent_loop.get_agent(self.selected_id) if self.selected_id else None
+        if agent is None:
+            return [[("class:muted", "No Agent selected")]]
+        profile = self._agent_profile(agent)
+        inner = max(10, width - 2)
+        rows: list = []
+
+        def section(label: str) -> None:
+            if rows:
+                rows.append([])
+            rows.append([("class:pane.title", label)])
+
+        def text(value: str, style: str = "class:profile.text",
+                 indent: str = "") -> None:
+            rows.extend(agents_transcript.wrap(
+                [(style, value)], inner, [("", indent)], [("", indent)]))
+
+        def field(label: str, value: str, style: str = "class:profile.value") -> None:
+            rows.extend(agents_transcript.wrap(
+                [(style, value or "—")], inner,
+                [("class:profile.label", label.ljust(12))], [("", " " * 12)]))
+
+        kind = self._KIND_LABELS.get(agent.role, profile["role_label"])
+        section("WHO")
+        rows.append([("class:profile.name", profile["name"]),
+                     ("class:muted", f"  {kind}  {symbols.BULLET}  {agent.id}")])
+        if profile["title"]:
+            text(profile["title"], "class:profile.title")
+        if profile["description"]:
+            text(profile["description"])
+        if profile["tags"]:
+            text(" ".join(f"#{tag}" for tag in profile["tags"][:8]), "class:message")
+
+        section("RESPONSIBILITY")
+        if agent.role == "primary":
+            field("takes work", "from you, in the foreground")
+        else:
+            field("takes work", f"from you (@{agent.name or agent.id}) "
+                                "and from the Agent above it")
+            parent = agent_loop.get_agent(agent.parent_id) if agent.parent_id else None
+            if parent is not None:
+                field("reports to", parent.name or parent.id)
+        field("delegates", "to temporary sub-agents it starts for its tasks")
+        field("tools", profile["tools"])
+
+        section("SETUP")
+        model_line = profile["model"] or "backend default"
+        if profile["model_available"] is False:
+            model_line += f" {symbols.WARN} not offered by backend"
+        elif profile["model_available"] == "checking":
+            model_line += " (checking…)"
+        if profile["model_source"]:
+            model_line += f"  ({profile['model_source']})"
+        field("model", model_line)
+        field("runs in", profile["deployment"].replace("home ", ""))
+
+        section("NOW")
+        status = self._display_status(agent)
+        icon, style = STATUS.get(status, (symbols.DOT_OPEN, "class:idle"))
+        if self._awaiting_approval(agent.id):
+            field("status", f"{symbols.WARN} waiting for your approval "
+                            "· Esc, then answer it in the CLI", "class:waiting")
+        else:
+            field("status", f"{icon} {status}", style)
+        field("task", profile["task"])
+        if status in WORKING:
+            field("elapsed", f"{int(self._working_elapsed(agent))}s")
+        field("tokens", self._format_tokens(int(getattr(agent, "usage_tokens", 0) or 0)))
+
+        children = self._children(agent)
+        section(f"DELEGATED ({len(children)})")
+        if not children:
+            text("No sub-agents right now.", "class:muted")
+        for child in children[:12]:
+            stage = str(getattr(child, "stage", "") or child.status)
+            c_icon, c_style = STATUS.get(child.status, (symbols.DOT_OPEN, "class:idle"))
+            task = self._current_task(child)
+            rows.extend(agents_transcript.wrap(
+                [("class:profile.value", f"{child.name or child.id}  "),
+                 ("class:muted", f"{stage}  {task if task != 'idle' else ''}")],
+                inner, [(c_style, f"{c_icon} ")], [("", "  ")]))
+
+        history = list(getattr(agent, "assignment_history", None) or [])[-6:]
+        section(f"RECENT TASKS ({len(history)})")
+        if not history:
+            text("Nothing yet." if agent.role != "primary"
+                 else "Conversations are in /resume.", "class:muted")
+        for entry in reversed(history):
+            mark = {"completed": symbols.OK, "aborted": symbols.FAIL,
+                    "error": symbols.FAIL}.get(entry.get("status"), symbols.DOT_OPEN)
+            mark_style = ("class:done" if entry.get("status") == "completed"
+                          else "class:error")
+            rows.extend(agents_transcript.wrap(
+                [("class:profile.value", str(entry.get("task") or "")[:200])],
+                inner, [(mark_style, f"{mark} ")], [("", "  ")]))
+
+        section("SWITCH")
+        if self._is_foreground(agent):
+            text("This is the CLI's foreground Agent.", "class:muted")
+        elif self.switch_target == agent.id:
+            text(f"Leaving /agents switches the CLI to {profile['name']}; "
+                 "its conversation continues there.", "class:running")
+        else:
+            text("Press Enter to switch to it when you leave /agents.",
+                 "class:muted")
+        return rows
+
     def inspector_fragments(self):
         fragments: list = []
         for row in self._panel_rows(self.PANEL_WIDTH):
@@ -2020,363 +2004,17 @@ class AgentsModeController:
             fragments.append(("", "\n"))
         return FormattedText(fragments)
 
-    def _input_action(self, agent) -> str:
-        if agent is None:
-            return "select an agent"
-        if agent.status in WORKING:
-            return "send update"
-        if (callable(self.repl_submit_cb)
-                and agent.id == agent_loop.get_current_agent_id()):
-            return "continue"
-        if agent.role in {"pool", "deployed"}:
-            return "new task"
-        if agent.role == "primary" and not callable(self.repl_submit_cb):
-            return "continue"
-        return "unavailable"
-
-
-    def dispatch(self, raw: str) -> None:
-        text = str(raw or "").strip()
-        if not text:
-            return
-        import secret_guard
-        error = secret_guard.input_error(text)
-        if error:
-            self.notice = error
-            self.invalidate()
-            return
-        if text.startswith("/"):
-            self.notice = (
-                "Slash commands are handled by the main CLI; "
-                "exit Agents Mode to run them")
-            self.invalidate()
-            return
-        if self.selected_id:
-            self.focus_scroll[self.selected_id] = 0
-            self.follow[self.selected_id] = True
-        # Agents Mode routes dialogue only. View-closing commands are consumed
-        # by accept() before dispatch; all other slash commands stay with the
-        # main CLI so they cannot be duplicated as Agent instructions.
-        target_id = self.selected_id
-        match = re.match(r"^@([A-Za-z0-9_.:-]+)\s+(.+)$", text, re.S)
-        if match:
-            reference, text = match.group(1), match.group(2).strip()
-            target_id = self.resolve_agent(reference)
-        agent = agent_loop.get_agent(target_id)
-        if agent is None or agent_loop.agent_scope_terminal(agent) != self.terminal_name:
-            self.notice = "Target Agent is not available in this terminal"
-            return
-        if agent.status in {"running", "thinking", "waiting", "queued"}:
-            try:
-                agent.message_queue.put_nowait(text)
-                agent_ui_events.hub.emit(
-                    "user_message", agent_id=agent.id,
-                    terminal_name=self.terminal_name,
-                    summary=text, detail=text, status="queued")
-                self.notice = f"Queued for {agent.name or agent.id}"
-            except queue.Full:
-                agent_ui_events.hub.emit(
-                    "user_message_failed", agent_id=agent.id,
-                    terminal_name=self.terminal_name,
-                    summary=text, detail=text, status="queue_full")
-                self.notice = f"{agent.name or agent.id} instruction queue is full"
-            except Exception as exc:
-                agent_ui_events.hub.emit(
-                    "user_message_failed", agent_id=agent.id,
-                    terminal_name=self.terminal_name,
-                    summary=text, detail=str(exc), status="delivery_error")
-                self.notice = (
-                    f"Could not queue instruction for "
-                    f"{agent.name or agent.id}: {exc}")
-        elif agent.status in {"idle", "ready", "done", "error", "aborted"}:
-            if self.execution_block_reason:
-                agent_ui_events.hub.emit(
-                    "user_message", agent_id=agent.id,
-                    terminal_name=self.terminal_name,
-                    summary=text, detail=text, status="rejected")
-                agent_ui_events.hub.emit(
-                    "input_rejected", agent_id=agent.id,
-                    terminal_name=self.terminal_name,
-                    summary=self.execution_block_reason,
-                    detail=self.execution_block_reason, status="error")
-                self.notice = self.execution_block_reason
-                self.invalidate()
-                return
-            if (callable(self.repl_submit_cb)
-                    and agent.id == agent_loop.get_current_agent_id()):
-                # The foreground can be scout/foreman too. Starting a new
-                # assignment here would reset its history behind the REPL.
-                ok, detail = self.repl_submit_cb(text)
-                self.notice = detail or "Sent"
-            elif agent.role == "primary":
-                if callable(self.repl_submit_cb):
-                    self.notice = (
-                        f"Exit Agents Mode and use /agent {agent.id} to continue "
-                        "this conversation")
-                elif not callable(self.primary_submit_cb):
-                    self.notice = "Primary runtime is unavailable"
-                else:
-                    ok, detail = self.primary_submit_cb(
-                        agent, text, self._deps_for(agent.id))
-                    self.notice = detail
-            elif agent.role not in {"pool", "deployed"}:
-                self.notice = (
-                    f"{agent.name or agent.id} is a finished temporary Agent "
-                    "and cannot accept a new assignment")
-            else:
-                ok, detail, _assignment = agent_loop.start_agent_assignment(
-                    agent.id, text, self._deps_for(agent.id), self.session,
-                    events_cb=self.external_events_cb)
-                self.notice = (f"Started new task for {agent.name or agent.id}"
-                               if ok else detail)
-        else:
-            self.notice = f"Agent state '{agent.status}' cannot accept input"
-        self.invalidate()
-
-    def _deps_for(self, agent_id: str):
-        """Return execution wiring whose approvals remain attributed to one Agent."""
-        deps = copy.copy(self.deps)
-        # prompt_toolkit is the sole terminal renderer while Agents Mode owns
-        # the screen. Rich Live/status/print output from worker threads causes
-        # duplicated input, lost redraws and apparently unresponsive Enter.
-        #
-        # One console PER AGENT, not one shared silent console: rich refuses a
-        # second live display on the same Console, so two agents streaming at
-        # the same time meant the later one died with
-        # LiveError("Only one live display may be active at once").
-        deps.console = self._console_for(agent_id)
-        for renderer in (
-                "display_command_output", "display_sub_terminal_preview",
-                "display_file_diff", "display_task_list"):
-            if hasattr(deps, renderer):
-                setattr(deps, renderer, lambda *_args, **_kwargs: None)
-        deps.request_command_approval = (
-            lambda command, reason: self._request_approval(
-                agent_id, "command", command, reason))
-        deps.request_file_write_approval = (
-            lambda path, preview, reason: self._request_approval(
-                agent_id, "write", path, "\n".join(
-                    part for part in (reason, preview) if part)))
-        deps.request_file_delete_approval = (
-            lambda path, preview, reason: self._request_approval(
-                agent_id, "delete", path, "\n".join(
-                    part for part in (reason, preview) if part)))
-        return deps
-
-    def _console_for(self, agent_id: str) -> Console:
-        """A private silent console per Agent (rich allows one live each)."""
-        console = self._agent_consoles.get(agent_id)
-        if console is None:
-            console = Console(file=_NullWriter(), force_terminal=False,
-                              width=self._console_width)
-            console.render_terminal = False
-            self._agent_consoles[agent_id] = console
-        return console
-
-    def _request_approval(self, agent_id: str, kind: str,
-                          summary: str, detail: str) -> bool:
-        """Bridge worker approval requests into the owning UI event loop."""
-        request_agent = agent_loop.get_agent(agent_id)
-        request_terminal = (
-            agent_loop.agent_scope_terminal(request_agent)
-            if request_agent is not None else None) or self.terminal_name
-        request = {
-            "id": f"approval-{time.time_ns()}",
-            "agent_id": agent_id,
-            "kind": kind,
-            "summary": str(summary or kind),
-            "detail": str(detail or ""),
-            "terminal_name": request_terminal,
-            "done": threading.Event(),
-            "approved": False,
-        }
-        with self._approval_lock:
-            closed = self._closed.is_set()
-            if not closed:
-                self._approvals.append(request)
-                is_head = len(self._approvals) == 1
-            else:
-                is_head = False
-            # Keep requested -> resolved ordering atomic with UI shutdown.
-            agent_ui_events.hub.emit(
-                "approval_requested", agent_id=agent_id,
-                terminal_name=request_terminal, summary=request["summary"],
-                detail=request["detail"], status="waiting",
-                data={"approvalId": request["id"], "kind": kind})
-        if closed:
-            agent_ui_events.hub.emit(
-                "approval_resolved", agent_id=agent_id,
-                terminal_name=request_terminal, summary=request["summary"],
-                status="denied",
-                data={"approvalId": request["id"], "kind": kind,
-                      "reason": "agents_mode_closed"})
+    @staticmethod
+    def _awaiting_approval(agent_id: str) -> bool:
+        try:
+            import approval_broker
+            return agent_id in approval_broker.pending_agents()
+        except Exception:
             return False
-        # A later request must not replace the text for the FIFO request that
-        # y/n will actually resolve.
-        if is_head:
-            self.notice = self._approval_notice(request)
-            self.invalidate()
-        else:
-            self._refresh_approval_notice()
-        while not request["done"].wait(timeout=0.1):
-            agent = agent_loop.get_agent(agent_id)
-            if (agent is None or agent.lifecycle_terminated
-                    or agent.abort_event.is_set()):
-                cancelled = False
-                with self._approval_lock:
-                    if request in self._approvals:
-                        self._approvals.remove(request)
-                        request["approved"] = False
-                        request["done"].set()
-                        cancelled = True
-                if cancelled:
-                    agent_ui_events.hub.emit(
-                        "approval_resolved", agent_id=agent_id,
-                        terminal_name=request_terminal,
-                        summary=request["summary"], status="denied",
-                        data={"approvalId": request["id"], "kind": kind,
-                              "reason": "agent_aborted"})
-                    self._refresh_approval_notice(default="Denied: Agent aborted")
-                break
-        return bool(request["approved"])
 
-    def _approval_notice(self, request: dict) -> str:
-        agent_name = self._agent_name(str(request.get("agent_id") or ""))
-        with self._approval_lock:
-            count = len(self._approvals)
-        queued = f" {symbols.BULLET} {count} pending" if count > 1 else ""
-        return (
-            f"Approval for {agent_name} ({request['kind']}): "
-            f"{self._crop(request['summary'], 62)}{queued}  "
-            "[y] approve  [n] deny"
-        )
-
-    def _approval_height(self) -> int:
-        request = self.pending_approval()
-        if request is None:
-            return 0
-        width, _height = self._terminal_size()
-        return len(self._approval_rows(request, self._right_width()))
-
-    def _approval_rows(self, request: dict, width: int) -> list:
-        """A permission card above the prompt: what, why, and two buttons."""
-        agent_name = self._agent_name(str(request.get("agent_id") or ""))
-        with self._approval_lock:
-            queue_size = len(self._approvals)
-        kind = str(request.get("kind") or "action")
-        verb = {"command": "wants to run a command", "write": "wants to write a file",
-                "delete": "wants to delete a file"}.get(kind, f"wants approval ({kind})")
-        border = "class:error" if kind == "delete" else "class:approval.border"
-        inner = width - 4
-        title = [("class:approval.title", f"{symbols.DOT_HALF} {agent_name} {verb}"),
-                 ("class:muted", f" {symbols.BULLET} on {request.get('terminal_name')}")]
-        if queue_size > 1:
-            title.append(("class:muted", f" {symbols.BULLET} 1 of {queue_size}"))
-        body: list = []
-        for chunk in agents_transcript.wrap(
-                [("class:user.text", str(request.get("summary") or ""))], inner):
-            body.append(chunk)
-        detail = [line for line in str(request.get("detail") or "").splitlines()
-                  if line.strip()][-6:]
-        for line in detail:
-            for chunk in agents_transcript.wrap([("class:muted", line)], inner,
-                                                hard=True)[:2]:
-                body.append(chunk)
-        body.append([])
-        yes_style = "class:button.hover" if self._hover == ("button", "yes") else "class:button.yes"
-        no_style = "class:button.no.hover" if self._hover == ("button", "no") else "class:button.no"
-        yes, no = " Approve  y ", " Deny  n "
-        body.append([(yes_style, yes), ("", "  "), (no_style, no)])
-        button_row = len(body)          # row index inside the card (top = 0)
-        self._button_hits = [(button_row, 2, 2 + cell_width(yes), "yes"),
-                             (button_row, 4 + cell_width(yes),
-                              4 + cell_width(yes) + cell_width(no), "no")]
-        title_w = cell_width("".join(t for _s, t in title))
-        top = [(border, "╭─ ")] + title + [
-            (border, " " + "─" * max(0, width - 5 - title_w) + "╮")]
-        rows = [_fit(top, width)]
-        for line in body:
-            rows.append([(border, "│ ")] + _fit(line, inner) + [(border, " │")])
-        rows.append([(border, "╰" + "─" * (width - 2) + "╯")])
-        return rows
-
-    def approval_lines(self, width: int, height: int) -> list:
-        request = self.pending_approval()
-        if request is None:
-            return [_fit([], width)] * height
-        rows = self._approval_rows(request, width)
-        return (rows + [_fit([], width)] * height)[:height]
-
-    def _approval_mouse(self, mouse_event):
-        x, y = mouse_event.position.x, mouse_event.position.y
-        hit = next((name for row, lo, hi, name in self._button_hits
-                    if row == y and lo <= x < hi), None)
-        if mouse_event.event_type == MouseEventType.MOUSE_MOVE:
-            hover = ("button", hit) if hit else None
-            if hover != self._hover:
-                self._hover = hover
-                self.invalidate()
-        elif mouse_event.event_type == MouseEventType.MOUSE_UP:
-            self._drag = None
-            if hit:
-                self._hover = None
-                self.resolve_approval(hit == "yes")
-        return None
-
-    def approval_fragments(self):
-        request = self.pending_approval()
-        if not request:
-            return FormattedText([])
-        fragments: list = []
-        for row in self._approval_rows(request, 72):
-            fragments.extend(row)
-            fragments.append(("", "\n"))
-        return FormattedText(fragments)
-
-    def _refresh_approval_notice(self, default: str = "") -> None:
-        following = self.pending_approval()
-        self.notice = (self._approval_notice(following)
-                       if following else default)
-        self.invalidate()
-
-    def pending_approval(self) -> Optional[dict]:
-        with self._approval_lock:
-            return self._approvals[0] if self._approvals else None
-
-    def resolve_approval(self, approved: bool) -> None:
-        with self._approval_lock:
-            if not self._approvals:
-                return
-            request = self._approvals.pop(0)
-            request["approved"] = bool(approved)
-            request["done"].set()
-        agent_ui_events.hub.emit(
-            "approval_resolved", agent_id=request["agent_id"],
-            terminal_name=request["terminal_name"], summary=request["summary"],
-            status="approved" if approved else "denied",
-            data={"approvalId": request["id"], "kind": request["kind"]})
-        self._refresh_approval_notice(
-            default="Approved" if approved else "Denied")
-
-    def deny_pending_approvals(self, *, close: bool = False,
-                               reason: str = "cancelled") -> None:
-        with self._approval_lock:
-            if close:
-                self._closed.set()
-            pending, self._approvals = self._approvals, []
-            for request in pending:
-                request["approved"] = False
-                request["done"].set()
-        for request in pending:
-            agent_ui_events.hub.emit(
-                "approval_resolved", agent_id=request["agent_id"],
-                terminal_name=request["terminal_name"], summary=request["summary"],
-                status="denied",
-                data={"approvalId": request["id"],
-                      "kind": request["kind"], "reason": reason})
-        if pending:
-            self.notice = "Denied pending approvals"
-            self.invalidate()
+    def awaiting_any(self) -> list:
+        """Roster Agents blocked on an approval; the CLI asks it, not this view."""
+        return [a for a in self._last_agents if self._awaiting_approval(a.id)]
 
     def resolve_agent(self, reference: str) -> str:
         folded = reference.casefold()
@@ -2454,28 +2092,14 @@ class AgentsModeController:
         self.invalidate()
 
     def run(self, input=None, output=None) -> None:
-        with self._approval_lock:
-            self._closed.clear()
+        """Run the read-only view until Esc.
+
+        Nothing typed here reaches an Agent: work is handed out from the CLI
+        prompt with ``@name``, and approvals are asked by the CLI. The view
+        watches, explains (Enter opens an Agent's detail page) and, on exit,
+        leaves one command for the REPL: switch to the Agent picked here.
+        """
         kb = KeyBindings()
-        input_buffer = Buffer(multiline=False)
-        self._input_buffer = input_buffer
-
-        def _remember_draft(buffer):
-            if self.selected_id:
-                self._drafts[self.selected_id] = buffer.text
-        input_buffer.on_text_changed += _remember_draft
-
-        def accept(buffer):
-            value = buffer.text
-            buffer.text = ""
-            if value.strip().casefold() in {"/exit", "/quit", "/q", "/back"}:
-                self.notice = "Leaving Agents Mode"
-                if self.app is not None:
-                    self.app.exit()
-                return False
-            self.dispatch(value)
-            return False
-        input_buffer.accept_handler = accept
 
         @kb.add("tab")
         def _tab(_event):
@@ -2484,21 +2108,26 @@ class AgentsModeController:
 
         narrow_list_filter = Condition(
             lambda: self._is_narrow() and self._narrow_list_mode)
+        wide_filter = ~narrow_list_filter
 
         @kb.add("enter", filter=narrow_list_filter)
         def _narrow_enter(_event):
-            # Narrow list-first: Enter dives into the selected agent's
-            # conversation.
             if self.selected_id:
                 self._narrow_list_mode = False
-                self.invalidate()
+                self.open_detail()
 
-        @kb.add("up", filter=narrow_list_filter)
-        def _narrow_up(_event):
+        @kb.add("enter", filter=wide_filter)
+        def _enter(_event):
+            if self.overlay:
+                self.overlay = False
+            self.open_detail()
+
+        @kb.add("up")
+        def _up(_event):
             self.cycle_agent(-1)
 
-        @kb.add("down", filter=narrow_list_filter)
-        def _narrow_down(_event):
+        @kb.add("down")
+        def _down(_event):
             self.cycle_agent(1)
 
         @kb.add("escape")
@@ -2509,12 +2138,12 @@ class AgentsModeController:
             elif self.overlay:
                 self.overlay = False
                 self.invalidate()
+            elif self.detail:
+                self.close_detail()
             elif self._is_narrow() and not self._narrow_list_mode:
-                # Narrow conversation: Esc goes back to the agent list.
                 self._narrow_list_mode = True
                 self.invalidate()
             else:
-                input_buffer.text = ""
                 event.app.exit()
 
         @kb.add("c-q")
@@ -2522,15 +2151,13 @@ class AgentsModeController:
             event.app.exit()
 
         @kb.add("c-c")
-        def _copy_or_clear(_event):
-            # Never leaves the view: Ctrl+C is copy/cancel here, and a
-            # reflexive press must not throw away the screen. Esc goes back.
+        def _copy(_event):
+            # Never leaves the view: Ctrl+C is copy here, and a reflexive
+            # press must not throw away the screen. Esc goes back.
             text = self._selected_text()
             if text and self._copy_to_clipboard(text):
                 self._selection = None
                 self.notice = f"Copied {len(text)} characters"
-            elif input_buffer.text:
-                input_buffer.reset()
             else:
                 self.notice = "Esc to go back"
             self.invalidate()
@@ -2538,16 +2165,6 @@ class AgentsModeController:
         @kb.add("c-d")
         def _eof_quit(event):
             event.app.exit()
-
-        approval_filter = Condition(lambda: self.pending_approval() is not None)
-
-        @kb.add("y", filter=approval_filter)
-        def _approve(_event):
-            self.resolve_approval(True)
-
-        @kb.add("n", filter=approval_filter)
-        def _deny(_event):
-            self.resolve_approval(False)
 
         @kb.add("q", filter=Condition(lambda: self.overlay))
         def _q(event):
@@ -2563,11 +2180,19 @@ class AgentsModeController:
 
         @kb.add("pageup")
         def _page_up(_event):
-            self.scroll(self.page_size())
+            if self.detail:
+                self._detail_offset = max(0, self._detail_offset - self.page_size())
+                self.invalidate()
+            else:
+                self.scroll(self.page_size())
 
         @kb.add("pagedown")
         def _page_down(_event):
-            self.scroll(-self.page_size())
+            if self.detail:
+                self._detail_offset += self.page_size()
+                self.invalidate()
+            else:
+                self.scroll(-self.page_size())
 
         @kb.add("end")
         def _end(_event):
@@ -2634,83 +2259,10 @@ class AgentsModeController:
                                  filter=~overlay_filter),
         ])
 
-        def working_selected() -> bool:
-            agent = agent_loop.get_agent(self.selected_id) if self.selected_id else None
-            return bool(agent) and str(getattr(agent, "status", "")) in WORKING
-
-        def border_style() -> str:
-            # The prompt's frame signals "busy" while the Agent in focus works.
-            # A static style: the previous time-based pulse redrew the box
-            # twice a second and could tear mid-frame on slow terminals.
-            if self.pending_approval() is not None:
-                return "class:box"
-            if working_selected():
-                return "class:box.active"
-            return "class:box"
-
-        def prompt_prefix():
-            agent = agent_loop.get_agent(self.selected_id) if self.selected_id else None
-            glyph = symbols.ARROW_RR if working_selected() else symbols.INFO
-            return FormattedText([("class:input.caret", f"{glyph} ")]) if agent \
-                else FormattedText([("class:placeholder", f"{symbols.INFO} ")])
-
-        def placeholder():
-            agent = agent_loop.get_agent(self.selected_id) if self.selected_id else None
-            if agent is None:
-                return FormattedText([("class:placeholder", "No Agent selected")])
-            if self.pending_approval() is not None:
-                return FormattedText([("class:placeholder",
-                                       "Answer the request above first")])
-            name = str(agent.name or agent.id)
-            if working_selected():
-                text = f"Add guidance for {name} while it works…"
-            else:
-                text = f"Message {name}…   @name routes one message elsewhere"
-            # Never wrap: a placeholder that takes two rows grows the prompt.
-            room = self._right_width() - 8
-            if cell_width(text) > room:
-                text = _crop_cells(f"Message {name}…", room)
-            return FormattedText([("class:placeholder", text)])
-
-        input_control = BufferControl(
-            buffer=input_buffer,
-            input_processors=[
-                BeforeInput(prompt_prefix),
-                ConditionalProcessor(AfterInput(placeholder),
-                                     filter=Condition(lambda: not input_buffer.text)),
-            ])
-        def _input_height() -> Dimension:
-            # Lock to 1 row while the placeholder shows: a height that
-            # flickers between 1 and 5 during background refreshes tears
-            # the box borders. Grow only when the user types past one line.
-            if not input_buffer.text:
-                return Dimension.exact(1)
-            return Dimension(min=1, max=5)
-        input_window = Window(input_control, wrap_lines=True,
-                              height=_input_height,
-                              dont_extend_height=True)
-        prompt_box = HSplit([
-            VSplit([Window(width=1, height=1, char="╭", style=border_style),
-                    Window(height=1, char="─", style=border_style),
-                    Window(width=1, height=1, char="╮", style=border_style)]),
-            VSplit([Window(width=1, char="│", style=border_style),
-                    Window(width=1),
-                    input_window,
-                    Window(width=1),
-                    Window(width=1, char="│", style=border_style)]),
-            VSplit([Window(width=1, height=1, char="╰", style=border_style),
-                    Window(height=1, char="─", style=border_style),
-                    Window(width=1, height=1, char="╯", style=border_style)]),
-        ])
         right = HSplit([
-            Window(_PaneControl(self.title_lines, self._title_mouse), height=1),
+            Window(_PaneControl(self.title_lines), height=1),
             Window(height=1, char="─", style="class:separator"),
             body,
-            ConditionalContainer(
-                Window(_PaneControl(self.approval_lines, self._approval_mouse),
-                       height=lambda: Dimension.exact(self._approval_height())),
-                filter=approval_filter),
-            prompt_box,
             Window(_PaneControl(self.footer_lines), height=1),
         ])
         # Narrow mode: list-first. The agent list takes the full screen;
@@ -2726,7 +2278,7 @@ class AgentsModeController:
             ConditionalContainer(normal_view, filter=~narrow_list_filter),
         ])
         self.app = Application(
-            layout=Layout(root, focused_element=input_window),
+            layout=Layout(root),
             key_bindings=kb, style=STYLE, full_screen=True,
             mouse_support=True, refresh_interval=None,
             min_redraw_interval=0.03,
@@ -2741,7 +2293,7 @@ class AgentsModeController:
                     toast = bool(self._notice) and (
                         time.monotonic() - self._notice_at
                         <= self.NOTICE_SECONDS + 0.5)
-                    active = scrolling or self.pending_approval() is not None or any(
+                    active = scrolling or any(
                         str(getattr(agent, "status", "")) in WORKING
                         for agent in self.agents())
                     # Theme following: if the CLI body's palette changed (this
@@ -2776,30 +2328,18 @@ class AgentsModeController:
                 laintas_cli._clear_stale_running_loop()
             except Exception:
                 pass
-            # Workers may outlive the full-screen application. Close the
-            # approval channel first so any later request is denied instead of
-            # waiting forever for a UI that no longer exists.
-            self.deny_pending_approvals(
-                close=True, reason="agents_mode_closed")
             agent_ui_events.hub.unsubscribe(self.on_event)
-            self._input_buffer = None
+            self.pending_commands = self.exit_commands()
             self.app = None
 
 
-def run_agents_mode(terminal_name: str, deps, session: dict,
+def run_agents_mode(terminal_name: str, deps=None, session=None,
                     external_events_cb: Optional[Callable] = None,
-                    primary_submit_cb: Optional[Callable] = None,
-                    existing_session=None,
-                    execution_block_reason: str = "",
-                    repl_submit_cb: Optional[Callable] = None,
-                    mirror=None):
+                    existing_session=None, mirror=None):
     controller = AgentsModeController(
         terminal_name, deps, session,
         external_events_cb=external_events_cb,
-        primary_submit_cb=primary_submit_cb,
         existing_session=existing_session,
-        execution_block_reason=execution_block_reason,
-        repl_submit_cb=repl_submit_cb,
         mirror=mirror)
     controller.run()
     return controller.existing_session

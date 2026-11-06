@@ -506,20 +506,30 @@ Explicit `--execute --session-id` retains its logical-session continuation behav
 
 `/agent <name>` switches the foreground conversation; each persistent agent
 has its own `/resume` history. Switching back preserves work completed in the
-background. A working agent can receive updates in `/agents`; switch the
-foreground to it after its task finishes.
+background.
+
+`@name task` hands work to another agent without leaving the foreground, both
+at the prompt and while a turn is running. An idle employee starts the task in
+the background; a working agent receives the line as an update. When a
+background task ends, a message appears behind the L> mark (Alt+0, `o` to
+open, or `/messages read <n>`); opening it switches to that agent's
+conversation. A background agent's approval is asked at the CLI prompt, with
+the half-typed line kept.
 
 > **Agent Isolation vs. Shared Configuration**:
 > - **Isolated per Agent**: Chat conversation history, local state variables, message queues, PTY/execution terminals, base model/provider bindings, and individual tool policies.
 > - **Shared across all Agents**: Working directory filesystem, persistent project memory, tool registry, and runtime configuration (`_runtime_config`). Adjusting iteration limits (e.g. `/config max_loops <n>` or `/max`) lifts or modifies boundaries globally for every agent in the process.
 
-`/agents` selects an agent to view or address without changing the foreground
-conversation or terminal ownership. Enter sends an update to a working agent,
-continues the current foreground agent, or starts a **new task** for another
-idle employee. The input hint shows which action applies. To continue another
-agent's existing conversation, leave the panel and use `/agent <name>`; use
-`/resume` there to choose its saved history. `/agents --plain` distinguishes
-the foreground agent and current conversation from older saved records.
+`/agents` is a read-only view of the persistent agents in this terminal (the
+main agent and employees; temporary sub-agents appear under their parent).
+It shows each agent's conversation and status, including an agent waiting for
+your approval. Enter opens an agent's detail page: who it is, what it is
+responsible for, its setup, what it is doing now, the sub-agents it delegated
+to and its recent tasks. It also makes that agent the switch target, so leaving
+the view switches the foreground to it (after the current turn, if one is
+running). Nothing typed in the view reaches an agent. `/agents --plain`
+distinguishes the foreground agent and current conversation from older saved
+records.
 
 `/station` opens the live agent/terminal manager. Press `v` to switch between
 delegation and terminal views, `Enter` for details, `e` to open the existing
