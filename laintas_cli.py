@@ -7376,14 +7376,12 @@ class _PrivateCommandHistory(FileHistory):
     """
 
     def append_string(self, string: str) -> None:
-        import secret_guard
-        if not _is_private_command(string) and not secret_guard.input_error(string):
+        if not _is_private_command(string):
             super().append_string(string)
 
     def load_history_strings(self):
-        import secret_guard
         for string in super().load_history_strings():
-            if not _is_private_command(string) and not secret_guard.input_error(string):
+            if not _is_private_command(string):
                 yield string
 
 
@@ -7419,12 +7417,6 @@ def _repl_prompt_idle_scope():
         yield
     finally:
         _repl_prompt_idle.clear()
-
-
-def _park_prompt_text(text: str) -> None:
-    """Pre-fill the next prompt with `text`."""
-    global _pending_prompt_default
-    _pending_prompt_default = text
 
 
 def _interrupt_prompt_keeping_draft() -> None:
@@ -10831,22 +10823,6 @@ def _call_backend_stream_impl(
         return {"reply": "Auxiliary AI is off. Run /model aux on to enable it.",
                 "tool_calls": [], "done": True, "error": True,
                 "code": "aux_disabled"}
-    import secret_guard
-    if messages is None:
-        # Legacy mode only: here `message` is the user's own turn, so gate
-        # it before transport (defense in depth; the input gates already
-        # checked it). In thread mode the user turn was gated at admission
-        # (REPL / agent_loop input checks), and `message`, `history` and
-        # `messages` also carry the system prompt and tool results, which
-        # are NOT user input. Credential-shaped strings in content the
-        # agent itself read or produced (a config dump, a token field in
-        # JSON) must not brick the session: an earlier version scanned the
-        # whole payload here, so one such string in the history blocked
-        # every later send, including /continue and plain questions.
-        _secret_error = secret_guard.send_error(message)
-        if _secret_error:
-            return {"reply": _secret_error, "tool_calls": [], "done": True,
-                    "error": True, "code": "sensitive_input"}
     backend_profile = get_backend_profile()
     backend_url = backend_profile.base_url
 
@@ -12127,12 +12103,6 @@ class AgentRegistry:
         content = payload.get("message", "")
         if not isinstance(content, str):
             self._push_final(req_id, "fail", "'message' must be a string")
-            return
-
-        import secret_guard
-        error = secret_guard.input_error(content)
-        if error:
-            self._push_final(req_id, "fail", error)
             return
 
         console.print(Panel(
@@ -28130,11 +28100,6 @@ def _queue_supplementary(target_queue: queue.Queue, line: str,
     line = str(line or "").strip()
     if not line:
         return False
-    import secret_guard
-    error = secret_guard.input_error(line)
-    if error:
-        console.print(error, style="yellow", markup=False)
-        return False
     if source == "local" and line.startswith("@"):
         handled, rest = _route_at_agent(line)
         if handled:
@@ -29820,13 +29785,6 @@ def _run_execute_mode(task: str, session: dict, depth: int, session_id: str = No
     prints the result to stdout, and returns the exit code. Local subagents run
     in-process; this entry point remains for scripts, CI, and external callers.
     """
-    import secret_guard
-    error = secret_guard.input_error(task)
-    if error:
-        console.print(error, style="yellow", markup=False)
-        if report is not None:
-            report.update(success=False, result="", error=error)
-        return 1
     # Apply the active mode's auto-approve posture before the loop starts.
     # Interactive sessions reach this through /mode and /auto; --execute never
     # did, so a mode declaring auto_approve="writes" still stopped at the first
@@ -31271,26 +31229,6 @@ def main():
             # is queued, the next iteration will pick it up and process it
             # before setting injected_done.
             continue
-
-        # Gate before echo, event publication, history, session storage or routing.
-        # Local slash commands are handled entirely by the CLI and never cross
-        # a model boundary, so the message-content guard must not block them.
-        # Explicit local credential-management commands use their own private UI.
-        import secret_guard
-        _is_local_slash = (
-            not _is_dialogue and user_input.lstrip().startswith("/"))
-        if (not _is_local_slash
-                and not (_is_password_command(user_input)
-                         or _carries_model_key(user_input))):
-            _secret_error = secret_guard.confirm_error(user_input)
-            if _secret_error:
-                console.print(_secret_error, style="yellow", markup=False)
-                # Put the text back so Enter confirms it (history never keeps it).
-                if _secret_error == secret_guard.CONFIRM and not _is_injected_line:
-                    _park_prompt_text(user_input)
-                if injected_done is not None:
-                    injected_done.set()
-                continue
 
         # `@agent task` hands work to another Agent in the background; the
         # foreground does not move. `@` + the foreground Agent (or an @word

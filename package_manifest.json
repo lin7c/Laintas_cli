@@ -138,8 +138,7 @@
     "retask_view",
     "acp_agent",
     "private_files",
-    "runtime_host",
-    "secret_guard"
+    "runtime_host"
   ],
   "packages": [
     "agent_tools",

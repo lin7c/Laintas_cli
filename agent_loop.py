@@ -3974,10 +3974,6 @@ def finish_primary_run(agent_id: str = "primary", *, reply: str = "",
 
 def queue_primary_message(agent_id: str, message: str) -> tuple[bool, str]:
     """Append input to the currently running primary task."""
-    import secret_guard
-    error = secret_guard.send_error(message)
-    if error:
-        return False, error
     import terminal_link
     if not terminal_link.local_admission_allowed():
         return False, "This terminal is controlled; append instructions from its controller."
@@ -11688,11 +11684,6 @@ def run_agent_loop(
     message_queue: if provided, drained between iterations — supplementary
     messages from the user are injected into the conversation context.
     """
-    import secret_guard
-    error = secret_guard.send_error(original_input)
-    if error:
-        return {"success": False, "msg": error, "state": state,
-                "session": existing_session, "exit_reason": "sensitive_input"}
     def _publish_progress_state(info, live_state, phase="working"):
         _publish_live_state(info, live_state)
         if progress_cb is not None:
