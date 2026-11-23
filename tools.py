@@ -3576,6 +3576,21 @@ def _resolve_backend_profile():
     return backend_profiles, profile
 
 
+def _record_media_usage(kind: str, model: str, billing, profile) -> None:
+    """Put a generation in the local /usage ledger (and ai-pow's `model.usage`
+    stream). Only the chat lane used to be recorded, so a session that made
+    images showed none of what they cost."""
+    try:
+        import usage_tracker
+        usage_tracker.record_billing(
+            kind=kind, model=str(model or ""), billing=billing,
+            official=bool(getattr(profile, "sends_laintas_credentials", False)),
+            backend_kind=str(getattr(profile, "kind", "") or ""),
+            purpose="tool")
+    except Exception:
+        pass
+
+
 def _bi_media_generate_image(params: dict, ctx: ToolCtx) -> dict:
     """Generate an image from a text prompt via the gateway."""
     prompt = (params.get("prompt") or "").strip()
@@ -3607,6 +3622,7 @@ def _bi_media_generate_image(params: dict, ctx: ToolCtx) -> dict:
     images = [u for u in (data.get("images") or []) if u]
     if not images:
         return {"ok": False, "error": "no image in response"}
+    _record_media_usage("image", data.get("model", ""), data.get("billing"), profile)
     return {"ok": True, "result": {
         "url": images[0],
         "model": data.get("model", ""),
@@ -3662,6 +3678,8 @@ def _bi_media_generate_video(params: dict, ctx: ToolCtx) -> dict:
         except (requests.RequestException, ValueError):
             continue  # a dropped poll is not a failed render
         if status.get("status") == "succeeded" and status.get("videoUrl"):
+            _record_media_usage("video", status.get("model", ""),
+                                status.get("billing"), profile)
             return {"ok": True, "result": {
                 "url": status["videoUrl"],
                 "model": status.get("model", ""),

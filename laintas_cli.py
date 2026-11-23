@@ -7027,10 +7027,7 @@ def _session_token_totals() -> tuple[int, int]:
     """Return (prompt_tokens, completion_tokens) for this process session."""
     try:
         import usage_tracker as _ut
-        with _ut._LOCK:
-            total_in = sum(r.get("in", 0) for r in _ut._SESSION)
-            total_out = sum(r.get("out", 0) for r in _ut._SESSION)
-        return total_in, total_out
+        return _ut.session_totals()
     except Exception:
         return 0, 0
 
@@ -8038,8 +8035,9 @@ def _model_supply_label(provider_id: str) -> str:
     Issues presets ("issues") are "Issues" — none of those is third-party
     supply.
     """
-    if provider_id == "laintas":
-        return "Laintas Supply"
+    if provider_id in ("laintas", "laintas-model"):
+        # Models Laintas deploys on rented compute (the gateway's own group).
+        return "laintas-model"
     if provider_id == "my-keys":
         return "Activated"
     if provider_id == "my-devices":
@@ -11413,19 +11411,25 @@ def _call_backend_stream_impl(
         # selected by the gateway; use that for accurate per-model accounting.
         # A backend-echoed "auto" is not a real model name, so skip it.
         _usage_model = (streamed_model if streamed_model not in ("", "auto") else "") or selected_model
+        # The record also travels back on the response (`_usage`), so the
+        # agent loop can charge the calling agent even when the backend sent
+        # no `_billing` and the counts are estimates.
+        _usage_rec = None
+        _usage_purpose = task_kind or "agent"
         if billing_info:
-            usage_tracker.record(
+            _usage_rec = usage_tracker.record(
                 model=_usage_model,
                 prompt_tokens=(billing_info or {}).get("promptTokens", 0),
                 cached_prompt_tokens=(billing_info or {}).get("cachedPromptTokens", 0),
                 completion_tokens=_completion_tokens,
-                cost_cents=(billing_info or {}).get("costCents", 0),
                 official=bool(billing_info.get("official")),
                 backend_kind=backend_profile.kind,
                 truncated=_truncated_turn,
+                purpose=_usage_purpose,
+                **usage_tracker.billing_fields(billing_info),
             )
         elif accumulated:
-            usage_tracker.record(
+            _usage_rec = usage_tracker.record(
                 model=_usage_model,
                 prompt_tokens=usage_tracker.estimate_tokens(
                     json.dumps(payload, ensure_ascii=False)),
@@ -11434,6 +11438,7 @@ def _call_backend_stream_impl(
                 backend_kind=backend_profile.kind,
                 estimated=True,
                 truncated=_truncated_turn,
+                purpose=_usage_purpose,
             )
 
         # Update the REPL status bar with the model used this call.
@@ -11509,6 +11514,7 @@ def _call_backend_stream_impl(
                     "_served_model": _usage_model,
                     "_reasoning_details": provider_reasoning,
                     "_billing": billing_info,
+                    "_usage": _usage_rec,
                     "_budget": budget_info,
                     "_diag_events": _diag_events + (
                         ["truncated_native_tool_calls_partially_kept"]
@@ -11527,6 +11533,7 @@ def _call_backend_stream_impl(
                 "_served_model": _usage_model,
                 "_reasoning_details": provider_reasoning,
                 "_billing": billing_info,
+                "_usage": _usage_rec,
                 "_budget": budget_info,
                 "_diag_events": _diag_events + ["parsed_native_tool_calls"],
             }
@@ -11552,6 +11559,7 @@ def _call_backend_stream_impl(
                     "_served_model": _usage_model,
                     "_reasoning_details": provider_reasoning,
                     "_billing": billing_info,
+                    "_usage": _usage_rec,
                     "_budget": budget_info,
                     "_diag_events": _diag_events + ["truncated_tagged_tool_calls_dropped"],
                 }
@@ -11566,6 +11574,7 @@ def _call_backend_stream_impl(
                 "_served_model": _usage_model,
                 "_reasoning_details": provider_reasoning,
                 "_billing": billing_info,
+                "_usage": _usage_rec,
                 "_budget": budget_info,
                 "_diag_events": _diag_events + ["parsed_tagged_tool_calls"],
             }
@@ -11587,6 +11596,7 @@ def _call_backend_stream_impl(
             "_served_model": _usage_model,
             "_reasoning_details": provider_reasoning,
             "_billing": billing_info,
+            "_usage": _usage_rec,
             "_budget": budget_info,
             "_diag_events": _diag_events,
         }
@@ -26193,6 +26203,19 @@ def _cmd_extensions(parts: list, session: dict) -> None:
                           Text(entry['scope']), Text(str(entry.get('source', ''))),
                           Text(entry['description']))
         console.print(table)
+        # Event handlers fail silently by design (they must never break the
+        # host), so a broken or slow observer is reported here instead.
+        for owner, health in sorted(
+                extension_runtime.get_runtime().observer_health().items()):
+            notes = []
+            if health.get("errors"):
+                notes.append(f"{health['errors']} event handler error(s), last: "
+                             f"{health.get('last_error', '')}")
+            if health.get("slow"):
+                notes.append(f"{health['slow']} slow event handler call(s), "
+                             f"longest {health.get('max_ms', 0):.0f} ms")
+            if notes:
+                console.print(Text(f"{owner}: " + "; ".join(notes), style="yellow"))
         console.print("[dim]/extensions info <name> for commands and source details.[/dim]")
         return
 

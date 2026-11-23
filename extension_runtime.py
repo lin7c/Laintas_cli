@@ -25,6 +25,7 @@ import json
 import re
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -183,9 +184,17 @@ def _lab_owned(manifest_path: Path) -> bool:
 #: tool.result      name, call_id, ok, session_id, run_id
 #: tool.batch_end   one round of tool calls finished: session_id, run_id
 #: model.usage      the usage_tracker record (model, in, out, cachedIn,
-#:                  costCents, official, backend, estimated, ...)
+#:                  costCents, official, backend, estimated, ...; from v2
+#:                  also kind, purpose, reasoning, cacheWrite, credits,
+#:                  funding, txId, session_id, run_id, agent_id). costCents
+#:                  is null when another party was billed (organization)
+#:                  and 0 when a membership paid in credits instead.
 #: agent.spawn      agent_id, parent_agent_id
 #: skill.used       name, basis
+#: An observer that takes longer than this delays the host thread that raised
+#: the event (often the model call itself); it is counted, not stopped.
+OBSERVER_SLOW_MS = 50.0
+
 OBSERVABLE_EVENTS: frozenset = frozenset({
     "turn.start", "turn.end", "assistant.reply", "tool.call", "tool.result",
     "tool.batch_end", "model.usage", "agent.spawn", "skill.used",
@@ -457,6 +466,10 @@ class ExtensionRuntime:
         # so `emit` iterates a snapshot without taking the lock.
         self._observers: dict[str, tuple[tuple[str, Callable], ...]] = {}
         self._capabilities: dict[str, frozenset] = {}
+        # {owner: {"errors", "last_error", "slow", "max_ms"}} -- observers run
+        # on the host's own threads and their failures are swallowed, so this
+        # is the only place a broken or slow handler shows up.
+        self._observer_health: dict[str, dict] = {}
         self._tool_prefixes: dict[str, str] = {}
         self._console: Any = None
         self._backend = BackendGateway()
@@ -559,11 +572,32 @@ class ExtensionRuntime:
         handlers = self._observers.get(event)
         if not handlers:
             return
-        for _owner, handler in handlers:
+        for owner, handler in handlers:
+            started = time.monotonic()
+            error = ""
             try:
                 handler(dict(payload))
-            except Exception:
-                pass
+            except Exception as exc:
+                error = f"{event}: {type(exc).__name__}: {exc}"[:300]
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            if error or elapsed_ms >= OBSERVER_SLOW_MS:
+                self._note_observer(owner, error, elapsed_ms)
+
+    def _note_observer(self, owner: str, error: str, elapsed_ms: float) -> None:
+        with self._lock:
+            health = self._observer_health.setdefault(
+                owner, {"errors": 0, "last_error": "", "slow": 0, "max_ms": 0.0})
+            if error:
+                health["errors"] += 1
+                health["last_error"] = error
+            if elapsed_ms >= OBSERVER_SLOW_MS:
+                health["slow"] += 1
+            health["max_ms"] = max(health["max_ms"], round(elapsed_ms, 1))
+
+    def observer_health(self) -> dict[str, dict]:
+        """Per-extension event-handler failures and slow calls this session."""
+        with self._lock:
+            return {owner: dict(item) for owner, item in self._observer_health.items()}
 
     def _manifest(self, directory: Path) -> dict:
         path = directory / "extension.json"

@@ -414,10 +414,12 @@ def build_request(route: DirectRoute, payload: dict) -> tuple[str, dict, dict]:
 def usage_billing(usage: dict) -> dict:
     """An OpenAI `usage` block in the shape the gateway's `_billing` event has."""
     details = usage.get("prompt_tokens_details") or {}
+    out_details = usage.get("completion_tokens_details") or {}
     return {
         "promptTokens": int(usage.get("prompt_tokens") or 0),
         "completionTokens": int(usage.get("completion_tokens") or 0),
         "cachedPromptTokens": int(details.get("cached_tokens") or 0),
+        "reasoningTokens": int(out_details.get("reasoning_tokens") or 0),
         "costCents": 0,
         "billingDomain": "direct",
         "official": False,

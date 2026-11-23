@@ -151,6 +151,12 @@ def save_agent_state(agent: "AgentInfo") -> bool:
         "active_assignment": _serialize_assignment(
             getattr(agent, "active_assignment", None)),
         "created_at": getattr(agent, "created_at", time.time()),
+        # Lifetime token counters, so /agents still shows what an employee
+        # has spent after a restart.
+        "usage_tokens": int(getattr(agent, "usage_tokens", 0) or 0),
+        "usage_prompt_tokens": int(getattr(agent, "usage_prompt_tokens", 0) or 0),
+        "usage_completion_tokens": int(
+            getattr(agent, "usage_completion_tokens", 0) or 0),
         "last_saved": time.time(),
     }
 
@@ -255,6 +261,13 @@ def apply_persisted_state(agent: "AgentInfo", data: dict) -> None:
             agent.depth = saved_depth
     except (TypeError, ValueError):
         pass
+    for key in ("usage_tokens", "usage_prompt_tokens", "usage_completion_tokens"):
+        try:
+            saved = int(data.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if saved > 0 and hasattr(agent, key):
+            setattr(agent, key, saved)
     deployment = data.get("deployment_terminal") or data.get("stationed_terminal")
     if not data.get("schema_version") and data.get("role") == "deployed":
         # Pre-v2 files conflated membership and deployment. Only a legacy
@@ -302,13 +315,16 @@ def apply_persisted_state(agent: "AgentInfo", data: dict) -> None:
                               policy_data.get("denied_tools", [])],
             ),
         )
-        active_data = data.get("active_assignment")
-        if isinstance(active_data, dict) and active_data.get("id"):
-            # A process restart cannot resume the old thread automatically.
-            active_data = dict(active_data)
-            active_data["status"] = "interrupted"
-            agent.assignment_history.append(active_data)
-            agent.active_assignment = None
+    # Independent of the profile: an agent saved without one (an empty
+    # profile serialises as {}) could still be mid-assignment, and nesting this
+    # under the profile branch dropped that assignment without a trace.
+    active_data = data.get("active_assignment")
+    if isinstance(active_data, dict) and active_data.get("id"):
+        # A process restart cannot resume the old thread automatically.
+        active_data = dict(active_data)
+        active_data["status"] = "interrupted"
+        agent.assignment_history.append(active_data)
+        agent.active_assignment = None
     if isinstance(data.get("assignment_history"), list):
         existing_ids = {
             str(item.get("id")) for item in agent.assignment_history

@@ -1192,7 +1192,7 @@ class SlashRegistryTests(unittest.TestCase):
         self.assertEqual(
             [(row["id"], row["provider"], row["supply"]) for row in rows],
             [
-                ("self-model", "laintas", "Laintas Supply"),
+                ("self-model", "laintas", "laintas-model"),
                 ("vendor-model", "openrouter", "Third-party Supply"),
                 ("custom-model", "custom-account", "Third-party Supply"),
                 ("hosted-model", "my-keys", "Activated"),

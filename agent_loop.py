@@ -3454,6 +3454,8 @@ class AgentInfo:
     concurrency_limit: int = 0               # group-local cap; global scheduler still applies
     route_reason: str = ""
     usage_tokens: int = 0                    # provider-reported tokens for this runtime identity
+    usage_prompt_tokens: int = 0             # the input share of usage_tokens
+    usage_completion_tokens: int = 0         # the output share of usage_tokens
     result: str = ""                          # final result text (set by mark_agent_finished)
     error: str = ""                           # error text if status=error
     # ── Contract (agent_contract) ──────────────────────────────────────
@@ -3992,8 +3994,12 @@ def queue_primary_message(agent_id: str, message: str) -> tuple[bool, str]:
 
 
 def get_all_agents() -> list:
+    # Primary first, then by creation. `created_at` alone put an employee
+    # restored from disk (it keeps its original hire time) ahead of the
+    # primary agent created this session.
     with _registry_lock:
-        return sorted(_agent_registry.values(), key=lambda a: a.created_at)
+        return sorted(_agent_registry.values(),
+                      key=lambda a: (a.role != "primary", a.created_at, a.id))
 
 
 def get_pool_agents() -> list:
@@ -5563,7 +5569,8 @@ def spawn_subagent(parent_id: str, task: str, deps,
                 # provider-reported token usage for this child.
                 "finish_reason": (str(result.get("exit_reason") or "")
                                   if isinstance(result, dict) else ""),
-                "completion_tokens": int(getattr(child, "usage_tokens", 0) or 0),
+                "completion_tokens": int(getattr(child, "usage_completion_tokens", 0) or 0),
+                "total_tokens": int(getattr(child, "usage_tokens", 0) or 0),
                 "silent_fail_count": int(child.state.get("_silent_fail_count", 0) or 0),
             }
             if _loop_error:
@@ -11564,10 +11571,14 @@ def _observed_turn(function):
     def wrapped(*args, **kwargs):
         depth = _current_turn_depth() + 1
         _turn_depth.value = depth
+        # A nested loop (a child agent run inline) attributes its own calls;
+        # the caller's attribution comes back when it returns.
+        usage_context = usage_tracker.current_context()
         try:
             return function(*args, **kwargs)
         finally:
             _turn_depth.value = depth - 1
+            usage_tracker.replace_context(usage_context)
             extension_runtime.emit("turn.end", depth=depth)
     return wrapped
 
@@ -11981,6 +11992,8 @@ def run_agent_loop(
         and not state.get("_suppress_terminal_render")
         and getattr(deps.console, "render_terminal", True) is not False
     )
+    usage_tracker.replace_context({"session_id": _session_id, "run_id": _run_id,
+                                   "agent_id": str(agent_id or "main")})
     try:
         extension_runtime.emit(
             "turn.start", session_id=_session_id, run_id=_run_id,
@@ -14058,16 +14071,26 @@ def run_agent_loop(
         debug_entry.billing = response.get("_billing", {})
         if agent_id:
             reported = response.get("_billing") or {}
+            # A backend that sends no `_billing` (an unmetered or external
+            # provider) still had its call recorded locally with estimated
+            # counts; charge the agent those rather than nothing.
+            local = response.get("_usage") or {}
             try:
-                spent = int(reported.get("totalTokens") or
-                            (int(reported.get("promptTokens") or 0)
-                             + int(reported.get("completionTokens") or 0)))
+                if reported:
+                    spent_in = int(reported.get("promptTokens") or 0)
+                    spent_out = int(reported.get("completionTokens") or 0)
+                else:
+                    spent_in = int(local.get("in") or 0)
+                    spent_out = int(local.get("out") or 0)
+                spent = int(reported.get("totalTokens") or (spent_in + spent_out))
             except (ValueError, TypeError):
-                spent = 0
+                spent_in = spent_out = spent = 0
             with _registry_lock:
                 billed_agent = _agent_registry.get(agent_id)
                 if billed_agent is not None:
                     billed_agent.usage_tokens += max(0, spent)
+                    billed_agent.usage_prompt_tokens += max(0, spent_in)
+                    billed_agent.usage_completion_tokens += max(0, spent_out)
                 billed_branches = set()
                 visited = set()
                 while billed_agent is not None and billed_agent.id not in visited:
