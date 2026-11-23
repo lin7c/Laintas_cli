@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 
-const FALLBACK = 'v2.1.0';
+const FALLBACK = 'v2.2.0';
 let latest;
 
 // Header and download packages share one request, including in StrictMode.
