@@ -184,6 +184,15 @@ _DEFAULT_CONFIG = {
     # Canonical model id only: the gateway resolves duplicate upstreams using
     # supplier priority/failover. Never pin compaction to OpenRouter here.
     "aux_provider": "",
+    # Models for the media generation tools (media.generate_image and
+    # media.generate_video), chosen with /model image and /model video.
+    # Empty = the gateway's own default for that kind. The enabled flags are
+    # the real off switch: a disabled kind's tool leaves the advertised tool
+    # list entirely, not just its prompt wording.
+    "image_enabled": True,
+    "image_model": "",
+    "video_enabled": True,
+    "video_model": "",
     # Thinking level for the review pass of compaction. `auto` leaves it to the
     # backend, which treats review as a judgement call and thinks at `medium`:
     # measured 2026-09-15 that is 4k-11k reasoning tokens and 1.5-4 minutes per
@@ -991,6 +1000,10 @@ _RUNTIME_CONFIG_DESCRIPTIONS = {
     "aux_enabled": "Allow auxiliary AI requests; off keeps local context pruning and pauses AI compaction, critic, intent, memory consolidation and progress reports",
     "aux_model": "Model for compaction / critic / memory-extraction (empty = use the main model)",
     "aux_provider": "Provider paired with aux_model",
+    "image_enabled": "Allow image generation (media.generate_image); off removes the tool from the advertised list",
+    "image_model": "Model for image generation (empty = gateway default)",
+    "video_enabled": "Allow video generation (media.generate_video); off removes the tool from the advertised list",
+    "video_model": "Model for video generation (empty = gateway default)",
     "compact_review_effort": "Thinking level for the summary-review step of context compaction (default none = no thinking, fastest compaction; auto/low/medium/high/max re-enable it — costs output tokens)",
     "max_loops": "Maximum agent-loop iterations per task",
     "max_tokens": "Output-token cap to request (0 = whatever the model and window allow)",
@@ -8035,6 +8048,36 @@ def aux_model_override() -> tuple[str, str]:
     return model, ""
 
 
+MEDIA_TOOL_BY_KIND = {
+    "image": "media.generate_image",
+    "video": "media.generate_video",
+}
+
+
+def media_generation_enabled(kind: str) -> bool:
+    """Whether one media generation kind (image/video) may run at all.
+
+    The two kinds are separate axes, mirroring /model image and /model
+    video: turning image generation off must not stop video, or the reverse.
+    """
+    if kind not in MEDIA_TOOL_BY_KIND:
+        return False
+    return bool(get_runtime_config(f"{kind}_enabled"))
+
+
+def media_model_override(kind: str) -> str:
+    """The model chosen for one media kind, or "" for the gateway default."""
+    if kind not in MEDIA_TOOL_BY_KIND:
+        return ""
+    return str(get_runtime_config(f"{kind}_model") or "").strip()
+
+
+def disabled_media_tool_names() -> set[str]:
+    """Tool names currently switched off via /model image|video."""
+    return {tool for kind, tool in MEDIA_TOOL_BY_KIND.items()
+            if not media_generation_enabled(kind)}
+
+
 def _aux_backend_reply(deps, session, *, system_prompt: str, messages: list,
                        task_kind: str, trajectory_id: str = "", cwd: str = "",
                        model: Optional[str] = None,
@@ -11228,7 +11271,7 @@ def _visible_tool_names_for_task(
             or plan_mode.is_plan_mode()
             or state.get("_prompt_lab_branch")
             or state.get("_evolution_lab_branch")):
-        return set(authorized_names)
+        return set(authorized_names) - disabled_media_tool_names()
     routed = context_router.stable_visible_names(
         query, tools_mod.get_registry().list(), state)
     # An open checklist means the person is mid-way through work the agent
@@ -11243,7 +11286,10 @@ def _visible_tool_names_for_task(
     # never route to by keyword.
     if state.get("_direct_commands"):
         routed |= {"terminal.read", "terminal.scroll"}
-    return set(authorized_names) & routed
+    # A media kind switched off with /model image|video loses its tool here,
+    # on every path above: this is the one place the advertised list is
+    # decided, so filtering here is removal, not a prompt-level suggestion.
+    return (set(authorized_names) & routed) - disabled_media_tool_names()
 
 
 def _prepare_tool_call(tc: dict, idx: int, loop: int) -> Optional[dict]:

@@ -1761,6 +1761,7 @@ from agent_loop import (
     run_agent_loop, LoopDeps, compaction_status_text,
     captured_system_prompt, lab_prompt_fallback,
     AUX_TASK_KINDS, aux_calls_enabled, aux_model_override, resolve_agent_model,
+    media_generation_enabled, media_model_override,
     register_terminal, unregister_terminal,
     get_terminal, get_all_terminals, close_all_terminals,
     rename_terminal,
@@ -4199,10 +4200,12 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     )),
     CommandSpec("/work", "Inspect or resume unified WorkGraph state", "Planning & Tasks", "/work [status|list|resume|history]", subcommands=("status", "list", "resume", "history")),
     CommandSpec("/workflow", "Run a multi-phase workflow", "Planning & Tasks", "/workflow {start|status|advance|approve|end|list}", subcommands=("start", "status", "advance", "approve", "end", "list")),
-    CommandSpec("/model", "Select the chat model: backend models or your own provider key", "Config & Tools", "/model [terminal|@agent] [id|reset] | aux [off|on|status|id|reset] | routing [everyday|complex <id|off>|candidates <id,…|all>|reset] | route [<route> [model] [window]|list] | add [provider] [key|$VAR] [model] [name] | remove <route>",
-        subcommands=("aux", "routing", "reset", "clear", "default", "route", "add", "remove"),
+    CommandSpec("/model", "Select the chat model: backend models or your own provider key", "Config & Tools", "/model [terminal|@agent] [id|reset] | aux [off|on|status|id|reset] | image [off|on|status|id|reset] | video [off|on|status|id|reset] | routing [everyday|complex <id|off>|candidates <id,…|all>|reset] | route [<route> [model] [window]|list] | add [provider] [key|$VAR] [model] [name] | remove <route>",
+        subcommands=("aux", "image", "video", "routing", "reset", "clear", "default", "route", "add", "remove"),
         completion_descriptions=(
             ("aux", "Enable, disable or select the model for auxiliary AI calls"),
+            ("image", "Enable, disable or select the default image generation model"),
+            ("video", "Enable, disable or select the default video generation model"),
             ("routing", "Auto model: which models it may pick, and one for everyday or complex tasks"),
             ("reset", "Clear this terminal's model override (use gateway auto-routing)"),
             ("clear", "Clear this terminal's model override (use gateway auto-routing)"),
@@ -4592,6 +4595,8 @@ _ARG_COMPLETIONS: dict[str, tuple] = {
         # terminals, the `aux` axis and `reset`.
         ((), _terminal_candidates(include_primary=True, stationed_only=True)),
         ((), _static_candidates(("aux", "Pick the compaction/critic/memory model"),
+                                ("image", "Pick the default image generation model, or switch it off"),
+                                ("video", "Pick the default video generation model, or switch it off"),
                                 ("route", "Who serves the chat: the backend or your key"),
                                 ("add", "Add your own provider key"),
                                 ("remove", "Delete a provider route and its key"))),
@@ -4611,6 +4616,16 @@ _ARG_COMPLETIONS: dict[str, tuple] = {
             ("on", "Resume auxiliary AI calls with the saved model"),
             ("status", "Show auxiliary AI state and saved model"),
             ("reset", "Enable auxiliary AI using the terminal's own model"))),
+        (("image",), _static_candidates(
+            ("off", "Stop image generation; keep the selected model for later"),
+            ("on", "Resume image generation with the saved model"),
+            ("status", "Show image generation state and saved model"),
+            ("reset", "Enable image generation with the gateway default model"))),
+        (("video",), _static_candidates(
+            ("off", "Stop video generation; keep the selected model for later"),
+            ("on", "Resume video generation with the saved model"),
+            ("status", "Show video generation state and saved model"),
+            ("reset", "Enable video generation with the gateway default model"))),
         (("routing",), _static_candidates(
             ("everyday", "Model for everyday tasks"),
             ("complex", "Model for complex tasks: design, debugging, refactoring"),
@@ -8366,6 +8381,56 @@ def fetch_available_models(
         _attach_model_tiers(models, data)
         return models, endpoint
 
+    raise RuntimeError(last_error or "No model endpoint responded")
+
+
+def fetch_media_models(
+    session: dict,
+    cancel_event: Optional[threading.Event] = None,
+) -> list[dict]:
+    """Fetch the gateway's media model catalogue (image and video rows).
+
+    The chat fetch above deliberately ignores the ``mediaModels`` field of
+    /api/models: media models are not chat models and must never enter the
+    chat picker. They are advertised separately precisely so a client can
+    offer them on their own axes (/model image, /model video). Returns the
+    raw rows ({id, kind, description, defaultSize, default, device?,
+    local?}); the gateway has already dropped switched-off or unservable
+    models, and orders the rest by grade, then price.
+    """
+    backend_profile = get_backend_profile()
+    headers, cookies = backend_profiles.request_auth(backend_profile, session)
+    endpoints = (
+        "/api/models",
+        "/api/chat/models",
+        "/api/ai/models",
+        "/api/model",
+    )
+    last_error = ""
+    for endpoint in endpoints:
+        if cancel_event is not None and cancel_event.is_set():
+            raise BlockingOperationCancelled("Model fetch cancelled")
+        try:
+            resp = requests.get(
+                f"{backend_profile.base_url}{endpoint}",
+                headers=headers, cookies=cookies,
+                timeout=20, allow_redirects=False)
+        except requests.RequestException as e:
+            last_error = str(e)
+            continue
+        if resp.status_code != 200:
+            last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            continue
+        try:
+            data = resp.json()
+        except ValueError:
+            last_error = f"Non-JSON response from {endpoint}: {resp.text[:200]}"
+            continue
+        rows = data.get("mediaModels") if isinstance(data, dict) else None
+        if isinstance(rows, list):
+            return [row for row in rows
+                    if isinstance(row, dict) and row.get("id") and row.get("kind")]
+        last_error = f"Unexpected response shape from {endpoint}"
     raise RuntimeError(last_error or "No model endpoint responded")
 
 
@@ -14472,6 +14537,8 @@ _SLASH_ARG_RULES: dict[tuple[str, ...], SlashArgRule] = {
     ("/detail",): _arg_rule(2, "/detail [on|off|trace [N]]"),
     ("/detail", "trace"): _arg_rule(2, "/detail trace [N]"),
     ("/model", "aux"): _arg_rule(2, "/model aux [off|on|status|id|reset]"),
+    ("/model", "image"): _arg_rule(2, "/model image [off|on|status|id|reset]"),
+    ("/model", "video"): _arg_rule(2, "/model video [off|on|status|id|reset]"),
     ("/model", "routing"): _arg_rule(
         3, "/model routing [everyday|complex <id|off> | candidates <id,…|all> | reset]"),
     ("/model", "reset"): _arg_rule(1, "/model reset"),
@@ -17123,6 +17190,135 @@ def _cmd_model_aux(args: list, session: dict) -> None:
                       "extraction. The terminal's own model is unchanged.[/dim]")
 
 
+_MEDIA_AXIS_LABELS = {"image": "Image generation", "video": "Video generation"}
+
+
+def _cmd_model_media(kind: str, args: list, session: dict) -> None:
+    """`/model image|video [off|on|status|id|reset]` -- one media axis.
+
+    Mirrors _cmd_model_aux deliberately: the same storage (terminal ui
+    preferences plus runtime config), the same semantics (selecting a model
+    enables the axis, `off` keeps the saved model, `reset` returns to the
+    gateway default), and a picker whose first entry is `off`. The two kinds
+    share nothing else: each has its own enabled flag and its own model.
+    The catalogue comes from /api/models' mediaModels, never from the chat
+    model list.
+    """
+    label = _MEDIA_AXIS_LABELS[kind]
+    enabled_key, model_key = f"{kind}_enabled", f"{kind}_model"
+    current = media_model_override(kind)
+
+    def _apply(**values) -> None:
+        ui = terminal_preferences.get_ui_preferences()
+        ui.update(values)
+        terminal_preferences.update({"ui": ui})
+        for key, value in values.items():
+            set_runtime_config(key, value)
+
+    def _status() -> None:
+        state = "on" if media_generation_enabled(kind) else "off"
+        console.print(f"{label}: [bold]{state}[/bold]; saved model: "
+                      f"[bold]{escape(current or 'gateway default')}[/bold]")
+
+    def _off() -> None:
+        _apply(**{enabled_key: False})
+        console.print(
+            f"[green]{label} off. media.generate_{kind} is no longer offered "
+            f"to the agent and the saved model is kept. "
+            f"Resume with /model {kind} on.[/green]")
+
+    if args and args[0].lower() == "status":
+        _status()
+        return
+    if args and args[0].lower() == "off":
+        _off()
+        return
+    if args and args[0].lower() == "on":
+        _apply(**{enabled_key: True})
+        _status()
+        return
+    if args and args[0].lower() in ("reset", "clear", "default"):
+        _apply(**{enabled_key: True, model_key: ""})
+        console.print(
+            f"[green]{label} model cleared -- the gateway's own default "
+            f"for {kind} will be used.[/green]")
+        return
+    if args:
+        _apply(**{enabled_key: True, model_key: args[0]})
+        console.print(f"[green]{label} model set to: [bold]{args[0]}[/bold][/green]")
+        return
+
+    try:
+        with _safe_status(
+                f"[dim]Fetching available models\u2026 {symbols.BULLET} Esc/Ctrl+C cancel[/dim]"):
+            media = run_cancellable_blocking(
+                lambda cancel: fetch_media_models(session, cancel_event=cancel))
+    except BlockingOperationCancelled:
+        console.print("[dim]Selection cancelled.[/dim]")
+        return
+    except Exception as exc:
+        console.print(f"[red]Failed to fetch models: {exc}[/red]")
+        _status()
+        console.print(f"Usage: /model {kind} [off|on|status|<model-id>|reset]")
+        return
+
+    rows = [row for row in media if row.get("kind") == kind]
+    if not rows:
+        console.print(f"[yellow]No {kind} models are currently offered by the gateway.[/yellow]")
+        _status()
+        return
+    if not sys.stdin.isatty():
+        _status()
+        return
+
+    entries = [{"id": "off", "description": f"Disable {kind} generation"}]
+    for row in rows:
+        notes = []
+        if row.get("default"):
+            notes.append("gateway default")
+        if row.get("device") or row.get("local"):
+            notes.append("your machine \u00b7 free")
+        if row.get("defaultSize"):
+            notes.append(f"default size {row['defaultSize']}")
+        description = str(row.get("description") or "")
+        suffix = " \u00b7 ".join(notes)
+        entries.append({"id": str(row["id"]),
+                        "description": " \u00b7 ".join(p for p in (description, suffix) if p)})
+    current_id = current if media_generation_enabled(kind) else "off"
+    labels, details = [], []
+    sel_idx = 0
+    for i, entry in enumerate(entries):
+        mark = " *" if entry["id"] == current_id else "  "
+        labels.append((f"{mark}[cyan]{escape(entry['id'])}[/cyan]", escape(entry["description"])))
+        details.append(f"Model: {escape(entry['id'])}\n{escape(entry['description'])}"
+                       + ("\n\nCurrently selected." if entry["id"] == current_id else ""))
+        if entry["id"] == current_id:
+            sel_idx = i
+    chosen = select_dialog(
+        labels,
+        title=f"{label} models",
+        full_screen=True,
+        search=True,
+        details=details,
+        confirm_label="Use model",
+        selected_index=sel_idx,
+        hint=(f"{symbols.ARROW_U}{symbols.ARROW_D}/wheel navigate  \u21b5 or click twice "
+              "select  Esc cancel"),
+    )
+    if chosen is None:
+        console.print("[dim]Unchanged.[/dim]")
+        return
+    entry = entries[labels.index(chosen)]
+    if entry["id"] == "off":
+        _off()
+        return
+    _apply(**{enabled_key: True, model_key: entry["id"]})
+    console.print(f"[green]{label} model set to [bold]{entry['id']}[/bold][/green]")
+    if entry["id"] != current:
+        console.print(f"[dim]Applies to media.generate_{kind} only. "
+                      "The terminal's chat model is unchanged.[/dim]")
+
+
 def _cmd_model_agent_base(agent, args: list, session: dict) -> None:
     """``/model @<agent> [id|reset]`` for an Agent with no terminal.
 
@@ -17484,6 +17680,12 @@ def _cmd_model(parts: list, raw_args: str, session: dict) -> None:
     # resolution below rather than pretending "aux" is a terminal name.
     if args and args[0].lower() == "aux":
         _cmd_model_aux(args[1:], session)
+        return
+    # `/model image` and `/model video` are their own axes too: media models
+    # are not chat models and belong to no terminal, so they short-circuit
+    # exactly like aux does.
+    if args and args[0].lower() in ("image", "video"):
+        _cmd_model_media(args[0].lower(), args[1:], session)
         return
     # The auto model's preferences: not a terminal's model either, so the same
     # short-circuit. Not named `auto` — `/model auto` selects the auto model.

@@ -3591,8 +3591,28 @@ def _record_media_usage(kind: str, model: str, billing, profile) -> None:
         pass
 
 
+def _media_axis(kind: str) -> tuple[bool, str]:
+    """(enabled, chosen model) for one media kind, from the runtime config.
+
+    The helpers live in agent_loop, next to the AUX ones; imported lazily for
+    the same circular-import reason as _resolve_backend_profile. Any failure
+    reads as enabled with no chosen model -- the historical behaviour --
+    rather than breaking generation outright.
+    """
+    try:
+        import agent_loop
+        return (agent_loop.media_generation_enabled(kind),
+                agent_loop.media_model_override(kind))
+    except Exception:
+        return True, ""
+
+
 def _bi_media_generate_image(params: dict, ctx: ToolCtx) -> dict:
     """Generate an image from a text prompt via the gateway."""
+    enabled, chosen_model = _media_axis("image")
+    if not enabled:
+        return {"ok": False, "error": "Image generation is off. "
+                "Run /model image on to enable it."}
     prompt = (params.get("prompt") or "").strip()
     if not prompt:
         return {"ok": False, "error": "missing 'prompt'"}
@@ -3605,6 +3625,12 @@ def _bi_media_generate_image(params: dict, ctx: ToolCtx) -> dict:
     body = {"prompt": prompt}
     if params.get("size"):
         body["size"] = str(params["size"])
+    # Only when the user picked one with /model image: an unset choice must
+    # stay unset so the gateway applies its own default, and a set one is
+    # sent as-is -- the gateway refuses an unknown or switched-off model and
+    # that refusal is reported, never silently re-routed to the default.
+    if chosen_model:
+        body["model"] = chosen_model
     headers, cookies = backend_profiles.request_auth(profile, ctx.session)
     try:
         resp = requests.post(f"{profile.base_url}/api/generate-image", json=body,
@@ -3638,6 +3664,10 @@ def _bi_media_generate_video(params: dict, ctx: ToolCtx) -> dict:
     timeout the task id is returned rather than swallowed — the render is still
     running server-side and will finish.
     """
+    enabled, chosen_model = _media_axis("video")
+    if not enabled:
+        return {"ok": False, "error": "Video generation is off. "
+                "Run /model video on to enable it."}
     prompt = (params.get("prompt") or "").strip()
     if not prompt:
         return {"ok": False, "error": "missing 'prompt'"}
@@ -3648,6 +3678,8 @@ def _bi_media_generate_video(params: dict, ctx: ToolCtx) -> dict:
         return {"ok": False, "error": f"missing dependency: {exc}"}
 
     body = {"prompt": prompt}
+    if chosen_model:
+        body["model"] = chosen_model
     for key in ("duration", "resolution", "ratio", "image"):
         if params.get(key) is not None:
             body[key] = params[key]
