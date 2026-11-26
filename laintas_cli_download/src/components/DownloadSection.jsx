@@ -33,12 +33,12 @@ const PLATFORM_INDEX = { linux: 0, mac: 1, windows: 2 };
 // Direct packages, for people who do not pipe scripts into their shell.
 // The rolling release pointer owns version and asset metadata.
 const PACKAGES = [
-  { id: 'linux-amd64', icon: Package, file: 'laintas-cli_linux_amd64.tar.gz', names: { zh: 'Linux · x86_64', en: 'Linux · x86_64' }, details: { zh: 'tar.gz · glibc 64 位', en: 'tar.gz · 64-bit glibc' } },
-  { id: 'linux-arm64', icon: Package, file: 'laintas-cli_linux_arm64.tar.gz', names: { zh: 'Linux · arm64', en: 'Linux · arm64' }, details: { zh: 'tar.gz · glibc 64 位', en: 'tar.gz · 64-bit glibc' } },
-  { id: 'mac-arm', icon: Laptop, file: 'laintas-cli_darwin_arm64.tar.gz', names: { zh: 'macOS · Apple Silicon', en: 'macOS · Apple Silicon' }, details: { zh: 'tar.gz', en: 'tar.gz' } },
-  { id: 'mac-intel', icon: Laptop, file: 'laintas-cli_darwin_amd64.tar.gz', names: { zh: 'macOS · Intel', en: 'macOS · Intel' }, details: { zh: 'tar.gz', en: 'tar.gz' } },
-  { id: 'windows', icon: Monitor, href: WINDOWS_DOWNLOAD, names: { zh: 'laintas-cli-windows', en: 'laintas-cli-windows' }, details: { zh: '安装程序 · 自带终端窗口，无需 WSL', en: 'Installer · its own terminal window, no WSL' } },
-  { id: 'source', icon: Code2, file: 'laintas-cli_source.zip', names: { zh: '源码包', en: 'Source package' }, details: { zh: 'Python 3.10+ · 审计与二次开发', en: 'Python 3.10+ · audit and extend' } },
+  { id: 'linux-amd64', icon: Package, file: 'laintas-cli_linux_amd64.tar.gz', names: { zh: 'Linux · x86_64', en: 'Linux · x86_64' } },
+  { id: 'linux-arm64', icon: Package, file: 'laintas-cli_linux_arm64.tar.gz', names: { zh: 'Linux · arm64', en: 'Linux · arm64' } },
+  { id: 'mac-arm', icon: Laptop, file: 'laintas-cli_darwin_arm64.tar.gz', names: { zh: 'macOS · Apple Silicon', en: 'macOS · Apple Silicon' } },
+  { id: 'mac-intel', icon: Laptop, file: 'laintas-cli_darwin_amd64.tar.gz', names: { zh: 'macOS · Intel', en: 'macOS · Intel' } },
+  { id: 'windows', icon: Monitor, href: WINDOWS_DOWNLOAD, names: { zh: 'Windows 桌面版', en: 'Windows desktop' }, tag: { zh: '无需 WSL', en: 'No WSL' } },
+  { id: 'source', icon: Code2, file: 'laintas-cli_source.zip', names: { zh: '源码包', en: 'Source package' } },
 ];
 
 // Capability icons, in the order of COPY[lang].caps.
@@ -108,14 +108,13 @@ const COPY = {
       ['Laintas 账户', '余额、订阅、用量与订单，所有产品在同一处查看。', 'https://laintas.com/dashboard'],
     ],
 
-    downloadTitle: ['现在，', '交给你的终端。'],
-    downloadIntro: '推荐一行命令安装；也可以直接下载安装包，或拿源码包审计与二次开发。',
+    downloadHeading: '下载',
     platformLabel: '选择安装平台', linux: 'Linux', mac: 'macOS', windows: 'Windows', copied: '已复制', copy: '复制',
     windowsAlt: '或直接下载安装包',
-    startSteps: [['运行安装命令', '自动识别架构并完成安装'], ['启动并登录', '输入 laintas-cli，按提示登录 Laintas 账号'], ['说出第一个任务', '比如“看看这个项目怎么跑起来”']],
-    windowsSteps: [['安装', '在 PowerShell 执行指令，或直接下载安装包；无需管理员权限'], ['启动并登录', '从开始菜单打开 laintas-cli-windows，登录页会在默认浏览器里打开'], ['开始对话', '在默认工作区给 agent 一个任务']],
-    packages: '安装包', download: '下载', checksums: '全部文件的 SHA256 校验和',
-    requirements: 'Linux 需 64 位 glibc 系统；Mac 支持 Apple Silicon 和 Intel，暂不包含 Helpwow Kernel；laintas-cli-windows 需 x86_64、Windows 10/11 和 WebView2，安装器可联网安装 WebView2；无需 WSL。',
+    afterInstall: '装好后运行 laintas-cli，登录即可。',
+    afterInstallWindows: '装好后从开始菜单打开 laintas-cli-windows，登录即可。',
+    packages: '安装包', download: '下载', checksums: 'SHA256',
+    requirementsLink: '系统要求',
   },
   en: {
     title: ['Your shell, as usual.', 'Plus an agent.'],
@@ -169,14 +168,13 @@ const COPY = {
       ['Laintas account', 'Balance, subscription, usage and orders for every product, in one place.', 'https://laintas.com/dashboard'],
     ],
 
-    downloadTitle: ['Now,', 'hand it to your terminal.'],
-    downloadIntro: 'The one-line installer is recommended. You can also grab a package directly, or audit and extend the source.',
+    downloadHeading: 'Download',
     platformLabel: 'Select install platform', linux: 'Linux', mac: 'macOS', windows: 'Windows', copied: 'Copied', copy: 'Copy',
     windowsAlt: 'Or download the installer',
-    startSteps: [['Run the installer', 'It detects your architecture and installs laintas-cli'], ['Start and sign in', 'Type laintas-cli and sign in to your Laintas account'], ['Give it a first task', 'Try “figure out how to run this project”']],
-    windowsSteps: [['Install', 'Run the command in PowerShell, or download the installer; no administrator rights needed'], ['Launch and sign in', 'Open laintas-cli-windows from Start; the sign-in page opens in your default browser'], ['Start a conversation', 'Give the agent a task in the default workspace']],
-    packages: 'Packages', download: 'Download', checksums: 'SHA256 checksums for every file',
-    requirements: 'Linux needs a 64-bit glibc system. Mac supports Apple Silicon and Intel without Helpwow Kernel. laintas-cli-windows needs Windows 10/11 x86_64 and WebView2; the installer can download WebView2. WSL is not needed.',
+    afterInstall: 'Run laintas-cli once it is installed, and sign in.',
+    afterInstallWindows: 'Then open laintas-cli-windows from Start and sign in.',
+    packages: 'Packages', download: 'Download', checksums: 'SHA256',
+    requirementsLink: 'System requirements',
   },
 };
 
@@ -327,26 +325,24 @@ export default function DownloadSection() {
 
         {/* ── Download ──────────────────────────────────────────────────── */}
         <section id="download" className="hp-section">
-          <ChapterHead title={c.downloadTitle} intro={c.downloadIntro} />
-          <InstallBar platform={installPlatform} setPlatform={setInstallPlatform} c={c} windowsRelease={windowsRelease} lang={lang} />
-          <ol className="st-start">
-            {(installPlatform === 'windows' ? c.windowsSteps : c.startSteps).map(([title, detail], index) => (
-              <li key={title}><span>0{index + 1}</span><strong>{title}</strong><p>{detail}</p></li>
-            ))}
-          </ol>
+          <h2 className="st-display st-download-title">{c.downloadHeading}</h2>
+          <InstallBar minimal platform={installPlatform} setPlatform={setInstallPlatform} c={c} windowsRelease={windowsRelease} lang={lang} />
+          <p className="st-note st-after-install">{installPlatform === 'windows' ? c.afterInstallWindows : c.afterInstall}</p>
           <p className="st-eco-title">{c.packages}</p>
           <div className="st-packages">
-            {PACKAGES.map(({ id, icon: Icon, file, href, names, details }) => (
+            {PACKAGES.map(({ id, icon: Icon, file, href, names, tag }) => (
               <a href={id === 'windows' ? windowsRelease.installer : href || `${RELEASE_BASE}/${file}`} key={id}>
                 <Icon size={18} strokeWidth={1.6} />
-                <span><strong>{names[lang] || names.en}</strong><small>{details[lang] || details.en}</small></span>
+                <span><strong>{names[lang] || names.en}{tag && <i className="st-pkg-tag">{tag[lang] || tag.en}</i>}</strong></span>
                 <code>{id === 'windows' ? windowsRelease.version : release}</code>
                 <em>{c.download}<ArrowDownToLine size={15} /></em>
               </a>
             ))}
           </div>
-          <a className="st-link" href={`${RELEASE_BASE}/SHA256SUMS.txt`}>{c.checksums}<ArrowUpRight size={14} /></a>
-          <p className="st-note">{c.requirements}</p>
+          <div className="st-download-links">
+            <a className="st-link" href={`${RELEASE_BASE}/SHA256SUMS.txt`}>{c.checksums}<ArrowUpRight size={14} /></a>
+            <Link className="st-link" to="/docs#install--requirements">{c.requirementsLink}<ArrowRight size={14} /></Link>
+          </div>
         </section>
       </div>
 
@@ -356,7 +352,7 @@ export default function DownloadSection() {
 }
 
 /* The two install entry points share platform state through the URL. */
-function InstallBar({ platform, setPlatform, c, windowsRelease, lang }) {
+function InstallBar({ platform, setPlatform, c, windowsRelease, lang, minimal = false }) {
   const { state, copy } = useClipboard(INSTALL_COMMANDS[platform]);
   const zh = lang === 'zh';
   return <div className="hp-install">
@@ -376,14 +372,16 @@ function InstallBar({ platform, setPlatform, c, windowsRelease, lang }) {
           </button>
         </div>
       </TabsContent>)}
-      <p className="install-feedback" role="status" data-state={state}>
+      {minimal ? (state === 'failed' && <p className="install-feedback" role="status" data-state={state}>
+        {zh ? '无法自动复制，请选中上方命令后手动复制。' : 'Copy unavailable. Select the command above and copy it manually.'}
+      </p>) : <p className="install-feedback" role="status" data-state={state}>
         {state === 'failed' ? (zh ? '无法自动复制，请选中上方命令后手动复制。' : 'Copy unavailable. Select the command above and copy it manually.')
           : state === 'copied' ? (zh ? '已复制。粘贴到终端运行，然后按下方步骤启动。' : 'Copied. Paste into your terminal, then follow the launch steps below.')
           : platform === 'windows' ? (zh ? '在 PowerShell 中运行 · 无需 WSL' : 'Run in PowerShell · No WSL needed')
           : (zh ? '在终端中运行 · 自动识别 CPU 架构' : 'Run in your terminal · Detects your CPU architecture')}
-      </p>
+      </p>}
     </Tabs>
-    <a className={`st-link install-alt-link${platform === 'windows' ? '' : ' is-off'}`} href={windowsRelease.installer} aria-hidden={platform !== 'windows'} tabIndex={platform === 'windows' ? undefined : -1}><ArrowDownToLine size={16} aria-hidden="true" />{c.windowsAlt} · {windowsRelease.version}</a>
+    {!minimal && <a className={`st-link install-alt-link${platform === 'windows' ? '' : ' is-off'}`} href={windowsRelease.installer} aria-hidden={platform !== 'windows'} tabIndex={platform === 'windows' ? undefined : -1}><ArrowDownToLine size={16} aria-hidden="true" />{c.windowsAlt} · {windowsRelease.version}</a>}
   </div>;
 }
 
