@@ -3,12 +3,12 @@ import { useLocation } from 'react-router-dom';
 import { useLanguage } from '../contexts/LanguageContext';
 
 const pages = {
-  '/': ['Laintas CLI — Agent Runtime for Terminal Operations', 'An autonomous coding agent in your terminal. Run commands, edit files, and manage agent workflows with observable controls.'],
+  '/': ['Download Laintas CLI', 'Download Laintas CLI for Linux, macOS and Windows: one install command, or a direct package.'],
   '/docs': ['Laintas CLI Documentation', 'Install Laintas CLI and learn terminal commands, agent workflows, permissions, plugins, and local runtime integration.'],
   '/plugins': ['Laintas CLI Plugins', 'Explore extensions and integrations for the Laintas CLI autonomous terminal agent.'],
 };
 const chinesePages = {
-  '/': ['Laintas CLI — 命令照常敲，其余交给 agent', '在熟悉的终端里运行命令，让 agent 读代码、改文件、跑测试。执行过程看得见，权限由你掌握。'],
+  '/': ['下载 Laintas CLI', '下载 Laintas CLI：Linux、macOS、Windows 一行命令安装，或直接下载安装包。'],
   '/docs': ['Laintas CLI 文档', '安装、登录、命令、工作流、安全策略与插件扩展。查找 Laintas CLI 的使用说明。'],
   '/plugins': ['Laintas CLI 插件市场', '查找官方与社区插件，复制安装命令，为 Laintas CLI 添加需要的能力。'],
 };
