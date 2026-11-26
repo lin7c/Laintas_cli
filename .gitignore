@@ -41,3 +41,7 @@ laintas_cli_download/public/windows/
 laintas_cli_download/public/windows-cli/
 
 *.egg-info/
+
+# local backups and build scratch (do not commit)
+backups/
+laintas_cli_download/build-scratch/

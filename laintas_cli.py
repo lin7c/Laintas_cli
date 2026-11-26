@@ -10868,6 +10868,7 @@ def _call_backend_stream_impl(
     prompt_budget: Optional[dict] = None,
     _local_sink: Optional[dict] = None,
     request_timeout_override: Optional[float] = None,
+    use_direct_route: bool = True,
 ) -> dict:
     """Call Helpwow backend /api/chat/stream, same as Helpwow frontend.
     Returns parsed {reply, command, memory, done, _billing} dict.
@@ -11019,7 +11020,7 @@ def _call_backend_stream_impl(
     # response is the same OpenAI SSE stream the gateway passes through, so
     # everything below stays one implementation. The Laintas session never
     # travels this path — the provider gets its own key and nothing else.
-    direct_route, direct_note = model_route.resolve()
+    direct_route, direct_note = model_route.resolve() if use_direct_route else (None, "")
     if direct_note:
         return {"reply": f"Request refused: {direct_note}. "
                          f"Use /model route {model_route.DEFAULT_ROUTE} to go through the backend.",

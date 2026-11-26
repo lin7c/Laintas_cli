@@ -124,6 +124,19 @@ class EventTranslationTests(unittest.TestCase):
         self.assertTrue(any(isinstance(u, ToolCallStart)
                             for _sid, u in agent._sent))
 
+    def test_concurrent_tools_keep_independent_ok_status(self):
+        agent = self._agent()
+        s = agent._sessions["s1"]
+        agent._forward_event(s, {"type": "tool_started", "toolCallId": "c1", "name": "shell", "command": "false"})
+        agent._forward_event(s, {"type": "tool_started", "toolCallId": "c2", "name": "read", "command": "a.py"})
+        agent._forward_event(s, {"type": "system", "kind": "tool", "content": "shell", "meta": {"ok": False, "call_id": "c1"}})
+        agent._forward_event(s, {"type": "system", "kind": "tool", "content": "read", "meta": {"ok": True, "call_id": "c2"}})
+        agent._forward_event(s, {"type": "system", "kind": "output", "content": "err", "meta": {"call_id": "c1"}})
+        agent._forward_event(s, {"type": "system", "kind": "output", "content": "ok", "meta": {"call_id": "c2"}})
+        updates = {u.tool_call_id: u.status for _sid, u in agent._sent if isinstance(u, ToolCallProgress)}
+        self.assertEqual(updates["c1"], "failed")
+        self.assertEqual(updates["c2"], "completed")
+
     def test_unknown_events_are_dropped(self):
         agent = self._agent()
         before = len(agent._sent)
@@ -194,11 +207,13 @@ class StdoutGuardTests(unittest.TestCase):
     def test_official_credentials_cannot_change_the_selected_account(self):
         import io
         import types
-        import laintas_cli as cli
-        with mock.patch.object(cli, "get_backend_profile", return_value=types.SimpleNamespace(sends_laintas_credentials=True)), \
-             mock.patch.object(cli, "load_session", return_value={"userId": "A", "cookies": {"session": "token"}}), \
-             mock.patch.object(cli, "check_session", return_value=("ok", {"id": "B"})), \
-             mock.patch.object(cli.paths, "ACCOUNT_USER_ID", "A"), \
+        cli = types.SimpleNamespace(
+            get_backend_profile=lambda: types.SimpleNamespace(sends_laintas_credentials=True),
+            load_session=lambda: {"userId": "A", "cookies": {"session": "test-token"}},
+            check_session=lambda _cached: ("ok", {"id": "B"}),
+            paths=types.SimpleNamespace(ACCOUNT_USER_ID="A"),
+        )
+        with mock.patch.dict(sys.modules, {"laintas_cli": cli}), \
              mock.patch.object(acp_agent, "LaintasAcpAgent") as agent, \
              mock.patch("sys.stderr", io.StringIO()) as err:
             self.assertEqual(acp_agent.serve(), 1)
@@ -223,10 +238,9 @@ class StdoutGuardTests(unittest.TestCase):
 class HandshakeProcessTests(unittest.TestCase):
     """End-to-end against a real `laintas-cli --acp` subprocess.
 
-    initialize + new_session only — a prompt needs a model backend and
-    belongs to integration runs, not the unit suite. What this proves:
-    the process starts, speaks valid ACP JSON-RPC on stdio, and keeps
-    the RPC stream clean of startup banner noise.
+    Verify initialization, new-session command discovery, and native
+    commands without a model call. The RPC stream must stay clean of
+    startup banner noise.
     """
 
     def test_official_without_credentials_exits_without_interactive_login(self):
@@ -241,23 +255,69 @@ class HandshakeProcessTests(unittest.TestCase):
             self.assertEqual(result.stdout, "")
             self.assertIn("sign-in required", result.stderr)
 
-    def test_initialize_and_new_session(self):
+    def test_initialize_and_native_model_selection(self):
+        import json
+        import tempfile
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         from acp import PROTOCOL_VERSION
         from acp.interfaces import Client
+        from acp.schema import AvailableCommandsUpdate
         from acp.stdio import spawn_agent_process
 
         class MinimalClient(Client):
+            def __init__(self):
+                self.updates = []
+
             async def request_permission(self, *args, **kwargs):
                 raise RuntimeError("not expected during handshake")
 
-        async def drive():
-            env = dict(os.environ)
+            async def session_update(self, session_id, update, **kwargs):
+                self.updates.append((session_id, update))
+
+        requests = []
+
+        class Gateway(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def _reply(self, content_type, body):
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path != "/api/models":
+                    self.send_error(404)
+                    return
+                self._reply("application/json", json.dumps({"providers": [
+                    {"id": "first-provider", "models": [{"id": "test-model"}]},
+                    {"id": "second-provider", "models": [{"id": "test-model"}, {"id": "other-model"}]},
+                ]}).encode())
+
+            def do_POST(self):
+                if self.path != "/api/chat/stream":
+                    self.send_error(404)
+                    return
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                requests.append(body)
+                chunk = {"model": body.get("model") or "auto-selected", "choices": [
+                    {"delta": {"content": "Wire model request verified"}, "finish_reason": "stop"},
+                ]}
+                stream = "data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n"
+                self._reply("text/event-stream", stream.encode())
+
+        async def drive(home, port):
+            env = dict(os.environ, LAINTAS_HOME=home, LAINTAS_ACCOUNT_ID="",
+                       LAINTAS_MODEL_ROUTE="fixture-direct-route")
+            client = MinimalClient()
             async with spawn_agent_process(
-                MinimalClient(),
+                client,
                 sys.executable,
                 os.path.join(REPO, "laintas_cli.py"),
                 "--acp",
-                "--backend", "http://127.0.0.1:1",
+                "--backend", f"http://127.0.0.1:{port}",
                 env=env,
             ) as (conn, _process):
                 init = await conn.initialize(
@@ -265,12 +325,39 @@ class HandshakeProcessTests(unittest.TestCase):
                     client_capabilities=None)
                 self.assertEqual(init.agent_info.name, "laintas-cli")
                 session = await conn.new_session(
-                    cwd=REPO, mcp_servers=[])
-                self.assertTrue(session.session_id)
-                return session
+                    cwd=home, mcp_servers=[])
+                advertised = [update for sid, update in client.updates
+                              if sid == session.session_id and isinstance(update, AvailableCommandsUpdate)]
+                self.assertEqual([item.name for item in advertised[0].available_commands], ["model"])
 
-        session = asyncio.run(asyncio.wait_for(drive(), timeout=90))
-        self.assertTrue(session.session_id)
+                for command, expected in (("/help", "not available"), ("/cwd", "not available"),
+                                          ("/model", "second-provider"),
+                                          ("/model test-model", "Several providers"),
+                                          ("/model 2", "second-provider"),
+                                          ("Reply with OK", "Wire model request verified"),
+                                          ("/model other-model", "other-model"),
+                                          ("/model reset", "auto-routing"),
+                                          ("Reply with OK again", "Wire model request verified")):
+                    result = await conn.prompt(session_id=session.session_id,
+                        prompt=[TextContentBlock(type="text", text=command)])
+                    self.assertEqual(result.stop_reason, "end_turn")
+                    messages = [update.content.text for sid, update in client.updates
+                                if sid == session.session_id and isinstance(update, AgentMessageChunk)]
+                    self.assertIn(expected, messages[-1])
+                self.assertEqual(requests[0].get("model"), "test-model")
+                self.assertEqual(requests[0].get("provider"), "second-provider")
+                self.assertEqual(requests[-1].get("model"), "")
+                self.assertNotIn("provider", requests[-1])
+
+        with tempfile.TemporaryDirectory(prefix="laintas-acp-slash-") as home, \
+                ThreadingHTTPServer(("127.0.0.1", 0), Gateway) as gateway:
+            thread = threading.Thread(target=gateway.serve_forever, daemon=True)
+            thread.start()
+            try:
+                asyncio.run(asyncio.wait_for(drive(home, gateway.server_port), timeout=45))
+            finally:
+                gateway.shutdown()
+                thread.join()
 
 
 if __name__ == "__main__":
