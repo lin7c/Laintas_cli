@@ -448,7 +448,6 @@ html { scroll-behavior: smooth; }
 
 .st-head h2 { font-size: clamp(32px, 3.1vw, 50px); line-height: 1.1; }
 .st-download-title { font-size: clamp(32px, 3.1vw, 50px); line-height: 1.1; }
-.st-download-sub { margin: 10px 0 26px; color: var(--ops-muted); font: 500 13px/1.5 var(--font-mono); letter-spacing: .04em; }
 #download .st-install { margin-top: 24px; }
 .st-after-install { font-size: 13px; }
 .st-pkg-tag { margin-left: 10px; padding: 3px 8px; border: 1px solid var(--ops-line-strong); border-radius: 999px; color: var(--ops-muted); font: 500 11px/1.6 var(--font-sans); font-style: normal; white-space: nowrap; }

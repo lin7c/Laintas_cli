@@ -12,8 +12,8 @@ import BrandMark from './BrandMark';
 
 const NavigationPreferences = createNavigationPreferences(NavReact);
 const NAV = {
-  zh: [['功能', '/docs'], ['安全', '/docs#security'], ['价格', 'https://laintas.com/pricing'], ['下载', '/#download'], ['文档', '/docs'], ['插件市场', '/plugins']],
-  en: [['Features', '/docs'], ['Security', '/docs#security'], ['Pricing', 'https://laintas.com/pricing'], ['Download', '/#download'], ['Docs', '/docs'], ['Plugins', '/plugins']],
+  zh: [['功能', '/#operations'], ['安全', '/#security'], ['价格', '/#pricing'], ['下载', '/#download'], ['文档', '/docs'], ['插件市场', '/plugins']],
+  en: [['Features', '/#operations'], ['Security', '/#security'], ['Pricing', '/#pricing'], ['Download', '/#download'], ['Docs', '/docs'], ['Plugins', '/plugins']],
 };
 
 export default function Header() {
@@ -70,9 +70,8 @@ export default function Header() {
   }
 
   const navLinks = NAV[lang].map(([label, href]) => {
-    if (href.startsWith('http')) return <a href={href} key={label + href} target="_blank" rel="noreferrer" onClick={() => setMobileOpen(false)}>{label}<ArrowUpRight aria-hidden="true" size={15} /></a>;
     const current = href.includes('#') ? location.pathname + location.hash === href : location.pathname === href;
-    return <Link to={href} key={label + href} aria-current={current ? 'location' : undefined} onClick={() => {
+    return <Link to={href} key={href} aria-current={current ? 'location' : undefined} onClick={() => {
       setMobileOpen(false);
       if (current && href.includes('#')) document.getElementById(href.split('#')[1])?.scrollIntoView({ block: 'start' });
     }}>{label}<ArrowUpRight aria-hidden="true" size={15} /></Link>;
