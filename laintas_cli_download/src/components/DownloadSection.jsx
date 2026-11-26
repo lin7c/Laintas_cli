@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import {
-  ArrowDownToLine, ArrowRight, ArrowUpRight, Check, Code2, Copy, Layers3,
-  Laptop, Monitor, Package, ShieldCheck, TerminalSquare, Waypoints, Play, Pause, RotateCcw, BookOpen,
+  ArrowDownToLine, ArrowRight, ArrowUpRight, Check, Code2, Copy,
+  Laptop, Monitor, Package, Play, Pause, RotateCcw, BookOpen,
 } from 'lucide-react';
 import { useLanguage } from '@/contexts/LanguageContext';
 import SiteFooter from './SiteFooter';
@@ -41,18 +41,15 @@ const PACKAGES = [
   { id: 'source', icon: Code2, file: 'laintas-cli_source.zip', names: { zh: '源码包', en: 'Source package' } },
 ];
 
-// Capability icons, in the order of COPY[lang].caps.
-const CAP_ICONS = [TerminalSquare, Waypoints, ShieldCheck, Layers3];
-
 // Pricing shown on this page mirrors laintas.com/pricing (the authoritative
 // source: laintas server/plans.js, served at laintas.com/api/plans). Values
 // are kept in sync with the main site's plan cards; the full
 // tier table and allowance comparison live on the pricing page itself.
 const PLANS = [
-  { id: 'free', price: '$0', period: '/ mo', title: { zh: '按量使用', en: 'Pay as you go' }, desc: { zh: '新号 100 次试用，只付用量。', en: '100-call trial for new accounts; only pay for usage.' }, badge: null, highlight: false },
-  { id: 'go', price: '$5', period: '/ mo', title: { zh: 'Go', en: 'Go' }, desc: { zh: '轻量使用，会员价入门档。', en: 'Member prices at the lowest entry point, for lighter use.' }, badge: null, highlight: false },
-  { id: 'pro', price: '$19.9', period: '/ mo', title: { zh: 'Pro', en: 'Pro' }, desc: { zh: '适合日常主力使用。', en: 'For everyday, full-time use.' }, badge: { zh: '最受欢迎', en: 'Most popular' }, highlight: true },
-  { id: 'gen', price: '$49.9', period: '/ mo', title: { zh: 'Gen', en: 'Gen' }, desc: { zh: '额度更大，会员价更低，突发速率更高。', en: 'A larger pool, lower member prices and a higher burst rate.' }, badge: null, highlight: false },
+  { id: 'free', price: '$0', period: '/ mo', title: { zh: '按量使用', en: 'Pay as you go' }, badge: null, highlight: false },
+  { id: 'go', price: '$5', period: '/ mo', title: { zh: 'Go', en: 'Go' }, badge: null, highlight: false },
+  { id: 'pro', price: '$19.9', period: '/ mo', title: { zh: 'Pro', en: 'Pro' }, badge: { zh: '最受欢迎', en: 'Most popular' }, highlight: true },
+  { id: 'gen', price: '$49.9', period: '/ mo', title: { zh: 'Gen', en: 'Gen' }, badge: null, highlight: false },
 ];
 
 const COPY = {
@@ -60,35 +57,19 @@ const COPY = {
     title: ['命令照常敲，', '其余交给 agent。'],
     lead: '在你原来的终端里读代码、改文件、跑测试，全程看得见，权限你说了算。',
     install: '安装 Laintas CLI', seeHow: '看它怎么工作',
-    facts: [['免费', '运行时免费使用，可下载源码审计'], ['Linux · macOS · Windows', 'x86_64 / arm64，Windows 10 2004+ / 11'], ['一个账号', '与 Helpwow、插件市场共用 Laintas 账号']],
-    videoTitle: '一段真实会话',
-    videoNote: '真实机器录制，含模型等待时间，可暂停、可拖动。',
 
     whyTitle: ['离你的文件', '最近的那个 agent。'],
     compareHead: ['', '聊天窗口', 'Laintas CLI'],
     compare: [
-      ['上下文', '你复制过去的几段代码', '整个工作目录、终端状态和项目记忆'],
-      ['执行', '给你一段命令，你自己去跑', '自己跑，读完整输出，再决定下一步'],
-      ['出错时', '你把报错转述回去', '它看到的就是你眼前那屏报错'],
-      ['长任务', '关掉页面就断了', '计划、事件和会话都落盘，/resume 接着做'],
-    ],
-    caps: [
-      ['真实终端', '直接命令绕过模型；交互程序、长任务和子终端保持原生 shell 行为。'],
-      ['并行分工', '子 agent 分头干活：HWO 协调协作，HWG 把依赖编译成可恢复的工作图。'],
-      ['分层授权', '模式、角色、阶段、策略、信任与审批层层收窄权限，运行时强制执行。'],
-      ['一个工具面', '内置工具、Skills、MCP 与插件扩展共用一个注册表和授权管道。'],
+      ['上下文', '你粘贴的代码', '工作区、终端、记忆'],
+      ['执行', '给你命令，自己跑', '自己跑完，定下一步'],
+      ['出错时', '你转述报错', '同屏看到报错'],
+      ['长任务', '关页就断', '落盘，/resume 续'],
     ],
 
     howTitle: ['一条指令进来，', '每一步都看得见。'],
-    steps: [
-      ['分流', '$ pytest → PTY'],
-      ['组装上下文', 'mode: act · scope: project'],
-      ['调用工具', 'read · shell.exec · edit'],
-      ['过闸', 'allow · ask · deny'],
-      ['执行并留痕', 'trace: on'],
-    ],
+    steps: ['分流', '组装上下文', '调用工具', '过闸', '执行并留痕'],
     gateTitle: ['并行，', '但不失控。'],
-    gateIntro: '模型再会说，也绕不过一条已经写死的策略。',
     gates: [
       ['放行', 'allow', ['读取项目文件', '运行测试', 'git status / diff']],
       ['询问', 'ask', ['写入或删除文件', 'git push', '读取 ~/.ssh 等凭据']],
@@ -99,9 +80,9 @@ const COPY = {
     perMonth: '/ 月', pricing: '查看完整定价与模型分档',
     ecoTitle: '同一个账号，也通向这些',
     eco: [
-      ['Helpwow', '网页端 AI 工作台，/connect 就能在浏览器里看这台机器的终端并派任务。', 'https://helpwow.laintas.com/'],
-      ['插件市场', '官方与社区扩展，/extensions install 一条命令装上，社区代码先过审查。', '/plugins'],
-      ['Laintas 账户', '余额、订阅、用量与订单，所有产品一处看。', 'https://laintas.com/dashboard'],
+      ['Helpwow', 'https://helpwow.laintas.com/'],
+      ['插件市场', '/plugins'],
+      ['Laintas 账户', 'https://laintas.com/dashboard'],
     ],
 
     downloadHeading: '下载',
@@ -116,35 +97,19 @@ const COPY = {
     title: ['Your shell, as usual.', 'Plus an agent.'],
     lead: 'Read code, edit files and run tests right in your own terminal — every step visible, permissions in your control.',
     install: 'Install Laintas CLI', seeHow: 'See how it works',
-    facts: [['Free', 'Free runtime, source you can download and audit'], ['Linux · macOS · Windows', 'x86_64 / arm64, Windows 10 2004+ / 11'], ['One account', 'Shared with Helpwow and the plugin market']],
-    videoTitle: 'A real session, recorded as it ran',
-    videoNote: 'Recorded on a real machine, model waiting time included. Pause or seek anytime.',
 
     whyTitle: ['The agent closest', 'to your files.'],
     compareHead: ['', 'Chat window', 'Laintas CLI'],
     compare: [
-      ['Context', 'The snippets you pasted in', 'The whole workspace, terminal state and project memory'],
-      ['Execution', 'Hands you a command to run', 'Runs it, reads the full output, decides the next step'],
-      ['On failure', 'You relay the error back', 'It sees the same screen of errors you do'],
-      ['Long tasks', 'Close the tab and it is gone', 'Plans, events and sessions persist; /resume picks up'],
-    ],
-    caps: [
-      ['Real terminal', 'Direct commands bypass the model; interactive programs, long jobs and named sub-terminals keep native shell behavior.'],
-      ['Parallel work', 'Sub-agents split the job: HWO coordinates live collaboration, HWG compiles dependencies into resumable graphs.'],
-      ['Layered authorization', 'Modes, roles, phases, global policy, trust and approvals narrow what a tool may do — enforced by the runtime.'],
-      ['One tool surface', 'Built-in tools, Skills, MCP servers and plugin-market extensions share one registry and one authorization pipeline.'],
+      ['Context', 'Code you paste in', 'Workspace, terminal, memory'],
+      ['Execution', 'Hands you a command to run', 'Runs it, then decides'],
+      ['On failure', 'You relay the error', 'Sees the same error screen'],
+      ['Long tasks', 'Dies with the tab', 'Persisted; /resume picks up'],
     ],
 
     howTitle: ['One request in.', 'Every step visible.'],
-    steps: [
-      ['Route', '$ pytest → PTY'],
-      ['Assemble context', 'mode: act · scope: project'],
-      ['Call tools', 'read · shell.exec · edit'],
-      ['Pass the gate', 'allow · ask · deny'],
-      ['Run and record', 'trace: on'],
-    ],
+    steps: ['Route', 'Assemble context', 'Call tools', 'Pass the gate', 'Run and record'],
     gateTitle: ['Parallel,', 'never out of hand.'],
-    gateIntro: 'No amount of model persuasion gets past a policy that already said no.',
     gates: [
       ['Allow', 'allow', ['Read project files', 'Run the tests', 'git status / diff']],
       ['Ask', 'ask', ['Write or delete files', 'git push', 'Read ~/.ssh and other credentials']],
@@ -155,9 +120,9 @@ const COPY = {
     perMonth: '/ mo', pricing: 'Full pricing and model tiers',
     ecoTitle: 'The same account also opens',
     eco: [
-      ['Helpwow', 'The web AI workspace — run /connect in the CLI to see this machine’s terminal and hand it tasks from your browser.', 'https://helpwow.laintas.com/'],
-      ['Plugin market', 'Official and community extensions, one /extensions install away; community code is reviewed first.', '/plugins'],
-      ['Laintas account', 'Balance, subscription, usage and orders for every product, in one place.', 'https://laintas.com/dashboard'],
+      ['Helpwow', 'https://helpwow.laintas.com/'],
+      ['Plugin market', '/plugins'],
+      ['Laintas account', 'https://laintas.com/dashboard'],
     ],
 
     downloadHeading: 'Download',
@@ -219,10 +184,6 @@ export default function DownloadSection() {
           </div>
 
           <DemoVideo lang={lang} c={c} />
-
-          <dl className="st-facts">
-            {c.facts.map(([term, detail]) => <div key={term}><dt>{term}</dt><dd>{detail}</dd></div>)}
-          </dl>
         </section>
 
         {/* ── Why, and the boundary that keeps it safe ──────────────────── */}
@@ -240,27 +201,13 @@ export default function DownloadSection() {
               </div>
             ))}
           </div>
-          <div className="st-caps">
-            {c.caps.map(([title, desc], index) => {
-              const Icon = CAP_ICONS[index];
-              return (
-                <article key={title}>
-                  <Icon size={18} strokeWidth={1.6} />
-                  <h3>{title}</h3>
-                  <p>{desc}</p>
-                </article>
-              );
-            })}
-          </div>
-
           <div id="workflow" className="hp-flow-block">
             <ChapterHead title={c.howTitle} small />
             <ol className="hp-flow">
-              {c.steps.map(([title, tag], index) => (
+              {c.steps.map((title, index) => (
                 <li key={title}>
                   <span className="hp-flow-num">0{index + 1}</span>
                   <span className="hp-flow-title">{title}</span>
-                  <code>{tag}</code>
                   {index < c.steps.length - 1 && <ArrowRight className="hp-flow-arrow" size={13} />}
                 </li>
               ))}
@@ -268,7 +215,7 @@ export default function DownloadSection() {
           </div>
 
           <div id="security" className="st-gate-block">
-            <ChapterHead title={c.gateTitle} intro={c.gateIntro} small />
+            <ChapterHead title={c.gateTitle} small />
             <div className="st-gates">
               {c.gates.map(([label, tone, items]) => (
                 <div className={`st-gate st-gate-${tone}`} key={tone}>
@@ -293,9 +240,6 @@ export default function DownloadSection() {
                     <p>{plan.title[lang] || plan.title.en}{badge && <em>{badge}</em>}</p>
                     <strong>{plan.price}<small>{c.perMonth}</small></strong>
                   </div>
-                  <div className="st-plan-body">
-                    <p>{plan.desc[lang] || plan.desc.en}</p>
-                  </div>
                   <ArrowUpRight className="st-plan-arrow" size={18} />
                 </a>
               );
@@ -304,9 +248,9 @@ export default function DownloadSection() {
           <a className="st-link" href="https://laintas.com/pricing" target="_blank" rel="noreferrer">{c.pricing}<ArrowUpRight size={14} /></a>
           <div className="st-eco">
             <p className="st-eco-title">{c.ecoTitle}</p>
-            {c.eco.map(([name, desc, href]) => (
+            {c.eco.map(([name, href]) => (
               <a key={name} href={href} {...(href.startsWith('http') ? { target: '_blank', rel: 'noreferrer' } : {})}>
-                <strong>{name}</strong><span>{desc}</span><ArrowUpRight size={16} />
+                <strong>{name}</strong><ArrowUpRight size={16} />
               </a>
             ))}
           </div>
@@ -429,9 +373,8 @@ function DemoVideo({ lang, c }) {
     wantsPlayback.current = true;
     video.play().catch(() => setFailed(true));
   }
-  return <figure id="demo" className="hp-video" aria-labelledby="demo-title">
+  return <figure id="demo" className="hp-video">
     <div className="hp-video-toolbar">
-      <h2 id="demo-title"><TerminalSquare size={17} aria-hidden="true" />{c.videoTitle}</h2>
       <div><button type="button" onClick={toggle} aria-label={zh ? (playing ? '暂停演示' : '播放演示') : (playing ? 'Pause demo' : 'Play demo')} aria-pressed={playing}>
         {playing ? <Pause size={15} aria-hidden="true" /> : <Play size={15} aria-hidden="true" />}<span>{zh ? (playing ? '暂停' : '播放') : (playing ? 'Pause' : 'Play')}</span>
       </button><button type="button" onClick={restart} aria-label={zh ? '重新播放' : 'Restart demo'}><RotateCcw size={15} aria-hidden="true" /><span>{zh ? '重播' : 'Restart'}</span></button></div>
@@ -445,12 +388,11 @@ function DemoVideo({ lang, c }) {
           else wantsPlayback.current = false;
         }}
         onError={() => setFailed(true)}
-        poster={`/media/laintas-cli-demo-${variant}.jpg`} aria-label={c.videoTitle} aria-describedby="demo-description">
+        poster={`/media/laintas-cli-demo-${variant}.jpg`} aria-label={zh ? 'Laintas CLI 演示' : 'Laintas CLI demo'}>
         <source src={`/media/laintas-cli-demo-${variant}.webm`} type="video/webm" />
         <source src={`/media/laintas-cli-demo-${variant}.mp4`} type="video/mp4" />
       </video>
     </div>
-    <figcaption id="demo-description">{c.videoNote}</figcaption>
     {failed && <p className="demo-error" role="status">{zh ? '演示暂时无法播放。' : 'The demo could not play. '}
       <a href={`/media/laintas-cli-demo-${variant}.mp4`}>{zh ? '打开视频文件' : 'Open the video file'}</a>
       <button type="button" onClick={restart}>{zh ? '重新加载' : 'Try again'}</button>
