@@ -5,6 +5,6 @@ self-updater (updater.py, `/v` command) both read this value, so it must match
 the version published in the release `manifest.json`.
 """
 
-__version__ = "2.2.1"  # PEP 440 package version for build tools.
-RELEASE_NAME = "Laintas CLI v2.2.1"
-RELEASE_TAG = "v2.2.1"
+__version__ = "2.2.2"  # PEP 440 package version for build tools.
+RELEASE_NAME = "Laintas CLI v2.2.2"
+RELEASE_TAG = "v2.2.2"
