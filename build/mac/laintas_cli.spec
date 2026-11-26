@@ -17,7 +17,11 @@ for _name in _MANIFEST['packages'] + _MANIFEST['data_dirs']:
 _datas += collect_data_files('certifi')
 
 _hidden = list(_MANIFEST['modules']) + list(_MANIFEST['packages'])
-_hidden += collect_submodules('detect_secrets')
+for _dep in ('detect_secrets', 'acp', 'pydantic', 'pydantic_core'):
+    try:
+        _hidden += collect_submodules(_dep)
+    except Exception:
+        pass
 _hidden += ['json', 'shlex', 'subprocess', 'platform', 'socket', 'urllib',
             'pathlib', 'datetime', 'uuid']
 

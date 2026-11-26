@@ -14994,16 +14994,20 @@ def run_agent_loop(
 
                         if (name in {"task.create", "task.update"}
                                 and result.get("ok")
-                                and deps.display_task_list is not None
                                 and events_cb is not None):
+                            _live_tasks = task_manager.list_tasks(
+                                cwd=tool_ctx.task_cwd or tool_ctx.cwd or None,
+                                session_id=_session_id or None,
+                                owner_agent_id=agent_id,
+                            )
+                            pending_events.append({"type": "plan", "tasks": [
+                                {"subject": task.get("subject", ""),
+                                 "status": task.get("status", "pending")}
+                                for task in _live_tasks
+                            ]})
                             _foreground = get_current_agent()
-                            if (_foreground is not None
+                            if (deps.display_task_list is not None and _foreground is not None
                                     and _foreground.id == agent_id):
-                                _live_tasks = task_manager.list_tasks(
-                                    cwd=tool_ctx.task_cwd or tool_ctx.cwd or None,
-                                    session_id=_session_id or None,
-                                    owner_agent_id=agent_id,
-                                )
                                 deps.display_task_list(_live_tasks, agent_id or "current")
 
                         if (name in {"retask.create", "retask.update"}
@@ -15254,7 +15258,8 @@ def run_agent_loop(
                                                      "call_id": call_id,
                                                      "salient": salient[:200]}})
                     pending_events.append({"type": "system", "kind": "output",
-                                            "content": formatted[:2000]})
+                                            "content": formatted[:2000],
+                                            "meta": {"call_id": call_id}})
                     events_cb(pending_events)
                     pending_events.clear()
 
